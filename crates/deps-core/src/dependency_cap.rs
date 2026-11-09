@@ -62,14 +62,17 @@ pub const MAX_DEPENDENCIES_PER_DOCUMENT: usize = 5000;
 /// # Examples
 ///
 /// ```
-/// use deps_core::dependency_cap::DependencyBudget;
+/// use deps_core::dependency_cap::{DependencyBudget, DependencyTruncation};
 ///
 /// let mut budget = DependencyBudget::new(2);
 /// assert!(budget.allow());
 /// assert!(budget.allow());
 /// assert!(!budget.allow(), "third entry exceeds the cap of 2");
 ///
-/// assert_eq!(budget.truncation(), Some((2, 3)));
+/// assert_eq!(
+///     budget.truncation(),
+///     Some(DependencyTruncation { kept: 2, total: 3 })
+/// );
 /// ```
 #[derive(Debug)]
 pub struct DependencyBudget {
@@ -104,16 +107,48 @@ impl DependencyBudget {
         }
     }
 
-    /// `Some((kept, total))` once more entries were seen than the budget allowed; `None` if
+    /// A [`DependencyTruncation`] once more entries were seen than the budget allowed; `None` if
     /// every entry seen so far fit within the cap. Read by each ecosystem's `ParseResult`
     /// to populate [`ParseResult::dependency_truncation`].
     #[must_use]
-    pub const fn truncation(&self) -> Option<(usize, usize)> {
+    pub const fn truncation(&self) -> Option<DependencyTruncation> {
         if self.total > self.cap {
-            Some((self.kept, self.total))
+            Some(DependencyTruncation {
+                kept: self.kept,
+                total: self.total,
+            })
         } else {
             None
         }
+    }
+}
+
+/// Kept versus declared dependency counts once the per-document ceiling truncated it (#796).
+///
+/// Named fields replace a positional `(kept, total)` tuple so the two counts cannot be
+/// swapped at a producer or consumer.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::dependency_cap::DependencyTruncation;
+///
+/// let truncation = DependencyTruncation { kept: 2, total: 3 };
+/// assert_eq!(truncation.omitted(), 1);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyTruncation {
+    /// Dependencies retained (the cap).
+    pub kept: usize,
+    /// Dependencies the document declared.
+    pub total: usize,
+}
+
+impl DependencyTruncation {
+    /// Number of declared dependencies that were dropped.
+    #[must_use]
+    pub const fn omitted(self) -> usize {
+        self.total.saturating_sub(self.kept)
     }
 }
 
@@ -130,7 +165,10 @@ mod tests {
         assert!(!budget.allow());
         assert!(!budget.allow());
 
-        assert_eq!(budget.truncation(), Some((3, 5)));
+        assert_eq!(
+            budget.truncation(),
+            Some(DependencyTruncation { kept: 3, total: 5 })
+        );
     }
 
     #[test]
@@ -157,6 +195,9 @@ mod tests {
         assert!(!budget.allow());
         assert!(!budget.allow());
 
-        assert_eq!(budget.truncation(), Some((0, 2)));
+        assert_eq!(
+            budget.truncation(),
+            Some(DependencyTruncation { kept: 0, total: 2 })
+        );
     }
 }

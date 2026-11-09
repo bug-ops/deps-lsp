@@ -1117,6 +1117,7 @@ mod tests {
         fn version_range() -> Range {
             Range::new(DepPosition::new(1, 8), DepPosition::new(1, 15))
         }
+        deps_core::impl_unprobed_dependency!(Dep);
         impl deps_core::Dependency for Dep {
             fn name(&self) -> &deps_core::PackageName {
                 &self.name
@@ -2522,9 +2523,6 @@ ser"
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     #[tokio::test]
@@ -2551,7 +2549,6 @@ ser"
     #[tokio::test]
     async fn test_search_packages_rewrites_filter_text_for_normalizing_registry() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct NormalizingRegistry;
         impl Registry for NormalizingRegistry {
@@ -2589,10 +2586,6 @@ ser"
 
             fn search_normalizes_query(&self) -> bool {
                 true
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -2800,7 +2793,6 @@ ser"
     #[tokio::test(start_paused = true)]
     async fn test_search_packages_times_out_and_returns_empty() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct SlowRegistry;
@@ -2835,10 +2827,6 @@ ser"
                     tokio::time::sleep(Duration::from_mins(1)).await;
                     Ok(vec![])
                 })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

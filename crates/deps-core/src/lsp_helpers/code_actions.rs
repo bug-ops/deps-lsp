@@ -403,6 +403,29 @@ fn build_unsatisfiable_fix_action<F: DependencyFormatter>(
     })
 }
 
+/// The registry-supplied replacement name for `dep`'s deprecated package, when the ecosystem
+/// opts in to package renames and the name is valid. The part of the rename quickfix that
+/// does not depend on document content, shared with the hover footer.
+fn offered_replacement_name<'a>(
+    dep: &dyn Dependency,
+    versions: VersionData<'a>,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<&'a str> {
+    if !formatter.supports_package_rename() {
+        return None;
+    }
+    let key = PackageKey::new(dep.name(), formatter);
+    let replacement = versions
+        .outcomes
+        .and_then(|o| o.deprecation(key.normalized()))
+        .and_then(|dep_info| dep_info.replacement.as_deref())
+        .filter(|r| !r.is_empty())?;
+    formatter
+        .validate_package_name(replacement)
+        .ok()
+        .map(|()| replacement)
+}
+
 /// Builds the "Replace with X" package-rename quickfix for `dep` (issue #205), if this
 /// ecosystem opts in via [`crate::lsp_helpers::DiagnosticPolicy::supports_package_rename`] and a
 /// registry-supplied replacement name is on record.
@@ -427,20 +450,7 @@ fn build_replacement_action(
     line_offsets: &LineOffsetTable,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<CodeAction> {
-    if !formatter.supports_package_rename() {
-        return None;
-    }
-
-    let key = PackageKey::new(dep.name(), formatter);
-    let replacement = versions
-        .outcomes
-        .and_then(|o| o.deprecation(key.normalized()))
-        .and_then(|dep_info| dep_info.replacement.as_deref())
-        .filter(|r| !r.is_empty())?;
-
-    if formatter.validate_package_name(replacement).is_err() {
-        return None;
-    }
+    let replacement = offered_replacement_name(dep, versions, formatter)?;
 
     let name_range: Range = dep.name_range().into();
     let name_slice = slice_for_range(content, line_offsets, name_range.into());
@@ -471,6 +481,90 @@ fn build_replacement_action(
         })),
         ..Default::default()
     })
+}
+
+/// Whether [`generate_code_actions`] would offer at least one action for `dep`, decided by the
+/// same builders and gates it runs, given the registry's answer in `fetched`.
+///
+/// The hover footer advertises `Cmd+.` through this, so it cannot promise an action
+/// `codeAction` then withholds (#1988). The one gate it cannot apply is the document-content
+/// literal-span check, which a hover has no text for.
+///
+/// The interactive-fetch circuit breaker enforces for hover but only observes for `codeAction`:
+/// with the breaker open, `fetched` is a degraded answer here and the footer is withheld while
+/// `codeAction` may still offer actions. An action without a footer is the safe direction.
+pub(super) fn code_actions_offered<P, F, R>(
+    parse_result: &P,
+    dep: &P::Dep,
+    versions: VersionData<'_>,
+    fetched: &FetchedVersions,
+    registry: &R,
+    formatter: &F,
+) -> bool
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+    R: Registry + ?Sized,
+{
+    let uri = parse_result.uri();
+    let (Some(version_range), Some(version_req)) = (dep.version_range(), dep.version_requirement())
+    else {
+        return false;
+    };
+    if version_req.as_str().is_empty() {
+        return false;
+    }
+    if offered_replacement_name(dep, versions, formatter).is_some() {
+        return true;
+    }
+    let version_range: Range = version_range.into();
+
+    let vulnerability_fix = build_vulnerability_fix_action(
+        parse_result,
+        dep,
+        uri,
+        version_range,
+        versions,
+        version_req.as_str(),
+        formatter,
+    )
+    .filter(|f| !fetched.rules_out(&f.version_native));
+    let unsatisfiable_fix =
+        build_unsatisfiable_fix_action(dep, uri, version_range, versions, version_req, formatter)
+            .filter(|f| !fetched.rules_out(&f.version_native));
+    if vulnerability_fix.is_some() || unsatisfiable_fix.is_some() {
+        return true;
+    }
+
+    let proven_ahead = matches!(
+        formatter.hover_provenance(dep),
+        Some(crate::lsp_helpers::HoverProvenance::CommitAheadOfLatestRelease { .. })
+    );
+    if proven_ahead
+        || requirement_is_placeholder_for(formatter, dep, version_req.as_str())
+        || !formatter.can_resolve_source(&dep.source())
+    {
+        return false;
+    }
+    let Some(registry_versions) = &fetched.live else {
+        return false;
+    };
+    let literal_target = strip_whitespace(
+        dep.version_literal()
+            .unwrap_or_else(|| version_req.as_str()),
+    );
+    let refactor = RefactorContext {
+        parse_result,
+        dep,
+        uri,
+        version_range,
+        version_req,
+        versions: &versions,
+        formatter,
+    };
+    refactor_targets(&refactor, registry, registry_versions)
+        .iter()
+        .any(|target| strip_whitespace(&target.new_text) != literal_target)
 }
 
 /// Generates the code actions offered for the dependency at `position`.
@@ -755,12 +849,52 @@ fn locate_action_target<'a, F: DependencyFormatter>(
 }
 
 /// The registry's answer for a code action's dependency.
-struct FetchedVersions {
+pub(super) struct FetchedVersions {
     live: Option<Arc<[Box<dyn Version>]>>,
     unverified: bool,
 }
 
 impl FetchedVersions {
+    /// This answer as a footer must read it, ahead of the `codeAction` it advertises.
+    ///
+    /// A genuine failure fails open only for the request that received it, and records a memo
+    /// that refuses every later lookup as unverified. The `codeAction` the footer points at is
+    /// such a later request, so a failure here promises no fix action.
+    ///
+    /// Call it only for a lookup the gate memoized (online, gate and ecosystem attached,
+    /// `InteractiveFetchRequest::is_memoized`). Offline or ungated there is no memo, so the
+    /// `codeAction` fails open too and the unchanged answer is the honest one. The memo lasts
+    /// 30 s: a later `codeAction` may offer the fix without a footer, the safe direction.
+    pub(super) const fn seen_by_the_next_request(mut self) -> Self {
+        if self.live.is_none() {
+            self.unverified = true;
+        }
+        self
+    }
+
+    /// The live version list, when the registry answered with one.
+    pub(super) const fn live(&self) -> Option<&Arc<[Box<dyn Version>]>> {
+        self.live.as_ref()
+    }
+
+    /// The registry's answer as `codeAction` reads it, from an interactive lookup's outcome.
+    pub(super) fn from_interactive(fetch: InteractiveFetch<Arc<[Box<dyn Version>]>>) -> Self {
+        match fetch {
+            InteractiveFetch::Live(list) => Self {
+                live: Some(list),
+                unverified: false,
+            },
+            InteractiveFetch::Degraded(NoLiveList::Failed) => Self {
+                live: None,
+                unverified: false,
+            },
+            InteractiveFetch::Degraded(NoLiveList::Unverified) => Self {
+                live: None,
+                unverified: true,
+            },
+        }
+    }
+
     /// Whether a fix targeting `version_native` must be dropped.
     ///
     /// On a genuine registry outage (`NoLiveList::Failed`) both fix actions still pass through
@@ -798,32 +932,20 @@ async fn fetch_fix_versions<R: Registry + ?Sized>(
             unverified: false,
         };
     }
-    match await_interactive_versions(
-        registry,
-        InteractiveFetchRequest::for_dependency(
-            versions,
-            uri,
-            dep,
-            formatter,
-            FetchContext::CodeAction,
-        ),
-        crate::freshness::FreshnessSettings::Disabled,
+    FetchedVersions::from_interactive(
+        await_interactive_versions(
+            registry,
+            InteractiveFetchRequest::for_dependency(
+                versions,
+                uri,
+                dep,
+                formatter,
+                FetchContext::CodeAction,
+            ),
+            crate::freshness::FreshnessSettings::Disabled,
+        )
+        .await,
     )
-    .await
-    {
-        InteractiveFetch::Live(list) => FetchedVersions {
-            live: Some(list),
-            unverified: false,
-        },
-        InteractiveFetch::Degraded(NoLiveList::Failed) => FetchedVersions {
-            live: None,
-            unverified: false,
-        },
-        InteractiveFetch::Degraded(NoLiveList::Unverified) => FetchedVersions {
-            live: None,
-            unverified: true,
-        },
-    }
 }
 
 /// What [`push_refactor_actions`] needs to know about the targeted dependency.
@@ -837,15 +959,22 @@ struct RefactorContext<'a, 'v, P: TypedParseResult, F> {
     formatter: &'a F,
 }
 
-/// Pushes one REFACTOR "Update to X" action per distinct, OSV-verified display version, and
-/// returns the index of the one for the registry's latest pick, if any.
-fn push_refactor_actions<P, F, R>(
+/// A display version that passed every gate of [`refactor_targets`], with the requirement text
+/// that replaces the dependency's current one.
+struct RefactorTarget {
+    item: crate::completion::VersionDisplayItem,
+    new_text: String,
+}
+
+/// The display versions an "Update to X" REFACTOR action may target: stable-policy filtered,
+/// safe to write, OSV-verified, and rendered into a requirement by the ecosystem. Shared by
+/// [`push_refactor_actions`] and [`code_actions_offered`], so the hover footer and `codeAction`
+/// agree on whether any exist.
+fn refactor_targets<P, F, R>(
     ctx: &RefactorContext<'_, '_, P, F>,
     registry: &R,
     registry_versions: &[Box<dyn Version>],
-    emitted_texts: &mut HashSet<String>,
-    actions: &mut Vec<CodeAction>,
-) -> Option<usize>
+) -> Vec<RefactorTarget>
 where
     P: TypedParseResult,
     F: DependencyFormatter<Dep = P::Dep>,
@@ -856,11 +985,10 @@ where
     let RefactorContext {
         parse_result,
         dep,
-        uri,
-        version_range,
         version_req,
         versions,
         formatter,
+        ..
     } = *ctx;
     let key = PackageKey::new(dep.name(), formatter);
     // Issue #1517/#1524: computed once, shared by both the `item.is_latest` gate (via
@@ -906,7 +1034,7 @@ where
         display_items.retain(|item| item.is_latest || !prereleases.contains(item.version.as_str()));
     }
 
-    let mut latest_refactor_idx = None;
+    let mut targets = Vec::new();
     for item in display_items {
         if !is_safe_version_string(item.version.as_str()) {
             warn_rejected_value(
@@ -952,12 +1080,32 @@ where
         else {
             continue;
         };
+        targets.push(RefactorTarget { item, new_text });
+    }
+    targets
+}
 
+/// Pushes one REFACTOR "Update to X" action per distinct, OSV-verified display version, and
+/// returns the index of the one for the registry's latest pick, if any.
+fn push_refactor_actions<P, F, R>(
+    ctx: &RefactorContext<'_, '_, P, F>,
+    registry: &R,
+    registry_versions: &[Box<dyn Version>],
+    emitted_texts: &mut HashSet<String>,
+    actions: &mut Vec<CodeAction>,
+) -> Option<usize>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+    R: Registry + ?Sized,
+{
+    let mut latest_refactor_idx = None;
+    for RefactorTarget { item, new_text } in refactor_targets(ctx, registry, registry_versions) {
         if !emitted_texts.insert(strip_whitespace(&new_text)) {
             continue;
         }
 
-        let edits = single_file_edit(uri, version_range.into(), new_text);
+        let edits = single_file_edit(ctx.uri, ctx.version_range.into(), new_text);
 
         if item.is_latest {
             latest_refactor_idx = Some(actions.len());
@@ -990,7 +1138,6 @@ mod tests {
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
     use crate::{ConcreteVersion, Dependency, PackageName, ParseResult, VersionReq};
-    use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3652,6 +3799,7 @@ mod tests {
             version_range: Option<Range>,
         }
 
+        crate::impl_unprobed_dependency!(CaDep);
         impl Dependency for CaDep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -3706,6 +3854,7 @@ mod tests {
             version_literal: Option<String>,
         }
 
+        crate::impl_unprobed_dependency!(CaLiteralDep);
         impl Dependency for CaLiteralDep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -3796,10 +3945,6 @@ mod tests {
             ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
             {
                 Box::pin(async move { Ok(Vec::new()) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

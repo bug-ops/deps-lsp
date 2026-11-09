@@ -16,7 +16,6 @@ use deps_core::{
 };
 use deps_npm::NpmRegistry;
 use serde::Deserialize;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -737,10 +736,6 @@ impl Registry for DenoRegistry {
         // for JSR specifically.
         self.npm
             .select_latest_matching(versions, req, selection_context)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

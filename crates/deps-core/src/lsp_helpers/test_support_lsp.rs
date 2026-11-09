@@ -12,7 +12,6 @@
 use super::test_support::{MockDep, MockParseResult, pkg};
 use super::*;
 use crate::{ConcreteVersion, PackageName, PublishTime, RemovalStatus, VersionReq};
-use std::any::Any;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind};
 
 /// Formatter stub mirroring `GoFormatter`'s override: reports the manifest
@@ -64,10 +63,6 @@ impl crate::Registry for MockRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A registry whose `get_versions` always errs, for exercising a fetch-failure code
@@ -102,10 +97,6 @@ impl crate::Registry for ErrorRegistry {
         _limit: usize,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -169,10 +160,6 @@ impl crate::Registry for SlowRegistry {
         _limit: usize,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -261,10 +248,6 @@ impl crate::Registry for CountingRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A registry whose `get_versions` always errs with `PackageNotFound`, for
@@ -308,10 +291,6 @@ impl crate::Registry for NotFoundRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A version with a configurable yanked flag and publish time, used for the
@@ -334,10 +313,6 @@ impl crate::Version for MockVersionWithAge {
     fn published_at(&self) -> Option<PublishTime> {
         self.published_at
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 pub(crate) struct TestVersion {
@@ -352,10 +327,6 @@ impl crate::Version for TestVersion {
 
     fn removal_status(&self) -> crate::RemovalStatus {
         crate::RemovalStatus::from_yanked(self.yanked)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -417,10 +388,6 @@ impl crate::Registry for MockRegistryWithVersions {
     ) -> Option<usize> {
         versions.iter().position(|v| v.is_stable())
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A version carrying an SPDX `license` list (issue #204), used by hover tests that
@@ -438,10 +405,6 @@ impl crate::Version for MockVersionWithLicense {
 
     fn license(&self) -> &[String] {
         &self.license
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -495,10 +458,6 @@ impl crate::Registry for MockRegistryWithLicensedVersions {
     ) -> Option<usize> {
         versions.iter().position(|v| v.is_stable())
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A version carrying an explicit [`RemovalStatus`], used where a test needs
@@ -516,10 +475,6 @@ impl crate::Version for MockVersionWithStatus {
 
     fn removal_status(&self) -> RemovalStatus {
         self.status
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -578,10 +533,6 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
         _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         crate::select_latest_for_existence(versions, |v| v.as_ref())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -657,10 +608,6 @@ impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
     ) -> Option<usize> {
         self.list_pick_index
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A registry returning a fixed, caller-supplied version list — used to
@@ -717,10 +664,6 @@ impl crate::Registry for FixedVersionRegistry {
         _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         crate::select_latest_for_existence(versions, |v| v.as_ref())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

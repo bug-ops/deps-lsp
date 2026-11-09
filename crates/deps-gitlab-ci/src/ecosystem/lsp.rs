@@ -12,9 +12,8 @@
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use deps_core::lsp_helpers::{
-    AuxiliaryLookup, CommentCheck, DependencyFormatter, FetchContext, InteractiveFetch,
-    InteractiveFetchRequest, ShaPinTail, await_interactive_fetch, sha_pin_rewrite,
-    truncate_for_diagnostic,
+    AuxiliaryLookup, DependencyFormatter, FetchContext, InteractiveFetch, InteractiveFetchRequest,
+    ShaPinTail, await_interactive_fetch, sha_pin_rewrite, truncate_for_diagnostic,
 };
 use deps_core::{PackageKey, PackageName, ParsedView};
 
@@ -98,49 +97,6 @@ pub(super) fn build_sha_pin_action(
         formatter,
         MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
     )
-}
-
-/// Builds the "Correct version comment" quickfix (#1734) for the SHA pin at `position` whose
-/// trailing `# tag` comment names a different tag than the one the pinned commit carries.
-///
-/// Locates the pin and its [`CommentCheck`] mismatch, then delegates to the shared
-/// [`deps_core::lsp_helpers::build_sha_comment_fix_action`], which offers a fix only for a
-/// comment naming another tag of the pinned commit.
-pub(super) fn build_sha_comment_fix_action(
-    dependencies: &[GitlabCiDependency],
-    position: Position,
-    uri: &Url,
-    formatter: &GitlabCiFormatter,
-) -> Option<CodeAction> {
-    let gl_dep = dependencies
-        .iter()
-        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
-    let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
-        return None;
-    };
-    deps_core::lsp_helpers::build_sha_comment_fix_action(
-        uri,
-        gl_dep.version_range?,
-        gl_dep.sha_comment()?,
-        &mismatch,
-    )
-}
-
-/// Builds the "Change ref to published tag" quickfix (#1781) for the `project:` tag pin at
-/// `position` whose `ref:` the project's complete Tags list proves unpublished.
-///
-/// Selects the pin through the same [`super::unknown_ref_target`] the diagnostic uses, so only a
-/// `project:` Tags list ever qualifies (never a `component:` Releases list), then delegates to
-/// [`deps_core::lsp_helpers::UnknownRefTarget::fix_action`].
-pub(super) fn build_unknown_ref_fix_action(
-    parse_result: &ParsedView<'_, GitlabCiParseResult>,
-    position: Position,
-    uri: &Url,
-    formatter: &GitlabCiFormatter,
-) -> Option<CodeAction> {
-    let gl_dep =
-        deps_core::lsp_helpers::dependency_at_position(parse_result, position.into(), formatter)?;
-    super::unknown_ref_target(formatter, gl_dep)?.fix_action(uri)
 }
 
 /// Builds the "Pin `{name}` to commit SHA" quickfix (validation follow-up C2/S2) for a

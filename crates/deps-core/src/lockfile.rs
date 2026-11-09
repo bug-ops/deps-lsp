@@ -379,6 +379,23 @@ pub struct ResolvedPackage {
     pub source: ResolvedSource,
     /// Dependencies of this package (for dependency tree analysis)
     pub dependencies: Vec<String>,
+    placement: EntryPlacement,
+}
+
+/// Where a lock-file entry sits relative to the project root, for lock formats that record
+/// transitive-only copies of a package under a nested location (#1981).
+///
+/// Exhaustive on purpose: every `match` must decide how each placement is treated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EntryPlacement {
+    /// The entry a root or workspace-member dependency resolves to. The default for every
+    /// lock format that does not distinguish nested copies.
+    #[default]
+    Hoisted,
+    /// A copy installed only for a transitive consumer (`package-lock.json`
+    /// `node_modules/<parent>/node_modules/<name>`). Never authoritative for a direct
+    /// dependency while a [`Self::Hoisted`] entry of the same name exists.
+    Nested,
 }
 
 impl std::fmt::Debug for ResolvedPackage {
@@ -393,6 +410,7 @@ impl std::fmt::Debug for ResolvedPackage {
             )
             .field("version", &self.version)
             .field("source", &self.source)
+            .field("placement", &self.placement)
             .field(
                 "dependencies",
                 &self
@@ -434,7 +452,21 @@ impl ResolvedPackage {
             version,
             source,
             dependencies: Vec::new(),
+            placement: EntryPlacement::Hoisted,
         }
+    }
+
+    /// Marks where this entry sits. See [`EntryPlacement`].
+    #[must_use]
+    pub fn with_placement(mut self, placement: EntryPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
+
+    /// Where this entry sits relative to the project root. See [`EntryPlacement`].
+    #[must_use]
+    pub const fn placement(&self) -> EntryPlacement {
+        self.placement
     }
 
     /// Attaches this package's own dependencies. See [`Self::dependencies`].
@@ -583,11 +615,24 @@ impl std::fmt::Debug for ResolvedPackages {
 /// non-semver version string is never ordered by two diverging policies depending on which
 /// caller is asking.
 pub(crate) fn compare_lockfile_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    match (semver::Version::parse(a), semver::Version::parse(b)) {
-        (Ok(va), Ok(vb)) => va.cmp(&vb),
-        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-        (Err(_), Err(_)) => a.cmp(b),
+    let (parsed_a, parsed_b) = (
+        semver::Version::parse(a).ok(),
+        semver::Version::parse(b).ok(),
+    );
+    compare_parsed_versions((parsed_a.as_ref(), a), (parsed_b.as_ref(), b))
+}
+
+/// [`compare_lockfile_versions`] for versions already parsed (`None` when the string is not
+/// semver), so a caller comparing one list many times parses each entry once.
+pub(crate) fn compare_parsed_versions(
+    (parsed_a, raw_a): (Option<&semver::Version>, &str),
+    (parsed_b, raw_b): (Option<&semver::Version>, &str),
+) -> std::cmp::Ordering {
+    match (parsed_a, parsed_b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => raw_a.cmp(raw_b),
     }
 }
 
@@ -711,7 +756,8 @@ impl ResolvedPackages {
     /// Lock-file spellings that normalize to one name (e.g. NuGet's `Newtonsoft.Json` and
     /// `newtonsoft.json` across target frameworks) are unioned: the resolved version is the
     /// best over the union, and the candidates map holds an entry only when the union has
-    /// more than one *distinct* version. Candidates are listed in lock-file-name order, then
+    /// more than one *distinct* version. A name with at least one [`EntryPlacement::Hoisted`]
+    /// entry ignores its [`EntryPlacement::Nested`] ones entirely (#1981). Candidates are listed in lock-file-name order, then
     /// insertion order, so the result is deterministic.
     ///
     /// Versions are compared with the semver-first comparator `best_package` uses, with a
@@ -767,7 +813,13 @@ impl ResolvedPackages {
 
         let mut versions = HashMap::with_capacity(union.len());
         let mut candidates = HashMap::new();
-        for (key, packages) in union {
+        for (key, mut packages) in union {
+            if packages
+                .iter()
+                .any(|package| package.placement == EntryPlacement::Hoisted)
+            {
+                packages.retain(|package| package.placement == EntryPlacement::Hoisted);
+            }
             if let Some(best) = best_package(packages.iter().copied()) {
                 versions.insert(
                     key.clone(),
@@ -1289,6 +1341,7 @@ mod tests {
                 checksum: "abc123".into(),
             },
             dependencies: vec!["serde_derive".into()],
+            placement: EntryPlacement::Hoisted,
         };
 
         packages.insert(pkg);
@@ -1322,6 +1375,7 @@ mod tests {
                 checksum: "old".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         packages.insert(ResolvedPackage {
@@ -1332,6 +1386,7 @@ mod tests {
                 checksum: "new".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         // Both versions stored, but len counts unique names
@@ -1353,6 +1408,7 @@ mod tests {
                 checksum: "a".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         packages.insert(ResolvedPackage {
@@ -1363,6 +1419,7 @@ mod tests {
                 checksum: "b".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         packages.insert(ResolvedPackage {
@@ -1373,6 +1430,7 @@ mod tests {
                 checksum: "c".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         assert_eq!(packages.len(), 1);
@@ -1389,6 +1447,7 @@ mod tests {
             version: "abc".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         packages.insert(ResolvedPackage {
@@ -1396,6 +1455,7 @@ mod tests {
             version: "xyz".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         // Falls back to string comparison: "xyz" > "abc"
@@ -1411,6 +1471,7 @@ mod tests {
             version: "not-a-version".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         packages.insert(ResolvedPackage {
@@ -1418,6 +1479,7 @@ mod tests {
             version: "1.0.0".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         // Parseable semver is preferred over non-parseable
@@ -1455,6 +1517,7 @@ mod tests {
                 checksum: "a".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         packages.insert(ResolvedPackage {
@@ -1465,6 +1528,7 @@ mod tests {
                 checksum: "b".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         let count = packages.iter().count();
@@ -1487,6 +1551,7 @@ mod tests {
                 checksum: "a".into(),
             },
             dependencies: vec![],
+            placement: EntryPlacement::Hoisted,
         });
 
         let map = packages.into_map();
@@ -1901,6 +1966,7 @@ mod tests {
                     version: content.trim().to_string(),
                     source: ResolvedSource::Path { path: ".".into() },
                     dependencies: vec![],
+                    placement: EntryPlacement::Hoisted,
                 });
                 Ok(packages)
             })
@@ -2121,6 +2187,7 @@ mod tests {
                     version: content.trim().to_string(),
                     source: ResolvedSource::Path { path: ".".into() },
                     dependencies: vec![],
+                    placement: EntryPlacement::Hoisted,
                 });
                 Ok(packages)
             })
@@ -2198,6 +2265,7 @@ mod tests {
                 rev: "deadbeef".to_string(),
             },
             dependencies: vec![crate::conformance::CREDENTIAL_PROBE_KEY.to_string()],
+            placement: EntryPlacement::Hoisted,
         },
     );
 
@@ -2397,5 +2465,40 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[&normalized("serde")].len(), 2);
+    }
+
+    #[test]
+    fn split_normalized_ignores_nested_entries_when_a_hoisted_one_exists() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(registry_pkg("minimist", "1.2.8"));
+        packages.insert(registry_pkg("minimist", "1.2.5").with_placement(EntryPlacement::Nested));
+        packages.insert(registry_pkg("foo", "1.0.0").with_placement(EntryPlacement::Nested));
+
+        let (versions, candidates) = packages.split_normalized(&Lowercase);
+
+        assert_eq!(
+            versions.get(&normalized("minimist")).map(|v| v.as_str()),
+            Some("1.2.8")
+        );
+        assert!(candidates.is_empty());
+        assert_eq!(
+            versions.get(&normalized("foo")).map(|v| v.as_str()),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn split_normalized_keeps_all_nested_entries_when_none_is_hoisted() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(registry_pkg("bar", "1.0.0").with_placement(EntryPlacement::Nested));
+        packages.insert(registry_pkg("bar", "2.0.0").with_placement(EntryPlacement::Nested));
+
+        let (versions, candidates) = packages.split_normalized(&Lowercase);
+
+        assert_eq!(
+            versions.get(&normalized("bar")).map(|v| v.as_str()),
+            Some("2.0.0")
+        );
+        assert_eq!(candidates[&normalized("bar")].len(), 2);
     }
 }

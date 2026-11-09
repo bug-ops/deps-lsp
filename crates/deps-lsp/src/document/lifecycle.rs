@@ -3,14 +3,14 @@
 //! This module provides unified open/change/close handlers that work with
 //! the ecosystem trait architecture, eliminating per-ecosystem duplication.
 
-use super::diff::{DependencyDiff, preserve_cache, reload_resolved_versions};
+use super::diff::{DeclaredRequirements, DependencyDiff, preserve_cache, reload_resolved_versions};
 use super::fetch::{
     fetch_failure_toast, fetch_registry_versions_for_change, merge_registry_fetch_result,
 };
 use super::gossip_prefetch::{run_gossip_prefetch, spawn_gossip_mismatch_refetch_if_needed};
 use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::osv_scan::{
-    OsvScanResult, rescan_osv_if_tag_index_now_warm, run_license_prefetch,
+    OsvScanResult, osv_scan_plan_is_stale, rescan_osv_if_tag_index_now_warm, run_license_prefetch,
     run_osv_phase_b_and_commit, run_osv_scan_phase_a,
 };
 use super::probes::spawn_background_probes;
@@ -298,13 +298,16 @@ async fn run_document_open_background_task(
     // `RegistryProgress`'s total. A non-resolvable source is dropped entirely, and two
     // occurrences of the same name resolving to *different* sources are dropped and recorded
     // as collided instead (spec FR-011) — see `prepare_fetch`/`dedup_dependencies_by_source`.
-    let Some(FetchPreparation {
-        dep_sources,
-        in_use,
-        selection_context,
-        collided_names,
-        ..
-    }) = prepare_open_fetch(
+    let Some((
+        FetchPreparation {
+            dep_sources,
+            in_use,
+            selection_context,
+            collided_names,
+            ..
+        },
+        declared,
+    )) = prepare_open_fetch(
         &uri,
         &state,
         ecosystem.as_ref(),
@@ -377,8 +380,14 @@ async fn run_document_open_background_task(
         "registry fetch complete"
     );
 
-    let failure_summary =
-        commit_open_fetch_result(&state, &uri, fetch_result, collided_names, success);
+    let failure_summary = commit_open_fetch_result(
+        &state,
+        &uri,
+        fetch_result,
+        collided_names,
+        declared,
+        success,
+    );
 
     finish_after_fetch(
         progress,
@@ -480,6 +489,9 @@ fn seed_cached_versions_from_lockfile(
 /// occurrences of the same name resolving to *different* sources are dropped and recorded
 /// as collided instead (spec FR-011) — see `prepare_fetch`/`dedup_dependencies_by_source`.
 ///
+/// Also returns the requirements every package is declared with at this moment, which
+/// [`commit_open_fetch_result`] records as the committed baseline (issue #1987).
+///
 /// `None` when the document or its parse result is gone, which aborts the fetch.
 fn prepare_open_fetch(
     uri: &Uri,
@@ -487,7 +499,7 @@ fn prepare_open_fetch(
     ecosystem: &dyn Ecosystem,
     resolved_versions: &ResolvedVersionsMap,
     resolved_version_candidates: &ResolvedCandidatesMap,
-) -> Option<FetchPreparation> {
+) -> Option<(FetchPreparation, DeclaredRequirements)> {
     let Some(doc) = state.get_document(uri) else {
         tracing::warn!("document not found, aborting fetch");
         return None;
@@ -496,26 +508,34 @@ fn prepare_open_fetch(
         tracing::warn!("no parse result, aborting fetch");
         return None;
     };
-    Some(prepare_fetch(
-        manifest,
-        ecosystem.formatter(),
-        ecosystem.ecosystem_id(),
-        resolved_versions,
-        resolved_version_candidates,
+    Some((
+        prepare_fetch(
+            manifest,
+            ecosystem.formatter(),
+            ecosystem.ecosystem_id(),
+            resolved_versions,
+            resolved_version_candidates,
+        ),
+        dependency_version_map(manifest, ecosystem.formatter()),
     ))
 }
 
 /// Commits a completed open-path registry fetch into the document (cached versions, outcomes,
 /// loading state), then returns `fetch_result.failure_summary`, the one field it does not
 /// consume, so the caller can still raise the fetch-failure toast.
+///
+/// `declared` replaces the document's registry baseline: it is what this fetch was prepared
+/// from, so a failure or miss counts as committed too (issue #1987).
 fn commit_open_fetch_result(
     state: &ServerState,
     uri: &Uri,
     fetch_result: FetchResult,
     collided_names: HashSet<NormalizedName>,
+    declared: DeclaredRequirements,
     success: bool,
 ) -> Option<FailureSummary> {
     if let Some(mut doc) = state.documents.get_mut(uri) {
+        doc.signals.registry_baseline.replace(declared);
         doc.update_cached_versions(fetch_result.versions);
         let mut outcomes = DependencyOutcomes::new();
         for (name, d) in fetch_result.deprecations {
@@ -698,8 +718,8 @@ impl ParseTrigger {
 /// Runs the pre-fetch probes of `uri`'s ecosystem and, when one asks for it, re-parses and
 /// commits the document once (spec 088 FR-017).
 ///
-/// Returns the diff of that re-parse (names added or whose version changed, whether an OSV
-/// rescan is due) so the caller can fetch what the re-parse introduced. `None` when nothing
+/// Returns whether an OSV rescan is due after that re-parse; the caller fetches what the
+/// re-parse introduced through the registry baseline. `None` when nothing
 /// changed, the document moved on, or the network is off. A re-parse runs no probe, so this
 /// cannot loop.
 async fn apply_pre_fetch_reparse(
@@ -733,8 +753,6 @@ async fn apply_pre_fetch_reparse(
     let content = state.get_document(uri)?.content.clone();
     let (reparsed, diff, _) = parse_and_diff_manifest(uri, &content, state, ecosystem).await;
     let needs_osv_rescan = diff.needs_osv_rescan();
-    let mut fetch = diff.added.clone();
-    fetch.extend(diff.version_changed.iter().cloned());
     commit_parsed_document(
         uri,
         ecosystem.as_ref(),
@@ -747,15 +765,12 @@ async fn apply_pre_fetch_reparse(
             guard: CommitGuard::ExpectVersion(version),
         },
     )
-    .then_some(PreFetchReparse {
-        fetch,
-        needs_osv_rescan,
-    })
+    .then_some(PreFetchReparse { needs_osv_rescan })
 }
 
-/// What a pre-fetch re-parse introduced, see [`apply_pre_fetch_reparse`].
+/// What a pre-fetch re-parse introduced, see [`apply_pre_fetch_reparse`]. The names it makes
+/// pending need no field: they are read from the document's registry baseline.
 struct PreFetchReparse {
-    fetch: Vec<NormalizedName>,
     needs_osv_rescan: bool,
 }
 
@@ -941,6 +956,10 @@ fn commit_parsed_document(
         doc_state.signals.outcomes.clear_yanked(changed_dep);
         doc_state.signals.outcomes.clear_fetch_failure(changed_dep);
     }
+    doc_state
+        .signals
+        .registry_baseline
+        .invalidate(&diff.version_changed);
 
     // Issue #1424 (impl-critic round 2, S2): a manifest edit that changes a dependency's
     // version requirement is this document's *only* resolved-version-move signal for
@@ -1078,20 +1097,6 @@ pub(crate) async fn handle_document_change_guarded(
         refetch = RefetchPolicy::AllDependencies;
     }
 
-    // Captured before `commit_parsed_document` consumes `parse_result` — only needed under
-    // `RefetchPolicy::AllDependencies` (issue #592), where the fetch must cover every
-    // dependency in the new manifest rather than only what `diff` calls for: a
-    // routing-only config change leaves the manifest's dependency set unchanged, so `diff`
-    // alone would see nothing to fetch.
-    let all_dependency_names: Vec<NormalizedName> = match refetch {
-        RefetchPolicy::Diff => Vec::new(),
-        RefetchPolicy::AllDependencies => parse_result.as_deref().ok().map_or_default(|pr| {
-            dependency_version_map(pr, ecosystem.formatter())
-                .into_keys()
-                .collect()
-        }),
-    };
-
     if !commit_parsed_document(
         &uri,
         ecosystem.as_ref(),
@@ -1110,18 +1115,18 @@ pub(crate) async fn handle_document_change_guarded(
         diagnostics::DiagnosticsSnapshot::capture(&state, &uri, &config).await;
 
     let needs_osv_rescan = diff.needs_osv_rescan();
-    let deps_to_fetch = match refetch {
-        RefetchPolicy::Diff => {
-            // The yanked probe must also re-run for a version-only edit, not just a
-            // newly added dependency — otherwise editing a dependency's pin from a
-            // safe version to a yanked one would never be checked, since an empty
-            // `deps_to_fetch` skips the entire registry fetch below (security F1).
-            let mut v = diff.added;
-            v.extend(diff.version_changed);
-            v
-        }
-        RefetchPolicy::AllDependencies => all_dependency_names,
-    };
+
+    // `commit_parsed_document` always installs a fresh `Idle` state, which would otherwise let
+    // a document with pending registry data publish "Unknown package" until the debounced
+    // task fetches (FR-008, issue #1987). The task recomputes the pending names itself.
+    let has_pending_fetch = state
+        .with_document(&uri, |doc| {
+            !pending_fetch_names(doc, ecosystem.formatter(), refetch).is_empty()
+        })
+        .unwrap_or(false);
+    if has_pending_fetch && let Some(mut doc) = state.documents.get_mut(&uri) {
+        doc.set_loading();
+    }
 
     // Spawn background task to update diagnostics. Captured before `tokio::spawn` so
     // this task's own span (and everything it spawns in turn) nests under whichever
@@ -1141,12 +1146,30 @@ pub(crate) async fn handle_document_change_guarded(
             },
             Arc::clone(&config),
             needs_osv_rescan,
-            deps_to_fetch,
         )
         .instrument(span),
     );
 
     Ok(Some(task))
+}
+
+/// The packages `doc` still needs a registry outcome for: under [`RefetchPolicy::Diff`] those
+/// the document's registry baseline has not committed for their current requirements (issue
+/// #1987), under [`RefetchPolicy::AllDependencies`] every declared package (issue #592: a
+/// routing-only change leaves the declaration unchanged, so only a forced full refetch sees it).
+fn pending_fetch_names(
+    doc: &DocumentState,
+    formatter: &dyn deps_core::EcosystemFormatter,
+    refetch: RefetchPolicy,
+) -> Vec<NormalizedName> {
+    let Some(manifest) = doc.manifest() else {
+        return Vec::new();
+    };
+    let declared = dependency_version_map(manifest, formatter);
+    match refetch {
+        RefetchPolicy::Diff => doc.signals.registry_baseline.pending(&declared),
+        RefetchPolicy::AllDependencies => declared.into_keys().collect(),
+    }
 }
 
 /// Config values snapshotted from `DepsConfig` before spawning [`run_document_change_task`]
@@ -1246,6 +1269,20 @@ pub(crate) const fn osv_phase_a_should_run(
     deps_to_fetch_is_empty: bool,
 ) -> bool {
     needs_osv_rescan || (osv_checks.is_active() && !deps_to_fetch_is_empty)
+}
+
+/// Whether `uri`'s committed OSV scan plan is stale while OSV checks are active (FR-005,
+/// issue #1987); see [`osv_scan_plan_is_stale`].
+fn osv_plan_is_stale(
+    state: &ServerState,
+    uri: &Uri,
+    ecosystem: &dyn Ecosystem,
+    osv_checks: OsvChecks,
+) -> bool {
+    osv_checks.is_active()
+        && state
+            .with_document(uri, |doc| osv_scan_plan_is_stale(doc, ecosystem))
+            .unwrap_or(false)
 }
 
 /// Which of [`spawn_osv_and_license_prefetch`]'s two independent spawns should run — named
@@ -1392,7 +1429,6 @@ async fn run_document_change_task(
     // struct's own "the task never needs to hold the config lock itself" property.
     live_config: Arc<RwLock<DepsConfig>>,
     mut needs_osv_rescan: bool,
-    mut deps_to_fetch: Vec<NormalizedName>,
 ) {
     tokio::time::sleep(DID_CHANGE_DEBOUNCE).await;
 
@@ -1401,8 +1437,16 @@ async fn run_document_change_task(
         && let Some(reparsed) = apply_pre_fetch_reparse(&uri, &state, &ecosystem).await
     {
         needs_osv_rescan |= reparsed.needs_osv_rescan;
-        deps_to_fetch.extend(reparsed.fetch);
     }
+
+    // Computed here, after the debounce and the re-parse, from what the document has committed
+    // — not handed in by the handler from a parse-to-parse diff, which cannot see a fetch that
+    // an earlier, aborted task never committed (issue #1987).
+    let deps_to_fetch = state
+        .with_document(&uri, |doc| {
+            pending_fetch_names(doc, ecosystem.formatter(), config.refetch)
+        })
+        .unwrap_or_default();
 
     // `handle_document_change_guarded` already validated this exact `uri` converts
     // successfully before spawning this task, so `None` here is unreachable in
@@ -1459,8 +1503,16 @@ async fn run_document_change_task(
     // its commit lands before either of this function's diagnostics publishes, not after.
     // See `spawn_osv_and_license_prefetch`'s own doc for the open-task counterpart, which
     // always runs both.
+    // A stale plan also covers an OSV outcome an aborted predecessor never committed (FR-005,
+    // issue #1987); it is false for an unchanged, fully scanned document.
+    let plan_stale = osv_plan_is_stale(
+        &state,
+        &uri,
+        ecosystem.as_ref(),
+        config.diagnostics.osv_checks(),
+    );
     let should_run_osv_phase_a = osv_phase_a_should_run(
-        needs_osv_rescan,
+        needs_osv_rescan || plan_stale,
         config.diagnostics.osv_checks(),
         deps_to_fetch.is_empty(),
     );
@@ -1555,32 +1607,24 @@ async fn run_document_change_task(
         .expect("fetch_permits semaphore is never closed");
 
     let dep_count = deps_to_fetch.len();
-    let (progress, fetch_result, attempted_names, collided_names) =
-        fetch_registry_versions_for_change(
-            &uri,
-            &state,
-            &client,
-            ecosystem.as_ref(),
-            &resolved_versions,
-            &resolved_version_candidates,
-            deps_to_fetch,
-            config.diagnostics.freshness,
-            config.diagnostics.fetch_timeout,
-            config.diagnostics.max_concurrent_fetches,
-            config.refetch,
-        )
-        .await;
-
-    let success = !fetch_result.versions.is_empty();
-
-    let failure_summary = merge_registry_fetch_result(
-        &state,
+    let (progress, fetched) = fetch_registry_versions_for_change(
         &uri,
-        fetch_result,
-        &attempted_names,
-        collided_names,
-        success,
-    );
+        &state,
+        &client,
+        ecosystem.as_ref(),
+        &resolved_versions,
+        &resolved_version_candidates,
+        deps_to_fetch,
+        config.diagnostics.freshness,
+        config.diagnostics.fetch_timeout,
+        config.diagnostics.max_concurrent_fetches,
+        config.refetch,
+    )
+    .await;
+
+    let success = !fetched.fetch_result.versions.is_empty();
+
+    let failure_summary = merge_registry_fetch_result(&state, &uri, fetched, success);
     drop(fetch_permit);
 
     finish_after_fetch(
@@ -2161,9 +2205,18 @@ mod rekey_signals_tests;
 #[path = "lifecycle_refresh_tests.rs"]
 mod refresh_tests;
 
+#[cfg(all(
+    test,
+    any(feature = "npm", feature = "cargo", feature = "github-actions")
+))]
+#[path = "lifecycle_initial_fetch_tests.rs"]
+mod initial_fetch_tests;
+
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;
+    #[cfg(feature = "cargo")]
+    use super::super::fetch::ChangeFetch;
     use super::*;
     use deps_core::ConcreteVersion;
     use deps_core::EcosystemId;
@@ -2802,9 +2855,12 @@ mod tests {
             let failure_summary = merge_registry_fetch_result(
                 &state,
                 &uri,
-                fetch_result,
-                &[NormalizedName::for_test("serde")],
-                HashSet::new(),
+                ChangeFetch {
+                    fetch_result,
+                    attempted_names: vec![NormalizedName::for_test("serde")],
+                    collided_names: HashSet::new(),
+                    requested: HashMap::new(),
+                },
                 false,
             );
             assert_eq!(failure_summary.map(|f| f.count()), Some(1));
@@ -2955,10 +3011,9 @@ mod tests {
         use deps_core::ecosystem::BoxFuture;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
-            Dependency, DiagnosticSeverities, EcosystemConfig, FreshnessSettings, Metadata,
-            Version, VersionData, completion::Completions,
+            Dependency, EcosystemConfig, FreshnessSettings, Metadata, Version, VersionData,
+            completion::Completions,
         };
-        use std::any::Any;
         use std::path::Path;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Barrier;
@@ -2968,6 +3023,7 @@ mod tests {
             name: PackageName,
             version_requirement: VersionReq,
         }
+        deps_core::impl_unprobed_dependency!(FakeDependency);
         impl Dependency for FakeDependency {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -3058,9 +3114,6 @@ mod tests {
             ) -> BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>> {
                 Box::pin(async move { Ok(vec![]) })
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct SlowFetchEcosystem {
@@ -3120,16 +3173,6 @@ mod tests {
                 _loading_state: deps_core::LoadingState,
                 _config: &'a EcosystemConfig,
             ) -> BoxFuture<'a, Vec<InlayHint>> {
-                Box::pin(async move { vec![] })
-            }
-            fn diagnostics<'a>(
-                &'a self,
-                _parsed: deps_core::ParsedView<'a, FakeParseResult>,
-                _versions: VersionData<'a>,
-                _uri: &'a url::Url,
-                _freshness: FreshnessSettings,
-                _severities: DiagnosticSeverities,
-            ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
                 Box::pin(async move { vec![] })
             }
             fn code_lenses<'a>(
@@ -5349,7 +5392,6 @@ mod pre_fetch_tests {
                 },
                 config,
                 false,
-                Vec::new(),
             )
             .await;
 

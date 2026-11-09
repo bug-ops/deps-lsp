@@ -20,7 +20,6 @@ use deps_core::{
     registry::{KeyShape, register_capped_with_occupied},
 };
 use serde::Deserialize;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -983,10 +982,6 @@ impl deps_core::Registry for NpmRegistry {
                 parsed_req.satisfies(&ver) && !v.removal_status().blocks_resolution()
             })
         })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

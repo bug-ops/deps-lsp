@@ -4,7 +4,6 @@
 // (#745), deps-nuget (#696), deps-swift (#673), deps-composer. deps-gradle shares this
 // exposure via delegation.
 #![recursion_limit = "256"]
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! pom.xml parsing and Maven Central integration.
 //!

@@ -1,5 +1,4 @@
 use deps_core::position::Range;
-use std::any::Any;
 use std::collections::HashMap;
 
 pub use deps_core::parser::DependencySource;
@@ -331,10 +330,6 @@ impl deps_core::Version for CargoVersion {
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 impl deps_core::Metadata for CrateInfo {
@@ -357,9 +352,24 @@ impl deps_core::Metadata for CrateInfo {
     fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.max_version
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for CargoDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            features: Vec::new(),
+            features_range: None,
+            source,
+            section: CargoDependencySection::Dependencies,
+            package: None,
+            custom_registry_origin: None,
+        }
     }
 }
 

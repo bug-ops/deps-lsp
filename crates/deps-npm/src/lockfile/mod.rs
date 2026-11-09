@@ -29,7 +29,7 @@
 
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
-    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
+    EntryPlacement, LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
     locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use deps_core::yaml_scalar_string;
@@ -298,13 +298,18 @@ async fn parse_package_lock_json(lockfile_path: &Path) -> Result<ResolvedPackage
     Ok(packages)
 }
 
+/// Builds the parse error every lock-file parser reports, tagged with its file type.
+pub(super) fn lockfile_parse_error(file_type: &'static str, message: &str) -> DepsError {
+    DepsError::parse_error(file_type, &message)
+}
+
 /// Parses `package-lock.json` content (already read and size-capped) into resolved packages.
 ///
 /// The CPU-bound half of [`parse_package_lock_json`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> {
     let lock_data: PackageLockJson = deps_core::parse_json_checked(content.as_bytes())
-        .map_err(|e| DepsError::parse_error("package-lock.json", &e))?;
+        .map_err(|e| lockfile_parse_error("package-lock.json", &e.to_string()))?;
 
     let mut packages = ResolvedPackages::new();
 
@@ -330,7 +335,9 @@ fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> 
         let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
 
         packages.insert(
-            ResolvedPackage::new(name, version.clone(), source).with_dependencies(dependencies),
+            ResolvedPackage::new(name, version.clone(), source)
+                .with_dependencies(dependencies)
+                .with_placement(package_lock_placement(&key)),
         );
     }
 
@@ -388,7 +395,7 @@ async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
 fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
     deps_core::check_yaml_bounds(content, "pnpm-lock.yaml")?;
 
-    let to_parse_error = |message: String| DepsError::parse_error("pnpm-lock.yaml", &message);
+    let to_parse_error = |message: String| lockfile_parse_error("pnpm-lock.yaml", &message);
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| {
         to_parse_error(format!(
@@ -519,6 +526,18 @@ fn strip_peer_suffix(version: &str) -> &str {
     version.split_once('(').map_or(version, |(base, _)| base)
 }
 
+/// Classifies a `package-lock.json` key: two or more `node_modules/` segments mean a copy
+/// nested under another package (a transitive consumer's), while the root `node_modules/<n>`
+/// and a workspace member's `<member>/node_modules/<n>` are what direct dependencies resolve
+/// to (#1981).
+fn package_lock_placement(key: &str) -> EntryPlacement {
+    if key.matches("node_modules/").nth(1).is_some() {
+        EntryPlacement::Nested
+    } else {
+        EntryPlacement::Hoisted
+    }
+}
+
 /// Extracts package name from lockfile key.
 ///
 /// # Examples
@@ -611,6 +630,27 @@ fn parse_git_source(url: &str) -> ResolvedSource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn package_lock_placement_flags_only_keys_nested_under_another_package() {
+        for key in [
+            "node_modules/minimist",
+            "node_modules/@babel/core",
+            "packages/bar/node_modules/minimist",
+        ] {
+            assert_eq!(
+                package_lock_placement(key),
+                EntryPlacement::Hoisted,
+                "{key}"
+            );
+        }
+        for key in [
+            "node_modules/foo/node_modules/minimist",
+            "packages/bar/node_modules/foo/node_modules/minimist",
+        ] {
+            assert_eq!(package_lock_placement(key), EntryPlacement::Nested, "{key}");
+        }
+    }
+
     use super::*;
     use std::assert_matches;
 

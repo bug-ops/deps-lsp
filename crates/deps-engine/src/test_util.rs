@@ -34,7 +34,6 @@ use deps_core::ecosystem::BoxFuture;
 use deps_core::ecosystem::private::Sealed;
 use deps_core::lsp_helpers::{ProbeEffect, ProbePhase, ProbeReport};
 use deps_core::test_util::StubFormatter;
-use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -66,10 +65,6 @@ impl Registry for StubRegistry {
     ) -> BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>> {
         Box::pin(async move { Ok(vec![]) })
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// The single dependency [`TestTier3Ecosystem`] parses into.
@@ -84,6 +79,7 @@ pub struct StubDependency {
     version_req: VersionReq,
 }
 
+deps_core::impl_unprobed_dependency!(StubDependency);
 impl deps_core::Dependency for StubDependency {
     fn name(&self) -> &PackageName {
         &self.name

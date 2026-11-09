@@ -5,8 +5,6 @@
 //! `requirements.txt`/`constraints.txt` files (pip's requirements file
 //! format).
 
-#[cfg(test)]
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Range, Uri};
@@ -924,15 +922,15 @@ dependencies = []
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let diagnostics = ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(&cached_versions, &resolved_versions),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert!(diagnostics.is_empty());
     }
@@ -1172,9 +1170,6 @@ dependencies = []
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     #[test]
@@ -1280,10 +1275,6 @@ dependencies = []
                     deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
                 > {
                     Box::pin(async move { Ok(Vec::new()) })
-                }
-
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
                 }
             }
 
@@ -2598,14 +2589,14 @@ name = "test"
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             assert!(hover.is_none());
         }
@@ -2627,15 +2618,15 @@ name = "test"
             };
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
+            .await;
 
             assert!(actions.is_empty());
         }

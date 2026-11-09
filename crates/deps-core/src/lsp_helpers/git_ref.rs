@@ -2287,6 +2287,7 @@ pub trait ShaPinning: DependencyFormatter + Send + Sync {
     ///     name: PackageName,
     /// }
     ///
+    /// # deps_core::impl_unprobed_dependency!(MockDep);
     /// impl Dependency for MockDep {
     ///     fn name(&self) -> &PackageName {
     ///         &self.name
@@ -4084,13 +4085,13 @@ mod tests {
 
         use crate::test_util::StubFormatter;
 
-        use crate::{Dependency, PackageName, VersionReq};
+        use crate::{PackageName, VersionReq};
 
         /// Resolves a dependency named `"resolvable"` to a fixed SHA; declines everything else
         /// — the minimal [`ShaPinning`] fixture these tests need, layered onto the shared
         /// [`MOCK_FORMATTER`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
         /// rather than hand-rolling a second formatter mock.
-        impl<D: Dependency + 'static> ShaPinning for StubFormatter<D> {
+        impl<D: crate::lsp_helpers::ProbeDependency + 'static> ShaPinning for StubFormatter<D> {
             fn resolve_static_sha_pin(&self, dep: &D) -> Option<ResolvedShaPin> {
                 if dep.name().as_str() != "resolvable" {
                     return None;

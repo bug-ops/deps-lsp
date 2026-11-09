@@ -20,7 +20,6 @@ use deps_core::{
     DepsError, EcosystemId, HttpCache, NormalizedName, PackageName, PublishTime, RateLimitEvidence,
     RefreshEvents, RefreshSender, Result,
 };
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -113,6 +112,12 @@ const MAX_IN_FLIGHT_ENTRIES: usize = 256;
 /// concurrently with the fetch already in flight (critic C2), degrading to pre-coalescing
 /// behavior rather than corrupting anything, but undermining the whole point of #208's S2
 /// fix.
+///
+/// The map is a per-repository serialization lock with a re-check under it, not a result
+/// broadcast, so it is deliberately not built on `deps_core`'s `claim_or_follow` (#1986): a
+/// follower there adopts the leader's outcome, whereas here each waiter re-reads the rate-limit
+/// gate and the tag index after acquiring the lock and fetches itself when the earlier fetch
+/// left nothing behind (a failed fetch stores nothing).
 fn evict_in_flight_if_full(map: &DashMap<PackageName, Arc<tokio::sync::Mutex<()>>>) {
     if map.len() < MAX_IN_FLIGHT_ENTRIES {
         return;
@@ -184,7 +189,7 @@ impl GithubActionsRegistry {
     /// around a registry whose fetches are fully mocked, letting an end-to-end
     /// `generate_hover` test reproduce a genuinely empty-but-successful live fetch
     /// (`available_versions == Some([])`) without a real network call.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub(crate) fn for_test(
         cache: Arc<HttpCache>,
@@ -674,10 +679,6 @@ impl deps_core::Registry for GithubActionsRegistry {
     /// GitHub's tags API exposes no yank/deprecation signal for actions.
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

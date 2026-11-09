@@ -53,7 +53,7 @@ pub struct DartParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 }
 
 /// Builds a scalar's [`FieldValue`], forcing [`FieldValue::Unpositioned`] while replaying a
@@ -2487,7 +2487,13 @@ flutter:
 
         let result = parse_pubspec_yaml(&yaml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), cap);
-        assert_eq!(result.dependency_truncation, Some((cap, cap + 1)));
+        assert_eq!(
+            result.dependency_truncation,
+            Some(deps_core::DependencyTruncation {
+                kept: cap,
+                total: cap + 1
+            })
+        );
         assert!(
             result
                 .dependencies
@@ -2520,6 +2526,9 @@ flutter:
             cap,
             "the receiver's own entry buffer must never exceed the budget's cap"
         );
-        assert_eq!(receiver.budget.truncation(), Some((cap, total)));
+        assert_eq!(
+            receiver.budget.truncation(),
+            Some(deps_core::DependencyTruncation { kept: cap, total })
+        );
     }
 }

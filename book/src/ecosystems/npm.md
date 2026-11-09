@@ -135,6 +135,29 @@ registry name and a nested install (`is-odd/is-number`) records its own version 
 `workspace:`, `link:`, `file:`, git and tarball entries are skipped, because Bun records no version for
 them. The binary `bun.lockb` is not read; run `bun install --save-text-lockfile` to get a `bun.lock`.
 
+### Several lock entries for one package
+
+A lock file can hold more than one entry for a package that satisfies a manifest requirement (a
+workspace member pinning an older copy, a transitive consumer's own range, a `foo/minimist` nested
+install). The lock file does not say which copy was installed for your dependency, so the version
+shown as in use is the **highest** satisfying entry, and every other satisfying entry is scanned
+for advisories as well. An advisory that affects only another locked copy is reported as `also
+locked at <version>`; see [Lock alternatives](../cross-ecosystem/yanked-and-vulnerabilities.md#lock-alternatives-issue-1981).
+
+The formats differ in how much they can attribute:
+
+- **`package-lock.json`** knows where each copy lives. A copy nested under another package
+  (`node_modules/foo/node_modules/minimist`) belongs to that package and is not a candidate for your
+  dependency. The root `node_modules/<name>` entry and a workspace member's own
+  `<member>/node_modules/<name>` entry are both candidates.
+- **`yarn.lock`, `bun.lock` and `pnpm-lock.yaml`** record entries without an owner (pnpm only per
+  importer, which `deps-lsp` flattens). A transitive consumer's copy of the same package therefore
+  also satisfies the requirement and is reported as `also locked at`, where `package-lock.json`
+  would have filtered it out.
+
+So the same project can show an extra `also locked at` finding under Yarn, Bun or pnpm that npm
+does not show. Selecting the entry by owner is tracked as a follow-up.
+
 ## Non-Registry Dependency Sources
 
 A dependency declared against a git repository, a local filesystem path, or a workspace

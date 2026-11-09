@@ -21,7 +21,6 @@ use deps_core::{
     SafePathSegment,
 };
 use serde::Deserialize;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -1119,7 +1118,7 @@ impl NuGetRegistry {
     /// version silently vanish from completion suggestions too
     /// (`prepare_version_display_items` filters on `removal_status().blocks_resolution()`
     /// unconditionally) — the wrong tradeoff the spec calls out. This method is instead
-    /// called only from [`crate::ecosystem::NuGetEcosystem`]'s `generate_hover` override,
+    /// called only from [`crate::ecosystem::NuGetEcosystem`]'s `decorate_hover` decoration,
     /// so only a hover request ever pays for it.
     ///
     /// Degrades to an empty set (never an error) on any fetch/parse failure, or when the
@@ -1532,10 +1531,6 @@ impl deps_core::Registry for NuGetRegistry {
     // see its doc comment — so it does not change this answer.
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -2132,14 +2127,6 @@ mod tests {
     fn test_pick_latest_matching_exact_pin_not_rescued() {
         let versions = vec![v("2.0.0-beta2"), v("2.0.0-beta1")];
         assert!(pick_latest_matching(versions, "[9.9.9]").is_none());
-    }
-
-    #[test]
-    fn test_registry_creation_and_trait_impls() {
-        use deps_core::Registry;
-        let cache = Arc::new(HttpCache::new());
-        let registry = NuGetRegistry::new(cache);
-        assert!(registry.as_any().is::<NuGetRegistry>());
     }
 
     /// #365 end-to-end coverage (critic S2): exercises the real production

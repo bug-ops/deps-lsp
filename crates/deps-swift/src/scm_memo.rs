@@ -12,12 +12,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use deps_core::swr_store::{Recency, Refreshed, SwrPolicy, SwrStore, Upserted};
 use deps_core::{FlightHandle, RefreshEvents, RefreshSender, SingleFlight};
+use futures::FutureExt;
 
 use crate::package_location::RegistryIdentityBuf;
 use crate::scm::{CaseFoldedScmUrl, IdentityLookup, MemoKey, RegistryIndexUrl};
@@ -156,8 +158,8 @@ impl ScmIdentityMemo {
     /// Runs `lookup` for `key` in a detached task, or joins the one already in flight.
     ///
     /// The task records its answer in the memo whether or not anyone still waits for it. It is
-    /// cut off after `timeout`, which records [`IdentityLookup::Failed`]. The caller bounds how
-    /// many lookups run at once.
+    /// cut off after `timeout`, and a panicking lookup, like one cut off, records
+    /// [`IdentityLookup::Failed`]. The caller bounds how many lookups run at once.
     pub(crate) fn start(
         self: &Arc<Self>,
         key: &MemoKey,
@@ -167,9 +169,19 @@ impl ScmIdentityMemo {
         let memo = Arc::clone(self);
         let recorded = key.clone();
         self.inflight.start_or_join(key.clone(), async move {
-            let answer = tokio::time::timeout(timeout, lookup)
+            // The flight also catches a panic, but only to report it to waiters; this task
+            // records its answer even when nobody waits, so it must negatively cache the panic.
+            let answer = match AssertUnwindSafe(tokio::time::timeout(timeout, lookup))
+                .catch_unwind()
                 .await
-                .unwrap_or(IdentityLookup::Failed);
+            {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(_elapsed)) => IdentityLookup::Failed,
+                Err(_panic) => {
+                    tracing::error!("repository identity lookup panicked");
+                    IdentityLookup::Failed
+                }
+            };
             memo.record(&recorded, answer, Instant::now());
         })
     }
@@ -191,7 +203,7 @@ mod tests {
     use crate::config::SwiftRegistryUrl;
     use crate::package_location::RegistryIdentityBuf;
     use crate::scm::ScmLookupUrl;
-    use deps_core::RefreshEvent;
+    use deps_core::{FlightEnd, RefreshEvent};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -390,8 +402,11 @@ mod tests {
         assert!(!second.issued());
 
         release_tx.send(()).unwrap();
-        assert!(first.wait(wait_budget(TIMEOUT)).await);
-        assert!(second.wait(wait_budget(TIMEOUT)).await);
+        assert_eq!(first.wait(wait_budget(TIMEOUT)).await, FlightEnd::Completed);
+        assert_eq!(
+            second.wait(wait_budget(TIMEOUT)).await,
+            FlightEnd::Completed
+        );
         assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             memo.get(&key, Instant::now()).unwrap().answer,
@@ -415,7 +430,10 @@ mod tests {
         release_tx.send(()).unwrap();
         let rejoin = memo.start(&key, TIMEOUT, async { IdentityLookup::Failed });
         assert!(!rejoin.issued());
-        assert!(rejoin.wait(wait_budget(TIMEOUT)).await);
+        assert_eq!(
+            rejoin.wait(wait_budget(TIMEOUT)).await,
+            FlightEnd::Completed
+        );
         assert_eq!(
             memo.get(&key, Instant::now()).unwrap().answer,
             unique("apple.swift-nio")
@@ -427,7 +445,7 @@ mod tests {
         let memo = Arc::new(ScmIdentityMemo::default());
         let key = k("apple/swift-nio");
         let first = memo.start(&key, TIMEOUT, async { IdentityLookup::NotRegistered });
-        assert!(first.wait(wait_budget(TIMEOUT)).await);
+        assert_eq!(first.wait(wait_budget(TIMEOUT)).await, FlightEnd::Completed);
         let second = memo.start(&key, TIMEOUT, async { IdentityLookup::NotRegistered });
         assert!(second.issued());
     }
@@ -437,7 +455,25 @@ mod tests {
         let memo = Arc::new(ScmIdentityMemo::default());
         let key = k("apple/swift-nio");
         let handle = memo.start(&key, TIMEOUT, std::future::pending());
-        assert!(handle.wait(wait_budget(TIMEOUT) * 2).await);
+        assert_eq!(
+            handle.wait(wait_budget(TIMEOUT) * 2).await,
+            FlightEnd::Completed
+        );
+        assert_eq!(
+            memo.get(&key, Instant::now()).unwrap().answer,
+            IdentityLookup::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_panicking_lookup_records_failed_even_when_nobody_waits() {
+        let memo = Arc::new(ScmIdentityMemo::default());
+        let key = k("apple/swift-nio");
+        let handle = memo.start(&key, TIMEOUT, async { panic!("lookup failed") });
+        assert_eq!(
+            handle.wait(wait_budget(TIMEOUT)).await,
+            FlightEnd::Completed
+        );
         assert_eq!(
             memo.get(&key, Instant::now()).unwrap().answer,
             IdentityLookup::Failed

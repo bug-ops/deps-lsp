@@ -65,6 +65,7 @@ pub(crate) fn drop_cache_for_forced_refetch(
     deps_to_fetch: &[NormalizedName],
 ) {
     doc.signals.cached_versions.clear();
+    doc.signals.registry_baseline.clear();
     doc.signals.outcomes.clear_all_fetch_failures();
     for name in deps_to_fetch {
         doc.signals
@@ -112,6 +113,61 @@ pub(crate) fn orphaned_for_test(names: &[&str]) -> OrphanedKeys {
         .map(|n| (NormalizedName::for_test(*n), Vec::new()))
         .collect();
     DependencyDiff::compute(&old, &HashMap::new()).removed
+}
+
+/// Declared version requirements of every occurrence of each package, in [`NormalizedName`]
+/// space — the shape [`DependencyDiff::compute`] compares.
+pub(crate) type DeclaredRequirements = HashMap<NormalizedName, Vec<Option<VersionReq>>>;
+
+/// The requirements each package had when a registry outcome (data, failure or miss) last
+/// committed for it (issue #1987).
+///
+/// A change task decides what to fetch by comparing the current declaration against this
+/// baseline instead of against the previous parse: an edit that aborts an in-flight fetch
+/// leaves the previous parse "unchanged" yet never fetched, so a parse-to-parse diff would
+/// skip the fetch for good. The comparison self-corrects across any number of aborted tasks,
+/// like [`super::state::PackageSignals::typosquat_checked_names`]. `Default` is "nothing
+/// committed". A recorded failure or miss counts as committed, so it is not refetched on every
+/// edit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegistryBaseline(DeclaredRequirements);
+
+impl RegistryBaseline {
+    /// Packages declared in `declared` whose current requirements have no committed outcome:
+    /// never fetched, or fetched under different requirements.
+    pub(crate) fn pending(&self, declared: &DeclaredRequirements) -> Vec<NormalizedName> {
+        let diff = DependencyDiff::compute(&self.0, declared);
+        let mut names = diff.added;
+        names.extend(diff.version_changed);
+        names
+    }
+
+    /// Replaces the baseline with exactly what a completed whole-document fetch requested.
+    pub(crate) fn replace(&mut self, committed: DeclaredRequirements) {
+        self.0 = committed;
+    }
+
+    /// Records the requirements a completed partial fetch requested, keeping other entries.
+    pub(crate) fn record(&mut self, committed: DeclaredRequirements) {
+        self.0.extend(committed);
+    }
+
+    /// Forgets `names`, so they are pending again (their outcomes were cleared by an edit).
+    pub(crate) fn invalidate(&mut self, names: &[NormalizedName]) {
+        for name in names {
+            self.0.remove(name);
+        }
+    }
+
+    /// Forgets everything, as a forced refetch dropped every cached outcome.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Number of packages with a committed outcome.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// Diff between old and new dependency sets, in [`NormalizedName`] space.
@@ -225,6 +281,11 @@ impl DependencyDiff {
 /// [`super::state::PackageSignals::resolved_versions`]/[`super::state::PackageSignals::resolved_version_candidates`]
 /// before and after [`super::state::DocumentState::update_resolved_versions`].
 ///
+/// The comparison covers the whole [`deps_core::lsp_helpers::InUseVersions`], not just the
+/// primary: a lock-file change that adds or removes a satisfying lock alternative with the
+/// primary unchanged still changes what the OSV scan must query (#1981). The cost is a harmless
+/// license re-fetch when only an alternative moved.
+///
 /// The returned names are also what [`reload_resolved_versions`] evicts from
 /// [`super::state::PackageSignals::licenses`] (issue #1424): a dependency whose in-use version
 /// just moved can no longer vouch for its previously cached license.
@@ -237,12 +298,24 @@ pub(crate) fn resolved_versions_changed(
     ecosystem_id: EcosystemId,
 ) -> Vec<NormalizedName> {
     let mut changed = Vec::new();
+    let mut old_memo = deps_core::lsp_helpers::LockSelectionMemo::default();
+    let mut new_memo = deps_core::lsp_helpers::LockSelectionMemo::default();
     manifest.for_each_formatted_dependency(&mut |bound| {
         let key = deps_core::PackageKey::new(bound.dependency().name(), bound.formatter());
-        let old =
-            bound.resolve_in_use_version(&key, old_resolved, Some(old_candidates), ecosystem_id);
-        let new =
-            bound.resolve_in_use_version(&key, new_resolved, Some(new_candidates), ecosystem_id);
+        let old = bound.resolve_in_use_versions_memoized(
+            &key,
+            old_resolved,
+            Some(old_candidates),
+            ecosystem_id,
+            &mut old_memo,
+        );
+        let new = bound.resolve_in_use_versions_memoized(
+            &key,
+            new_resolved,
+            Some(new_candidates),
+            ecosystem_id,
+            &mut new_memo,
+        );
         if old != new {
             changed.push(key.normalized().clone());
         }
@@ -2263,6 +2336,7 @@ time = "0.1"
             name: PackageName,
             version_req: Option<VersionReq>,
         }
+        deps_core::impl_unprobed_dependency!(StubDependency);
         impl deps_core::Dependency for StubDependency {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -2569,5 +2643,120 @@ time = "0.1"
                  resolved_versions value (the highest entry, 0.3.36) stays unchanged"
             );
         }
+
+        /// #1981 (critic S1): a lock reload that adds or removes a satisfying lock alternative
+        /// while the primary stays put still changes what the OSV scan queries, so it must be
+        /// reported as a change.
+        #[test]
+        fn test_resolved_versions_changed_detects_a_lock_alternative_added_or_removed() {
+            let minimist = StubDependency {
+                name: PackageName::new("minimist"),
+                version_req: Some(VersionReq::new("1.2")),
+            };
+            let manifest = document(vec![minimist], IDENTITY_FORMATTER, EcosystemId::Cargo);
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("minimist"),
+                ConcreteVersion::from("2.0.0"),
+            ))
+            .collect();
+            let candidates = |versions: &[&str]| -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
+                std::iter::once((
+                    NormalizedName::for_test("minimist"),
+                    versions.iter().map(|v| ConcreteVersion::from(*v)).collect(),
+                ))
+                .collect()
+            };
+            let without = candidates(&["1.2.8", "2.0.0"]);
+            let with = candidates(&["1.2.5", "1.2.8", "2.0.0"]);
+            let changed = |old: &ResolvedCandidatesMap, new: &ResolvedCandidatesMap| {
+                !resolved_versions_changed(
+                    &*manifest,
+                    &resolved,
+                    old,
+                    &resolved,
+                    new,
+                    EcosystemId::Cargo,
+                )
+                .is_empty()
+            };
+
+            assert!(changed(&without, &with), "an added alternative is a change");
+            assert!(
+                changed(&with, &without),
+                "a removed alternative is a change"
+            );
+            assert!(!changed(&with, &with), "identical candidates are no change");
+        }
+    }
+}
+
+#[cfg(test)]
+mod registry_baseline_tests {
+    use super::*;
+
+    fn name(n: &str) -> NormalizedName {
+        NormalizedName::for_test(n)
+    }
+
+    fn declared(entries: &[(&str, &str)]) -> DeclaredRequirements {
+        entries
+            .iter()
+            .map(|(n, req)| (name(n), vec![Some(VersionReq::new(*req))]))
+            .collect()
+    }
+
+    #[test]
+    fn nothing_committed_makes_every_declared_package_pending() {
+        let pending = RegistryBaseline::default().pending(&declared(&[("a", "1"), ("b", "2")]));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn committed_packages_with_unchanged_requirements_are_not_pending() {
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(declared(&[("a", "1"), ("b", "2")]));
+        assert!(
+            baseline
+                .pending(&declared(&[("a", "1"), ("b", "2")]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn changed_or_added_requirements_are_pending() {
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(declared(&[("a", "1"), ("b", "2")]));
+        let mut pending = baseline.pending(&declared(&[("a", "1"), ("b", "3"), ("c", "1")]));
+        pending.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        assert_eq!(pending, [name("b"), name("c")]);
+    }
+
+    #[test]
+    fn record_keeps_other_entries_and_replace_drops_them() {
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(declared(&[("a", "1")]));
+        baseline.record(declared(&[("b", "2")]));
+        assert_eq!(baseline.len(), 2);
+        baseline.replace(declared(&[("c", "3")]));
+        assert_eq!(baseline.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_and_clear_make_packages_pending_again() {
+        let all = declared(&[("a", "1"), ("b", "2")]);
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(all.clone());
+        baseline.invalidate(&[name("a")]);
+        assert_eq!(baseline.pending(&all), [name("a")]);
+        baseline.clear();
+        assert_eq!(baseline.pending(&all).len(), 2);
+    }
+
+    #[test]
+    fn pruning_a_removed_package_forgets_its_baseline() {
+        let mut signals = crate::document::state::PackageSignals::default();
+        signals.registry_baseline.replace(declared(&[("a", "1")]));
+        signals.prune_removed(&orphaned_for_test(&["a"]));
+        assert_eq!(signals.registry_baseline.len(), 0);
     }
 }

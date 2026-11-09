@@ -196,7 +196,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
 
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests. Does
     // not replace registry.rs's `test_registry_creation`, which constructs `CratesIoRegistry`
@@ -355,9 +354,6 @@ mod tests {
         }
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

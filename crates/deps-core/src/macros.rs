@@ -232,10 +232,6 @@ macro_rules! impl_version {
             fn removal_status(&self) -> $crate::registry::RemovalStatus {
                 ($status)(self)
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -255,10 +251,6 @@ macro_rules! impl_version {
             fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
                 self.$published_at
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -277,10 +269,6 @@ macro_rules! impl_version {
 
             fn is_prerelease(&self) -> bool {
                 ($prerelease)(self)
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -305,10 +293,6 @@ macro_rules! impl_version {
 
             fn is_prerelease(&self) -> bool {
                 ($prerelease)(self)
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -345,10 +329,6 @@ macro_rules! impl_version {
                 let f: fn(&$type) -> Option<&$crate::registry::Deprecation> = $deprecation;
                 f(self)
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -383,10 +363,6 @@ macro_rules! impl_version {
 
             fn license(&self) -> &[String] {
                 &self.$license
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -453,10 +429,6 @@ macro_rules! impl_metadata {
             fn latest_version(&self) -> &$crate::ConcreteVersion {
                 &self.$latest_version
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
 }
@@ -486,7 +458,7 @@ macro_rules! __impl_parse_result_workspace_root {
 macro_rules! __impl_parse_result_dependency_truncation {
     () => {};
     ($field:ident) => {
-        fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        fn dependency_truncation(&self) -> Option<$crate::DependencyTruncation> {
             self.$field
         }
     };
@@ -527,7 +499,7 @@ macro_rules! __impl_parse_result_rejected_registries {
 /// * `dependencies` - Field name for dependencies vec (`Vec<DepType>`)
 /// * `uri` - Field name for document URI (`Url`)
 /// * `workspace_root` - Optional: field name for workspace root (`Option<PathBuf>`)
-/// * `dependency_truncation` - Optional: field name for the `Option<(usize, usize)>`
+/// * `dependency_truncation` - Optional: field name for the `Option<DependencyTruncation>`
 ///   [`ecosystem::ParseResult::dependency_truncation`](crate::ecosystem::ParseResult::dependency_truncation)
 ///   override (#796) — omit when the parser has no [`crate::DependencyBudget`] wired in yet
 ///   (the trait default `None` applies).
@@ -553,7 +525,7 @@ macro_rules! __impl_parse_result_rejected_registries {
 /// pub struct MyParseResult {
 ///     pub dependencies: Vec<MyDependency>,
 ///     pub uri: Url,
-///     pub dependency_truncation: Option<(usize, usize)>,
+///     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 /// }
 ///
 /// impl_parse_result!(MyParseResult, MyDependency {
@@ -641,7 +613,7 @@ macro_rules! impl_parse_result {
 /// impl deps_core::Registry for MyRegistry {
 ///     impl_registry_versions_method!(get_versions);
 ///     impl_registry_versions_method!(get_versions_with);
-///     // ... get_latest_matching, search, as_any still hand-written ...
+///     // ... get_latest_matching and search still hand-written ...
 /// }
 /// ```
 #[macro_export]
@@ -727,6 +699,62 @@ macro_rules! impl_get_versions_with_passthrough {
                 _freshness: $crate::FreshnessSettings,
             ) -> $crate::error::Result<::std::vec::Vec<$version>> {
                 self.get_versions(name).await
+            }
+        }
+    };
+}
+
+/// Implements [`ProbeDependency`](crate::lsp_helpers::ProbeDependency) for a test double that
+/// the `non_public_route` conformance probe (#1977) never builds.
+///
+/// [`DependencyFormatter::Dep`](crate::lsp_helpers::DependencyFormatter::Dep) requires a
+/// probe, but a hand-written fixture dependency has no parser-free constructor; calling the
+/// generated [`probe`](crate::lsp_helpers::ProbeDependency::probe) panics, so a double that
+/// does get probed must implement the trait by hand instead.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::ProbeDependency;
+/// use deps_core::parser::DependencySource;
+/// use deps_core::position::Range;
+/// use deps_core::{PackageName, VersionReq};
+///
+/// struct Fixture {
+///     name: PackageName,
+///     name_range: Range,
+///     version: Option<VersionReq>,
+///     version_range: Option<Range>,
+///     source: DependencySource,
+/// }
+///
+/// deps_core::impl_dependency!(Fixture {
+///     name: name,
+///     name_range: name_range,
+///     version: version,
+///     version_range: version_range,
+///     source: source,
+/// });
+///
+/// deps_core::impl_unprobed_dependency!(Fixture);
+///
+/// fn requires_probe<D: ProbeDependency>() {}
+/// requires_probe::<Fixture>();
+/// ```
+#[cfg(any(test, feature = "test-util"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+#[macro_export]
+macro_rules! impl_unprobed_dependency {
+    ($type:ty) => {
+        impl $crate::lsp_helpers::ProbeDependency for $type {
+            fn probe(
+                _name: $crate::PackageName,
+                _source: $crate::parser::DependencySource,
+            ) -> Self {
+                unreachable!(concat!(
+                    stringify!($type),
+                    " is a test double that is never probed"
+                ))
             }
         }
     };
@@ -828,7 +856,7 @@ mod tests {
         dependencies: Vec<TestDependency>,
         uri: url::Url,
         workspace_root: Option<std::path::PathBuf>,
-        dependency_truncation: Option<(usize, usize)>,
+        dependency_truncation: Option<crate::DependencyTruncation>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
         rejected_registries: Vec<crate::ecosystem::RejectedRegistryOccurrence>,
     }
@@ -837,9 +865,11 @@ mod tests {
     struct TestParseResultTruncationAndBlockedRegistries {
         dependencies: Vec<TestDependency>,
         uri: url::Url,
-        dependency_truncation: Option<(usize, usize)>,
+        dependency_truncation: Option<crate::DependencyTruncation>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
     }
+
+    crate::impl_unprobed_dependency!(TestDependency);
 
     impl_dependency!(TestDependency {
         name: name,
@@ -1024,7 +1054,6 @@ mod tests {
         };
         assert!(deprecated.deprecation().is_none());
         assert!(!deprecated.is_prerelease());
-        assert!(deprecated.as_any().is::<TestVersionWithDeprecation>());
 
         let licensed = TestVersionWithLicense {
             version: "1.0.0".into(),
@@ -1034,7 +1063,6 @@ mod tests {
             license: vec!["MIT".to_string()],
         };
         assert_eq!(licensed.license(), ["MIT".to_string()]);
-        assert!(licensed.as_any().is::<TestVersionWithLicense>());
     }
 
     #[test]
@@ -1048,7 +1076,6 @@ mod tests {
 
         assert_eq!(version.version_string().as_str(), "2.0.0");
         assert!(version.removal_status().blocks_resolution());
-        assert!(version.as_any().is::<TestVersion>());
         assert!(version.published_at().is_none());
     }
 
@@ -1069,7 +1096,6 @@ mod tests {
             version.published_at(),
             Some(PublishTime::from_unix_secs(1_000))
         );
-        assert!(version.as_any().is::<TestVersionWithPublishedAt>());
     }
 
     #[test]
@@ -1124,7 +1150,6 @@ mod tests {
         assert_eq!(pkg.name(), "my-pkg");
         assert_eq!(pkg.description(), Some("A test package"));
         assert_eq!(pkg.documentation(), Some("https://example.com"));
-        assert!(pkg.as_any().is::<TestPackage>());
     }
 
     #[test]
@@ -1162,7 +1187,7 @@ mod tests {
             }],
             uri: crate::test_util::test_uri("/test"),
             workspace_root: Some(std::path::PathBuf::from("/workspace")),
-            dependency_truncation: Some((5, 10)),
+            dependency_truncation: Some(crate::DependencyTruncation { kept: 5, total: 10 }),
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
                 block: crate::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
@@ -1183,7 +1208,10 @@ mod tests {
             result.workspace_root(),
             Some(std::path::Path::new("/workspace"))
         );
-        assert_eq!(result.dependency_truncation(), Some((5, 10)));
+        assert_eq!(
+            result.dependency_truncation(),
+            Some(crate::DependencyTruncation { kept: 5, total: 10 })
+        );
         assert_eq!(result.blocked_registries().len(), 1);
         assert_eq!(result.own_dependencies().len(), 1);
     }
@@ -1197,7 +1225,7 @@ mod tests {
         let result = TestParseResultTruncationAndBlockedRegistries {
             dependencies: vec![],
             uri: crate::test_util::test_uri("/test"),
-            dependency_truncation: Some((3, 7)),
+            dependency_truncation: Some(crate::DependencyTruncation { kept: 3, total: 7 }),
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
                 block: crate::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
@@ -1207,7 +1235,10 @@ mod tests {
         };
 
         assert!(result.workspace_root().is_none());
-        assert_eq!(result.dependency_truncation(), Some((3, 7)));
+        assert_eq!(
+            result.dependency_truncation(),
+            Some(crate::DependencyTruncation { kept: 3, total: 7 })
+        );
         assert_eq!(result.blocked_registries().len(), 1);
         assert!(result.own_dependencies().is_empty());
     }

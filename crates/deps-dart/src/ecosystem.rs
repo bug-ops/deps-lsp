@@ -212,7 +212,6 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     use deps_core::NormalizedName;
     #[cfg(test)]
-    use std::any::Any;
 
     /// #1687 e2e: a `pubspec.lock`-resolved `0.8.13+1` against pub.dev latest `0.8.13+23`
     /// must render as outdated, not up to date.
@@ -407,9 +406,6 @@ dependencies:
             }
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
         let meta = MockMetadata {

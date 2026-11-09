@@ -8,7 +8,6 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use deps_core::lsp_helpers::{CommentCheck, DependencyFormatter};
 use deps_core::{ParsedView, TypedParseResult};
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 
@@ -76,48 +75,6 @@ pub(super) fn build_sha_pin_action(
         formatter,
         MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
     )
-}
-
-/// Builds the "Correct version comment" quickfix (#1734) for the SHA pin at `position` whose
-/// trailing `# tag` comment names a different tag than the one the pinned commit carries.
-///
-/// Locates the pin and its [`CommentCheck`] mismatch, then delegates to the shared
-/// [`deps_core::lsp_helpers::build_sha_comment_fix_action`].
-pub(super) fn build_sha_comment_fix_action(
-    parsed: ParsedView<'_, GithubActionsParseResult>,
-    position: Position,
-    uri: &Url,
-    formatter: &GithubActionsFormatter,
-) -> Option<CodeAction> {
-    let gha_dep = parsed
-        .own_dependencies()
-        .iter()
-        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
-    let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
-        return None;
-    };
-    deps_core::lsp_helpers::build_sha_comment_fix_action(
-        uri,
-        gha_dep.version_range?,
-        gha_dep.sha_comment()?.pin_comment(),
-        &mismatch,
-    )
-}
-
-/// Builds the "Change ref to published tag" quickfix (#1781) for the tag-pinned step at
-/// `position` whose ref the repository's complete tag list proves unpublished.
-///
-/// Selects the pin through the same [`super::unknown_ref_target`] the diagnostic uses, then
-/// delegates to [`deps_core::lsp_helpers::UnknownRefTarget::fix_action`].
-pub(super) fn build_unknown_ref_fix_action(
-    parsed: ParsedView<'_, GithubActionsParseResult>,
-    position: Position,
-    uri: &Url,
-    formatter: &GithubActionsFormatter,
-) -> Option<CodeAction> {
-    let gha_dep =
-        deps_core::lsp_helpers::dependency_at_position(&parsed, position.into(), formatter)?;
-    super::unknown_ref_target(formatter, gha_dep)?.fix_action(uri)
 }
 
 /// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a

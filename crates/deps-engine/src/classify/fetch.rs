@@ -484,7 +484,6 @@ impl FetchResult {
 ///     Version, VersionReq,
 /// };
 /// use deps_engine::classify::fetch::fetch_latest_versions_parallel;
-/// use std::any::Any;
 /// use std::collections::HashMap;
 /// use std::sync::Arc;
 ///
@@ -497,9 +496,6 @@ impl FetchResult {
 /// impl Version for SimpleVersion {
 ///     fn version_string(&self) -> &ConcreteVersion {
 ///         &self.version
-///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
 ///     }
 /// }
 ///
@@ -533,10 +529,6 @@ impl FetchResult {
 ///         _limit: usize,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>> {
 ///         Box::pin(async move { Ok(vec![]) })
-///     }
-///
-///     fn as_any(&self) -> &dyn Any {
-///         self
 ///     }
 /// }
 ///
@@ -1303,9 +1295,6 @@ impl Version for CooldownCandidate {
     fn is_prerelease(&self) -> bool {
         self.prerelease
     }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// D2 in-use floor classification (spec 074 FR-003b / spec 075 OQ1 / spec 076 FR-016/FR-017):
@@ -1669,6 +1658,7 @@ mod tests {
             addr_tag: u32,
         }
 
+        deps_core::impl_unprobed_dependency!(MockDep);
         impl Dependency for MockDep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -1855,7 +1845,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_with_timeout() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct TimeoutRegistry;
@@ -1893,10 +1882,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry: Arc<dyn Registry> = Arc::new(TimeoutRegistry);
@@ -1933,7 +1918,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_fast_packages_not_blocked() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct MixedRegistry;
@@ -1974,10 +1958,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -2023,7 +2003,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_concurrency_limit() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -2073,10 +2052,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let current = Arc::new(AtomicUsize::new(0));
@@ -2118,7 +2093,6 @@ mod tests {
     async fn test_fetch_partial_success_with_mixed_outcomes() {
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct MixedOutcomeRegistry;
@@ -2192,10 +2166,6 @@ mod tests {
                 // `get_latest_matching` — must override it (not rely on the `None` default)
                 // to keep exercising "package-fast" as a successful fetch.
                 if versions.is_empty() { None } else { Some(0) }
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -2364,7 +2334,6 @@ mod tests {
     async fn test_fetch_latest_versions_parallel_carries_license_into_fetch_result() {
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct LicensedRegistry;
 
@@ -2414,10 +2383,6 @@ mod tests {
             ) -> Option<usize> {
                 (!versions.is_empty()).then_some(0)
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry: Arc<dyn Registry> = Arc::new(LicensedRegistry);
@@ -2464,7 +2429,6 @@ mod tests {
         use deps_core::freshness::{FreshnessSettings, PublishTime};
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct FreshnessAwareRegistry;
 
@@ -2525,10 +2489,6 @@ mod tests {
             ) -> Option<usize> {
                 if versions.is_empty() { None } else { Some(0) }
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry: Arc<dyn Registry> = Arc::new(FreshnessAwareRegistry);
@@ -2570,7 +2530,6 @@ mod tests {
      {
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, StabilityFloor, Version};
-        use std::any::Any;
         use std::sync::Mutex;
 
         struct ContextAwareRegistry {
@@ -2621,10 +2580,6 @@ mod tests {
                     .push(selection_context.minimum_stability());
                 if versions.is_empty() { None } else { Some(0) }
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry = Arc::new(ContextAwareRegistry {
@@ -2669,7 +2624,6 @@ mod tests {
      {
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, StabilityFloor, Version};
-        use std::any::Any;
         use std::sync::Mutex;
 
         struct FallbackContextAwareRegistry {
@@ -2714,10 +2668,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -2764,7 +2714,6 @@ mod tests {
     async fn test_fetch_falls_back_to_get_latest_matching_when_list_based_pick_finds_nothing() {
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         /// Mimics an untagged Go module: `get_versions` (the list endpoint) is empty, but
         /// `get_latest_matching` (a different, more complete endpoint) still resolves a
@@ -2805,10 +2754,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry: Arc<dyn Registry> = Arc::new(UntaggedModuleRegistry);
@@ -2841,7 +2786,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_registry_error_handled() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct ErrorRegistry;
 
@@ -2879,10 +2823,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -2950,7 +2890,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_failed_log_redacts_credential_shaped_package_name() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         // M1 (impl-critic on the original #1209 fix): a real ecosystem registry's
         // `get_versions` runs inside a `#[tracing::instrument(fields(package = ...))]` span
@@ -3005,10 +2944,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -3065,7 +3000,6 @@ mod tests {
         // the common typo'd-dependency case, inverting the bug this field
         // exists to fix.
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct NotFoundRegistry {
             at_endpoint: bool,
@@ -3115,10 +3049,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -3248,7 +3178,6 @@ mod tests {
         // NuGet) that propagate a raw `DepsError::HttpStatus { status: 404 }`
         // instead of mapping it to `PackageNotFound`.
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct Http404Registry;
 
@@ -3289,10 +3218,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry: Arc<dyn Registry> = Arc::new(Http404Registry);
@@ -3328,7 +3253,6 @@ mod tests {
         // and confirms the same not-found-vs-failure gating (#267 C1) applies
         // there too, per-package via the `not_found` name.
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct FallbackErrorRegistry;
 
@@ -3371,10 +3295,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let registry: Arc<dyn Registry> = Arc::new(FallbackErrorRegistry);
@@ -3414,7 +3334,6 @@ mod tests {
         // timeout is never a "not found", so it must always land in
         // `fetch_failed` (and count toward `failed_count`, S2).
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct FallbackTimeoutRegistry;
@@ -3448,10 +3367,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -3490,7 +3405,6 @@ mod tests {
         // error. Here not-found resolves immediately and the actionable error resolves
         // after a delay, winning the race — `priority_error` must still make it win.
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct MixedErrorRegistry;
@@ -3533,10 +3447,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -3581,7 +3491,6 @@ mod tests {
         // not-found ones must still surface one via `first_error` instead of silently
         // reporting nothing.
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct AllNotFoundRegistry;
 
@@ -3616,10 +3525,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -3660,7 +3565,6 @@ mod tests {
         // built unconditionally from both fields (#490): asserts `FetchResult` reports
         // `failed_count` equal to batch size *and* a populated `first_error` together.
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
         use std::time::Duration;
 
         struct AlwaysTimesOutRegistry;
@@ -3697,10 +3601,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -3808,7 +3708,6 @@ mod tests {
         use super::*;
         use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Version};
-        use std::any::Any;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Per-package outcome for the primary (and, under #206, only)
@@ -3899,10 +3798,6 @@ mod tests {
 
             fn reports_yanked(&self) -> bool {
                 self.reports_yanked
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -4232,10 +4127,6 @@ mod tests {
             fn reports_yanked(&self) -> bool {
                 true
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         #[tokio::test]
@@ -4489,7 +4380,6 @@ mod tests {
     mod deprecation_derivation_tests {
         use super::*;
         use deps_core::{Metadata, Version};
-        use std::any::Any;
 
         struct MockDeprecatedVersion {
             version: ConcreteVersion,
@@ -4505,9 +4395,6 @@ mod tests {
             }
             fn deprecation(&self) -> Option<&Deprecation> {
                 self.deprecation.as_ref()
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -4557,10 +4444,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -4627,7 +4510,6 @@ mod tests {
         use deps_core::{
             GossipCooldown, GossipRiskLevel, Metadata, PublishTime, Registry, Version,
         };
-        use std::any::Any;
 
         /// Returns a fixed, newest-first version list regardless of the queried package name.
         ///
@@ -4744,10 +4626,6 @@ mod tests {
                     // "latest".
                     Some(0)
                 }
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -5116,7 +4994,6 @@ mod tests {
         use super::*;
         use deps_core::test_util::MockVersion;
         use deps_core::{PublishTime, Registry, Version};
-        use std::any::Any;
 
         /// A fixed, newest-first version list — `select_latest_matching` mirrors a real
         /// ecosystem's own selection rules (skip yanked/prerelease), same contract
@@ -5168,10 +5045,6 @@ mod tests {
                 versions
                     .iter()
                     .position(|v| !v.removal_status().blocks_resolution() && !v.is_prerelease())
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -5285,10 +5158,6 @@ mod tests {
                 versions
                     .iter()
                     .position(|v| !v.removal_status().blocks_resolution() && !v.is_prerelease())
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -5830,7 +5699,6 @@ mod tests {
         use deps_core::position::{Position, Range};
         use deps_core::test_util::{MockVersion, StubFormatter};
         use deps_core::{Dependency, Metadata, Registry, Version};
-        use std::any::Any;
         use std::sync::Mutex;
 
         const LOWERCASE_FORMATTER: StubFormatter = StubFormatter::new()
@@ -5843,6 +5711,7 @@ mod tests {
             addr_tag: u32,
         }
 
+        deps_core::impl_unprobed_dependency!(MockDep);
         impl Dependency for MockDep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -5935,10 +5804,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

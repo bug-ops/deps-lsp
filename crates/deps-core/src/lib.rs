@@ -3,7 +3,6 @@
 // error under `-D warnings` (rust-lang/rust#159228). Same fix as deps-cargo #745, deps-nuget
 // #696, deps-swift #673.
 #![recursion_limit = "256"]
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! Core abstractions for deps-lsp.
 //!
@@ -250,12 +249,12 @@ pub use cache::{
     BodyLimit, CacheMode, CachedResponse, CredentialHeader, HttpCache, NetworkMode, RequestAuth,
     RequestHeader, RevalidationFailure,
 };
-pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
+pub use dependency_cap::{DependencyBudget, DependencyTruncation, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{
     DepsDevClient, FetchCompleteness, GossipCooldown, GossipFindings, GossipLowUsage,
     GossipRiskLevel, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal, TyposquatSignal,
 };
-pub use detached_flight::{FlightHandle, SingleFlight};
+pub use detached_flight::{FlightEnd, FlightHandle, SingleFlight};
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
     EcosystemBase, EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult,
@@ -287,8 +286,8 @@ pub use licenses::{
     evaluate as evaluate_license_policy, resolve_license_entries,
 };
 pub use lockfile::{
-    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_and_parse_lockfile,
-    read_lockfile_content,
+    EntryPlacement, LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
+    read_and_parse_lockfile, read_lockfile_content,
 };
 pub use lsp_helpers::{
     BoundDependency, CachedVersionsMap, DependencyFormatter, DependencyGate, DependencyOutcome,
@@ -324,8 +323,8 @@ pub use parser::{
 pub use path_segment::{DotSegmentError, SafePathSegment, SegmentedPathName};
 pub use position::{Position, Range};
 pub use registry::{
-    ChainNotFound, Deprecation, Metadata, Registry, RemovalStatus, Version,
-    classify_default_registry_url, existence_wildcard_req, find_latest_stable,
+    ChainNotFound, Deprecation, Metadata, MetadataAny, Registry, RegistryAny, RemovalStatus,
+    Version, VersionAny, classify_default_registry_url, existence_wildcard_req, find_latest_stable,
     has_default_prerelease_marker, hash_routing_key, is_existence_wildcard,
     is_existence_wildcard_str, not_found_or, select_latest_for_existence,
 };

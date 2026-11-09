@@ -7,7 +7,7 @@
 //! `ServerState`/`DocumentState`/`Client`: marking a document loading, opening an LSP progress
 //! notification, and merging a completed fetch's result back into document state.
 
-use super::diff::drop_cache_for_forced_refetch;
+use super::diff::{DeclaredRequirements, drop_cache_for_forced_refetch};
 use super::resolved::RefetchPolicy;
 use super::state::ServerState;
 use crate::progress::RegistryProgress;
@@ -25,7 +25,7 @@ use deps_engine::classify::fetch::{
     DepSources, FailureSummary, FetchResult, apply_fetch_outcomes, fetch_latest_versions_parallel,
     prepare_fetch,
 };
-use deps_engine::classify::resolved::forget_local_locked_misses;
+use deps_engine::classify::resolved::{dependency_version_map, forget_local_locked_misses};
 use std::collections::{HashMap, HashSet};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
@@ -70,9 +70,21 @@ fn retain_requested(dep_sources: &mut DepSources, requested: &[NormalizedName]) 
     dep_sources.retain(|(key, _)| requested.contains(key.normalized()));
 }
 
-/// Fans the registry fetch out for the added/version-changed dependencies determined by the
-/// caller's diff: marks the document loading, opens an LSP progress notification when the
-/// client supports it, resolves each dependency occurrence to a fetchable source (deduping
+/// What [`fetch_registry_versions_for_change`] fetched, as [`merge_registry_fetch_result`]
+/// consumes it.
+pub(crate) struct ChangeFetch {
+    pub(crate) fetch_result: FetchResult,
+    /// Every normalized name a fetch was attempted for this round.
+    pub(crate) attempted_names: Vec<NormalizedName>,
+    pub(crate) collided_names: HashSet<NormalizedName>,
+    /// Requirements of every requested name (also the non-resolvable and collided ones) as
+    /// declared when the fetch started, recorded as committed by the merge (issue #1987).
+    pub(crate) requested: DeclaredRequirements,
+}
+
+/// Fans the registry fetch out for the dependencies the caller determined are pending: marks
+/// the document loading, opens an LSP progress notification when the client supports it,
+/// resolves each dependency occurrence to a fetchable source (deduping
 /// same-name collisions across different resolved sources), and fetches latest versions in
 /// parallel. Returns everything the caller needs to merge the result and end the progress
 /// notification, without exposing the intermediate `in_use`/`dep_sources` bookkeeping.
@@ -89,12 +101,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
     fetch_timeout: FetchTimeout,
     max_concurrent_fetches: FetchConcurrency,
     refetch: RefetchPolicy,
-) -> (
-    Option<RegistryProgress>,
-    FetchResult,
-    Vec<NormalizedName>,
-    HashSet<NormalizedName>,
-) {
+) -> (Option<RegistryProgress>, ChangeFetch) {
     tracing::info!(
         count = deps_to_fetch.len(),
         "fetching versions for added/version-changed dependencies"
@@ -130,11 +137,12 @@ pub(crate) async fn fetch_registry_versions_for_change(
     // Build the in-use-version map (§4.6), the manifest's own `SelectionContext` (#1433),
     // and the added/changed dependencies' resolved sources (spec FR-001/FR-011) from the
     // freshly-committed parse result and the resolved versions just loaded above.
-    let (in_use, selection_context, dep_sources, collided_names): (
+    let (in_use, selection_context, dep_sources, collided_names, requested): (
         HashMap<NormalizedName, Vec<ConcreteVersion>>,
         deps_core::SelectionContext,
         DepSources,
         HashSet<NormalizedName>,
+        DeclaredRequirements,
     ) = match state.get_document(uri) {
         Some(doc) => match doc.manifest() {
             Some(pr) => {
@@ -148,11 +156,14 @@ pub(crate) async fn fetch_registry_versions_for_change(
                 // This call only fetches the added/version-changed subset the caller's diff
                 // determined, unlike `prepare_fetch`'s default full-manifest set.
                 retain_requested(&mut prep.dep_sources, &deps_to_fetch);
+                let mut requested = dependency_version_map(pr, ecosystem.formatter());
+                requested.retain(|name, _| deps_to_fetch.contains(name));
                 (
                     prep.in_use,
                     prep.selection_context,
                     prep.dep_sources,
                     prep.collided_names,
+                    requested,
                 )
             }
             None => (
@@ -160,6 +171,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
                 deps_core::SelectionContext::none(),
                 Vec::new(),
                 HashSet::new(),
+                HashMap::new(),
             ),
         },
         None => (
@@ -167,6 +179,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
             deps_core::SelectionContext::none(),
             Vec::new(),
             HashSet::new(),
+            HashMap::new(),
         ),
     };
 
@@ -207,25 +220,40 @@ pub(crate) async fn fetch_registry_versions_for_change(
         .await;
     }
 
-    (progress, fetch_result, attempted_names, collided_names)
+    (
+        progress,
+        ChangeFetch {
+            fetch_result,
+            attempted_names,
+            collided_names,
+            requested,
+        },
+    )
 }
 
 /// Merges a completed registry fetch into the document's cache and outcome maps —
 /// newly fetched versions, yanked/fetch-failure markers,
 /// collided names recorded as not-attempted, and deprecation / no-comparable-versions
-/// bookkeeping — then marks the document loaded or failed depending on `success`. Returns
+/// bookkeeping — records `requested` as committed in the document's
+/// [`RegistryBaseline`](super::diff::RegistryBaseline) (a failure or miss counts, issue #1987),
+/// then marks the document loaded or failed depending on `success`. Returns
 /// `fetch_result.failure_summary`, the one `FetchResult` field this function does not
 /// consume, so the caller can still raise the fetch-failure toast after `fetch_result`
 /// itself has been moved in here.
 pub(crate) fn merge_registry_fetch_result(
     state: &ServerState,
     uri: &Uri,
-    fetch_result: FetchResult,
-    attempted_names: &[NormalizedName],
-    collided_names: HashSet<NormalizedName>,
+    fetched: ChangeFetch,
     success: bool,
 ) -> Option<FailureSummary> {
+    let ChangeFetch {
+        fetch_result,
+        attempted_names,
+        collided_names,
+        requested,
+    } = fetched;
     if let Some(mut doc) = state.documents.get_mut(uri) {
+        doc.signals.registry_baseline.record(requested);
         // Captured before `fetch_result.versions` is consumed below: every name
         // successfully fetched this round, used by the S1 deprecation-clearing
         // loop further down to distinguish "fetched and clean" from "not fetched
@@ -251,7 +279,7 @@ pub(crate) fn merge_registry_fetch_result(
         );
         merge_lookup_misses_after_fetch(
             &mut doc.signals.outcomes,
-            attempted_names,
+            &attempted_names,
             fetch_result.lookup_misses,
         );
         if success {
@@ -365,7 +393,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_failure_toast_wording_for_mixed_not_found_and_genuine_failure_batch() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct FallbackErrorRegistry;
 
@@ -407,10 +434,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -515,7 +538,6 @@ dependencies = ["requests>=2.0.0"]
         use super::*;
         use deps_core::{DiagnosticSeverities, Metadata, Version, VersionData};
         use deps_engine::classify::resolved::collect_in_use_versions;
-        use std::any::Any;
 
         #[derive(Debug, Clone)]
         struct MockYankVersion {
@@ -529,9 +551,6 @@ dependencies = ["requests>=2.0.0"]
             }
             fn removal_status(&self) -> deps_core::RemovalStatus {
                 deps_core::RemovalStatus::from_yanked(self.yanked)
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -582,10 +601,6 @@ dependencies = ["requests>=2.0.0"]
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

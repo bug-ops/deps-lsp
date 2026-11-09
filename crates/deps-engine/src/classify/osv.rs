@@ -254,6 +254,7 @@ pub fn build_scan_targets(
     let mut target_index: HashMap<deps_core::osv::VulnKey, usize> = HashMap::new();
     let mut skipped = deps_core::osv::VulnerabilityMap::new();
     let keys = document.vulnerability_keys(resolved_versions, Some(resolved_version_candidates));
+    let mut memo = deps_core::lsp_helpers::LockSelectionMemo::default();
 
     document.for_each_formatted_dependency(&mut |bound| {
         let (dep, formatter) = (bound.dependency(), bound.formatter());
@@ -270,11 +271,12 @@ pub fn build_scan_targets(
         // append-only ledger (only `go mod tidy` prunes it), so its last-occurrence-wins
         // parse can yield a stale, no-longer-selected version (see
         // `manifest_requirement_is_resolved_version`).
-        let versions = bound.resolve_in_use_versions(
+        let versions = bound.resolve_in_use_versions_memoized(
             &package_key,
             resolved_versions,
             Some(resolved_version_candidates),
             ecosystem,
+            &mut memo,
         );
 
         let Some(versions) = versions else {
@@ -320,7 +322,8 @@ pub fn build_scan_targets(
             versions.primary().clone(),
             formatter,
         )
-        .with_siblings(&versions, formatter);
+        .with_siblings(&versions, formatter)
+        .with_lock_alternatives(&versions, formatter);
         match target_index.entry(target.key.clone()) {
             Entry::Vacant(slot) => {
                 slot.insert(targets.len());
@@ -1129,6 +1132,7 @@ mod tests {
             source: DependencySource,
         }
 
+        deps_core::impl_unprobed_dependency!(MockDep);
         impl Dependency for MockDep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -1244,6 +1248,86 @@ mod tests {
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
             assert!(skipped.is_empty());
+        }
+
+        /// #1981: the other satisfying lock entries must reach the scan target, or OSV would
+        /// only be asked about the primary version.
+        #[test]
+        fn build_scan_targets_passes_lock_alternatives_to_the_target() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("1.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let name = NormalizedName::for_test("serde");
+            let resolved = HashMap::from([(name.clone(), "1.0.195".into())]);
+            let candidates =
+                HashMap::from([(name, vec!["1.0.195".into(), "1.0.5".into(), "2.0.0".into()])]);
+
+            let (targets, skipped) = build_scan_targets(
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
+                &resolved,
+                &candidates,
+                EcosystemId::Cargo,
+            );
+            assert!(skipped.is_empty());
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "1.0.195");
+            let alternatives: Vec<&str> = targets[0]
+                .lock_alternatives()
+                .iter()
+                .map(|a| a.version().as_str())
+                .collect();
+            assert_eq!(alternatives, ["1.0.5"]);
+        }
+
+        /// #1981 (S2): an exact pin and a range over the same lock entries become two targets,
+        /// and only the range's carries the older entry, whichever occurrence comes first.
+        #[test]
+        fn build_scan_targets_gives_each_duplicate_occurrence_its_own_alternatives() {
+            let occurrence = |req: &str| MockDep {
+                name: PackageName::new("serde"),
+                version_req: Some(VersionReq::new(req)),
+                source: DependencySource::Registry,
+            };
+            let name = NormalizedName::for_test("serde");
+            let resolved = HashMap::from([(name.clone(), "1.0.195".into())]);
+            let candidates = HashMap::from([(name, vec!["1.0.5".into(), "1.0.195".into()])]);
+
+            for requirements in [["1.0.195", "1.0"], ["1.0", "1.0.195"]] {
+                let (targets, _skipped) = build_scan_targets(
+                    stub_document_with(
+                        MockParseResult {
+                            deps: requirements.map(occurrence).into(),
+                        },
+                        StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                        EcosystemId::Cargo,
+                    )
+                    .as_ref(),
+                    &resolved,
+                    &candidates,
+                    EcosystemId::Cargo,
+                );
+                assert_eq!(targets.len(), 2, "{requirements:?}");
+                let mut alternatives: Vec<Vec<&str>> = targets
+                    .iter()
+                    .map(|t| {
+                        t.lock_alternatives()
+                            .iter()
+                            .map(|a| a.version().as_str())
+                            .collect()
+                    })
+                    .collect();
+                alternatives.sort();
+                assert_eq!(alternatives, [Vec::<&str>::new(), vec!["1.0.5"]]);
+            }
         }
 
         /// Parses `content` as `file` through the real ecosystem, so the document carries its own
@@ -2340,6 +2424,7 @@ mod tests {
             source: DependencySource,
         }
 
+        deps_core::impl_unprobed_dependency!(MockDep);
         impl Dependency for MockDep {
             fn name(&self) -> &PackageName {
                 &self.name

@@ -44,8 +44,9 @@ documented contract enforced by code review, not a compiler-enforced wall.
   `deps-core::deps_dev`'s deps.dev `system` mapping — to be updated at compile time.
 - **`ParseResult` / `Dependency`** — trait-object interfaces a parser returns; ecosystem-specific
   dependency types are exposed generically and are never downcast (`as_any` is gone from
-  `Ecosystem`, `ParseResult` and `Dependency`; clippy's `disallowed-methods` also bans the
-  remaining test-only `Registry`/`Version`/`Metadata::as_any` in production code).
+  `Ecosystem`, `ParseResult` and `Dependency`; on `Registry`/`Version`/`Metadata` it exists only
+  under `cfg(test)` or the `test-util` feature, through blanket `RegistryAny`/`VersionAny`/
+  `MetadataAny` supertraits, so a production downcast does not compile).
   `ParseResult::blocked_registries()` additionally reports any dependency line whose
   registry-index resolution was blocked by the workspace-registry reachability policy (see
   [Network security](#network-security-ssrf-host-classification) below), so a blocked custom

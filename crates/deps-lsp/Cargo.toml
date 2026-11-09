@@ -74,7 +74,7 @@ deps-core = { workspace = true, features = ["test-util"] }
 # itself optionally enabled) never reaches them.
 deps-deno = { workspace = true, features = ["lsp-responses"] }
 deps-engine = { workspace = true, features = ["lsp-responses", "test-util"] }
-deps-github-actions = { workspace = true, features = ["lsp-responses"] }
+deps-github-actions = { workspace = true, features = ["lsp-responses", "test-util"] }
 deps-gitlab-ci = { workspace = true, features = ["lsp-responses"] }
 deps-npm = { workspace = true, features = ["lsp-responses"] }
 insta = { workspace = true, features = ["json"] }

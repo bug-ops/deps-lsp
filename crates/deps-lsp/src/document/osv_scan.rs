@@ -48,6 +48,7 @@ enum PlannedQuery {
         version: deps_core::osv::OsvVersion,
         siblings: Vec<deps_core::osv::OsvVersion>,
         sibling_coverage: deps_core::osv::SiblingCoverage,
+        lock_alternatives: Vec<deps_core::osv::OsvVersion>,
     },
     Skip(deps_core::osv::SkipReason),
 }
@@ -79,6 +80,11 @@ impl OsvScanPlan {
                         .map(|s| s.version().clone())
                         .collect(),
                     sibling_coverage: target.sibling_coverage(),
+                    lock_alternatives: target
+                        .lock_alternatives()
+                        .iter()
+                        .map(|a| a.version().clone())
+                        .collect(),
                 },
             )
         });
@@ -240,6 +246,18 @@ pub(crate) async fn rescan_after_resolved_version_change(
     .await;
 }
 
+/// Whether the [`OsvScanPlan`] rebuilt from `doc`'s current state differs from the one its last
+/// committed scan ran with — also true when no scan ever committed, which is how a change task
+/// notices an OSV outcome lost to an aborted predecessor (issue #1987).
+pub(crate) fn osv_scan_plan_is_stale(
+    doc: &super::state::DocumentState,
+    ecosystem: &dyn Ecosystem,
+) -> bool {
+    scan_inputs(doc, ecosystem).is_some_and(|(targets, skipped)| {
+        OsvScanPlan::new(&targets, &skipped) != doc.signals.osv_scan_plan
+    })
+}
+
 /// Whether [`rescan_osv_if_tag_index_now_warm`] ran the OSV pipeline and committed a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RescanOutcome {
@@ -292,11 +310,9 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         return RescanOutcome::Unchanged;
     }
 
-    let plan_changed = state.get_document(uri).is_some_and(|doc| {
-        scan_inputs(&doc, ecosystem.as_ref()).is_some_and(|(targets, skipped)| {
-            OsvScanPlan::new(&targets, &skipped) != doc.signals.osv_scan_plan
-        })
-    });
+    let plan_changed = state
+        .get_document(uri)
+        .is_some_and(|doc| osv_scan_plan_is_stale(&doc, ecosystem.as_ref()));
     if !plan_changed {
         return RescanOutcome::Unchanged;
     }
@@ -1246,6 +1262,7 @@ mod tests {
             version_req: VersionReq,
         }
 
+        deps_core::impl_unprobed_dependency!(FakeTier3Dep);
         impl Dependency for FakeTier3Dep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -2324,6 +2341,42 @@ mod tests {
             assert_ne!(plan(&[]), plan(&["4.9.0"]));
             assert_ne!(plan(&["4.9.0"]), plan(&["4.9.0", "4.10.0"]));
             assert_eq!(plan(&["4.9.0"]), plan(&["4.9.0"]));
+        }
+
+        /// #1981: two plans that differ only by a target's lock alternatives are not equal, so a
+        /// lock-file change adding or removing a satisfying entry triggers a rescan.
+        #[test]
+        fn osv_scan_plan_differs_when_only_lock_alternatives_differ() {
+            use deps_core::ConcreteVersion;
+            use deps_core::osv::{OsvPackageName, OsvQueryName, ScanTarget};
+
+            struct Identity;
+            impl deps_core::lsp_helpers::SourcePolicy for Identity {}
+            impl deps_core::lsp_helpers::OsvNaming for Identity {}
+
+            let target = |alternatives: &[&str]| {
+                let versions =
+                    deps_core::lsp_helpers::InUseVersions::for_test_with_lock_alternatives(
+                        ConcreteVersion::new("1.2.8"),
+                        alternatives
+                            .iter()
+                            .map(|v| ConcreteVersion::new(*v))
+                            .collect(),
+                    );
+                ScanTarget::from_native(
+                    deps_core::test_util::vuln_key("minimist"),
+                    OsvQueryName::Confirmed(OsvPackageName::new("minimist").unwrap()),
+                    ConcreteVersion::new("1.2.8"),
+                    &Identity,
+                )
+                .with_lock_alternatives(&versions, &Identity)
+            };
+            let skipped = deps_core::osv::VulnerabilityMap::new();
+            let plan = |alternatives: &[&str]| OsvScanPlan::new(&[target(alternatives)], &skipped);
+
+            assert_ne!(plan(&[]), plan(&["1.2.5"]));
+            assert_ne!(plan(&["1.2.5"]), plan(&["1.2.5", "1.2.6"]));
+            assert_eq!(plan(&["1.2.5"]), plan(&["1.2.5"]));
         }
 
         /// #1668: a skip because the resolved tag was only a moving alias (`v2`) is just as

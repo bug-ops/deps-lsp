@@ -21,6 +21,10 @@ workspace = true
 # explicitly, directly or via `deps-engine`'s own `lsp-responses`; `deps-cli` never does,
 # keeping `tower-lsp-server` out of its dependency tree.
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
+# Test-only constructors (`GithubActionsEcosystem::for_test`) so another crate's integration
+# tests can point the registry at a mock server. Dev-dependency use only: `deps-lsp`'s
+# non-dev tree must never enable it (CI's `cargo tree -e features,no-dev` guard).
+test-util = ["deps-core/test-util"]
 
 [dependencies]
 dashmap = { workspace = true }

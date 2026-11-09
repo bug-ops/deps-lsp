@@ -194,6 +194,24 @@ deps_core::impl_dependency!(BundlerDependency {
     version_literal: version_literal,
 });
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for BundlerDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            group: DependencyGroup::default(),
+            source,
+            platforms: Vec::new(),
+            require: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,7 +460,6 @@ mod tests {
         assert_eq!(version.version_string(), "1.2.3");
         assert!(!version.removal_status().blocks_resolution());
         assert!(version.features().is_empty());
-        assert!(version.as_any().is::<BundlerVersion>());
     }
 
     #[test]
@@ -484,7 +501,6 @@ mod tests {
         assert_eq!(gem.repository(), Some("https://github.com/rails/rails"));
         assert_eq!(gem.documentation(), Some("https://api.rubyonrails.org"));
         assert_eq!(gem.latest_version(), "7.0.8");
-        assert!(gem.as_any().is::<GemInfo>());
     }
 
     #[test]

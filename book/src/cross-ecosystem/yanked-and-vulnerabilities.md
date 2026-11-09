@@ -30,6 +30,29 @@ real vulnerability:
 an informational-only advisory is reported the same way there — visible in the output, but
 distinguishable from a graded finding via its severity field.
 
+## Lock alternatives (issue #1981)
+
+When a lock file holds several entries that satisfy one dependency's requirement, `deps-lsp` and
+`deps-cli` cannot tell which one the package manager installed for it. The highest satisfying entry
+drives "Current", yanked and update status. The OSV scan queries it and every other satisfying
+entry (up to 16, lowest versions first), so an advisory that affects only the newer copy or only an
+older one is never hidden:
+
+- An advisory matched only by another locked copy is listed with `also locked at <versions>`.
+- If any of those scans could not be completed, the advisory list is marked incomplete, and no
+  "affected through another copy" claim is made.
+- A clean answer for the primary while another entry could not be checked (a failed query, an
+  unparsable version, or more than 16 entries) is reported as not checked, never as clean. The
+  structural cases report `lock-alternatives-unchecked`, which counts as a scan-incomplete gap for
+  `deps-cli check --fail-on unchecked`, and is shown in hover only (no standing diagnostic).
+
+A "fixed in" version that does not lie above the primary version is not offered as an upgrade for
+an advisory that only another locked copy matches, since editing the manifest would not move that copy.
+
+`package-lock.json` filters out a copy nested under another package; `yarn.lock`, `bun.lock` and
+`pnpm-lock.yaml` cannot attribute entries and report it as `also locked at`. See
+[npm lock files](../ecosystems/npm.md#several-lock-entries-for-one-package).
+
 ## Yanked-Version Diagnostics
 
 `diagnostics.yanked_severity` flags a dependency pinned to a version the registry

@@ -18,7 +18,6 @@ use deps_core::registry::{CapResult, KeyShape, register_capped};
 use deps_core::{
     EcosystemId, NormalizedName, PackageName, PublishTime, RefreshEvents, RefreshSender,
 };
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -815,10 +814,6 @@ impl deps_core::Registry for GitlabCiRegistry {
     /// GitLab exposes no yank/deprecation signal for either endpoint.
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

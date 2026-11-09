@@ -13,8 +13,8 @@
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use deps_core::lsp_helpers::{redact_name_for_diagnostic, redact_requirement_for_diagnostic};
 use deps_core::osv::{
-    CoverageGap, LockPresence, LockResolution, OsvClient, OsvId, ScanOutcome, SkipReason, VulnKey,
-    VulnKeys, VulnSeverity, VulnerabilityMap,
+    CoverageGap, LockPresence, LockResolution, MAX_LOCK_ALTERNATIVES, OsvClient, OsvId,
+    ScanOutcome, SkipReason, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
 };
 use deps_core::policy_config::{OsvChecks, PolicyConfig};
 use deps_core::position::Range;
@@ -628,6 +628,7 @@ pub struct OsvCoverage {
     unverified_registry: usize,
     scan_incomplete: usize,
     query_failed: usize,
+    lock_alternatives_unchecked: usize,
 }
 
 impl OsvCoverage {
@@ -639,7 +640,19 @@ impl OsvCoverage {
             unverified_registry,
             scan_incomplete,
             query_failed: 0,
+            lock_alternatives_unchecked: 0,
         }
+    }
+
+    /// This coverage with `lock_alternatives_unchecked` dependencies whose other satisfying
+    /// lock-file entries could not all be checked.
+    #[must_use]
+    pub const fn with_lock_alternatives_unchecked(
+        mut self,
+        lock_alternatives_unchecked: usize,
+    ) -> Self {
+        self.lock_alternatives_unchecked = lock_alternatives_unchecked;
+        self
     }
 
     /// This coverage with `query_failed` dependencies whose OSV query failed.
@@ -666,6 +679,10 @@ impl OsvCoverage {
         let mut coverage = Self::default();
         for (key, outcome) in vulnerabilities.into_iter().flat_map(|map| map.iter()) {
             if let ScanOutcome::Skipped(reason) = outcome {
+                if *reason == SkipReason::LockAlternativesUnchecked {
+                    coverage.lock_alternatives_unchecked += 1;
+                    continue;
+                }
                 let reason_lock = if unlocked.contains(key) {
                     LockPresence::Absent
                 } else {
@@ -704,12 +721,16 @@ impl OsvCoverage {
         self.unverified_registry += other.unverified_registry;
         self.scan_incomplete += other.scan_incomplete;
         self.query_failed += other.query_failed;
+        self.lock_alternatives_unchecked += other.lock_alternatives_unchecked;
     }
 
     /// Dependencies whose vulnerability data was not checked, across all gap classes.
     #[must_use]
     pub const fn unchecked(&self) -> usize {
-        self.unverified_registry + self.scan_incomplete + self.query_failed
+        self.unverified_registry
+            + self.scan_incomplete
+            + self.query_failed
+            + self.lock_alternatives_unchecked
     }
 
     /// The stderr note for this run, or `None` when every dependency was either checked or
@@ -736,7 +757,16 @@ impl OsvCoverage {
                 dependency_count(self.query_failed)
             )
         });
-        let notes: Vec<String> = [unverified, incomplete, failed]
+        let lock_alternatives = (self.lock_alternatives_unchecked > 0).then(|| {
+            format!(
+                "not every lock-file entry satisfying the requirement was checked for {} (more \
+                 than {MAX_LOCK_ALTERNATIVES} satisfying entries, so only the lowest \
+                 {MAX_LOCK_ALTERNATIVES} alternatives were scanned, or an entry's version could \
+                 not be matched)",
+                dependency_count(self.lock_alternatives_unchecked)
+            )
+        });
+        let notes: Vec<String> = [unverified, incomplete, lock_alternatives, failed]
             .into_iter()
             .flatten()
             .collect();
@@ -893,9 +923,9 @@ pub async fn check_manifest(
     let mut osv_coverage =
         OsvCoverage::from_vulnerabilities(analysis.vulnerabilities.as_ref(), lock, &unlocked);
     if analysis.vulnerabilities.is_some()
-        && let Some((kept, total)) = analysis.parse_result.dependency_truncation()
+        && let Some(truncation) = analysis.parse_result.dependency_truncation()
     {
-        osv_coverage.add_truncated(total.saturating_sub(kept));
+        osv_coverage.add_truncated(truncation.omitted());
     }
     let findings = diagnostics
         .into_iter()
@@ -2000,6 +2030,21 @@ mod tests {
         assert!(!note.contains("query failed"));
     }
 
+    /// #1981: an unchecked lock alternative never suggests a token, which would not help.
+    #[test]
+    fn test_osv_coverage_note_explains_unchecked_lock_alternatives() {
+        let note = OsvCoverage::default()
+            .with_lock_alternatives_unchecked(2)
+            .note()
+            .expect("note");
+        assert!(note.contains(
+            "not every lock-file entry satisfying the requirement was checked for 2 dependencies"
+        ));
+        assert!(note.contains("more than 16 satisfying entries"));
+        assert!(!note.contains("GITHUB_TOKEN"));
+        assert!(!note.contains("scan incomplete"));
+    }
+
     #[test]
     fn test_osv_coverage_note_names_query_failure_separately() {
         let coverage = OsvCoverage::new(0, 1).with_query_failed(2);
@@ -2154,6 +2199,7 @@ mod tests {
             version_req: deps_core::VersionReq,
             version_range: PosRange,
         }
+        deps_core::impl_unprobed_dependency!(FixtureDep);
         impl Dependency for FixtureDep {
             fn name(&self) -> &PackageName {
                 &self.name

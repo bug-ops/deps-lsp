@@ -633,6 +633,7 @@ mod tests {
         version_range: Option<Range>,
     }
 
+    deps_core::impl_unprobed_dependency!(MockDep);
     impl Dependency for MockDep {
         fn name(&self) -> &PackageName {
             &self.name

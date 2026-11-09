@@ -1,7 +1,6 @@
 //! Domain types for NuGet/.NET project dependencies.
 
 use deps_core::position::Range;
-use std::any::Any;
 
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
 #[non_exhaustive]
@@ -103,10 +102,6 @@ impl deps_core::Version for NuGetVersion {
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// Package metadata from a NuGet search result.
@@ -187,6 +182,21 @@ deps_core::impl_metadata!(PackageInfo {
     latest_version: latest_version,
 });
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for NuGetDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_requirement: None,
+            version_range: None,
+            source,
+            feed_route: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +255,6 @@ mod tests {
         assert_eq!(ver.version_string(), "13.0.3");
         assert!(!ver.removal_status().blocks_resolution());
         assert!(!ver.is_prerelease());
-        assert!(ver.as_any().is::<NuGetVersion>());
     }
 
     #[test]
@@ -290,6 +299,5 @@ mod tests {
         );
         assert_eq!(info.latest_version(), "13.0.3");
         assert!(info.repository().is_none());
-        assert!(info.as_any().is::<PackageInfo>());
     }
 }

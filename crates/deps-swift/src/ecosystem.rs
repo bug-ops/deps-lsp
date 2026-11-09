@@ -13,8 +13,6 @@ use deps_core::{
     },
 };
 use futures::StreamExt;
-#[cfg(test)]
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(feature = "lsp-responses")]
@@ -540,29 +538,15 @@ impl TypedEcosystem for SwiftEcosystem {
         }
     }
 
-    /// The shared diagnostics plus a notice for each eligible dependency whose identity lookup
-    /// failed.
-    fn diagnostics<'a>(
+    /// A notice for each eligible dependency whose identity lookup failed.
+    fn decorate_diagnostics<'a>(
         &'a self,
         parsed: ParsedView<'a, SwiftParseResult>,
-        versions: deps_core::VersionData<'a>,
-        uri: &'a Url,
-        freshness: deps_core::FreshnessSettings,
-        severities: DiagnosticSeverities,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
-        Box::pin(async move {
-            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                &parsed,
-                versions,
-                self.own_formatter(),
-                uri,
-                freshness,
-                severities,
-                deps_core::PublishTime::now(),
-            );
-            diagnostics.extend(self.lookup_failed_notices(parsed.typed()));
-            diagnostics
-        })
+        _severities: DiagnosticSeverities,
+        out: &'a mut Vec<Diagnostic>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ()> {
+        out.extend(self.lookup_failed_notices(parsed.typed()));
+        Box::pin(std::future::ready(()))
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -953,9 +937,6 @@ mod tests {
         }
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

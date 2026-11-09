@@ -8,7 +8,9 @@ pub mod typed;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use manifest::EcosystemManifest;
 pub use manifest::ParsedManifest;
-pub use typed::TypedEcosystem;
+#[cfg(feature = "lsp-responses")]
+pub use typed::{HoverDecoration, HoverDecorator, code_actions, hover};
+pub use typed::{TypedEcosystem, diagnostics};
 
 use crate::{
     Registry,
@@ -184,7 +186,7 @@ macro_rules! ecosystem_ids {
     ( $( $(#[$vmeta:meta])* $variant:ident => $id:literal ),+ $(,)? ) => {
         /// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
         ///
-        /// [`EcosystemBase::id`] returns a `&'static str` for registry lookups and document
+        /// `dyn Ecosystem::id` returns a `&'static str` for registry lookups and document
         /// storage, but any code that needs to *branch* on ecosystem identity should match on
         /// this enum instead of re-deriving its own partial match over that string: an
         /// unhandled variant here is a compile error, while an unhandled string is a silent
@@ -220,7 +222,7 @@ macro_rules! ecosystem_ids {
             /// missing-match compile error, not a silently incomplete set.
             pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
 
-            /// Returns the canonical string identifier, matching [`EcosystemBase::id`] for the
+            /// Returns the canonical string identifier, matching `dyn Ecosystem::id` for the
             /// corresponding ecosystem implementation.
             #[must_use]
             pub const fn id(self) -> &'static str {
@@ -625,7 +627,7 @@ pub trait ParseResult: Send + Sync {
         Vec::new()
     }
 
-    /// Dependency-count ceiling info (#796): `Some((kept, total))` once this document's
+    /// Dependency-count ceiling info (#796): a [`crate::DependencyTruncation`] once this document's
     /// dependency count was truncated to [`crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT`]
     /// by [`parse_manifest_blocking`], `None` otherwise.
     ///
@@ -633,7 +635,7 @@ pub trait ParseResult: Send + Sync {
     /// [`ParsedManifest`] [`parse_manifest_blocking`] returns reports a truncation, so this
     /// needs no per-ecosystem implementation. Read by
     /// `deps_core::lsp_helpers::diagnostics`' truncation notice.
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+    fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
         None
     }
 }
@@ -1336,23 +1338,10 @@ pub trait EcosystemBase: Send + Sync + private::Sealed {
     /// Exhaustively typed ecosystem identity.
     ///
     /// Every implementor lives in this sealed trait's own workspace, so the enum is
-    /// authoritative for identity and [`Self::id`] is derived from it rather than
-    /// independently authored — a typo or rename here is a compile error instead of a
-    /// runtime mismatch between [`EcosystemId::ALL`] and this ecosystem's registration.
+    /// the single source of identity — the string form is [`EcosystemId::id`], and a typo
+    /// or rename here is a compile error instead of a runtime mismatch between
+    /// [`EcosystemId::ALL`] and this ecosystem's registration.
     fn ecosystem_id(&self) -> EcosystemId;
-
-    /// Unique identifier (e.g., "cargo", "npm", "pypi")
-    ///
-    /// This identifier is used for ecosystem registration and routing. The default
-    /// implementation derives it from [`Self::ecosystem_id`], so an implementor that leaves
-    /// `id()` at its default can no longer author a mismatched string independently — but
-    /// `id()` remains a provided (overridable) method, so this guarantee holds only for that
-    /// default, not for an implementor that overrides `id()` directly (as some test doubles
-    /// deliberately do). Code needing the two to agree should verify it explicitly, e.g. via
-    /// [`crate::conformance::assert_ecosystem_id`].
-    fn id(&self) -> &'static str {
-        self.ecosystem_id().id()
-    }
 
     /// Human-readable name (e.g., "Cargo (Rust)", "npm (JavaScript)")
     ///
@@ -1706,6 +1695,37 @@ pub trait Ecosystem: EcosystemBase + typed::BlanketOnly {
         content: &str,
         uri: &url::Url,
     ) -> Option<Box<dyn ParsedManifest>>;
+
+    /// How this ecosystem's own formatter routes a dependency named `name` that resolves from
+    /// `source` (see [`DependencyFormatter::non_public_route`]).
+    ///
+    /// The conformance probe behind `deps-engine/tests/osv_non_public_routes.rs` (#1977): it
+    /// builds a real dependency of this ecosystem through [`ProbeDependency`], so a
+    /// cross-ecosystem test can iterate every registered ecosystem without a synthetic
+    /// dependency. Only available with the `test-util` feature, never reachable from a
+    /// production build.
+    ///
+    /// [`DependencyFormatter::non_public_route`]: crate::lsp_helpers::DependencyFormatter::non_public_route
+    /// [`ProbeDependency`]: crate::lsp_helpers::ProbeDependency
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    fn probe_non_public_route(
+        &self,
+        name: crate::PackageName,
+        source: crate::parser::DependencySource,
+    ) -> crate::osv::NonPublicRoute;
+}
+
+impl dyn Ecosystem + '_ {
+    /// Unique string identifier (e.g. `"cargo"`, `"npm"`) used for registration and routing.
+    ///
+    /// Always [`EcosystemId::id`] of [`EcosystemBase::ecosystem_id`]: it is an inherent
+    /// method on the trait object rather than an overridable trait method, so an
+    /// implementor cannot author a second, mismatched identity string.
+    #[must_use]
+    pub fn id(&self) -> &'static str {
+        self.ecosystem_id().id()
+    }
 }
 
 #[cfg(test)]
@@ -1906,10 +1926,6 @@ mod tests {
     impl private::Sealed for StubEcosystem {}
 
     impl EcosystemBase for StubEcosystem {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-
         fn ecosystem_id(&self) -> EcosystemId {
             EcosystemId::Cargo
         }
@@ -1976,6 +1992,7 @@ mod tests {
             version: Range,
             features: Range,
         }
+        crate::impl_unprobed_dependency!(OriginMockDep);
         impl Dependency for OriginMockDep {
             fn name(&self) -> &crate::PackageName {
                 static NAME: std::sync::LazyLock<crate::PackageName> =
@@ -2177,10 +2194,10 @@ mod tests {
         );
         assert_eq!(
             parsed.dependency_truncation(),
-            Some((
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(crate::DependencyTruncation {
+                kept: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
     }
 
@@ -2245,10 +2262,10 @@ mod tests {
         );
         assert_eq!(
             parsed.dependency_truncation(),
-            Some((
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(crate::DependencyTruncation {
+                kept: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
     }
 

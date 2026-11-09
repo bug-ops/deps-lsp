@@ -215,6 +215,47 @@ mod tests {
         }
     }
 
+    /// #1981: an unchecked lock alternative is a scan-incomplete gap for every lock presence, so
+    /// `--fail-on unchecked` fails on it while the default categories stay clean.
+    #[test]
+    fn test_unchecked_gate_fails_on_unchecked_lock_alternatives() {
+        use deps_core::osv::{LockPresence, ScanOutcome, SkipReason, VulnerabilityMap};
+        use std::collections::HashSet;
+
+        let mut map = VulnerabilityMap::new();
+        map.insert(
+            deps_core::test_util::vuln_key("minimist"),
+            ScanOutcome::Skipped(SkipReason::LockAlternativesUnchecked),
+        );
+        for lock in [LockPresence::Found, LockPresence::Absent] {
+            let coverage = OsvCoverage::from_vulnerabilities(Some(&map), lock, &HashSet::new());
+            assert_eq!(
+                coverage,
+                OsvCoverage::default().with_lock_alternatives_unchecked(1)
+            );
+            assert_eq!(
+                exit_code(
+                    &CheckReport::default(),
+                    &strict(),
+                    &coverage,
+                    online(),
+                    ExecutionOutcome::Clean
+                ),
+                EXIT_POLICY_VIOLATION
+            );
+            assert_eq!(
+                exit_code(
+                    &CheckReport::default(),
+                    &FailOnPolicy::default_categories(),
+                    &coverage,
+                    online(),
+                    ExecutionOutcome::Clean
+                ),
+                EXIT_CLEAN
+            );
+        }
+    }
+
     #[test]
     fn test_unchecked_gate_passes_with_full_coverage() {
         assert_eq!(

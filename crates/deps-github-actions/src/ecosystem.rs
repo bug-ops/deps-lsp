@@ -4,13 +4,15 @@ use crate::registry::RepositoryIndexes;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
+use deps_core::ecosystem::HoverDecorator;
+#[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
     EcosystemBase, ParsedView, Registry, Result, TypedEcosystem, TypedParseResult,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
-    lsp_helpers::unknown_ref_diagnostics,
+    lsp_helpers::{GitTagsPinning, git_tags_diagnostics},
 };
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -25,9 +27,11 @@ use deps_core::lsp_helpers::{CommentCheck, ProbePhase, ProbePlan, ProbeReport, U
 #[cfg(feature = "lsp-responses")]
 mod lsp;
 #[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::{git_tags_sha_comment_fix_action, git_tags_unknown_ref_fix_action};
+#[cfg(feature = "lsp-responses")]
 use lsp::{
-    VERSION_OPERATOR_CHARS, build_sha_comment_fix_action, build_sha_pin_action,
-    build_unknown_ref_fix_action, collect_pin_all_to_sha_edits, position_past_sha_pin_own_ref,
+    VERSION_OPERATOR_CHARS, build_sha_pin_action, collect_pin_all_to_sha_edits,
+    position_past_sha_pin_own_ref,
 };
 
 /// Whether `gha_dep`'s ref is diagnosable as a tag — either because
@@ -86,6 +90,90 @@ impl GithubActionsEcosystem {
         Self {
             registry,
             formatter,
+        }
+    }
+
+    /// Creates an ecosystem whose registry talks to `api_base` (a mock server) instead of the
+    /// GitHub API, with no token regardless of the ambient `GITHUB_TOKEN`.
+    ///
+    /// Lets another crate's integration tests drive the real fetch pipeline against a mocked
+    /// GitHub API. Only available with the `test-util` feature, which must never be enabled
+    /// outside dev-dependencies.
+    #[cfg(feature = "test-util")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    #[must_use]
+    pub fn for_test(cache: Arc<deps_core::HttpCache>, api_base: impl Into<String>) -> Self {
+        let registry = Arc::new(GithubActionsRegistry::for_test(cache, api_base, false));
+        let formatter = GithubActionsFormatter::new(registry.tag_index())
+            .with_probe_stores(registry.probe_stores());
+        Self {
+            registry,
+            formatter,
+        }
+    }
+}
+
+#[cfg(feature = "lsp-responses")]
+impl GithubActionsEcosystem {
+    /// Reads the tag index when applied, not when built: the decorator is built while the
+    /// shared hover is still fetching, and that fetch is what warms the index.
+    fn hover_decorator<'a>(&'a self, gha_dep: &'a GithubActionsDependency) -> HoverDecorator<'a> {
+        Box::new(move |hover| self.decorate_finished_hover(gha_dep, hover))
+    }
+
+    fn decorate_finished_hover(&self, gha_dep: &GithubActionsDependency, hover: &mut Hover) {
+        use deps_core::lsp_helpers::{DependencyFormatter, PinResolution};
+
+        if gha_dep.version_range.is_none() {
+            return;
+        }
+
+        // #501/#550: the shared footer gate only sees `VersionData`, not `tag_index`, so a
+        // `PinStyle::Tag` step with a warm `TagIndex` entry can have a real "Pin to commit
+        // SHA" quickfix even when the shared gate suppressed the footer. Restored
+        // idempotently, using the eligibility check the quickfix and code lens build on (#1177).
+        if self.formatter.resolve_static_sha_pin(gha_dep).is_some()
+            && !hover
+                .markdown()
+                .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER)
+        {
+            hover.push_markdown(deps_core::lsp_helpers::CMD_DOT_FOOTER);
+        }
+
+        let Some(sha) = self.formatter.pinned_commit(gha_dep) else {
+            return;
+        };
+
+        let resolved_tag = match self.formatter.resolved_pin_version(gha_dep) {
+            PinResolution::Resolved { pin, .. } => Some(pin.version().as_str().to_string()),
+            PinResolution::Unresolved
+            | PinResolution::NotYetIndexed
+            | PinResolution::Unlisted
+            | PinResolution::Untagged
+            | PinResolution::Unpublished
+            | PinResolution::CommentContradicted => None,
+        };
+        let written_tag = gha_dep
+            .version_req
+            .as_ref()
+            .map(deps_core::VersionReq::as_str);
+        if let Some(resolved_tag) = resolved_tag.filter(|resolved| {
+            !(gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved.as_str()))
+        }) {
+            hover.rewrite_markdown(|md| {
+                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
+            });
+        }
+
+        if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gha_dep)
+            && let Some(comment) = gha_dep.sha_comment()
+        {
+            let line = deps_core::lsp_helpers::sha_comment_mismatch_hover_line(
+                &sha,
+                &comment.pin_comment().tag,
+                &mismatch,
+            );
+            hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
         }
     }
 }
@@ -227,7 +315,7 @@ impl TypedEcosystem for GithubActionsEcosystem {
     /// `# vX.Y.Z` comment, on the `#` itself, or inside the comment (issue #1182). That
     /// pin's `version_range` intentionally extends through the comment —
     /// `crate::formatter::GithubActionsFormatter::format_version_replacing_for`'s edit
-    /// range and [`Self::hover`]'s `**Resolved**` splice both depend on it
+    /// range and [`Self::decorate_hover`]'s `**Resolved**` splice both depend on it
     /// spanning the full `<sha> # <tag>` text — so `detect_completion_context` still
     /// reports a `Version` context there. `position_past_sha_pin_own_ref` checks the
     /// cursor position directly against the SHA's own end column rather than scanning
@@ -269,10 +357,9 @@ impl TypedEcosystem for GithubActionsEcosystem {
         })
     }
 
-    /// Appends the mutable-ref-pin diagnostic (issue #473) to the shared default's
-    /// output, one per `PinStyle::Tag` step — an additive, independent signal from the
-    /// outdated-version diagnostic the shared default already computes (spec 031
-    /// NFR-004: this override never changes that behavior, only appends to it).
+    /// Appends the mutable-ref-pin diagnostic (issue #473), one per `PinStyle::Tag` step, an
+    /// additive signal beside the outdated-version diagnostic the shared generator computes
+    /// (spec 031 NFR-004).
     ///
     /// Gated on `severities.mutable_ref_pin_enabled` (spec 031 FR-009, corrected during
     /// implementation review): `severities.mutable_ref_pin` alone cannot silence this
@@ -281,89 +368,60 @@ impl TypedEcosystem for GithubActionsEcosystem {
     /// Also appends the SHA-comment-mismatch diagnostic (issue #1722), which is not gated on
     /// `mutable_ref_pin_enabled`: it only fires for a provable mismatch, and the unknown-ref
     /// diagnostic (#1766) for a tag pin that is a full release no published tag matches.
-    fn diagnostics<'a>(
+    fn decorate_diagnostics<'a>(
         &'a self,
         parsed: ParsedView<'a, GithubActionsParseResult>,
-        versions: deps_core::VersionData<'a>,
-        uri: &'a Url,
-        freshness: deps_core::FreshnessSettings,
         severities: deps_core::lsp_helpers::DiagnosticSeverities,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
-        Box::pin(async move {
-            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                &parsed,
-                versions,
-                &self.formatter,
-                uri,
-                freshness,
-                severities,
-                deps_core::PublishTime::now(),
-            );
-            if severities.mutable_ref_pin_enabled {
-                diagnostics.extend(mutable_ref_pin_diagnostics(
-                    parsed.own_dependencies(),
-                    severities.mutable_ref_pin,
-                    &self.formatter.tag_index,
-                ));
-            }
-            diagnostics.extend(sha_comment_mismatch_diagnostics(
+        out: &'a mut Vec<Diagnostic>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ()> {
+        if severities.mutable_ref_pin_enabled {
+            out.extend(mutable_ref_pin_diagnostics(
                 parsed.own_dependencies(),
-                severities.sha_comment_mismatch,
-                &self.formatter,
+                severities.mutable_ref_pin,
+                &self.formatter.tag_index,
             ));
-            diagnostics.extend(unknown_ref_diagnostics(
-                parsed.own_dependencies(),
-                severities.unknown_ref,
-                |dep| unknown_ref_target(&self.formatter, dep),
-            ));
-            diagnostics
-        })
+        }
+        out.extend(git_tags_diagnostics(
+            parsed.own_dependencies(),
+            &self.formatter,
+            severities,
+        ));
+        Box::pin(std::future::ready(()))
     }
 
-    /// Appends the "Pin to commit SHA" quickfix (issue #473) to the shared default's
-    /// output when the position's dependency is a `PinStyle::Tag` step with a resolvable
-    /// `TagIndex` entry.
+    /// Appends the "Pin to commit SHA" quickfix (issue #473) when the position's dependency is
+    /// a `PinStyle::Tag` step with a resolvable `TagIndex` entry, and the SHA-comment and
+    /// unknown-ref fixes.
     #[cfg(feature = "lsp-responses")]
-    fn code_actions<'a>(
+    fn decorate_code_actions<'a>(
         &'a self,
         parsed: ParsedView<'a, GithubActionsParseResult>,
         position: Position,
         uri: &'a Url,
-        versions: deps_core::VersionData<'a>,
-        content: &'a str,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CodeAction>> {
-        Box::pin(async move {
-            let registry = self.registry();
-            let mut actions = deps_core::lsp_helpers::generate_code_actions(
-                &parsed,
-                position,
-                uri,
-                versions,
-                content,
-                registry.as_ref(),
-                &self.formatter,
-            )
-            .await;
-            actions.extend(build_sha_pin_action(parsed, position, uri, &self.formatter));
-            actions.extend(build_sha_comment_fix_action(
-                parsed,
-                position,
-                uri,
-                &self.formatter,
-            ));
-            actions.extend(build_unknown_ref_fix_action(
-                parsed,
-                position,
-                uri,
-                &self.formatter,
-            ));
-            actions
-        })
+        _versions: deps_core::VersionData<'a>,
+        out: &'a mut Vec<CodeAction>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ()> {
+        out.extend(build_sha_pin_action(parsed, position, uri, &self.formatter));
+        let dependencies = parsed.own_dependencies();
+        let position = position.into();
+        out.extend(git_tags_sha_comment_fix_action(
+            dependencies,
+            &self.formatter,
+            position,
+            uri,
+        ));
+        out.extend(git_tags_unknown_ref_fix_action(
+            dependencies,
+            &self.formatter,
+            position,
+            uri,
+        ));
+        Box::pin(std::future::ready(()))
     }
 
-    /// One documented NFR-004 divergence (S3): appends a `**Resolved**` line naming the
-    /// tag a SHA pin's commit actually corresponds to, per
-    /// [`crate::registry::GithubActionsRegistry`]'s `TagIndex`.
+    /// One documented NFR-004 divergence (S3): a `**Resolved**` line naming the tag a SHA
+    /// pin's commit actually corresponds to, per [`crate::registry::GithubActionsRegistry`]'s
+    /// `TagIndex`.
     ///
     /// Necessary, not merely additive: `versions.resolved` (the shared helper's
     /// `**Current**` source) is keyed by package name and is unconditionally empty for
@@ -377,95 +435,16 @@ impl TypedEcosystem for GithubActionsEcosystem {
     /// written text; an exact tag already shows its own version, and a floating tag whose
     /// commit only carries that same tag is not spliced (the line would be a tautology).
     /// Guarded on `dep.version_range().is_some()` (N3): a non-resolvable dependency (a
-    /// reusable-workflow call, `./local`, `docker://…`) still matches the shared helper's
-    /// own hover-target predicate and must not have a `**Resolved**` line spliced onto it.
+    /// reusable-workflow call, `./local`, `docker://…`) must not have a `**Resolved**` line
+    /// spliced onto it.
     #[cfg(feature = "lsp-responses")]
-    fn hover<'a>(
+    fn decorate_hover<'a>(
         &'a self,
-        parsed: ParsedView<'a, GithubActionsParseResult>,
-        position: Position,
-        versions: deps_core::VersionData<'a>,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Option<Hover>> {
-        Box::pin(async move {
-            let registry = self.registry.clone();
-            let base_hover = deps_core::lsp_generate_hover(
-                &parsed,
-                position,
-                versions,
-                registry.as_ref(),
-                &self.formatter,
-                freshness,
-                deps_core::PublishTime::now(),
-            )
-            .await;
-            let mut hover = base_hover?;
-
-            let Some(gha_dep) = parsed.own_dependencies().iter().find(|d| {
-                deps_core::position_in_range(position.into(), d.name_range)
-                    || d.version_range
-                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
-            }) else {
-                return Some(hover);
-            };
-            if gha_dep.version_range.is_none() {
-                return Some(hover);
-            }
-
-            // #501/#550: the shared footer gate only sees `VersionData`, not `tag_index` —
-            // so a `PinStyle::Tag` step with a warm `TagIndex` entry can have a real "Pin to
-            // commit SHA" quickfix even when the shared gate suppressed the footer for lack
-            // of `VersionData`. Restored post-hoc via `CMD_DOT_FOOTER`, idempotently, using
-            // the same centralized eligibility check the quickfix/code-lens build on (#1177).
-            if self.formatter.resolve_static_sha_pin(gha_dep).is_some()
-                && !hover
-                    .markdown()
-                    .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER)
-            {
-                hover.push_markdown(deps_core::lsp_helpers::CMD_DOT_FOOTER);
-            }
-
-            let Some(sha) = self.formatter.pinned_commit(gha_dep) else {
-                return Some(hover);
-            };
-
-            use deps_core::lsp_helpers::{DependencyFormatter, PinResolution};
-            let resolved_tag = match self.formatter.resolved_pin_version(gha_dep) {
-                PinResolution::Resolved { pin, .. } => Some(pin.version().as_str().to_string()),
-                PinResolution::Unresolved
-                | PinResolution::NotYetIndexed
-                | PinResolution::Unlisted
-                | PinResolution::Untagged
-                | PinResolution::Unpublished
-                | PinResolution::CommentContradicted => None,
-            };
-
-            let written_tag = gha_dep
-                .version_req
-                .as_ref()
-                .map(deps_core::VersionReq::as_str);
-            if let Some(resolved_tag) = resolved_tag.filter(|resolved| {
-                !(gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved.as_str()))
-            }) {
-                hover.rewrite_markdown(|md| {
-                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
-                });
-            }
-
-            if let Some(CommentCheck::Mismatch(mismatch)) =
-                self.formatter.sha_comment_check(gha_dep)
-                && let Some(comment) = gha_dep.sha_comment()
-            {
-                let line = deps_core::lsp_helpers::sha_comment_mismatch_hover_line(
-                    &sha,
-                    &comment.pin_comment().tag,
-                    &mismatch,
-                );
-                hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
-            }
-
-            Some(hover)
-        })
+        _parsed: ParsedView<'a, GithubActionsParseResult>,
+        hovered: &'a GithubActionsDependency,
+        _versions: deps_core::VersionData<'a>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, HoverDecorator<'a>> {
+        Box::pin(std::future::ready(self.hover_decorator(hovered)))
     }
 
     /// One [`TextEdit`] per `PinStyle::Tag` step in `parsed` resolvable to a commit
@@ -524,7 +503,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 /// question the same way: a diagnostic's advisory text needs no live cache hit the way
 /// an actual destructive edit does).
 ///
-/// [`GithubActionsEcosystem::hover`]'s footer guard reaches the same predicate
+/// [`GithubActionsEcosystem::decorate_hover`]'s footer guard reaches the same predicate
 /// through `resolve_static_sha_pin`.
 pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
     gha_dep.pin == Some(PinStyle::Tag) && gha_dep.is_plain_scalar && gha_dep.is_last_on_line
@@ -586,33 +565,31 @@ fn mutable_ref_pin_diagnostics(
         .collect()
 }
 
-/// Builds one SHA-comment-mismatch [`Diagnostic`] (issue #1722) per SHA-pinned step whose
-/// trailing `# tag` comment provably names a different commit than the pinned SHA.
-///
-/// Emits nothing for a confirmed comment, a commentless pin, or an unverifiable one (cold
-/// cache, or a SHA absent from a truncated tag list).
-fn sha_comment_mismatch_diagnostics(
-    dependencies: &[GithubActionsDependency],
-    severity: Severity,
-    formatter: &GithubActionsFormatter,
-) -> Vec<Diagnostic> {
-    dependencies
-        .iter()
-        .filter_map(|gha_dep| {
-            let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
-                return None;
-            };
-            let comment = gha_dep.sha_comment()?;
-            Some(deps_core::lsp_helpers::sha_comment_mismatch_diagnostic(
-                gha_dep.version_range?,
-                &gha_dep.name,
-                &formatter.pinned_commit(gha_dep)?,
-                &comment.pin_comment().tag,
-                &mismatch,
-                severity,
-            ))
-        })
-        .collect()
+impl GitTagsPinning for GithubActionsFormatter {
+    fn sha_comment_check(&self, dep: &GithubActionsDependency) -> Option<CommentCheck> {
+        Self::sha_comment_check(self, dep)
+    }
+
+    fn pinned_commit(
+        &self,
+        dep: &GithubActionsDependency,
+    ) -> Option<deps_core::lsp_helpers::CommitSha> {
+        Self::pinned_commit(self, dep)
+    }
+
+    fn sha_pin_comment<'a>(
+        &self,
+        dep: &'a GithubActionsDependency,
+    ) -> Option<&'a deps_core::lsp_helpers::ShaPinComment> {
+        dep.sha_comment().map(crate::types::ShaComment::pin_comment)
+    }
+
+    fn unknown_ref_target<'a>(
+        &self,
+        dep: &'a GithubActionsDependency,
+    ) -> Option<UnknownRefTarget<'a>> {
+        unknown_ref_target(self, dep)
+    }
 }
 
 /// The tag pin `gha_dep` and the index that can speak for it, shared by the unknown-ref
@@ -678,7 +655,6 @@ mod tests {
     use super::*;
     use deps_core::Dependency;
     use deps_core::lsp_helpers::{LowercaseNaming, NormalizeName};
-    use std::any::Any;
 
     fn tag_index_event(name: &PackageName) -> deps_core::RefreshEvent {
         deps_core::RefreshEvent::TagIndex(LowercaseNaming.normalize_package_name(name))
@@ -785,7 +761,8 @@ mod tests {
         let cached = HashMap::new();
         let resolved = HashMap::new();
 
-        eco.diagnostics(
+        deps_core::ecosystem::diagnostics(
+            &eco,
             ParsedView::new(&parse_result),
             deps_core::VersionData::new(&cached, &resolved),
             &uri,
@@ -883,15 +860,15 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &parse_result.uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &parse_result.uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         let found = diagnostics
             .iter()
@@ -1005,15 +982,15 @@ mod tests {
 
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         let mutable_ref_pin_messages: Vec<&str> = diagnostics
             .iter()
@@ -1122,15 +1099,15 @@ mod tests {
         );
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let warm = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let warm = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
         let warm_message = warm
             .iter()
             .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
@@ -1159,15 +1136,15 @@ mod tests {
         );
         let resolved = HashMap::new();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert_eq!(
             diagnostics.len(),
@@ -1199,15 +1176,15 @@ mod tests {
         let severities = deps_core::lsp_helpers::DiagnosticSeverities::new()
             .with_mutable_ref_pin(Severity::Error);
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                severities,
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            severities,
+        )
+        .await;
 
         let found = diagnostics
             .iter()
@@ -1230,15 +1207,15 @@ mod tests {
         let severities =
             deps_core::lsp_helpers::DiagnosticSeverities::new().with_mutable_ref_pin_enabled(false);
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                severities,
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            severities,
+        )
+        .await;
 
         assert!(
             !diagnostics
@@ -1353,15 +1330,15 @@ mod tests {
         let parse_result = eco.parse(content, &uri).await.unwrap();
         let (cached, resolved) = empty_versions();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert!(
             diagnostics
@@ -1385,15 +1362,15 @@ mod tests {
         assert!(parse_result.dependencies.is_empty());
         let (cached, resolved) = empty_versions();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
@@ -1431,9 +1408,6 @@ mod tests {
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     #[test]
@@ -1468,8 +1442,8 @@ mod tests {
         use deps_core::lsp_helpers::splice_resolved_line;
 
         /// Exercises `build_sha_pin_action` directly rather than through
-        /// `GithubActionsEcosystem::code_actions`: the shared default that override
-        /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
+        /// `deps_core::ecosystem::code_actions`: the shared generator it
+        /// runs first drives a *live* registry fetch (to list "Update to X" actions),
         /// which would overwrite a hand-seeded `TagIndex` fixture with real GitHub data before
         /// this function ever runs.
         #[test]
@@ -1733,16 +1707,16 @@ mod tests {
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved)
-                        .with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover should be generated for the dependency on this line");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
 
             let content = hover.markdown();
             assert!(
@@ -1777,18 +1751,18 @@ mod tests {
             let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
-            let md = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved)
-                        .with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover")
-                .markdown()
-                .to_string();
+            let md = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover")
+            .markdown()
+            .to_string();
             assert!(
                 md.contains(&format!("**Resolved**: `{expected}`")),
                 "got: {md}"
@@ -1830,7 +1804,8 @@ mod tests {
             let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
-            eco.hover(
+            deps_core::ecosystem::hover(
+                &eco,
                 ParsedView::new(&parse_result),
                 position,
                 deps_core::VersionData::new(&cached, &resolved)
@@ -1883,16 +1858,16 @@ mod tests {
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved)
-                        .with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover should be generated for the dependency on this line");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
 
             let content = hover.markdown();
             assert!(
@@ -1946,15 +1921,15 @@ mod tests {
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover should be generated for the dependency on this line");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
 
             let content = hover.markdown();
             assert!(
@@ -2000,16 +1975,16 @@ mod tests {
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved)
-                        .with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover should be generated for the dependency on this line");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
 
             let content = hover.markdown();
             assert!(
@@ -2049,16 +2024,16 @@ mod tests {
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved)
-                        .with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover should be generated for the dependency on this line");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
 
             let content = hover.markdown();
             assert!(
@@ -2135,15 +2110,15 @@ mod tests {
             let versions =
                 || deps_core::VersionData::new(&cached, &resolved).with_vulnerabilities(&vulns);
 
-            let diagnostics = eco
-                .diagnostics(
-                    ParsedView::new(&parse_result),
-                    versions(),
-                    &uri,
-                    deps_core::FreshnessSettings::default(),
-                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                )
-                .await;
+            let diagnostics = deps_core::ecosystem::diagnostics(
+                &eco,
+                ParsedView::new(&parse_result),
+                versions(),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
             assert!(
                 diagnostics
                     .iter()
@@ -2151,15 +2126,15 @@ mod tests {
                 "{diagnostics:?}"
             );
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    Position::new(1, 30),
-                    versions().with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                Position::new(1, 30),
+                versions().with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover");
             assert!(
                 hover.markdown().contains(r"matched release tag v4\.9\.0"),
                 "{}",
@@ -2334,15 +2309,15 @@ mod tests {
             let outdated_lines = [1_u32, 2, 3, 4];
             let control_line = 5_u32;
 
-            let diagnostics = eco
-                .diagnostics(
-                    ParsedView::new(&parse_result),
-                    versions(),
-                    &uri,
-                    deps_core::FreshnessSettings::default(),
-                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                )
-                .await;
+            let diagnostics = deps_core::ecosystem::diagnostics(
+                &eco,
+                ParsedView::new(&parse_result),
+                versions(),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
             let mut diagnostic_lines: Vec<u32> = diagnostics
                 .iter()
                 .filter(|d| d.message().contains("Newer version available"))
@@ -2382,20 +2357,35 @@ mod tests {
             assert!(!names_latest(control_line), "control: {hints:?}");
 
             for line in outdated_lines {
-                let hover = eco
-                    .hover(
-                        ParsedView::new(&parse_result),
-                        Position::new(line, 40),
-                        versions().with_network(deps_core::NetworkMode::Offline),
-                        deps_core::FreshnessSettings::default(),
-                    )
-                    .await
-                    .expect("hover");
-                assert!(
+                let hover = deps_core::ecosystem::hover(
+                    &eco,
+                    ParsedView::new(&parse_result),
+                    Position::new(line, 40),
+                    versions().with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover");
+                let sha_column = content
+                    .lines()
+                    .nth(line as usize)
+                    .and_then(|text| text.find(|c: char| c.is_ascii_digit()))
+                    .expect("the pin line carries a SHA");
+                let actions = deps_core::ecosystem::code_actions(
+                    &eco,
+                    ParsedView::new(&parse_result),
+                    Position::new(line, sha_column as u32 + 1),
+                    &uri,
+                    versions().with_network(deps_core::NetworkMode::Offline),
+                    &content,
+                )
+                .await;
+                assert_eq!(
                     hover
                         .markdown()
                         .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
-                    "line {line}: {}",
+                    !actions.is_empty(),
+                    "line {line}: footer must match code actions {actions:?}; hover: {}",
                     hover.markdown()
                 );
             }
@@ -2509,15 +2499,15 @@ mod tests {
                 let content = format!("steps:\n{line}\n");
                 let parse_result = eco.parse(&content, &uri).await.unwrap();
                 let versions = deps_core::VersionData::new(&cached, &resolved);
-                let diagnostics = eco
-                    .diagnostics(
-                        ParsedView::new(&parse_result),
-                        versions,
-                        &uri,
-                        deps_core::FreshnessSettings::default(),
-                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                    )
-                    .await;
+                let diagnostics = deps_core::ecosystem::diagnostics(
+                    &eco,
+                    ParsedView::new(&parse_result),
+                    versions,
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
                 let planned = deps_core::edit::collect_update_edits(
                     &ParsedView::new(&parse_result),
                     &content,
@@ -2536,15 +2526,15 @@ mod tests {
                 assert_eq!(applied, format!("steps:\n{expected_line}\n"), "{line}");
 
                 let reparsed = eco.parse(&applied, &uri).await.unwrap();
-                let after = eco
-                    .diagnostics(
-                        ParsedView::new(&reparsed),
-                        versions,
-                        &uri,
-                        deps_core::FreshnessSettings::default(),
-                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                    )
-                    .await;
+                let after = deps_core::ecosystem::diagnostics(
+                    &eco,
+                    ParsedView::new(&reparsed),
+                    versions,
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
                 assert_eq!(newer_count(&after), 0, "{line}: not idempotent: {after:?}");
                 // A comment after a flow mapping with sibling keys is deliberately not
                 // attributed to the ref, so the stale `# v4.0.0` left behind is not flagged.
@@ -2609,11 +2599,11 @@ mod tests {
             let range = parse_result.dependencies[dep_index]
                 .version_range()
                 .unwrap();
-            let action = build_sha_comment_fix_action(
-                ParsedView::new(&parse_result),
-                Position::new(range.start.line, range.start.character),
-                &uri,
+            let action = git_tags_sha_comment_fix_action(
+                ParsedView::new(&parse_result).own_dependencies(),
                 &eco.formatter,
+                deps_core::position::Position::new(range.start.line, range.start.character),
+                &uri,
             )?;
             let fixed = apply_single_edit(content, &uri, &action);
             Some((action, fixed))
@@ -2754,7 +2744,8 @@ mod tests {
                 deps_core::PackageVersions::latest_only("v2.87.22"),
             );
             let resolved = HashMap::new();
-            eco.diagnostics(
+            deps_core::ecosystem::diagnostics(
+                eco,
                 ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
@@ -2843,12 +2834,13 @@ mod tests {
                 let range = parse_result.dependencies[dep_index]
                     .version_range()
                     .unwrap();
-                let position = Position::new(range.start.line, range.start.character);
-                build_unknown_ref_fix_action(
-                    ParsedView::new(&parse_result),
+                let position =
+                    deps_core::position::Position::new(range.start.line, range.start.character);
+                git_tags_unknown_ref_fix_action(
+                    ParsedView::new(&parse_result).own_dependencies(),
+                    &eco.formatter,
                     position,
                     &uri,
-                    &eco.formatter,
                 )
                 .map(|action| (action.title.clone(), apply_single_edit(text, &uri, &action)))
             };
@@ -3092,7 +3084,8 @@ mod tests {
                 let parse_result = &parse_result;
                 let eco = &eco;
                 async move {
-                    eco.hover(
+                    deps_core::ecosystem::hover(
+                        eco,
                         ParsedView::new(parse_result),
                         Position::new(line, 40),
                         versions,
@@ -3149,16 +3142,16 @@ mod tests {
                 ),
             ] {
                 let parse_result = ecosystem.parse(&text, &uri).await.unwrap();
-                let hover = ecosystem
-                    .hover(
-                        ParsedView::new(&parse_result),
-                        Position::new(line, 40),
-                        deps_core::VersionData::new(&cached, &resolved)
-                            .with_network(deps_core::NetworkMode::Offline),
-                        deps_core::FreshnessSettings::default(),
-                    )
-                    .await
-                    .expect("hover");
+                let hover = deps_core::ecosystem::hover(
+                    ecosystem,
+                    ParsedView::new(&parse_result),
+                    Position::new(line, 40),
+                    deps_core::VersionData::new(&cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover");
                 assert!(
                     !hover.markdown().contains("**Warning**"),
                     "{}",
@@ -3193,15 +3186,15 @@ mod tests {
             );
             let resolved = HashMap::new();
 
-            let diagnostics = eco
-                .diagnostics(
-                    ParsedView::new(&parse_result),
-                    deps_core::VersionData::new(&cached, &resolved),
-                    &uri,
-                    deps_core::FreshnessSettings::default(),
-                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                )
-                .await;
+            let diagnostics = deps_core::ecosystem::diagnostics(
+                &eco,
+                ParsedView::new(&parse_result),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
             assert!(
                 diagnostics
                     .iter()
@@ -3388,14 +3381,14 @@ mod tests {
             let name_position = parse_result.dependencies[0].name_range().start.into();
             let (cached, resolved) = empty_versions();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    name_position,
-                    deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                name_position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             assert!(
                 hover.is_some(),

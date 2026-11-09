@@ -519,6 +519,10 @@ pub struct ScanTarget {
     /// only via [`Self::with_siblings`].
     #[raw]
     sibling_coverage: SiblingCoverage,
+    /// Other lock-file entries satisfying the same requirement; an advisory affecting any of
+    /// them affects the dependency (#1981). Set only via [`Self::with_lock_alternatives`].
+    #[raw]
+    lock_alternatives: Vec<ScanVersion>,
 }
 
 /// Whether a scan target's sibling release tags were read from a complete tag list.
@@ -618,7 +622,38 @@ impl ScanTarget {
             display_version,
             siblings: Vec::new(),
             sibling_coverage: SiblingCoverage::Complete,
+            lock_alternatives: Vec::new(),
         }
+    }
+
+    /// Attaches the lock-file entries of `versions` that also satisfy the dependency's
+    /// requirement, deriving each wire version via `naming.osv_version`.
+    ///
+    /// The lock file cannot say which satisfying entry the package manager installed for this
+    /// dependency, so [`crate::osv::OsvClient`] scans each of them (up to
+    /// [`crate::osv::MAX_LOCK_ALTERNATIVES`]) alongside the target's own version. The target's
+    /// own `version` and `display_version` are never touched.
+    #[must_use]
+    pub fn with_lock_alternatives(
+        mut self,
+        versions: &crate::lsp_helpers::InUseVersions,
+        naming: &dyn crate::lsp_helpers::OsvNaming,
+    ) -> Self {
+        self.lock_alternatives = versions
+            .lock_alternatives()
+            .iter()
+            .map(|native| ScanVersion {
+                version: naming.osv_version(native),
+                display_version: native.clone(),
+            })
+            .collect();
+        self
+    }
+
+    /// The lock-file entries attached via [`Self::with_lock_alternatives`], lowest version first.
+    #[must_use]
+    pub fn lock_alternatives(&self) -> &[ScanVersion] {
+        &self.lock_alternatives
     }
 
     /// Attaches the sibling release tags of `versions`, deriving each wire version via
@@ -715,6 +750,7 @@ mod scan_target_debug_redaction_tests {
             display_version: ConcreteVersion::new("1.0.0"),
             siblings: Vec::new(),
             sibling_coverage: crate::osv::SiblingCoverage::Complete,
+            lock_alternatives: Vec::new(),
         },
     );
 }
@@ -1161,7 +1197,27 @@ pub struct DependencyVulnerabilities {
     pub(crate) sibling_matches: Option<SiblingMatches>,
 }
 
-/// Sibling release tags an advisory matched, never empty by construction.
+/// Which kind of extra version an advisory matched instead of the scanned primary version.
+///
+/// Exhaustive so every renderer decides what each origin means.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::MatchOrigin;
+///
+/// assert_ne!(MatchOrigin::ReleaseTag, MatchOrigin::LockEntry);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOrigin {
+    /// A release tag naming the same commit as the scanned version.
+    ReleaseTag,
+    /// Another lock-file entry satisfying the dependency's requirement (#1981).
+    LockEntry,
+}
+
+/// Versions an advisory matched instead of the scanned primary version, never empty by
+/// construction.
 ///
 /// Shared (`Arc`) so an `Option<MatchedTags>` field stays pointer-sized in the status types
 /// that hold it and rendering a note never copies the tags.
@@ -1170,18 +1226,50 @@ pub struct MatchedTags(Arc<NonEmptyTags>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NonEmptyTags {
+    origin: MatchOrigin,
     first: ConcreteVersion,
     rest: Vec<ConcreteVersion>,
 }
 
 impl MatchedTags {
     pub(crate) fn from_tags(tags: Vec<ConcreteVersion>) -> Option<Self> {
-        let mut tags = tags.into_iter();
-        let first = tags.next()?;
-        Some(Self::new(first, tags.collect()))
+        Self::from_versions(MatchOrigin::ReleaseTag, tags)
     }
 
-    /// Builds the set from its lowest tag and the rest, in ascending order.
+    pub(crate) fn from_versions(
+        origin: MatchOrigin,
+        versions: Vec<ConcreteVersion>,
+    ) -> Option<Self> {
+        let mut versions = versions.into_iter();
+        let first = versions.next()?;
+        Some(Self(Arc::new(NonEmptyTags {
+            origin,
+            first,
+            rest: versions.collect(),
+        })))
+    }
+
+    /// Builds a [`MatchOrigin::LockEntry`] set from its lowest version and the rest, for tests
+    /// of consumers in other crates.
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    #[must_use]
+    pub fn lock_entries_for_test(first: ConcreteVersion, rest: Vec<ConcreteVersion>) -> Self {
+        Self(Arc::new(NonEmptyTags {
+            origin: MatchOrigin::LockEntry,
+            first,
+            rest,
+        }))
+    }
+
+    /// What kind of version these are.
+    #[must_use]
+    pub fn origin(&self) -> MatchOrigin {
+        self.0.origin
+    }
+
+    /// Builds a [`MatchOrigin::ReleaseTag`] set from its lowest tag and the rest, in ascending
+    /// order.
     ///
     /// # Examples
     ///
@@ -1194,7 +1282,11 @@ impl MatchedTags {
     /// ```
     #[must_use]
     pub fn new(first: ConcreteVersion, rest: Vec<ConcreteVersion>) -> Self {
-        Self(Arc::new(NonEmptyTags { first, rest }))
+        Self(Arc::new(NonEmptyTags {
+            origin: MatchOrigin::ReleaseTag,
+            first,
+            rest,
+        }))
     }
 
     /// The matched tags, lowest version first.
@@ -1340,13 +1432,18 @@ impl DependencyVulnerabilities {
         if self.advisories.items().is_empty() || !self.advisories.is_complete() {
             return None;
         }
+        // Release-tag and lock-entry matches never coexist: tag siblings come only from a tag
+        // pin and lock alternatives only from a lock-file candidate set.
+        let mut origin = None;
         let mut tags = Vec::new();
         for advisory in self.advisories.items() {
-            tags.extend(matches.tags.get(&advisory.id)?.iter().cloned());
+            let matched = matches.tags.get(&advisory.id)?;
+            origin.get_or_insert(matched.origin());
+            tags.extend(matched.iter().cloned());
         }
         tags.sort_by(|a, b| super::compare_version_strings(a.as_str(), b.as_str()));
         tags.dedup();
-        MatchedTags::from_tags(tags)
+        MatchedTags::from_versions(origin?, tags)
     }
 
     /// Whether the "fixed in" version of `advisory` may be shown or followed as an upgrade: false
@@ -1651,6 +1748,11 @@ pub enum SkipReason {
     /// (403/404) stays downgraded until a later fetch succeeds, because the tag index is only
     /// populated on success; the LSP rescans as soon as it is.
     SiblingTagsUnknown,
+    /// Another lock-file entry satisfies the dependency's requirement and could not be checked:
+    /// its scan was skipped for a structural reason, or more entries exist than
+    /// [`crate::osv::MAX_LOCK_ALTERNATIVES`]. The dependency's own version came back clean, so
+    /// the answer is not authoritative for the entry the package manager installed (#1981).
+    LockAlternativesUnchecked,
 }
 
 /// Whether a lock file backed a manifest's version resolution; decides whether
@@ -1729,6 +1831,7 @@ impl SkipReason {
             Self::Truncated
             | Self::CanonicalNameUnconfirmed
             | Self::SiblingTagsUnknown
+            | Self::LockAlternativesUnchecked
             | Self::UnevaluableAdvisoryRange => Some(CoverageGap::ScanIncomplete),
             Self::NoConcreteVersion => match lock {
                 LockPresence::Found => Some(CoverageGap::ScanIncomplete),
@@ -1759,6 +1862,7 @@ impl SkipReason {
             Self::UnmatchableVersion => "unmatchable-version",
             Self::UnevaluableAdvisoryRange => "unevaluable-advisory-range",
             Self::SiblingTagsUnknown => "sibling-tags-unknown",
+            Self::LockAlternativesUnchecked => "lock-alternatives-unchecked",
         }
     }
 
@@ -1835,6 +1939,9 @@ impl SkipReason {
             ),
             Self::SiblingTagsUnknown => {
                 Some("the release tags sharing this version's commit could not be determined")
+            }
+            Self::LockAlternativesUnchecked => {
+                Some("another lock-file entry satisfying the requirement could not be checked")
             }
         }
     }
@@ -2020,6 +2127,10 @@ mod skip_reason_unchecked_reason_tests {
                 SkipReason::SiblingTagsUnknown,
                 Some("the release tags sharing this version's commit could not be determined"),
             ),
+            (
+                SkipReason::LockAlternativesUnchecked,
+                Some("another lock-file entry satisfying the requirement could not be checked"),
+            ),
         ];
         for (reason, expected) in cases {
             assert_eq!(
@@ -2036,6 +2147,19 @@ mod skip_reason_unchecked_reason_tests {
         let reason = SkipReason::SiblingTagsUnknown;
         assert!(!reason.is_structural());
         assert_eq!(reason.as_str(), "sibling-tags-unknown");
+    }
+
+    /// #1981: an unchecked lock alternative is transient and trips the strict gate.
+    #[test]
+    fn lock_alternatives_unchecked_is_a_scan_incomplete_gap() {
+        use super::{CoverageGap, LockPresence};
+
+        let reason = SkipReason::LockAlternativesUnchecked;
+        assert!(!reason.is_structural());
+        assert_eq!(reason.as_str(), "lock-alternatives-unchecked");
+        for lock in [LockPresence::Found, LockPresence::Absent] {
+            assert_eq!(reason.coverage_gap(lock), Some(CoverageGap::ScanIncomplete));
+        }
     }
 
     /// #1683: the unconfirmed-name skip is transient and never storable as structural.
@@ -2060,6 +2184,7 @@ mod skip_reason_unchecked_reason_tests {
             SkipReason::CanonicalNameUnconfirmed,
             SkipReason::QueryFailed,
             SkipReason::Truncated,
+            SkipReason::LockAlternativesUnchecked,
         ] {
             let lower = reason.unchecked_reason().expect("has text").to_lowercase();
             for forbidden in ["fix", "lockfile", "lock file", "resolve this", "add a"] {
@@ -2194,6 +2319,15 @@ impl VulnKey {
     /// lookup) where going through [`vuln_key_for`] would require a full [`crate::Dependency`].
     pub(crate) fn from_name(name: &crate::NormalizedName) -> Self {
         Self(name.as_str().to_string())
+    }
+
+    /// The internal key of this key's `index`th lock-alternative sub-scan; never escapes
+    /// [`crate::osv::OsvClient`] and cannot collide with a [`vulnerability_keys`] signature.
+    pub(crate) fn lock_alternative(&self, index: usize) -> Self {
+        Self(format!(
+            "{}{VERSION_QUALIFIER_SEPARATOR}lock:{index}",
+            self.0
+        ))
     }
 
     /// A key spelled as given, for fixtures that stand in for a derived key.
@@ -2383,6 +2517,7 @@ pub fn vuln_key_for(
 ///     name_range: Range,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -2480,8 +2615,6 @@ where
     F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
 {
     use crate::Dependency;
-    use crate::lsp_helpers::resolve_in_use_versions;
-
     let deps = parse_result.own_dependencies();
 
     // One signature per occurrence: public-registry-content deps (F1b) carry their own
@@ -2491,24 +2624,30 @@ where
     // `resolved_candidates` (#649) lets two occurrences of a renamed/aliased name pinned to
     // different lock-file majors compute distinct `v:{version}` signatures instead of
     // colliding — see `resolve_occurrence_version`.
+    let mut memo = crate::lsp_helpers::LockSelectionMemo::default();
     let signatures: Vec<(String, String)> = deps
         .iter()
         .map(|dep| {
             let key = crate::PackageKey::new(dep.name(), formatter);
             let signature = if formatter.public_content(dep).is_some() {
-                match resolve_in_use_versions(
+                match crate::lsp_helpers::resolve_in_use_versions_memoized(
                     dep,
                     &key,
                     resolved,
                     resolved_candidates,
                     formatter,
                     ecosystem,
+                    &mut memo,
                 ) {
                     Some(v) => {
                         let mut signature = format!("v:{}", v.primary());
                         for sibling in v.siblings() {
                             signature.push(' ');
                             signature.push_str(sibling.as_str());
+                        }
+                        for alternative in v.lock_alternatives() {
+                            signature.push_str(" +");
+                            signature.push_str(alternative.as_str());
                         }
                         // Only an incomplete list is marked, so ecosystems without tag indexes
                         // keep their keys.
@@ -4212,7 +4351,7 @@ mod vulnerability_keys_candidates_tests {
     impl<D: 'static> crate::lsp_helpers::DiagnosticPolicy for PinByRequirementFormatter<D> {}
     impl<D: 'static> crate::lsp_helpers::SourcePolicy for PinByRequirementFormatter<D> {}
     impl<D: 'static> crate::lsp_helpers::OsvNaming for PinByRequirementFormatter<D> {}
-    impl<D: crate::Dependency + 'static> crate::lsp_helpers::DependencyFormatter
+    impl<D: crate::lsp_helpers::ProbeDependency + 'static> crate::lsp_helpers::DependencyFormatter
         for PinByRequirementFormatter<D>
     {
         type Dep = D;
@@ -4304,6 +4443,230 @@ mod vulnerability_keys_candidates_tests {
         assert_ne!(
             keys.get(&deps[0].name_range()),
             keys.get(&deps[1].name_range())
+        );
+    }
+
+    /// #1981: two occurrences of one name with the same primary but different lock alternatives
+    /// (an exact pin and a range over the same entries) must not share a key, or the dedup in
+    /// `OsvClient::resolve` would give both whichever target came first.
+    #[test]
+    fn vulnerability_keys_differ_when_only_the_lock_alternatives_differ() {
+        use crate::lsp_helpers::test_support::{MockParseResult, StrictSemverFormatter};
+
+        let dep = |requirement: &str, line: u32| MockDep {
+            name: PackageName::new("minimist"),
+            version_req: VersionReq::new(requirement),
+            version_range: Range::new(Position::new(line, 10), Position::new(line, 20)),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 8)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![dep("=1.2.8", 0), dep("^1.2.0", 1)],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let name = crate::NormalizedName::for_test("minimist");
+        let resolved =
+            std::collections::HashMap::from([(name.clone(), ConcreteVersion::new("1.2.8"))]);
+        let candidates = std::collections::HashMap::from([(
+            name,
+            vec![ConcreteVersion::new("1.2.5"), ConcreteVersion::new("1.2.8")],
+        )]);
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &resolved,
+            Some(&candidates),
+            &StrictSemverFormatter,
+            EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        assert_ne!(
+            keys.get(&deps[0].name_range()),
+            keys.get(&deps[1].name_range())
+        );
+
+        let ranged = crate::lsp_helpers::resolve_in_use_versions(
+            &parse_result.deps[1],
+            &crate::test_util::package_key("minimist"),
+            &resolved,
+            Some(&candidates),
+            &StrictSemverFormatter,
+            EcosystemId::Cargo,
+        )
+        .unwrap();
+        assert_eq!(
+            ranged.lock_alternatives(),
+            [ConcreteVersion::new("1.2.5")].as_slice()
+        );
+
+        let target = |in_use: &crate::lsp_helpers::InUseVersions| {
+            ScanTarget::from_native(
+                crate::test_util::vuln_key("minimist"),
+                OsvQueryName::Confirmed(OsvPackageName::new("minimist").unwrap()),
+                in_use.primary().clone(),
+                &StrictSemverFormatter,
+            )
+            .with_lock_alternatives(in_use, &StrictSemverFormatter)
+        };
+        let alternatives = |target: &ScanTarget| {
+            target
+                .lock_alternatives()
+                .iter()
+                .map(|a| a.display_version().as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let exact = crate::lsp_helpers::resolve_in_use_versions(
+            &parse_result.deps[0],
+            &crate::test_util::package_key("minimist"),
+            &resolved,
+            Some(&candidates),
+            &StrictSemverFormatter,
+            EcosystemId::Cargo,
+        )
+        .unwrap();
+        assert_eq!(alternatives(&target(&ranged)), ["1.2.5"]);
+        assert!(alternatives(&target(&exact)).is_empty());
+    }
+
+    /// Counts requirement compilations and per-candidate matches, so a test can bound the work
+    /// of lock selection without timing it.
+    struct CountingFormatter {
+        compiled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        matched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct MatchEverything(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::lsp_helpers::RequirementMatcher for MatchEverything {
+        fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(true)
+        }
+
+        fn strict_prerelease_exclusion(&self) -> bool {
+            false
+        }
+    }
+
+    impl crate::lsp_helpers::PackageNaming for CountingFormatter {}
+    impl crate::lsp_helpers::PackageRendering for CountingFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl crate::lsp_helpers::RequirementResolution for CountingFormatter {
+        fn compile_bounded_requirement(
+            &self,
+            _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
+        ) -> Option<Box<dyn crate::lsp_helpers::RequirementMatcher>> {
+            self.compiled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Box::new(MatchEverything(std::sync::Arc::clone(
+                &self.matched,
+            ))))
+        }
+    }
+    impl crate::lsp_helpers::DiagnosticMessages for CountingFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for CountingFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for CountingFormatter {}
+    impl crate::lsp_helpers::OsvNaming for CountingFormatter {}
+    impl crate::lsp_helpers::DependencyFormatter for CountingFormatter {
+        type Dep = MockDep;
+    }
+
+    const MANY_ENTRIES: usize = 3000;
+    const MANY_OCCURRENCES: u32 = 400;
+
+    fn many_candidates() -> std::collections::HashMap<NormalizedName, Vec<ConcreteVersion>> {
+        std::collections::HashMap::from([(
+            NormalizedName::for_test("itoa"),
+            (0..MANY_ENTRIES)
+                .map(|n| ConcreteVersion::new(format!("1.0.{n}")))
+                .collect(),
+        )])
+    }
+
+    fn many_resolved() -> std::collections::HashMap<NormalizedName, ConcreteVersion> {
+        std::collections::HashMap::from([(
+            NormalizedName::for_test("itoa"),
+            ConcreteVersion::new(format!("1.0.{}", MANY_ENTRIES - 1)),
+        )])
+    }
+
+    fn counting_formatter() -> CountingFormatter {
+        CountingFormatter {
+            compiled: std::sync::Arc::default(),
+            matched: std::sync::Arc::default(),
+        }
+    }
+
+    /// #1981 (security re-audit): many occurrences of one name against a lock file with
+    /// thousands of entries must cost one requirement compile and one pass over the entries
+    /// per distinct `(name, requirement)`, not per occurrence.
+    #[test]
+    fn vulnerability_keys_select_once_per_distinct_name_and_requirement() {
+        use crate::lsp_helpers::test_support::MockParseResult;
+        use std::sync::atomic::Ordering;
+
+        let occurrence = |line: u32| MockDep {
+            name: PackageName::new("itoa"),
+            version_req: VersionReq::new("*"),
+            version_range: Range::new(Position::new(line, 10), Position::new(line, 20)),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 8)),
+        };
+        let parse_result = MockParseResult {
+            deps: (0..MANY_OCCURRENCES).map(occurrence).collect(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let formatter = counting_formatter();
+
+        let _keys = vulnerability_keys(
+            &parse_result,
+            &many_resolved(),
+            Some(&many_candidates()),
+            &formatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(formatter.compiled.load(Ordering::Relaxed), 1);
+        assert_eq!(formatter.matched.load(Ordering::Relaxed), MANY_ENTRIES);
+    }
+
+    /// The alternatives kept are the lowest `MAX_LOCK_ALTERNATIVES + 1` distinct versions, so
+    /// the signature and the scan stay bounded however many entries the lock file holds.
+    #[test]
+    fn lock_alternatives_keep_only_the_lowest_cap_plus_one() {
+        let dep = MockDep {
+            name: PackageName::new("itoa"),
+            version_req: VersionReq::new("*"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        let in_use = crate::lsp_helpers::resolve_in_use_versions(
+            &dep,
+            &crate::test_util::package_key("itoa"),
+            &many_resolved(),
+            Some(&many_candidates()),
+            &counting_formatter(),
+            EcosystemId::Cargo,
+        )
+        .unwrap();
+
+        let expected: Vec<String> = (0..=crate::osv::MAX_LOCK_ALTERNATIVES)
+            .map(|n| format!("1.0.{n}"))
+            .collect();
+        let kept: Vec<&str> = in_use
+            .lock_alternatives()
+            .iter()
+            .map(|v| v.as_str())
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(
+            in_use.primary().as_str(),
+            format!("1.0.{}", MANY_ENTRIES - 1)
         );
     }
 

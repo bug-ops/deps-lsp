@@ -764,6 +764,26 @@ deps_core::impl_metadata!(NpmPackage {
     latest_version: latest_version,
 });
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for NpmDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            origin: NpmDependencyOrigin::Manifest {
+                section: NpmDependencySection::Dependencies,
+                catalog_ref: None,
+            },
+            source,
+            registry_entry: None,
+            package: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

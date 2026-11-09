@@ -1,7 +1,6 @@
 //! Domain types for Maven/pom.xml dependencies.
 
 use deps_core::position::Range;
-use std::any::Any;
 
 /// A single `<dependency>` declaration parsed from a `pom.xml`.
 #[non_exhaustive]
@@ -226,10 +225,6 @@ impl deps_core::Version for MavenVersion {
         vec![]
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
     }
@@ -255,9 +250,26 @@ impl deps_core::Metadata for ArtifactInfo {
     fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.latest_version
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for MavenDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        let (group_id, artifact_id) = name.as_str().split_once(':').map_or_else(
+            || (name.as_str().to_owned(), String::new()),
+            |(group, artifact)| (group.to_owned(), artifact.to_owned()),
+        );
+        Self {
+            group_id,
+            artifact_id,
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            scope: MavenScope::default(),
+            source,
+        }
     }
 }
 
@@ -364,7 +376,6 @@ mod tests {
         assert!(!ver.removal_status().blocks_resolution());
         assert!(!ver.is_prerelease());
         assert!(ver.features().is_empty());
-        assert!(ver.as_any().is::<MavenVersion>());
         assert_eq!(
             ver.published_at(),
             Some(deps_core::PublishTime::from_unix_secs(1_699_000_000))
@@ -405,7 +416,6 @@ mod tests {
         assert_eq!(info.latest_version(), "3.14.0");
         assert!(info.repository().is_none());
         assert!(info.documentation().is_none());
-        assert!(info.as_any().is::<ArtifactInfo>());
     }
 
     #[test]

@@ -22,7 +22,6 @@ use deps_core::{
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
-use std::any::Any;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -904,10 +903,6 @@ impl deps_core::Registry for PypiRegistry {
                 specs.contains(&ver) && !v.removal_status().blocks_resolution() && !ver.is_pre()
             })
         })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

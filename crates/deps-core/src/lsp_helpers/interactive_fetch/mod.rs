@@ -252,6 +252,14 @@ impl<'a> InteractiveFetchRequest<'a> {
         self.key.declared()
     }
 
+    /// Whether a version-list lookup for this request is memoized by the gate: online, with a
+    /// gate and an ecosystem attached. Only then does a failure leave a memo that refuses the
+    /// next lookup as unverified.
+    #[cfg(feature = "lsp-responses")]
+    pub(super) fn is_memoized<R: Registry + ?Sized>(&self, registry: &R) -> bool {
+        self.gated(registry, LookupKind::VersionList).is_some()
+    }
+
     /// The gate and lookup this request is memoized under, or `None` when the request must
     /// take the plain bounded await: no gate attached, no ecosystem to qualify the key with, or
     /// offline mode (FR-013).
@@ -483,7 +491,6 @@ struct Admitted<'a> {
 /// #     fn search_raw<'a>(&'a self, _: &'a str, _: usize)
 /// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
 /// #     { Box::pin(async { Ok(Vec::new()) }) }
-/// #     fn as_any(&self) -> &dyn std::any::Any { self }
 /// # }
 /// let cached = HashMap::new();
 /// let resolved = HashMap::new();

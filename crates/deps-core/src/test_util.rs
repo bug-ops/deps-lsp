@@ -274,10 +274,6 @@ impl crate::Metadata for MockMetadata {
     fn latest_version(&self) -> &crate::ConcreteVersion {
         &self.latest_version
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// [`MockVersion`]'s `is_prerelease` behavior — see [`MockVersion::with_prerelease`].
@@ -401,10 +397,6 @@ impl crate::Version for MockVersion {
 
     fn license(&self) -> &[String] {
         &self.license
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -558,10 +550,6 @@ impl crate::Registry for MockRegistry {
         _source: &crate::DependencySource,
     ) -> crate::RegistryEndpoint {
         self.endpoint.unwrap_or(crate::RegistryEndpoint::Unresolved)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -1085,6 +1073,7 @@ pub async fn capture_tracing_span_fields_async(
 #[derive(Debug, Clone)]
 pub struct StubDependency {
     name: crate::PackageName,
+    source: crate::parser::DependencySource,
 }
 
 impl StubDependency {
@@ -1093,7 +1082,14 @@ impl StubDependency {
     pub fn new(name: &str) -> Self {
         Self {
             name: crate::PackageName::new(name),
+            source: crate::parser::DependencySource::Registry,
         }
+    }
+}
+
+impl crate::lsp_helpers::ProbeDependency for StubDependency {
+    fn probe(name: crate::PackageName, source: crate::parser::DependencySource) -> Self {
+        Self { name, source }
     }
 }
 
@@ -1115,7 +1111,7 @@ impl crate::Dependency for StubDependency {
     }
 
     fn source(&self) -> crate::parser::DependencySource {
-        crate::parser::DependencySource::Registry
+        self.source.clone()
     }
 }
 

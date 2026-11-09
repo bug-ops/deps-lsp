@@ -164,6 +164,24 @@ deps_core::impl_metadata!(SwiftPackage {
     latest_version: latest_version,
 });
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for SwiftDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            url: String::new(),
+            source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

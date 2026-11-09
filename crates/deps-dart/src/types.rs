@@ -175,6 +175,23 @@ impl deps_core::Dependency for DartDependency {
     }
 }
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for DartDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            section: DependencySection::default(),
+            source,
+            git_path: None,
+            name_range_is_synthetic: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +311,6 @@ mod tests {
         assert_eq!(ver.version_string(), "1.0.0");
         assert!(!ver.removal_status().blocks_resolution());
         assert!(ver.features().is_empty());
-        assert!(ver.as_any().is::<DartVersion>());
     }
 
     #[test]
@@ -344,7 +360,6 @@ mod tests {
         assert_eq!(info.name(), "provider");
         assert!(info.description().is_some());
         assert_eq!(info.latest_version(), "6.1.2");
-        assert!(info.as_any().is::<PackageInfo>());
     }
 
     #[test]

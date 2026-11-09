@@ -3,11 +3,13 @@
 //! the yanked-diagnostic consistency check in [`super::diagnostics`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::lockfile::compare_parsed_versions;
 use crate::lsp_helpers::{
     BoundedVersionReq, DependencyFormatter, EcosystemFormatter, PinResolution, ResolvedPin,
 };
-use crate::osv::SiblingCoverage;
+use crate::osv::{MAX_LOCK_ALTERNATIVES, SiblingCoverage};
 use crate::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
@@ -377,12 +379,14 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// version requirement (FR-001/FR-002), among a name's multiple retained lock-file entries.
 ///
 /// Filters `candidates` down to those [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]
-/// accepts, then returns the highest-semver entry among that satisfying subset — falling back
+/// accepts, then returns the **highest**-semver entry among that satisfying subset — falling back
 /// to [`crate::lockfile`]'s lexicographic tiebreak for non-parseable versions
 /// ([`crate::lockfile::compare_lockfile_versions`]), the same ordering a single-candidate
-/// collapse already uses, so this never diverges from it. Returns `None` when nothing
-/// satisfies the requirement (FR-003) — the caller must not then substitute an arbitrary
-/// non-matching entry.
+/// collapse already uses, so this never diverges from it. The candidates map cannot say which
+/// entry the package manager installed for this dependency, so every other satisfying entry is
+/// reported as a lock alternative ([`InUseVersions::lock_alternatives`]) and scanned too (#1981).
+/// Returns `None` when nothing satisfies the requirement (FR-003) — the caller must not then
+/// substitute an arbitrary non-matching entry.
 /// Prefers [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s precise, ecosystem-native
 /// comparator (e.g. `deps-cargo`'s real `semver::VersionReq` range semantics) over
 /// [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]'s looser heuristic — critical
@@ -392,29 +396,230 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// turning a real match into a false FR-003 skip. `compile_bounded_requirement` is only used when
 /// it succeeds; an ecosystem that returns `None` (requirement fails to parse under its own
 /// comparator) falls back to the heuristic exactly as it did before this existed.
-fn version_matches_requirement(
+///
+/// The requirement is compiled once for the whole candidate list, not once per candidate.
+/// Returns one flag per candidate, in order; an oversized requirement satisfies none.
+fn satisfying_mask(
+    candidates: &[ConcreteVersion],
+    requirement: &crate::VersionReq,
     formatter: &dyn EcosystemFormatter,
-    version: &ConcreteVersion,
-    requirement: BoundedVersionReq<'_>,
-) -> bool {
-    if let Some(matcher) = formatter.compile_bounded_requirement(requirement) {
-        matcher.matches(version) == Some(true)
-    } else {
-        formatter.version_satisfies_bounded_requirement(version, requirement)
+) -> Vec<bool> {
+    // #1472: an oversized requirement's parse cost would multiply by `candidates.len()`.
+    let Some(requirement) = BoundedVersionReq::new(requirement) else {
+        return vec![false; candidates.len()];
+    };
+    let matcher = formatter.compile_bounded_requirement(requirement);
+    candidates
+        .iter()
+        .map(|version| match &matcher {
+            Some(matcher) => matcher.matches(version) == Some(true),
+            None => formatter.version_satisfies_bounded_requirement(version, requirement),
+        })
+        .collect()
+}
+
+/// A candidate list's versions parsed as semver, one slot per candidate, shared across every
+/// requirement selected from that list in one pass.
+type ParsedVersions = Arc<[Option<semver::Version>]>;
+
+fn parse_all(candidates: &[ConcreteVersion]) -> ParsedVersions {
+    candidates
+        .iter()
+        .map(|v| semver::Version::parse(v.as_str()).ok())
+        .collect()
+}
+
+/// One candidate with its parsed form, ordered like [`crate::lockfile::compare_lockfile_versions`].
+#[derive(Clone, Copy)]
+struct Entry<'v, 'p> {
+    version: &'v ConcreteVersion,
+    parsed: &'p Option<semver::Version>,
+}
+
+fn compare_entries(a: &Entry<'_, '_>, b: &Entry<'_, '_>) -> std::cmp::Ordering {
+    compare_parsed_versions(
+        (a.parsed.as_ref(), a.version.as_str()),
+        (b.parsed.as_ref(), b.version.as_str()),
+    )
+}
+
+/// The flagged candidates with their parsed forms.
+fn flagged_entries<'v, 'p>(
+    candidates: &'v [ConcreteVersion],
+    parsed: &'p [Option<semver::Version>],
+    mask: &'p [bool],
+) -> impl Iterator<Item = Entry<'v, 'p>> {
+    candidates
+        .iter()
+        .zip(parsed)
+        .zip(mask)
+        .filter(|(_, flagged)| **flagged)
+        .map(|((version, parsed), _)| Entry { version, parsed })
+}
+
+/// The lock entries an occurrence could be using, with the parse cache of their list.
+struct Candidates<'a> {
+    entries: &'a [ConcreteVersion],
+    parsed: ParsedVersions,
+    possible: Vec<bool>,
+}
+
+impl<'a> Candidates<'a> {
+    fn highest(&self) -> Option<&'a ConcreteVersion> {
+        flagged_entries(self.entries, &self.parsed, &self.possible)
+            .max_by(compare_entries)
+            .map(|entry| entry.version)
+    }
+
+    /// The lowest `MAX_LOCK_ALTERNATIVES + 1` distinct possible versions other than `primary`,
+    /// lowest first. One past the cap is kept so a consumer can tell that more exist; the rest
+    /// are never needed, so the cost is linear in the list plus a sort of at most that many
+    /// entries, and the result holds no more memory than it has elements.
+    fn lowest_others(&self, primary: &ConcreteVersion) -> Vec<ConcreteVersion> {
+        const KEPT: usize = MAX_LOCK_ALTERNATIVES + 1;
+        let mut seen = std::collections::HashSet::new();
+        let mut others: Vec<Entry<'_, '_>> =
+            flagged_entries(self.entries, &self.parsed, &self.possible)
+                .filter(|entry| entry.version != primary && seen.insert(entry.version.as_str()))
+                .collect();
+        if others.len() > KEPT {
+            others.select_nth_unstable_by(KEPT - 1, compare_entries);
+            others.truncate(KEPT);
+        }
+        others.sort_by(compare_entries);
+        others.iter().map(|entry| entry.version.clone()).collect()
     }
 }
 
-fn best_candidate_for_requirement<'a>(
-    candidates: &'a [ConcreteVersion],
-    requirement: &crate::VersionReq,
+/// Selections already computed within one pass: per `(name, requirement)` pair, and the parsed
+/// form of each name's candidate list.
+///
+/// A manifest can repeat one dependency (target-specific sections, markers) against a lock
+/// file holding thousands of entries for it; selecting once per distinct pair and parsing each
+/// list once per name keeps a pass linear in the lock entries instead of in occurrences times
+/// entries.
+#[derive(Debug, Default)]
+pub struct LockSelectionMemo {
+    selections: HashMap<MemoKey, Option<Selection>>,
+    parsed: HashMap<NormalizedName, ParsedVersions>,
+}
+
+type MemoKey = (NormalizedName, Option<String>);
+
+/// A primary version and its lock alternatives.
+type Selection = (ConcreteVersion, Vec<ConcreteVersion>);
+
+/// Whether a lock selection also lists the alternatives to the primary, which costs a sort of
+/// the satisfying entries that a primary-only caller never needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlternativeScope {
+    PrimaryOnly,
+    WithAlternatives,
+}
+
+/// The occurrence's primary version and the lock entries that could equally be in use.
+struct Picked<'a> {
+    primary: &'a ConcreteVersion,
+    /// `None` when the primary is the collapsed entry and no other candidate competes.
+    candidates: Option<Candidates<'a>>,
+}
+
+/// The single selection policy behind hover, inlay hints and OSV targeting (#649, #1981).
+///
+/// With several lock candidates and a requirement, the primary is the highest candidate that
+/// satisfies it, and none satisfying (FR-003) is `None` rather than an arbitrary entry. Without
+/// a requirement, or with at most one candidate, the primary is the collapsed
+/// `resolved_versions` entry; a bare name with several candidates keeps all of them as possible.
+/// `parsed_cache` lets repeated selections from one list share its parse.
+fn pick<'a>(
+    dep: &dyn Dependency,
+    key: &PackageKey,
+    resolved_versions: &'a HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&'a HashMap<NormalizedName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
-) -> Option<&'a ConcreteVersion> {
-    // #1472: an oversized requirement's parse cost would multiply by `candidates.len()`.
-    let requirement = BoundedVersionReq::new(requirement)?;
-    candidates
-        .iter()
-        .filter(|v| version_matches_requirement(formatter, v, requirement))
-        .max_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()))
+    parsed_cache: Option<&mut HashMap<NormalizedName, ParsedVersions>>,
+) -> Option<Picked<'a>> {
+    let collapsed = resolved_versions.get(key.normalized());
+    let Some(entries) = resolved_version_candidates
+        .and_then(|candidates| candidates.get(key.normalized()))
+        .filter(|candidates| candidates.len() > 1)
+    else {
+        return Some(Picked {
+            primary: collapsed?,
+            candidates: None,
+        });
+    };
+    let parsed = match parsed_cache {
+        Some(cache) => Arc::clone(
+            cache
+                .entry(key.normalized().clone())
+                .or_insert_with(|| parse_all(entries)),
+        ),
+        None => parse_all(entries),
+    };
+    let (primary, possible) = match dep.version_requirement() {
+        Some(req) => (None, satisfying_mask(entries, req, formatter)),
+        None => (collapsed, vec![true; entries.len()]),
+    };
+    let candidates = Candidates {
+        entries,
+        parsed,
+        possible,
+    };
+    Some(Picked {
+        primary: match primary {
+            Some(primary) => primary,
+            None => candidates.highest()?,
+        },
+        candidates: Some(candidates),
+    })
+}
+
+/// The occurrence's primary version and its lock alternatives (lowest first, capped).
+fn select_occurrence(
+    dep: &dyn Dependency,
+    key: &PackageKey,
+    resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+    formatter: &dyn EcosystemFormatter,
+    scope: AlternativeScope,
+    memo: Option<&mut LockSelectionMemo>,
+) -> Option<Selection> {
+    let select = |parsed_cache: Option<&mut HashMap<NormalizedName, ParsedVersions>>| {
+        let Picked {
+            primary,
+            candidates,
+        } = pick(
+            dep,
+            key,
+            resolved_versions,
+            resolved_version_candidates,
+            formatter,
+            parsed_cache,
+        )?;
+        let alternatives = match (scope, candidates) {
+            (AlternativeScope::WithAlternatives, Some(candidates)) => {
+                candidates.lowest_others(primary)
+            }
+            (AlternativeScope::PrimaryOnly, _) | (AlternativeScope::WithAlternatives, None) => {
+                Vec::new()
+            }
+        };
+        Some((primary.clone(), alternatives))
+    };
+    let multiple_candidates = resolved_version_candidates
+        .and_then(|candidates| candidates.get(key.normalized()))
+        .is_some_and(|candidates| candidates.len() > 1);
+    match memo.filter(|_| multiple_candidates && scope == AlternativeScope::WithAlternatives) {
+        Some(LockSelectionMemo { selections, parsed }) => selections
+            .entry((
+                key.normalized().clone(),
+                dep.version_requirement().map(|r| r.as_str().to_string()),
+            ))
+            .or_insert_with(|| select(Some(parsed)))
+            .clone(),
+        None => select(None),
+    }
 }
 
 /// Resolves one dependency occurrence's lock-file version, disambiguating by its own
@@ -435,6 +640,7 @@ fn best_candidate_for_requirement<'a>(
 /// [`super::hover::generate_hover`] and [`super::inlay_hints::generate_inlay_hints`] so all
 /// three surfaces (hover, inlay hints, OSV target selection) apply the identical
 /// per-occurrence disambiguation policy (US-001/US-002).
+#[cfg(feature = "lsp-responses")]
 pub(crate) fn resolve_occurrence_version<'a>(
     dep: &dyn Dependency,
     key: &PackageKey,
@@ -442,15 +648,15 @@ pub(crate) fn resolve_occurrence_version<'a>(
     resolved_version_candidates: Option<&'a HashMap<NormalizedName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<&'a ConcreteVersion> {
-    let candidates =
-        resolved_version_candidates.and_then(|candidates| candidates.get(key.normalized()));
-
-    match (candidates, dep.version_requirement()) {
-        (Some(candidates), Some(req)) if candidates.len() > 1 => {
-            best_candidate_for_requirement(candidates, req, formatter)
-        }
-        _ => resolved_versions.get(key.normalized()),
-    }
+    pick(
+        dep,
+        key,
+        resolved_versions,
+        resolved_version_candidates,
+        formatter,
+        None,
+    )
+    .map(|picked| picked.primary)
 }
 
 /// The version of `dep` this project treats as actually in use.
@@ -493,6 +699,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     version_req: Option<VersionReq>,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -558,28 +765,33 @@ pub fn resolve_in_use_version<F: DependencyFormatter>(
     formatter: &F,
     ecosystem: EcosystemId,
 ) -> Option<ConcreteVersion> {
-    resolve_in_use_versions(
+    resolve_in_use_versions_scoped(
         dep,
         key,
         resolved_versions,
         resolved_version_candidates,
         formatter,
         ecosystem,
+        AlternativeScope::PrimaryOnly,
+        None,
     )
     .map(InUseVersions::into_primary)
 }
 
-/// Every version of one dependency occurrence that is in use: the primary plus any sibling
-/// release tags naming the same commit.
+/// Every version of one dependency occurrence that is in use: the primary, any sibling
+/// release tags naming the same commit, and any other lock entries satisfying the requirement.
 ///
 /// Siblings come only from a formatter-resolved tag pin (GitHub Actions SHA and exact-tag
 /// pins), each admitted through the same queryability gate as the primary. Every value states
 /// whether its sibling list is complete ([`Self::sibling_coverage`]): a primary read from
 /// manifest text for a pin that a truncated tag list does not reach has unknown siblings.
+/// Lock alternatives come only from the lock-file candidate branch, so the two lists are
+/// disjoint by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InUseVersions {
     primary: ConcreteVersion,
     siblings: Vec<ConcreteVersion>,
+    lock_alternatives: Vec<ConcreteVersion>,
     sibling_coverage: SiblingCoverage,
 }
 
@@ -590,6 +802,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
+            lock_alternatives: Vec::new(),
             sibling_coverage: SiblingCoverage::Complete,
         }
     }
@@ -600,6 +813,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
+            lock_alternatives: Vec::new(),
             sibling_coverage: SiblingCoverage::Truncated,
         }
     }
@@ -610,6 +824,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
+            lock_alternatives: Vec::new(),
             sibling_coverage: SiblingCoverage::NotYetIndexed,
         }
     }
@@ -634,7 +849,21 @@ impl InUseVersions {
         Self {
             primary,
             siblings,
+            lock_alternatives: Vec::new(),
             sibling_coverage,
+        }
+    }
+
+    /// Like [`Self::for_test`], with lock alternatives.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test_with_lock_alternatives(
+        primary: ConcreteVersion,
+        lock_alternatives: Vec<ConcreteVersion>,
+    ) -> Self {
+        Self {
+            lock_alternatives,
+            ..Self::untagged(primary)
         }
     }
 
@@ -660,7 +889,16 @@ impl InUseVersions {
         &self.siblings
     }
 
-    /// Discards the siblings, keeping the primary.
+    /// Other lock-file entries that also satisfy the requirement, distinct and lowest first.
+    ///
+    /// The lock file cannot say which of them the package manager installed for this
+    /// dependency, so each is scanned for advisories alongside the primary (#1981).
+    #[must_use]
+    pub fn lock_alternatives(&self) -> &[ConcreteVersion] {
+        &self.lock_alternatives
+    }
+
+    /// Discards the siblings and lock alternatives, keeping the primary.
     #[must_use]
     pub fn into_primary(self) -> ConcreteVersion {
         self.primary
@@ -671,7 +909,8 @@ impl InUseVersions {
 /// primary's commit (see [`InUseVersions`]).
 ///
 /// Siblings only come from an ecosystem's tag-pin resolution (GitHub Actions); every other
-/// source yields an empty list.
+/// source yields an empty list. Lock alternatives only come from a name with several
+/// satisfying lock-file candidates.
 ///
 /// # Examples
 ///
@@ -690,6 +929,7 @@ impl InUseVersions {
 ///     version_req: Option<VersionReq>,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -751,6 +991,58 @@ pub fn resolve_in_use_versions<F: DependencyFormatter>(
     formatter: &F,
     ecosystem: EcosystemId,
 ) -> Option<InUseVersions> {
+    resolve_in_use_versions_scoped(
+        dep,
+        key,
+        resolved_versions,
+        resolved_version_candidates,
+        formatter,
+        ecosystem,
+        AlternativeScope::WithAlternatives,
+        None,
+    )
+}
+
+/// [`resolve_in_use_versions`] reusing `memo` for repeated `(name, requirement)` lock selections.
+///
+/// Use one fresh [`LockSelectionMemo`] per pass over a manifest, against one fixed pair of
+/// resolved-version maps: the memo is keyed by name and requirement only, so it must not
+/// outlive a change to the maps. The result is identical to [`resolve_in_use_versions`].
+pub fn resolve_in_use_versions_memoized<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+    formatter: &F,
+    ecosystem: EcosystemId,
+    memo: &mut LockSelectionMemo,
+) -> Option<InUseVersions> {
+    resolve_in_use_versions_scoped(
+        dep,
+        key,
+        resolved_versions,
+        resolved_version_candidates,
+        formatter,
+        ecosystem,
+        AlternativeScope::WithAlternatives,
+        Some(memo),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the three public entry points differ only in `scope` and `memo`"
+)]
+fn resolve_in_use_versions_scoped<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+    formatter: &F,
+    ecosystem: EcosystemId,
+    scope: AlternativeScope,
+    memo: Option<&mut LockSelectionMemo>,
+) -> Option<InUseVersions> {
     if formatter.manifest_requirement_is_resolved_version(dep) {
         return dep
             .version_requirement()
@@ -758,14 +1050,19 @@ pub fn resolve_in_use_versions<F: DependencyFormatter>(
             .map(|v| InUseVersions::untagged(ConcreteVersion::from(v)));
     }
 
-    if let Some(version) = resolve_occurrence_version(
+    if let Some((primary, lock_alternatives)) = select_occurrence(
         dep,
         key,
         resolved_versions,
         resolved_version_candidates,
         formatter,
+        scope,
+        memo,
     ) {
-        return Some(InUseVersions::untagged(version.clone()));
+        return Some(InUseVersions {
+            lock_alternatives,
+            ..InUseVersions::untagged(primary)
+        });
     }
 
     // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
@@ -783,6 +1080,7 @@ pub fn resolve_in_use_versions<F: DependencyFormatter>(
             Some(InUseVersions {
                 primary,
                 siblings,
+                lock_alternatives: Vec::new(),
                 sibling_coverage: sibling_coverage.into(),
             })
         }
@@ -1885,9 +2183,8 @@ mod tests {
     }
 
     /// FR-002: when more than one lock-file entry satisfies an occurrence's requirement,
-    /// the tiebreak must pick the highest-semver *among the satisfying subset*, not the
-    /// highest overall — `2.0.0` here is the highest candidate but does not satisfy `^1.0`,
-    /// so it must never be picked.
+    /// the tiebreak picks the highest-semver *among the satisfying subset* — `2.0.0` is the
+    /// highest candidate but does not satisfy `^1.0`, so it must never be picked.
     #[test]
     fn best_candidate_for_requirement_picks_highest_of_satisfying_subset() {
         use crate::VersionReq;
@@ -1924,41 +2221,195 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// FR-002 end-to-end through `in_use_version`/`resolve_occurrence_version`, not just the
-    /// isolated `best_candidate_for_requirement` helper.
+    /// FR-002 end-to-end: the highest satisfying entry is the primary, and the other
+    /// satisfying entry is the lock alternative (#1981); `2.0.0` is neither.
     #[test]
-    fn in_use_version_tiebreaks_among_multiple_satisfying_candidates() {
+    fn in_use_version_picks_highest_satisfying_and_reports_the_rest_as_alternatives() {
+        let versions = resolve_caret_pkg("^1.0", &["1.0.5", "2.0.0", "1.0.1"]).unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("1.0.5"));
+        assert_eq!(
+            versions.lock_alternatives(),
+            &[ConcreteVersion::from("1.0.1")]
+        );
+        assert!(versions.siblings().is_empty());
+    }
+
+    #[test]
+    fn lock_alternatives_are_distinct_and_lowest_first() {
+        let versions =
+            resolve_caret_pkg("^1.0", &["1.0.9", "1.0.3", "1.0.3", "1.0.5", "1.0.9"]).unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("1.0.9"));
+        assert_eq!(
+            versions.lock_alternatives(),
+            &[
+                ConcreteVersion::from("1.0.3"),
+                ConcreteVersion::from("1.0.5")
+            ]
+        );
+    }
+
+    #[test]
+    fn lock_alternatives_empty_for_a_single_satisfying_candidate() {
+        let versions = resolve_caret_pkg("^1.0", &["1.0.5", "2.0.0"]).unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("1.0.5"));
+        assert!(versions.lock_alternatives().is_empty());
+    }
+
+    #[test]
+    fn lock_alternatives_empty_for_a_single_candidate() {
+        let versions = resolve_caret_pkg("^1.0", &["1.0.5"]).unwrap();
+
+        assert!(versions.lock_alternatives().is_empty());
+    }
+
+    /// A bare name has no requirement to narrow the lock entries, so every other entry is an
+    /// alternative and the primary stays the highest.
+    #[test]
+    fn lock_alternatives_include_every_other_entry_for_a_bare_name() {
+        use crate::lsp_helpers::test_support::MockMarkedDep;
+
+        let dep = MockMarkedDep {
+            name: PackageName::new("pkg"),
+            name_range: Range::default(),
+            markers: None,
+        };
+        let candidates = HashMap::from([(
+            NormalizedName::for_test("pkg"),
+            ["2.1.0", "1.26.4", "1.0.0"]
+                .map(ConcreteVersion::from)
+                .to_vec(),
+        )]);
+        let collapsed = HashMap::from([(
+            NormalizedName::for_test("pkg"),
+            ConcreteVersion::from("2.1.0"),
+        )]);
+
+        let versions = resolve_in_use_versions(
+            &dep,
+            &crate::test_util::package_key("pkg"),
+            &collapsed,
+            Some(&candidates),
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER.for_dependency(),
+            EcosystemId::Cargo,
+        )
+        .unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("2.1.0"));
+        assert_eq!(
+            versions.lock_alternatives(),
+            [
+                ConcreteVersion::from("1.0.0"),
+                ConcreteVersion::from("1.26.4")
+            ]
+        );
+    }
+
+    /// #1981 (security re-verification): a pass of many distinct requirements over one big
+    /// candidate list must parse that list once, and each memoized selection must keep only
+    /// its capped alternatives, not an allocation sized by the whole list.
+    #[test]
+    fn memo_parses_each_list_once_and_retains_only_capped_alternatives() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        const ENTRIES: usize = 2000;
+        const REQUIREMENTS: usize = 50;
+        let name = NormalizedName::for_test("pkg");
+        let candidates = HashMap::from([(
+            name.clone(),
+            (0..ENTRIES)
+                .map(|n| ConcreteVersion::from(format!("1.0.{n}")))
+                .collect::<Vec<_>>(),
+        )]);
+        let resolved =
+            HashMap::from([(name, ConcreteVersion::from(format!("1.0.{}", ENTRIES - 1)))]);
+        let mut memo = LockSelectionMemo::default();
+
+        for n in 0..REQUIREMENTS {
+            let dep = MockDep {
+                name: PackageName::new("pkg"),
+                version_req: VersionReq::new(format!(">=1.0.{n}")),
+                version_range: Range::default(),
+                name_range: Range::default(),
+            };
+            let in_use = resolve_in_use_versions_memoized(
+                &dep,
+                &crate::test_util::package_key("pkg"),
+                &resolved,
+                Some(&candidates),
+                &CaretFormatter,
+                EcosystemId::Cargo,
+                &mut memo,
+            )
+            .unwrap();
+            assert_eq!(in_use.lock_alternatives().len(), MAX_LOCK_ALTERNATIVES + 1);
+            assert_eq!(
+                in_use
+                    .lock_alternatives()
+                    .first()
+                    .map(ConcreteVersion::as_str),
+                Some(format!("1.0.{n}").as_str())
+            );
+        }
+
+        assert_eq!(memo.selections.len(), REQUIREMENTS);
+        assert_eq!(
+            memo.parsed.len(),
+            1,
+            "one parse cache per name, not per requirement"
+        );
+        for (_, alternatives) in memo.selections.values().flatten() {
+            assert!(alternatives.capacity() <= MAX_LOCK_ALTERNATIVES + 1);
+        }
+    }
+
+    fn best_candidate_for_requirement<'a>(
+        candidates: &'a [ConcreteVersion],
+        requirement: &crate::VersionReq,
+        formatter: &dyn EcosystemFormatter,
+    ) -> Option<&'a ConcreteVersion> {
+        let mask = satisfying_mask(candidates, requirement, formatter);
+        Candidates {
+            entries: candidates,
+            parsed: parse_all(candidates),
+            possible: mask,
+        }
+        .highest()
+    }
+
+    fn resolve_caret_pkg(requirement: &str, locked: &[&str]) -> Option<InUseVersions> {
         use crate::VersionReq;
         use crate::lsp_helpers::test_support::MockDep;
 
         let dep = MockDep {
             name: PackageName::new("pkg"),
-            version_req: VersionReq::new("^1.0"),
+            version_req: VersionReq::new(requirement),
             version_range: Range::default(),
             name_range: Range::default(),
         };
-
-        let resolved_versions = HashMap::new();
         let mut candidates = HashMap::new();
         candidates.insert(
             NormalizedName::for_test("pkg"),
-            vec![
-                ConcreteVersion::from("1.0.1"),
-                ConcreteVersion::from("1.0.5"),
-                ConcreteVersion::from("2.0.0"),
-            ],
+            locked.iter().map(|v| ConcreteVersion::from(*v)).collect(),
         );
 
-        let result = resolve_in_use_version(
+        let collapsed: HashMap<NormalizedName, ConcreteVersion> = locked
+            .last()
+            .map(|v| (NormalizedName::for_test("pkg"), ConcreteVersion::from(*v)))
+            .into_iter()
+            .collect();
+
+        resolve_in_use_versions(
             &dep,
             &crate::test_util::package_key("pkg"),
-            &resolved_versions,
+            &collapsed,
             Some(&candidates),
             &CaretFormatter,
             EcosystemId::Cargo,
-        );
-
-        assert_eq!(result, Some(ConcreteVersion::from("1.0.5")));
+        )
     }
 
     // --- in_use_version end-to-end: #664's exact repro (no lock file, bare full version) ---
@@ -2140,6 +2591,7 @@ mod tests {
         assert_eq!(versions.primary().as_str(), "v4.8.0");
         let siblings: Vec<&str> = versions.siblings().iter().map(|s| s.as_str()).collect();
         assert_eq!(siblings, ["v4.9.0", "v4.10.0"]);
+        assert!(versions.lock_alternatives().is_empty());
     }
 
     /// #1709 (G7): a most-specific two-component primary keeps its two-component siblings.

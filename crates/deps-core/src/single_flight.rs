@@ -161,6 +161,7 @@ pub(crate) struct OwnedLeader<K: Hash + Eq, T> {
     flights: Arc<FlightMap<K, T>>,
     key: K,
     sender: watch::Sender<Slot<T>>,
+    released: bool,
 }
 
 impl<K: Hash + Eq, T> OwnedLeader<K, T> {
@@ -168,11 +169,21 @@ impl<K: Hash + Eq, T> OwnedLeader<K, T> {
     pub(crate) fn follower(&self) -> Follower<T> {
         Follower(self.sender.subscribe())
     }
+
+    /// Releases the claim, then hands `value` to every follower, so a woken follower always
+    /// finds the key free.
+    pub(crate) fn publish(mut self, value: T) {
+        self.flights.remove(&self.key);
+        self.released = true;
+        self.sender.send_replace(Slot::Ready(value));
+    }
 }
 
 impl<K: Hash + Eq, T> Drop for OwnedLeader<K, T> {
     fn drop(&mut self) {
-        self.flights.remove(&self.key);
+        if !self.released {
+            self.flights.remove(&self.key);
+        }
     }
 }
 
@@ -196,6 +207,7 @@ where
             flights: Arc::clone(in_flight),
             key,
             sender,
+            released: false,
         }),
     }
 }
@@ -334,6 +346,22 @@ mod tests {
 
         assert_eq!(own.wait().await, None);
         assert_eq!(joined.wait().await, None);
+        assert!(flights.is_empty());
+        let OwnedClaim::Leader(_) = claim_or_follow_owned(&flights, "key") else {
+            panic!("the released key is claimable again");
+        };
+    }
+
+    #[tokio::test]
+    async fn a_published_owned_leader_hands_over_its_value_with_the_key_free() {
+        let flights = Arc::new(Flights::new());
+        let OwnedClaim::Leader(leader) = claim_or_follow_owned(&flights, "key") else {
+            panic!("expected to lead");
+        };
+        let own = leader.follower();
+        leader.publish(9);
+
+        assert_eq!(own.wait().await, Some(9));
         assert!(flights.is_empty());
         let OwnedClaim::Leader(_) = claim_or_follow_owned(&flights, "key") else {
             panic!("the released key is claimable again");

@@ -7,7 +7,6 @@ Create registry client in `registry.rs`:
 
 use crate::types::{Ecosystem}Version;
 use deps_core::{DepsError, HttpCache, Result, ecosystem::BoxFuture};
-use std::any::Any;
 use std::sync::Arc;
 
 const REGISTRY_URL: &str = "https://registry.example.com";
@@ -84,10 +83,6 @@ impl deps_core::Registry for {Ecosystem}Registry {
         _limit: usize,
     ) -> BoxFuture<'a, deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>> {
         Box::pin(async move { Ok(vec![]) })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 ```

@@ -77,7 +77,7 @@ pub struct ComposerParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 }
 
 // Hand-written rather than `deps_core::impl_parse_result!`: that macro's optional fields
@@ -101,7 +101,7 @@ impl deps_core::ParseResult for ComposerParseResult {
         &self.uri
     }
 
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+    fn dependency_truncation(&self) -> Option<deps_core::DependencyTruncation> {
         self.dependency_truncation
     }
 

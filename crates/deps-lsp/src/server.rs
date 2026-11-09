@@ -15,6 +15,7 @@ use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
 use deps_core::policy_config::{GossipChecks, OsvChecks, TyposquatChecks};
+use deps_engine::classify::resolved::LockfileLoad;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -33,6 +34,35 @@ use tower_lsp_server::ls_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
+
+/// Whether a watched lock file still exists on disk when its change event is handled; a
+/// deletion event leaves nothing to locate or parse (#1989).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockfilePresence {
+    Present,
+    Absent,
+}
+
+impl LockfilePresence {
+    /// Absent only when nothing exists at `path`: a lock that cannot be stat'ed or is not a
+    /// regular file is still there, so the parse path reports the failure and keeps the
+    /// previous in-use versions instead of re-resolving them away.
+    fn of(path: &std::path::Path) -> Self {
+        match deps_core::fs_probe::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Ok(_) | Err(_) => Self::Present,
+        }
+    }
+
+    async fn probe(path: &std::path::Path) -> Self {
+        let path = path.to_path_buf();
+        // A panicked probe is treated as present: the parse path then reports a reload failure
+        // and keeps the previous in-use versions instead of wiping them.
+        tokio::task::spawn_blocking(move || Self::of(&path))
+            .await
+            .unwrap_or(Self::Present)
+    }
+}
 
 /// LSP command identifiers.
 mod commands {
@@ -522,25 +552,14 @@ impl Backend {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "per-document reload loop borrows self and lockfile state inline"
-    )]
-    async fn handle_lockfile_change(
+    /// Open manifests whose lock file is `lockfile_path`, each paired with the one reload of it.
+    async fn refreshes_for_present_lockfile(
         &self,
         lockfile_path: &std::path::Path,
         ecosystem: deps_core::EcosystemId,
-    ) {
-        let Some(ecosystem_impl) = self.state.ecosystem_registry.get(ecosystem) else {
-            tracing::error!("Unknown ecosystem: {}", ecosystem);
-            return;
-        };
-
-        let Some(lock_provider) = ecosystem_impl.lockfile_provider() else {
-            tracing::warn!("Ecosystem {} has no lock file provider", ecosystem);
-            return;
-        };
-
+        ecosystem_impl: &Arc<dyn deps_core::Ecosystem>,
+        lock_provider: Arc<dyn deps_core::LockFileProvider>,
+    ) -> Vec<(Uri, LockfileLoad)> {
         // `locate_lockfile` does a synchronous ancestor-directory `stat` walk per candidate
         // document (#963), so scanning inline would block the tokio worker thread once per
         // document. Run the whole scan in `spawn_blocking` instead.
@@ -574,17 +593,8 @@ impl Backend {
         });
 
         if affected_uris.is_empty() {
-            tracing::debug!(
-                "No open manifests affected by lock file: {}",
-                lockfile_path.display()
-            );
-            return;
+            return Vec::new();
         }
-
-        tracing::info!(
-            "Updating {} manifest(s) affected by lock file change",
-            affected_uris.len()
-        );
 
         // Reload lock file (cache was invalidated, so this re-parses) via the same
         // get-or-parse-then-split sequence `load_resolved_versions` uses (issue #1424, was
@@ -606,190 +616,296 @@ impl Backend {
             lockfile_path,
         )
         .await;
-        let lockfile_reload_ok = load.reload_ok();
-        if !lockfile_reload_ok {
+        if !load.reload_ok() {
             let message = format!("Failed to reload lock file: {}", lockfile_path.display());
             tracing::error!("{}", message);
             self.client.log_message(MessageType::ERROR, message).await;
         }
-        let (resolved_versions, resolved_version_candidates) = load.into_maps();
+        affected_uris
+            .into_iter()
+            .map(|uri| (uri, load.clone()))
+            .collect()
+    }
 
-        for uri in affected_uris {
-            // Captured per URI, and never held across an await: the snapshot owns its values,
-            // so no config read guard outlives the call.
-            let snapshot =
-                diagnostics::DiagnosticsSnapshot::capture(&self.state, &uri, &self.config).await;
-            // Detected before the overwrite below (issue #1395): a lock-file-only change
-            // has no `DependencyDiff` to gate the OSV rescan on the way a manifest edit
-            // does, so this compares each dependency occurrence's resolved-in-use version,
-            // before vs. after the reload, via the same policy OSV target selection itself
-            // consults (critic S1) — not a raw-name lookup against the collapsed
-            // `resolved_versions` map, which misses a normalized-name mismatch or a
-            // multi-candidate name whose per-occurrence selection moved.
-            //
-            // `reload_resolved_versions` (issue #1398/#1399 code review) shares the
-            // diff-and-write sequence with `document::lifecycle::run_document_change_task`'s
-            // own debounced-edit lock-drift check, including that call's own
-            // `if lockfile_reload_ok { ... } else { false }` gating (issue #1424
-            // impl-critic M1): `reload_resolved_versions` always unconditionally
-            // overwrites `resolved_versions`/`resolved_version_candidates` with whatever it
-            // is given, so calling it on a `Failed` reload — whose maps are always empty —
-            // would silently wipe known-good, previously-resolved data instead of leaving
-            // it untouched until a subsequent reload actually succeeds. Not
-            // `vulnerabilities_enabled && lockfile_reload_ok`: a tier-3 ecosystem's license
-            // can go stale on a resolved-version change whether or not vulnerability
-            // scanning is turned on, so the drift signal must be available for the license
-            // trigger below too, not just the OSV one.
-            let resolved_changed = if lockfile_reload_ok {
-                reload_resolved_versions(
-                    &uri,
-                    &self.state,
-                    ecosystem_impl.as_ref(),
-                    &resolved_versions,
-                    &resolved_version_candidates,
-                )
-            } else {
-                false
-            };
+    /// Open manifests under the deleted lock file's directory, each re-resolved from scratch
+    /// (#1989): a manifest may fall back to an ancestor's lock file or to none at all, which
+    /// resolving through its own URI decides, since the deleted file can no longer be located.
+    async fn refreshes_for_absent_lockfile(
+        &self,
+        lockfile_path: &std::path::Path,
+        ecosystem: deps_core::EcosystemId,
+        ecosystem_impl: &Arc<dyn deps_core::Ecosystem>,
+    ) -> Vec<(Uri, LockfileLoad)> {
+        let Some(lock_dir) = lockfile_path.parent() else {
+            return Vec::new();
+        };
+        let affected: Vec<(Uri, url::Url)> = self
+            .state
+            .documents
+            .iter()
+            .filter(|entry| entry.value().ecosystem == ecosystem)
+            .filter_map(|entry| {
+                let domain_uri = crate::lsp_types_interop::from_lsp_uri(entry.key())?;
+                let manifest_path = deps_core::lockfile::resolve_manifest_file_path(&domain_uri)?;
+                manifest_path
+                    .starts_with(lock_dir)
+                    .then(|| (entry.key().clone(), domain_uri))
+            })
+            .collect();
 
-            // Shared with `run_document_change_task`'s identical formula (issue #1407
-            // code-review should-fix: the two call sites used to hand-roll this by hand) —
-            // this path has no manifest diff of its own, so `diff_needs_rescan` is always
-            // `false`. `requires_dedicated_fetch` in practice only ever gates the license
-            // half of this true for Dart/Swift here: of the four tier-3 ecosystems, only
-            // they have a `LockFileProvider` — Gradle and Deno have none, so
-            // `handle_lockfile_change` already returned above before reaching this loop
-            // for them.
-            let (needs_osv_rescan, needs_license_refresh) = change_task_triggers(
-                ResolvedVersionMove {
-                    diff_needs_rescan: false,
-                    resolved_changed,
-                },
-                ChangeTaskTriggerGates {
-                    osv_checks: snapshot.osv_checks(),
-                    requires_dedicated_fetch: ecosystem_impl
-                        .license_source()
-                        .requires_dedicated_fetch(),
-                },
-            );
-
-            // The maps update unconditionally (inside `reload_resolved_versions` above),
-            // but the generation only bumps when paired with a rescan/refresh that will
-            // produce a fresh commit under the new generation (issue #1395 critic N2):
-            // bumping on every lock-file reload regardless would silently invalidate a
-            // concurrently in-flight manifest-edit-triggered OSV scan's staleness guard
-            // (S3) with no rescan ever re-triggered to replace the now-discarded result —
-            // e.g. adding an already-locked transitive dependency races a `cargo metadata`
-            // lock-file rewrite that changes nothing about that dependency's own
-            // resolution.
-            if (needs_osv_rescan || needs_license_refresh)
-                && let Some(mut doc) = self.state.documents.get_mut(&uri)
-            {
-                doc.bump_resolved_generation(self.state.next_resolved_versions_generation());
-            }
-
-            if needs_osv_rescan || needs_license_refresh {
-                // A detached `tokio::spawn`, deliberately NOT `spawn_background_task`
-                // (issue #1395 critic N1): that shared per-URI task slot is also owned by
-                // the open/edit path's own registry-fetch + `set_loaded` task
-                // (`run_document_open_background_task`/`run_document_change_task`), and
-                // installing this rescan there would abort that task — stranding the
-                // document in `Loading` until `loading_ceiling` and dropping its registry
-                // fetch entirely (the project already documents this exact hazard for the
-                // watched-config reparse path, see `lifecycle.rs`/`reparse.rs`). The S3
-                // generation guard (paired with the conditional bump above) already gives
-                // this rescan its ordering safety without needing the
-                // cancel-on-superseding-task semantics `spawn_background_task` provides,
-                // and a late commit against a closed/removed document is already a safe
-                // no-op (`run_osv_phase_b_and_commit` returns early when `get_document`
-                // finds nothing).
-                //
-                // Known limitation (critic M4): the content guard (`run_osv_phase_b_and_commit`)
-                // and the `resolved_versions_generation` guard are this rescan's (and, since
-                // #1407, the license refresh's) only ordering protection — there is no
-                // `spawn_background_task` slot installed for it, so a manifest edit racing in
-                // mid-rescan does NOT abort this task the way it would an open/change-path
-                // fetch. Instead, either guard can independently drop this rescan's now-stale
-                // result once it finishes: the lock-file-driven refresh is then lost until the
-                // next lock-file/manifest event. Narrow window, not worth extra machinery to
-                // close.
-                let state = Arc::clone(&self.state);
-                let client = self.client.clone();
-                let config = Arc::clone(&self.config);
-                let ecosystem_impl = Arc::clone(&ecosystem_impl);
-                let rescan_uri = uri.clone();
-                let log_uri = uri.clone();
-                // Supervised the same way as the `did_change_configuration` reparse worker
-                // below (issue #1399): a panic here would otherwise be silently swallowed by
-                // the detached `tokio::spawn` above, leaving this document's OSV/license
-                // diagnostics stale with no log trail to explain why.
-                spawn_supervised(
-                    async move {
-                        // `needs_license_refresh` is already ecosystem-gated above. Run
-                        // concurrently with the OSV rescan (critic M1) — sequential awaits
-                        // here would sum both phases' network latency into the diagnostics
-                        // publish below, unlike the open/edit paths, which already run their
-                        // OSV phase A and license pre-fetch concurrently.
-                        let license_uri = rescan_uri.clone();
-                        let license_state = Arc::clone(&state);
-                        let license_ecosystem = Arc::clone(&ecosystem_impl);
-                        tokio::join!(
-                            async {
-                                if needs_osv_rescan {
-                                    rescan_after_resolved_version_change(
-                                        &rescan_uri,
-                                        &state,
-                                        &ecosystem_impl,
-                                        snapshot.fetch_timeout,
-                                    )
-                                    .await;
-                                }
-                            },
-                            async {
-                                if needs_license_refresh {
-                                    run_license_prefetch(
-                                        license_uri,
-                                        license_state,
-                                        license_ecosystem,
-                                        snapshot.fetch_timeout,
-                                    )
-                                    .await;
-                                }
-                            }
-                        );
-
-                        let dep_count = diagnostics::document_dependency_count(&state, &rescan_uri);
-                        diagnostics::publish_document_diagnostics(
-                            &state,
-                            &client,
-                            &rescan_uri,
-                            &config,
-                            dep_count,
-                        )
-                        .await;
-                    },
-                    move |e| {
-                        tracing::error!(
-                            "lockfile-change rescan for {:?} panicked ({e}); its OSV/license \
-                             diagnostics may be stale",
-                            log_uri
-                        );
-                    },
-                );
-                continue;
-            }
-
-            // Computed per URI (#636): each affected document can produce a different
-            // ceiling, so it can't be hoisted out of the loop.
-            let dep_count = diagnostics::document_dependency_count(&self.state, &uri);
-            diagnostics::publish_document_diagnostics(
-                &self.state,
-                &self.client,
-                &uri,
-                &self.config,
-                dep_count,
+        let mut refreshes = Vec::with_capacity(affected.len());
+        for (uri, domain_uri) in affected {
+            let load = deps_engine::classify::resolved::load_resolved_versions(
+                &domain_uri,
+                &self.state.lockfile_cache,
+                ecosystem_impl.as_ref(),
             )
             .await;
+            if !load.reload_ok() {
+                let message = format!("Failed to reload lock file for: {}", domain_uri.as_str());
+                tracing::error!("{}", message);
+                self.client.log_message(MessageType::ERROR, message).await;
+            }
+            refreshes.push((uri, load));
+        }
+        refreshes
+    }
+
+    /// Re-resolves one open manifest against `load` after its lock file changed or vanished,
+    /// then rescans OSV/licenses when an in-use version moved and republishes diagnostics.
+    async fn refresh_document_after_lockfile_change(
+        &self,
+        uri: Uri,
+        ecosystem_impl: &Arc<dyn deps_core::Ecosystem>,
+        load: LockfileLoad,
+    ) {
+        let lockfile_reload_ok = load.reload_ok();
+        let (resolved_versions, resolved_version_candidates) = load.into_maps();
+        let ecosystem_impl = Arc::clone(ecosystem_impl);
+        // Captured per URI, and never held across an await: the snapshot owns its values,
+        // so no config read guard outlives the call.
+        let snapshot =
+            diagnostics::DiagnosticsSnapshot::capture(&self.state, &uri, &self.config).await;
+        // Detected before the overwrite below (issue #1395): a lock-file-only change
+        // has no `DependencyDiff` to gate the OSV rescan on the way a manifest edit
+        // does, so this compares each dependency occurrence's resolved-in-use version,
+        // before vs. after the reload, via the same policy OSV target selection itself
+        // consults (critic S1) — not a raw-name lookup against the collapsed
+        // `resolved_versions` map, which misses a normalized-name mismatch or a
+        // multi-candidate name whose per-occurrence selection moved.
+        //
+        // `reload_resolved_versions` (issue #1398/#1399 code review) shares the
+        // diff-and-write sequence with `document::lifecycle::run_document_change_task`'s
+        // own debounced-edit lock-drift check, including that call's own
+        // `if lockfile_reload_ok { ... } else { false }` gating (issue #1424
+        // impl-critic M1): `reload_resolved_versions` always unconditionally
+        // overwrites `resolved_versions`/`resolved_version_candidates` with whatever it
+        // is given, so calling it on a `Failed` reload — whose maps are always empty —
+        // would silently wipe known-good, previously-resolved data instead of leaving
+        // it untouched until a subsequent reload actually succeeds. Not
+        // `vulnerabilities_enabled && lockfile_reload_ok`: a tier-3 ecosystem's license
+        // can go stale on a resolved-version change whether or not vulnerability
+        // scanning is turned on, so the drift signal must be available for the license
+        // trigger below too, not just the OSV one.
+        let resolved_changed = if lockfile_reload_ok {
+            reload_resolved_versions(
+                &uri,
+                &self.state,
+                ecosystem_impl.as_ref(),
+                &resolved_versions,
+                &resolved_version_candidates,
+            )
+        } else {
+            false
+        };
+
+        // Shared with `run_document_change_task`'s identical formula (issue #1407
+        // code-review should-fix: the two call sites used to hand-roll this by hand) —
+        // this path has no manifest diff of its own, so `diff_needs_rescan` is always
+        // `false`. `requires_dedicated_fetch` in practice only ever gates the license
+        // half of this true for Dart/Swift here: of the four tier-3 ecosystems, only
+        // they have a `LockFileProvider` — Gradle and Deno have none, so
+        // `handle_lockfile_change` already returned above before reaching this loop
+        // for them.
+        let (needs_osv_rescan, needs_license_refresh) = change_task_triggers(
+            ResolvedVersionMove {
+                diff_needs_rescan: false,
+                resolved_changed,
+            },
+            ChangeTaskTriggerGates {
+                osv_checks: snapshot.osv_checks(),
+                requires_dedicated_fetch: ecosystem_impl
+                    .license_source()
+                    .requires_dedicated_fetch(),
+            },
+        );
+
+        // The maps update unconditionally (inside `reload_resolved_versions` above),
+        // but the generation only bumps when paired with a rescan/refresh that will
+        // produce a fresh commit under the new generation (issue #1395 critic N2):
+        // bumping on every lock-file reload regardless would silently invalidate a
+        // concurrently in-flight manifest-edit-triggered OSV scan's staleness guard
+        // (S3) with no rescan ever re-triggered to replace the now-discarded result —
+        // e.g. adding an already-locked transitive dependency races a `cargo metadata`
+        // lock-file rewrite that changes nothing about that dependency's own
+        // resolution.
+        if (needs_osv_rescan || needs_license_refresh)
+            && let Some(mut doc) = self.state.documents.get_mut(&uri)
+        {
+            doc.bump_resolved_generation(self.state.next_resolved_versions_generation());
+        }
+
+        if needs_osv_rescan || needs_license_refresh {
+            // A detached `tokio::spawn`, deliberately NOT `spawn_background_task`
+            // (issue #1395 critic N1): that shared per-URI task slot is also owned by
+            // the open/edit path's own registry-fetch + `set_loaded` task
+            // (`run_document_open_background_task`/`run_document_change_task`), and
+            // installing this rescan there would abort that task — stranding the
+            // document in `Loading` until `loading_ceiling` and dropping its registry
+            // fetch entirely (the project already documents this exact hazard for the
+            // watched-config reparse path, see `lifecycle.rs`/`reparse.rs`). The S3
+            // generation guard (paired with the conditional bump above) already gives
+            // this rescan its ordering safety without needing the
+            // cancel-on-superseding-task semantics `spawn_background_task` provides,
+            // and a late commit against a closed/removed document is already a safe
+            // no-op (`run_osv_phase_b_and_commit` returns early when `get_document`
+            // finds nothing).
+            //
+            // Known limitation (critic M4): the content guard (`run_osv_phase_b_and_commit`)
+            // and the `resolved_versions_generation` guard are this rescan's (and, since
+            // #1407, the license refresh's) only ordering protection — there is no
+            // `spawn_background_task` slot installed for it, so a manifest edit racing in
+            // mid-rescan does NOT abort this task the way it would an open/change-path
+            // fetch. Instead, either guard can independently drop this rescan's now-stale
+            // result once it finishes: the lock-file-driven refresh is then lost until the
+            // next lock-file/manifest event. Narrow window, not worth extra machinery to
+            // close.
+            let state = Arc::clone(&self.state);
+            let client = self.client.clone();
+            let config = Arc::clone(&self.config);
+            let ecosystem_impl = Arc::clone(&ecosystem_impl);
+            let rescan_uri = uri.clone();
+            let log_uri = uri.clone();
+            // Supervised the same way as the `did_change_configuration` reparse worker
+            // below (issue #1399): a panic here would otherwise be silently swallowed by
+            // the detached `tokio::spawn` above, leaving this document's OSV/license
+            // diagnostics stale with no log trail to explain why.
+            spawn_supervised(
+                async move {
+                    // `needs_license_refresh` is already ecosystem-gated above. Run
+                    // concurrently with the OSV rescan (critic M1) — sequential awaits
+                    // here would sum both phases' network latency into the diagnostics
+                    // publish below, unlike the open/edit paths, which already run their
+                    // OSV phase A and license pre-fetch concurrently.
+                    let license_uri = rescan_uri.clone();
+                    let license_state = Arc::clone(&state);
+                    let license_ecosystem = Arc::clone(&ecosystem_impl);
+                    tokio::join!(
+                        async {
+                            if needs_osv_rescan {
+                                rescan_after_resolved_version_change(
+                                    &rescan_uri,
+                                    &state,
+                                    &ecosystem_impl,
+                                    snapshot.fetch_timeout,
+                                )
+                                .await;
+                            }
+                        },
+                        async {
+                            if needs_license_refresh {
+                                run_license_prefetch(
+                                    license_uri,
+                                    license_state,
+                                    license_ecosystem,
+                                    snapshot.fetch_timeout,
+                                )
+                                .await;
+                            }
+                        }
+                    );
+
+                    let dep_count = diagnostics::document_dependency_count(&state, &rescan_uri);
+                    diagnostics::publish_document_diagnostics(
+                        &state,
+                        &client,
+                        &rescan_uri,
+                        &config,
+                        dep_count,
+                    )
+                    .await;
+                },
+                move |e| {
+                    tracing::error!(
+                        "lockfile-change rescan for {:?} panicked ({e}); its OSV/license \
+                         diagnostics may be stale",
+                        log_uri
+                    );
+                },
+            );
+            return;
+        }
+
+        // Computed per URI (#636): each affected document can produce a different
+        // ceiling, so it can't be hoisted out of the loop.
+        let dep_count = diagnostics::document_dependency_count(&self.state, &uri);
+        diagnostics::publish_document_diagnostics(
+            &self.state,
+            &self.client,
+            &uri,
+            &self.config,
+            dep_count,
+        )
+        .await;
+    }
+
+    async fn handle_lockfile_change(
+        &self,
+        lockfile_path: &std::path::Path,
+        ecosystem: deps_core::EcosystemId,
+    ) {
+        let Some(ecosystem_impl) = self.state.ecosystem_registry.get(ecosystem) else {
+            tracing::error!("Unknown ecosystem: {}", ecosystem);
+            return;
+        };
+
+        let Some(lock_provider) = ecosystem_impl.lockfile_provider() else {
+            tracing::warn!("Ecosystem {} has no lock file provider", ecosystem);
+            return;
+        };
+
+        let refreshes = match LockfilePresence::probe(lockfile_path).await {
+            LockfilePresence::Present => {
+                self.refreshes_for_present_lockfile(
+                    lockfile_path,
+                    ecosystem,
+                    &ecosystem_impl,
+                    lock_provider,
+                )
+                .await
+            }
+            LockfilePresence::Absent => {
+                self.refreshes_for_absent_lockfile(lockfile_path, ecosystem, &ecosystem_impl)
+                    .await
+            }
+        };
+
+        if refreshes.is_empty() {
+            tracing::debug!(
+                "No open manifests affected by lock file: {}",
+                lockfile_path.display()
+            );
+            return;
+        }
+
+        tracing::info!(
+            "Updating {} manifest(s) affected by lock file change",
+            refreshes.len()
+        );
+
+        for (uri, load) in refreshes {
+            self.refresh_document_after_lockfile_change(uri, &ecosystem_impl, load)
+                .await;
         }
 
         // Detached, capability-gated, timeout-bounded (#493): see
@@ -1902,6 +2018,23 @@ fn build_batch_workspace_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lockfile_presence_is_absent_only_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.lock");
+        std::fs::write(&file, "").unwrap();
+        let directory = dir.path().join("package-lock.json");
+        std::fs::create_dir(&directory).unwrap();
+
+        assert_eq!(LockfilePresence::of(&file), LockfilePresence::Present);
+        assert_eq!(LockfilePresence::of(&directory), LockfilePresence::Present);
+        assert_eq!(
+            LockfilePresence::of(&dir.path().join("missing.lock")),
+            LockfilePresence::Absent
+        );
+    }
+
     #[cfg(any(
         feature = "cargo",
         feature = "dart",
@@ -3386,6 +3519,123 @@ let package = Package(
             "resolved_versions_generation must not bump when no rescan is scheduled to \
              pair with it (critic N2)"
         );
+    }
+
+    /// Opens `manifest` next to `lockfile`, drives a lock-file change to populate the in-use
+    /// version, then deletes the lock file and drives the deletion event (#1989).
+    #[cfg(any(feature = "cargo", feature = "npm"))]
+    async fn assert_lockfile_deletion_clears_in_use_version(
+        ecosystem_id: deps_core::EcosystemId,
+        manifest: (&str, &str),
+        lockfile: (&str, &str),
+        dependency: &str,
+        resolved: &str,
+    ) {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join(lockfile.0);
+        std::fs::write(&lockfile_path, lockfile.1).unwrap();
+        let uri = Uri::from_file_path(temp_dir.path().join(manifest.0)).unwrap();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        backend
+            .config
+            .write()
+            .await
+            .policy
+            .diagnostics
+            .vulnerabilities_enabled = false;
+
+        let ecosystem = backend.state.ecosystem_registry.get(ecosystem_id).unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(
+                manifest.1,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
+        backend.state.update_document(
+            uri.clone(),
+            DocumentState::new_from_parse_result(
+                ecosystem_id,
+                manifest.1.to_string(),
+                parse_result,
+            ),
+        );
+
+        let key = NormalizedName::for_test(dependency);
+        backend
+            .handle_lockfile_change(&lockfile_path, ecosystem_id)
+            .await;
+        let resolved_before = backend
+            .state
+            .get_document(&uri)
+            .unwrap()
+            .signals
+            .resolved_versions
+            .get(&key)
+            .map(|v| v.as_str().to_string());
+        assert_eq!(
+            resolved_before.as_deref(),
+            Some(resolved),
+            "the lock file must resolve the dependency before it is deleted"
+        );
+
+        std::fs::remove_file(&lockfile_path).unwrap();
+        backend.state.lockfile_cache.invalidate(&lockfile_path);
+        backend
+            .handle_lockfile_change(&lockfile_path, ecosystem_id)
+            .await;
+
+        let doc = backend.state.get_document(&uri).unwrap();
+        assert!(
+            !doc.signals.resolved_versions.contains_key(&key),
+            "deleting {} must drop the in-use version of {dependency}",
+            lockfile.0
+        );
+    }
+
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_1989_cargo_lock_deletion_clears_in_use_versions() {
+        assert_lockfile_deletion_clears_in_use_version(
+            deps_core::EcosystemId::Cargo,
+            (
+                "Cargo.toml",
+                "[dependencies]\nalpha-dep = { git = \"https://example.invalid/alpha-dep\" }\n",
+            ),
+            (
+                "Cargo.lock",
+                "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+                 [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+                 source = \"git+https://example.invalid/alpha-dep#abcdef1234567890abcdef1234567890abcdef12\"\n",
+            ),
+            "alpha-dep",
+            "0.1.0",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_1989_yarn_lock_deletion_clears_in_use_versions() {
+        assert_lockfile_deletion_clears_in_use_version(
+            deps_core::EcosystemId::Npm,
+            (
+                "package.json",
+                r#"{"name":"t","version":"1.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+            ),
+            (
+                "yarn.lock",
+                "# yarn lockfile v1\n\nlodash@^4.17.0:\n  version \"4.17.11\"\n  resolved \"https://registry.yarnpkg.com/lodash/-/lodash-4.17.11.tgz\"\n",
+            ),
+            "lodash",
+            "4.17.11",
+        )
+        .await;
     }
 
     /// Regression guard for issue #1395 critic M1: a lock-file reload error falls back to

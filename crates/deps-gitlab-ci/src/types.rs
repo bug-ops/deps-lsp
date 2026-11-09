@@ -409,7 +409,7 @@ pub struct GitlabCiParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
     /// Dependencies whose host resolved to [`HostRef::PolicyBlocked`] (issue #967), one entry
     /// per affected dependency. Surfaced by
     /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
@@ -428,6 +428,29 @@ deps_core::impl_parse_result!(
         blocked_registries: blocked_registries,
     }
 );
+
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for GitlabCiDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        let project_path = name.as_str().to_owned();
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            source,
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Project,
+            host: HostRef::Unresolved(String::new()),
+            pin: None,
+            comment_slot: CommentSlot::Unavailable,
+            project_path,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -67,6 +67,7 @@ pub async fn handle_hover(
                 .with_resolved_version_candidates()
                 .with_vulnerabilities(vulnerability_visibility)
                 .with_latest_status(osv_checks)
+                .with_candidate_status(osv_checks)
                 .with_outcomes()
                 .with_license_prefetch()
                 .with_gossip_prefetch(gossip_visibility)

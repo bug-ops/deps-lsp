@@ -2122,7 +2122,7 @@ mod tests {
         use deps_core::VersionData;
         use deps_core::ecosystem::BoxFuture;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::hover::Hover;
+        use tower_lsp_server::ls_types::CodeAction;
 
         struct TaggedEcosystem {
             id: EcosystemId,
@@ -2150,14 +2150,19 @@ mod tests {
             }
         }
         crate::test_utils::impl_parsing_stub_ecosystem!(TaggedEcosystem, {
-            fn hover<'a>(
+            fn decorate_code_actions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
                 _position: tower_lsp_server::ls_types::Position,
+                _uri: &'a url::Url,
                 _versions: VersionData<'a>,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> BoxFuture<'a, Option<Hover>> {
-                Box::pin(async move { Some(Hover::new(format!("hover from {}", self.tag), None)) })
+                out: &'a mut Vec<CodeAction>,
+            ) -> BoxFuture<'a, ()> {
+                out.push(CodeAction {
+                    title: format!("action from {}", self.tag),
+                    ..CodeAction::default()
+                });
+                Box::pin(std::future::ready(()))
             }
         });
 
@@ -2189,21 +2194,21 @@ mod tests {
 
             let cached = HashMap::new();
             let resolved = HashMap::new();
-            let mut texts = Vec::new();
+            let mut titles = Vec::new();
             for doc in &docs {
-                let hover = doc
+                let actions = doc
                     .manifest()
                     .expect("document carries its manifest")
-                    .generate_hover(
+                    .generate_code_actions(
                         tower_lsp_server::ls_types::Position::new(0, 0),
+                        &url,
                         VersionData::new(&cached, &resolved),
-                        deps_core::FreshnessSettings::default(),
+                        "",
                     )
-                    .await
-                    .expect("the double always answers");
-                texts.push(hover.markdown().to_string());
+                    .await;
+                titles.extend(actions.into_iter().map(|action| action.title));
             }
-            assert_eq!(texts, ["hover from first", "hover from second"]);
+            assert_eq!(titles, ["action from first", "action from second"]);
         }
     }
 

@@ -8,7 +8,6 @@ crate now follows (`deps-cargo` was the sole historical exception, fixed in #760
 ```rust
 //! Types for {Ecosystem} dependency management.
 
-use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 pub use deps_core::parser::DependencySource;
@@ -82,10 +81,6 @@ impl deps_core::Version for {Ecosystem}Version {
         // Implement based on ecosystem's prerelease conventions
         let version = self.version.as_str();
         version.contains('-') || version.contains("alpha") || version.contains("beta")
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 ```
