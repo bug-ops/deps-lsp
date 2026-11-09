@@ -175,7 +175,7 @@ fn test_discover_and_resolve_public_api_smoke() {
 /// FR-009/US-004 structural auth-gate property, exercised end-to-end from
 /// `parse_cargo_toml`: a workspace-declared registry entry must never carry a token,
 /// even when a same-named `$CARGO_HOME/config.toml` entry has one — proven here via
-/// `resolved_registries`, the exact channel `CargoEcosystem::parse_manifest` uses to
+/// `resolved_registries`, the exact channel `CargoEcosystem::parse` uses to
 /// register a client's credential into the shared `CargoRegistry` router.
 #[test]
 fn test_workspace_resolved_registry_never_carries_auth_even_with_cargo_home_present() {

@@ -119,7 +119,7 @@ pub struct DenoParseResult {
     /// Every `.npmrc`-resolved alternate registry index an `npm:`-scheme import classified
     /// against (#1227) — the `deno.json` counterpart of
     /// `deps_npm::parser::NpmParseResult::resolved_registries`. Consumed by
-    /// `DenoEcosystem::parse_manifest`, which registers each one on the shared
+    /// `DenoEcosystem::parse`, which registers each one on the shared
     /// [`crate::registry::DenoRegistry`] via
     /// [`crate::registry::DenoRegistry::register_alternate_npm`] so a later
     /// `AlternateRegistry`-sourced fetch actually has a client to route through, instead of

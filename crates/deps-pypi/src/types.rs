@@ -396,10 +396,6 @@ impl deps_core::Dependency for PypiDependency {
     fn markers_range(&self) -> Option<Range> {
         self.markers_range
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 impl deps_core::Metadata for PypiPackage {

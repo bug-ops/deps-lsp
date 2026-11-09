@@ -1924,7 +1924,6 @@ mod tests {
         let result = parse_pom_xml(xml, &test_uri()).unwrap();
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.workspace_root().is_none());
-        assert!(result.as_any().is::<MavenParseResult>());
     }
 
     #[test]

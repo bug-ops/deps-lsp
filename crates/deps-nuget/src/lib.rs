@@ -5,6 +5,7 @@
 // into `recursion_depth_exceeding_limit`, which the fuzz CI job's `-D warnings` nightly
 // build turns into a hard error (rust-lang/rust#159228). Same fix as deps-swift (#673).
 #![recursion_limit = "256"]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! NuGet/.NET project file parsing and registry integration.
 //!

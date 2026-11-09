@@ -1,19 +1,19 @@
 use tower_lsp_server::ls_types::{CodeLens, Command, Position, Range, TextEdit};
 
-use crate::ParseResult;
+use crate::TypedParseResult;
 
-use super::{EcosystemFormatter, VersionData};
+use super::{DependencyFormatter, VersionData};
 
 /// `workspace/executeCommand` id for the bulk "Pin N {noun} to commit SHA" code lens.
 ///
 /// Issue #633, generalized cross-ecosystem in #640 — shared by every ecosystem that
-/// overrides [`crate::Ecosystem::collect_pin_all_to_sha_edits`], mirroring
+/// overrides [`crate::ParsedManifest::collect_pin_all_to_sha_edits`], mirroring
 /// `deps-lsp.updateAllOutdated`'s single-command-for-every-ecosystem shape.
 pub const PIN_ALL_TO_SHA_COMMAND_ID: &str = "deps-lsp.pinAllToSha";
 
 /// Singular/plural noun for an ecosystem's bulk "Pin N {noun} to commit SHA" lens title,
 /// consulted by [`build_pin_all_to_sha_lens`] — see
-/// [`crate::Ecosystem::pin_all_to_sha_noun`].
+/// [`crate::EcosystemBase::pin_all_to_sha_noun`].
 // Exhaustive: closed singular/plural pair — every ecosystem implementing
 // `pin_all_to_sha_noun` constructs this by literal, and a third field would need a new
 // concept entirely, not an extension of this one (issue #769).
@@ -37,7 +37,7 @@ pub struct PinNoun {
 /// - it declares a non-empty version requirement that [`crate::edit::requirement_is_placeholder_for`]
 ///   does not consider an unexpanded placeholder (#1370 central gate);
 /// - the formatter's
-///   [`requirement_status_for`](crate::lsp_helpers::RequirementGate::requirement_status_for)
+///   [`requirement_status_for`](crate::lsp_helpers::DependencyGate::requirement_status_for)
 ///   reports the declared requirement as [`Outdated`](crate::lsp_helpers::RequirementStatus::Outdated)
 ///   — the same predicate the diagnostics pipeline's outdated rule calls, though that rule
 ///   also gates on `formatter.can_resolve_source`, which this planner does not check, so the
@@ -68,17 +68,21 @@ pub struct PinNoun {
 /// a guard against future parser changes, not an expected code path.
 ///
 /// `content` is the manifest source, needed for the literal-span guard above — the same
-/// parameter [`Ecosystem::generate_completions`](crate::Ecosystem::generate_completions)
+/// parameter [`ParsedManifest::generate_completions`](crate::ParsedManifest::generate_completions)
 /// already threads through for a similar reason.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     collect_update_all_edits, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-///     PackageRendering, PackageVersions, RequirementResolution, SourcePolicy, VersionData,
+///     collect_update_all_edits, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+///     OsvNaming, PackageNaming, PackageRendering, PackageVersions, RequirementResolution,
+///     SourcePolicy, VersionData,
 /// };
-/// use deps_core::{ConcreteVersion, Dependency, NormalizedName, ParseResult, PackageName, VersionReq};
+/// use deps_core::{
+/// ConcreteVersion, Dependency, NormalizedName, PackageName, ParseResult, TypedParseResult,
+/// VersionReq,
+/// };
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use tower_lsp_server::ls_types::{Position, Range};
@@ -98,6 +102,9 @@ pub struct PinNoun {
 /// impl DiagnosticPolicy for MockFormatter {}
 /// impl SourcePolicy for MockFormatter {}
 /// impl OsvNaming for MockFormatter {}
+/// impl DependencyFormatter for MockFormatter {
+///     type Dep = MockDep;
+/// }
 ///
 /// struct MockDep {
 ///     name: PackageName,
@@ -113,7 +120,6 @@ pub struct PinNoun {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// struct MockParseResult { deps: Vec<MockDep>, uri: url::Url }
@@ -123,7 +129,10 @@ pub struct PinNoun {
 ///     }
 ///     fn workspace_root(&self) -> Option<&std::path::Path> { None }
 ///     fn uri(&self) -> &url::Url { &self.uri }
-///     fn as_any(&self) -> &dyn Any { self }
+/// }
+/// impl TypedParseResult for MockParseResult {
+///     type Dep = MockDep;
+///     fn own_dependencies(&self) -> &[MockDep] { &self.deps }
 /// }
 ///
 /// let content = r#"serde = "1.0.0""#;
@@ -151,12 +160,16 @@ pub struct PinNoun {
 /// assert_eq!(edits.len(), 1);
 /// assert_eq!(edits[0].new_text, "1.2.0");
 /// ```
-pub fn collect_update_all_edits(
-    parse_result: &dyn ParseResult,
+pub fn collect_update_all_edits<P, F>(
+    parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
-) -> Vec<TextEdit> {
+    formatter: &F,
+) -> Vec<TextEdit>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     crate::edit::collect_update_edits(parse_result, content, versions, formatter)
         .into_iter()
         .map(|planned| planned.edit.into())
@@ -194,10 +207,11 @@ impl crate::edit::EditSpan for TextEdit {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     generate_code_lenses, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-///     PackageRendering, RequirementResolution, SourcePolicy, VersionData,
+///     generate_code_lenses, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+///     OsvNaming, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
+///     VersionData,
 /// };
-/// use deps_core::{ConcreteVersion, PackageName, ParseResult};
+/// use deps_core::{ConcreteVersion, Dependency, PackageName, ParseResult, TypedParseResult};
 /// use std::collections::HashMap;
 ///
 /// struct MockFormatter;
@@ -215,14 +229,30 @@ impl crate::edit::EditSpan for TextEdit {
 /// impl DiagnosticPolicy for MockFormatter {}
 /// impl SourcePolicy for MockFormatter {}
 /// impl OsvNaming for MockFormatter {}
+/// impl DependencyFormatter for MockFormatter {
+///     type Dep = EmptyDependency;
+/// }
 ///
 /// // An empty parse result yields no outdated dependencies, so no lens is generated.
+/// # struct EmptyDependency;
+/// # impl Dependency for EmptyDependency {
+/// #     fn name(&self) -> &PackageName { unreachable!() }
+/// #     fn name_range(&self) -> deps_core::position::Range { unreachable!() }
+/// #     fn version_requirement(&self) -> Option<&deps_core::VersionReq> { None }
+/// #     fn version_range(&self) -> Option<deps_core::position::Range> { None }
+/// #     fn source(&self) -> deps_core::parser::DependencySource {
+/// #         deps_core::parser::DependencySource::Registry
+/// #     }
+/// # }
 /// # struct EmptyParseResult { uri: url::Url }
+/// # impl TypedParseResult for EmptyParseResult {
+/// #     type Dep = EmptyDependency;
+/// #     fn own_dependencies(&self) -> &[EmptyDependency] { &[] }
+/// # }
 /// # impl deps_core::ParseResult for EmptyParseResult {
 /// #     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> { vec![] }
 /// #     fn workspace_root(&self) -> Option<&std::path::Path> { None }
 /// #     fn uri(&self) -> &url::Url { &self.uri }
-/// #     fn as_any(&self) -> &dyn std::any::Any { self }
 /// # }
 /// let parse_result = EmptyParseResult { uri: deps_core::test_util::test_uri("/test/Cargo.toml") };
 /// let cached = HashMap::new();
@@ -239,14 +269,18 @@ impl crate::edit::EditSpan for TextEdit {
 ///
 /// assert!(lenses.is_empty());
 /// ```
-pub fn generate_code_lenses(
-    parse_result: &dyn ParseResult,
+pub fn generate_code_lenses<P, F>(
+    parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     uri: &url::Url,
     command_id: &str,
-) -> Vec<CodeLens> {
+) -> Vec<CodeLens>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     let edits = collect_update_all_edits(parse_result, content, versions, formatter);
     if edits.is_empty() {
         return Vec::new();
@@ -325,8 +359,7 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
-    use crate::{ConcreteVersion, Dependency, PackageName, VersionReq};
-    use std::any::Any;
+    use crate::{ConcreteVersion, Dependency, PackageName, ParseResult, VersionReq};
     use std::collections::HashMap;
 
     mod update_all_edits_tests {
@@ -355,9 +388,6 @@ mod tests {
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct UaeParseResult {
@@ -375,8 +405,12 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl crate::TypedParseResult for UaeParseResult {
+            type Dep = UaeDep;
+            fn own_dependencies(&self) -> &[UaeDep] {
+                &self.deps
             }
         }
 
@@ -440,6 +474,10 @@ mod tests {
 
         impl OsvNaming for FloorFormatter {}
 
+        impl DependencyFormatter for FloorFormatter {
+            type Dep = UaeDep;
+        }
+
         #[test]
         fn test_zero_outdated_returns_empty_edits_and_no_lens() {
             let content = r#"serde = "1.0.0""#;
@@ -452,14 +490,15 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits = collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER);
+            let edits =
+                collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER.for_dependency());
             assert!(edits.is_empty());
 
             let lenses = generate_code_lenses(
                 &pr,
                 content,
                 versions,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
             );
@@ -485,7 +524,8 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits = collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER);
+            let edits =
+                collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER.for_dependency());
             assert_eq!(edits.len(), 2);
             assert_eq!(edits[0].range, range(0, 9, 0, 14));
             assert_eq!(
@@ -502,7 +542,7 @@ mod tests {
                 &pr,
                 content,
                 versions,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
             );
@@ -528,7 +568,7 @@ mod tests {
                 &pr,
                 content,
                 versions,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
             );
@@ -554,7 +594,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
         }
@@ -577,7 +617,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
                 edits.is_empty(),
@@ -600,7 +640,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
         }
@@ -622,7 +662,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
                 edits.is_empty(),
@@ -645,7 +685,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
         }
@@ -667,7 +707,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
         }
@@ -689,7 +729,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
         }
@@ -762,6 +802,10 @@ mod tests {
 
             impl OsvNaming for NoOpFormatter {}
 
+            impl DependencyFormatter for NoOpFormatter {
+                type Dep = UaeDep;
+            }
+
             let content = r#"pkg = "1.0.0""#;
             let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);
             let mut cached = HashMap::new();
@@ -801,7 +845,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
                 edits.is_empty(),
@@ -830,7 +874,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(edits.len(), 1, "whitespace-only divergence must not skip");
         }
@@ -856,7 +900,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
                 edits.len(),
@@ -887,7 +931,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
                 edits.len(),
@@ -917,7 +961,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
                 edits.len(),
@@ -947,7 +991,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
                 edits.len(),
@@ -977,7 +1021,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
                 edits.is_empty(),
@@ -1007,11 +1051,12 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits = collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER);
+            let edits =
+                collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER.for_dependency());
             let diagnostics = generate_diagnostics_from_cache(
                 &pr,
                 versions,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 crate::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -1050,7 +1095,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(edits.len(), 1, "the overlapping later edit must be dropped");
         }
@@ -1099,88 +1144,46 @@ mod tests {
 
         #[test]
         fn test_trait_default_returns_empty() {
-            use crate::Ecosystem as _;
+            use crate::{EcosystemBase as _, TypedEcosystem as _};
 
             struct DefaultEcosystem;
             impl crate::ecosystem::private::Sealed for DefaultEcosystem {}
-            impl crate::Ecosystem for DefaultEcosystem {
+            impl crate::ecosystem::EcosystemBase for DefaultEcosystem {
                 fn ecosystem_id(&self) -> crate::EcosystemId {
                     crate::EcosystemId::Cargo
                 }
+
                 fn display_name(&self) -> &'static str {
                     "Default"
                 }
+
                 fn manifest_filenames(&self) -> &[&'static str] {
                     &[]
                 }
-                fn parse_manifest<'a>(
-                    &'a self,
-                    _content: &'a str,
-                    _uri: &'a url::Url,
-                ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>
-                {
-                    unimplemented!()
-                }
+
                 fn registry(&self) -> std::sync::Arc<dyn crate::Registry> {
                     unimplemented!()
                 }
-                fn formatter(&self) -> &dyn EcosystemFormatter {
-                    unimplemented!()
-                }
-                fn generate_completions<'a>(
-                    &'a self,
-                    _parse_result: &'a dyn ParseResult,
-                    _position: tower_lsp_server::ls_types::Position,
-                    _content: &'a str,
-                    _freshness: crate::FreshnessSettings,
-                ) -> crate::ecosystem::BoxFuture<'a, crate::completion::Completions>
-                {
-                    unimplemented!()
-                }
-                fn complete_version<'a>(
-                    &'a self,
-                    _request: crate::completion::CompletionRequest<'a>,
-                    _package_name: crate::PackageName,
-                    _prefix: String,
-                ) -> crate::ecosystem::BoxFuture<'a, crate::completion::Completions>
-                {
-                    unimplemented!()
-                }
+
                 fn completion_insert_text(
                     &self,
                     _metadata: &dyn crate::Metadata,
                 ) -> Option<String> {
                     unimplemented!()
                 }
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
-                }
             }
+
+            crate::impl_stub_typed_ecosystem!(DefaultEcosystem);
 
             let eco = DefaultEcosystem;
-            let uri = crate::test_util::test_uri("/test/manifest");
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
-            struct EmptyParseResult {
-                uri: url::Url,
-            }
-            impl ParseResult for EmptyParseResult {
-                fn dependencies(&self) -> Vec<&dyn crate::Dependency> {
-                    vec![]
-                }
-                fn workspace_root(&self) -> Option<&std::path::Path> {
-                    None
-                }
-                fn uri(&self) -> &url::Url {
-                    &self.uri
-                }
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
-                }
-            }
-            let pr = EmptyParseResult { uri };
+            let pr = crate::test_util::stub_parse_result(0);
 
-            let edits = eco.collect_pin_all_to_sha_edits(&pr, VersionData::new(&cached, &resolved));
+            let edits = eco.pin_all_to_sha_edits(
+                crate::ParsedView::new(&pr),
+                VersionData::new(&cached, &resolved),
+            );
             assert!(edits.is_empty());
             assert_eq!(eco.pin_all_to_sha_noun().singular, "ref");
             assert_eq!(eco.pin_all_to_sha_noun().plural, "refs");

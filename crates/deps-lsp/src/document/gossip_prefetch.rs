@@ -657,7 +657,7 @@ mod tests {
             .expect("npm ecosystem not found");
 
         let content_v1 = r#"{"dependencies":{"vite":"^8.0.0","left-pad":"^1.0.0"}}"#.to_string();
-        let parse_result_v1 = ecosystem
+        let parse_result_v1 = Arc::clone(&ecosystem)
             .parse_manifest(&content_v1, &domain_uri)
             .await
             .expect("v1 manifest must parse");
@@ -677,7 +677,7 @@ mod tests {
         // drops "left-pad" — mirrors a real edit rebuilding `DocumentState` wholesale.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let content_v2 = r#"{"dependencies":{"vite":"^8.0.0"}}"#.to_string();
-        let parse_result_v2 = ecosystem
+        let parse_result_v2 = Arc::clone(&ecosystem)
             .parse_manifest(&content_v2, &domain_uri)
             .await
             .expect("v2 manifest must parse");
@@ -752,7 +752,7 @@ mod tests {
             .expect("npm ecosystem not found");
 
         let content_registry = r#"{"dependencies":{"vite":"^8.0.0"}}"#.to_string();
-        let parse_result_registry = ecosystem
+        let parse_result_registry = Arc::clone(&ecosystem)
             .parse_manifest(&content_registry, &domain_uri)
             .await
             .expect("registry-sourced manifest must parse");
@@ -794,7 +794,7 @@ mod tests {
         // registry-version fetch that makes the carried-forward entry mismatched.
         let content_git =
             r#"{"dependencies":{"vite":"git+https://github.com/example/vite.git"}}"#.to_string();
-        let parse_result_git = ecosystem
+        let parse_result_git = Arc::clone(&ecosystem)
             .parse_manifest(&content_git, &domain_uri)
             .await
             .expect("git-sourced manifest must parse");
@@ -870,7 +870,7 @@ mod tests {
             .expect("npm ecosystem not found");
 
         let content = r#"{"dependencies":{"vite":"^8.0.0"}}"#.to_string();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(&content, &domain_uri)
             .await
             .expect("manifest must parse");

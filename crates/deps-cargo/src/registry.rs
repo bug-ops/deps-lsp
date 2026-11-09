@@ -539,7 +539,7 @@ impl CargoRegistry {
     /// need to reconstruct a `RegistryIndex` (and the `RegistryTrust`/policy that would require)
     /// just to look one up (plan-1b §1.2, critic S2).
     ///
-    /// Used by completion (`crate::ecosystem::CargoEcosystem::generate_completions`, FR-012)
+    /// Used by completion (`crate::ecosystem::CargoEcosystem::completions`, FR-012)
     /// to address one specific alternate index directly via [`deps_core::Registry`]'s
     /// generic helpers, without going through this router's source-based dispatch.
     #[must_use]
@@ -709,7 +709,7 @@ mod tests {
     use super::*;
     use crate::config::RegistryTrust;
     use crate::ecosystem::CargoEcosystem;
-    use deps_core::{DepsError, Ecosystem};
+    use deps_core::{DepsError, EcosystemBase};
     use std::assert_matches;
     use std::collections::HashMap;
 

@@ -8,11 +8,11 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use deps_core::NarrowDependency;
-use deps_core::lsp_helpers::{CommentCheck, PackageRendering};
+use deps_core::lsp_helpers::{CommentCheck, DependencyFormatter};
+use deps_core::{ParsedView, TypedParseResult};
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 
-use super::{GithubActionsFormatter, GithubActionsParseResult, ParseResultTrait, Url};
+use super::{GithubActionsFormatter, GithubActionsParseResult, Url};
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
@@ -21,18 +21,18 @@ use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 pub(super) const VERSION_OPERATOR_CHARS: &[char] = &[];
 
 /// Whether `position` sits strictly past a comment-annotated SHA pin's own ref text —
-/// see `GithubActionsEcosystem::generate_completions`'s doc for why this check exists
+/// see `GithubActionsEcosystem::complete_version`'s doc for why this check exists
 /// (issue #1182) and why it cannot be a check on the extracted completion prefix.
 ///
 /// Only a `PinStyle::Sha` with a `comment` has a `version_range` extending past the ref, so
 /// only there is `position` compared against the SHA's own end column (range start plus SHA
 /// length). A position exactly at that column (still typing the SHA) is not past it.
 pub(super) fn position_past_sha_pin_own_ref(
-    parsed: &GithubActionsParseResult,
+    parsed: ParsedView<'_, GithubActionsParseResult>,
     position: Position,
 ) -> bool {
     let position: deps_core::position::Position = position.into();
-    parsed.dependencies.iter().any(|gha_dep| {
+    parsed.own_dependencies().iter().any(|gha_dep| {
         let Some(range) = gha_dep.version_range else {
             return false;
         };
@@ -64,13 +64,13 @@ pub(super) fn position_past_sha_pin_own_ref(
 /// [`GithubActionsFormatter`]'s [`deps_core::lsp_helpers::ShaPinning`] impl, which carries
 /// this guard.
 pub(super) fn build_sha_pin_action(
-    parse_result: &dyn ParseResultTrait,
+    parsed: ParsedView<'_, GithubActionsParseResult>,
     position: Position,
     uri: &Url,
     formatter: &GithubActionsFormatter,
 ) -> Option<CodeAction> {
     deps_core::lsp_helpers::build_sha_pin_action(
-        parse_result,
+        &parsed,
         position,
         uri,
         formatter,
@@ -84,16 +84,15 @@ pub(super) fn build_sha_pin_action(
 /// Locates the pin and its [`CommentCheck`] mismatch, then delegates to the shared
 /// [`deps_core::lsp_helpers::build_sha_comment_fix_action`].
 pub(super) fn build_sha_comment_fix_action(
-    parse_result: &dyn ParseResultTrait,
+    parsed: ParsedView<'_, GithubActionsParseResult>,
     position: Position,
     uri: &Url,
     formatter: &GithubActionsFormatter,
 ) -> Option<CodeAction> {
-    let dep = parse_result
-        .dependencies()
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-    let gha_dep = formatter.own_dependency(dep)?;
+    let gha_dep = parsed
+        .own_dependencies()
+        .iter()
+        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
     let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
         return None;
     };
@@ -111,14 +110,13 @@ pub(super) fn build_sha_comment_fix_action(
 /// Selects the pin through the same [`super::unknown_ref_target`] the diagnostic uses, then
 /// delegates to [`deps_core::lsp_helpers::UnknownRefTarget::fix_action`].
 pub(super) fn build_unknown_ref_fix_action(
-    parse_result: &dyn ParseResultTrait,
+    parsed: ParsedView<'_, GithubActionsParseResult>,
     position: Position,
     uri: &Url,
     formatter: &GithubActionsFormatter,
 ) -> Option<CodeAction> {
-    let dep =
-        deps_core::lsp_helpers::dependency_at_position(parse_result, position.into(), formatter)?;
-    let gha_dep = formatter.own_dependency(dep)?;
+    let gha_dep =
+        deps_core::lsp_helpers::dependency_at_position(&parsed, position.into(), formatter)?;
     super::unknown_ref_target(formatter, gha_dep)?.fix_action(uri)
 }
 
@@ -128,12 +126,12 @@ pub(super) fn build_unknown_ref_fix_action(
 /// resolvable `TagIndex` entry (cache miss) is silently skipped, exactly like that
 /// quickfix's own withholding behavior — never blocking on, or triggering, a fetch.
 pub(super) fn collect_pin_all_to_sha_edits(
-    parse_result: &dyn ParseResultTrait,
+    parsed: ParsedView<'_, GithubActionsParseResult>,
     formatter: &GithubActionsFormatter,
 ) -> Vec<TextEdit> {
-    let edits: Vec<TextEdit> = parse_result
-        .dependencies()
-        .into_iter()
+    let edits: Vec<TextEdit> = parsed
+        .own_dependencies()
+        .iter()
         .filter_map(|dep| deps_core::lsp_helpers::sha_pin_text_edit(formatter, dep))
         .collect();
     deps_core::lsp_helpers::dedup_overlapping_edits(edits, "collect_pin_all_to_sha_edits")

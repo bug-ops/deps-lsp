@@ -1,6 +1,8 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 
+#[cfg(doc)]
+use crate::EcosystemBase;
 use crate::{ConfigOwner, Ecosystem, EcosystemId, UserHome, WatchedConfigEffect};
 
 /// One ecosystem's interest in a changed config file, from
@@ -199,7 +201,7 @@ impl EcosystemRegistry {
     /// Lookup is two-stage: an exact, case-sensitive match against
     /// registered manifest filenames (e.g. `"Cargo.toml"`) is tried first;
     /// if that misses, the filename's extension is matched case-insensitively
-    /// against registered [`Ecosystem::manifest_extensions`]. This asymmetry
+    /// against registered [`EcosystemBase::manifest_extensions`]. This asymmetry
     /// is deliberate — exact filenames are canonical and case-sensitive on
     /// Unix filesystems, while extensions on unbounded basenames (e.g.
     /// `*.csproj`) come from MSBuild/Windows projects that commonly vary
@@ -248,7 +250,7 @@ impl EcosystemRegistry {
         self.get(*id)
     }
 
-    /// Matches `filename` against registered [`Ecosystem::manifest_patterns`],
+    /// Matches `filename` against registered [`EcosystemBase::manifest_patterns`],
     /// case-sensitively, returning the ecosystem id of the most specific
     /// match (greatest `prefix.len() + suffix.len()`, ties broken by pattern
     /// string ascending) rather than the first `DashMap` hit — so the result
@@ -277,13 +279,13 @@ impl EcosystemRegistry {
     ///
     /// Extracts the filename from the URI path and looks up the ecosystem.
     ///
-    /// A bare-basename [`Ecosystem::manifest_filenames`] match and a
-    /// [`Ecosystem::manifest_directory_patterns`] match are both attempted, and when they
+    /// A bare-basename [`EcosystemBase::manifest_filenames`] match and a
+    /// [`EcosystemBase::manifest_directory_patterns`] match are both attempted, and when they
     /// disagree — one registered ecosystem's basename rule and a *different* registered
     /// ecosystem's directory-and-suffix rule both match the same path — the directory
     /// pattern wins (issue #706 review finding, CRITICAL): it carries strictly more
     /// path-specific signal than a bare basename that (by design, see
-    /// [`Ecosystem::manifest_filenames`]) matches anywhere in the tree. Concretely: GitHub
+    /// [`EcosystemBase::manifest_filenames`]) matches anywhere in the tree. Concretely: GitHub
     /// Actions' `action.yml`/`action.yaml` basename match and GitLab CI's
     /// `.gitlab/ci/*.yml` directory pattern would otherwise silently race on
     /// `.gitlab/ci/action.yml`, with the basename match winning purely because it was
@@ -331,11 +333,11 @@ impl EcosystemRegistry {
 
     /// Matches a file whose containing directory path (tail) and file suffix are
     /// declared by an ecosystem's
-    /// [`manifest_directory_patterns`](Ecosystem::manifest_directory_patterns) — e.g.
+    /// [`manifest_directory_patterns`](EcosystemBase::manifest_directory_patterns) — e.g.
     /// Python's single-segment `requirements/base.txt` layout, or GitHub Actions'
     /// multi-segment `.github/workflows/ci.yml` layout, where the basename alone
     /// carries no ecosystem signal. This needs the full path, not just the basename,
-    /// so unlike [`manifest_patterns`](Ecosystem::manifest_patterns) it is consulted
+    /// so unlike [`manifest_patterns`](EcosystemBase::manifest_patterns) it is consulted
     /// only from [`for_uri`](Self::for_uri), never from
     /// [`for_filename`](Self::for_filename). Mirrors
     /// [`for_lockfile`](Self::for_lockfile)'s linear scan rather than
@@ -349,7 +351,7 @@ impl EcosystemRegistry {
     /// its own disambiguation, not silent first-match-wins.
     ///
     /// A directory pattern from one ecosystem racing a *basename*
-    /// [`manifest_filenames`](Ecosystem::manifest_filenames) entry from a different
+    /// [`manifest_filenames`](EcosystemBase::manifest_filenames) entry from a different
     /// ecosystem (e.g. GitLab CI's `.gitlab/ci/*.yml` directory
     /// pattern vs. GitHub Actions' `action.yml` basename, both matching
     /// `.gitlab/ci/action.yml`) is a separate, resolved case — this function alone cannot
@@ -400,10 +402,10 @@ impl EcosystemRegistry {
 
     /// Get ecosystem for a lock file name
     ///
-    /// An entry in [`Ecosystem::lockfile_filenames`] is either an exact name
+    /// An entry in [`EcosystemBase::lockfile_filenames`] is either an exact name
     /// (`"Cargo.lock"`) or a single-`*`-wildcard pattern
     /// (`"packages.*.lock.json"`, NuGet's per-project lock files) — the same
-    /// prefix/suffix scheme [`Ecosystem::manifest_patterns`] uses, applied
+    /// prefix/suffix scheme [`EcosystemBase::manifest_patterns`] uses, applied
     /// here via a linear scan (mirroring `get_for_directory_pattern`'s own linear scan)
     /// rather than a dedicated map, since the pattern count per ecosystem is tiny.
     ///
@@ -472,7 +474,7 @@ impl EcosystemRegistry {
     }
 
     /// Get *every* ecosystem watching `path`, each paired with the
-    /// [`crate::WatchedConfigEffect`] of its matching [`Ecosystem::watched_configs`] entry.
+    /// [`crate::WatchedConfigEffect`] of its matching [`EcosystemBase::watched_configs`] entry.
     ///
     /// Matching is [`crate::WatchedConfig::matches`] (component-wise path suffix). More than one
     /// ecosystem can watch the same config file (e.g. both npm and Deno resolve `.npmrc`),
@@ -536,7 +538,7 @@ impl EcosystemRegistry {
         matched
     }
 
-    /// Get all [`Ecosystem::watched_configs`] glob patterns for file watching —
+    /// Get all [`EcosystemBase::watched_configs`] glob patterns for file watching —
     /// mirrors [`Self::all_lockfile_patterns`], scanning the *config* list instead.
     ///
     /// Deduplicated (issue #1232 M1): more than one ecosystem can watch the same config
@@ -580,7 +582,7 @@ impl Default for EcosystemRegistry {
     }
 }
 
-/// Matches a lock file `filename` against one [`Ecosystem::lockfile_filenames`] entry: an
+/// Matches a lock file `filename` against one [`EcosystemBase::lockfile_filenames`] entry: an
 /// exact name, or — for a NuGet-style `packages.*.lock.json` entry — a single-`*`
 /// prefix/suffix pattern, the same scheme [`EcosystemRegistry::register`] uses to split
 /// `manifest_patterns` (S2, #451 follow-up).
@@ -634,7 +636,7 @@ fn directory_pattern_matches(path: &str, filename: &str, dir_pattern: &str, suff
     }
 }
 
-/// Whether `filename` matches a raw [`Ecosystem::manifest_patterns`] entry (e.g.
+/// Whether `filename` matches a raw [`EcosystemBase::manifest_patterns`] entry (e.g.
 /// `"requirements*.txt"`).
 ///
 /// Applies the same single-`*`-wildcard semantics
@@ -643,7 +645,7 @@ fn directory_pattern_matches(path: &str, filename: &str, dir_pattern: &str, suff
 ///
 /// Exposed so an ecosystem can ask "would my own `manifest_patterns` have matched this
 /// basename?" independently of an `EcosystemRegistry` instance — e.g. to gate a
-/// [`Ecosystem::manifest_directory_patterns`]-only match more strictly than a primary
+/// [`EcosystemBase::manifest_directory_patterns`]-only match more strictly than a primary
 /// basename match (#452 S6): a file routed to an ecosystem purely by directory-name
 /// convention carries far weaker "this really is a manifest" evidence than one that
 /// also matches a basename pattern.
@@ -673,18 +675,9 @@ pub fn manifest_pattern_matches(filename: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
     use std::path::Path;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
 
-    #[cfg(feature = "lsp-responses")]
-    use crate::completion::Completions;
-    use crate::test_util::StubFormatter;
-    use crate::{
-        ConfigReach, OwnerReach, ParseResult, Registry, UserHome, WatchedConfig,
-        lsp_helpers::EcosystemFormatter,
-    };
+    use crate::{ConfigReach, OwnerReach, Registry, UserHome, WatchedConfig};
 
     struct MockEcosystem {
         id: &'static str,
@@ -708,7 +701,7 @@ mod tests {
 
     impl crate::ecosystem::private::Sealed for MockEcosystem {}
 
-    impl Ecosystem for MockEcosystem {
+    impl crate::ecosystem::EcosystemBase for MockEcosystem {
         // Routing tests below assert on `self.id`, an arbitrary test label (e.g. "test",
         // "exact") that is not always a real `EcosystemId` variant, so `id()` stays an
         // explicit override rather than deriving from `ecosystem_id()`.
@@ -736,51 +729,16 @@ mod tests {
             self.watched_configs
         }
 
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            _uri: &'a url::Url,
-        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
-            Box::pin(async move { unimplemented!() })
-        }
-
         fn registry(&self) -> Arc<dyn Registry> {
-            unimplemented!()
-        }
-
-        fn formatter(&self) -> &dyn EcosystemFormatter {
-            &StubFormatter::DEFAULT
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn generate_completions<'a>(
-            &'a self,
-            _parse_result: &'a dyn ParseResult,
-            _position: Position,
-            _content: &'a str,
-            _freshness: crate::FreshnessSettings,
-        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
-            Box::pin(async move { Completions::default() })
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn complete_version<'a>(
-            &'a self,
-            _request: crate::completion::CompletionRequest<'a>,
-            _package_name: crate::PackageName,
-            _prefix: String,
-        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             unimplemented!()
         }
 
         fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
             unimplemented!()
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
+
+    crate::impl_stub_typed_ecosystem!(MockEcosystem);
 
     // Unbounded-basename extension routing, mirrors NuGet's *.csproj
     struct MockExtEcosystem {
@@ -792,7 +750,7 @@ mod tests {
 
     impl crate::ecosystem::private::Sealed for MockExtEcosystem {}
 
-    impl Ecosystem for MockExtEcosystem {
+    impl crate::ecosystem::EcosystemBase for MockExtEcosystem {
         fn id(&self) -> &'static str {
             self.id
         }
@@ -813,51 +771,16 @@ mod tests {
             self.extensions
         }
 
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            _uri: &'a url::Url,
-        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
-            Box::pin(async move { unimplemented!() })
-        }
-
         fn registry(&self) -> Arc<dyn Registry> {
-            unimplemented!()
-        }
-
-        fn formatter(&self) -> &dyn EcosystemFormatter {
-            &StubFormatter::DEFAULT
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn generate_completions<'a>(
-            &'a self,
-            _parse_result: &'a dyn ParseResult,
-            _position: Position,
-            _content: &'a str,
-            _freshness: crate::FreshnessSettings,
-        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
-            Box::pin(async move { Completions::default() })
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn complete_version<'a>(
-            &'a self,
-            _request: crate::completion::CompletionRequest<'a>,
-            _package_name: crate::PackageName,
-            _prefix: String,
-        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             unimplemented!()
         }
 
         fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
             unimplemented!()
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
+
+    crate::impl_stub_typed_ecosystem!(MockExtEcosystem);
 
     // Mock ecosystem with basename patterns (mirrors PyPI's `requirements*.txt`) and,
     // since issue #706's review, exact `manifest_filenames` too (mirrors GitHub Actions'
@@ -872,7 +795,7 @@ mod tests {
 
     impl crate::ecosystem::private::Sealed for MockPatternEcosystem {}
 
-    impl Ecosystem for MockPatternEcosystem {
+    impl crate::ecosystem::EcosystemBase for MockPatternEcosystem {
         fn id(&self) -> &'static str {
             self.id
         }
@@ -897,51 +820,16 @@ mod tests {
             self.dir_patterns
         }
 
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            _uri: &'a url::Url,
-        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
-            Box::pin(async move { unimplemented!() })
-        }
-
         fn registry(&self) -> Arc<dyn Registry> {
-            unimplemented!()
-        }
-
-        fn formatter(&self) -> &dyn EcosystemFormatter {
-            &StubFormatter::DEFAULT
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn generate_completions<'a>(
-            &'a self,
-            _parse_result: &'a dyn ParseResult,
-            _position: Position,
-            _content: &'a str,
-            _freshness: crate::FreshnessSettings,
-        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
-            Box::pin(async move { Completions::default() })
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn complete_version<'a>(
-            &'a self,
-            _request: crate::completion::CompletionRequest<'a>,
-            _package_name: crate::PackageName,
-            _prefix: String,
-        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
             unimplemented!()
         }
 
         fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
             unimplemented!()
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
+
+    crate::impl_stub_typed_ecosystem!(MockPatternEcosystem);
 
     fn pypi_pattern_registry() -> EcosystemRegistry {
         let registry = EcosystemRegistry::new();
@@ -1872,7 +1760,7 @@ mod tests {
         );
     }
 
-    /// Routing keys on `Ecosystem::ecosystem_id`, not `Ecosystem::id` — even when an
+    /// Routing keys on `EcosystemBase::ecosystem_id`, not `EcosystemBase::id` — even when an
     /// implementor overrides `id()` to something that disagrees with `ecosystem_id()` (as
     /// `ecosystem::tests::StubEcosystem` does). Uses `MockEcosystem` here (`StubEcosystem`
     /// is private to its own module) with `id: "not-cargo"` deliberately mismatched against

@@ -1,11 +1,12 @@
+use crate::types::CargoDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
-    bare_meaning, compile_semver_requirement, format_version_replacing_by_shape,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, bare_meaning, compile_semver_requirement, format_version_replacing_by_shape,
     up_to_date_for_comparators_via_compiled_matcher,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
 
 /// Maximum crate name length this diagnostic accepts.
 ///
@@ -141,17 +142,6 @@ impl PackageRendering for CargoFormatter {
         self.render_replacing(version, current, RewriteTarget::Update)
     }
 
-    /// Security-fix and cooldown-fallback targets keep the full picked version in a tilde
-    /// requirement (`~0.7` -> `~0.7.3`), so the floor never drops below `version`.
-    fn format_version_replacing_floor_for(
-        &self,
-        _dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        self.render_replacing(version, current, RewriteTarget::Floor)
-    }
-
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::crate_url(name.as_str())
     }
@@ -165,6 +155,21 @@ impl PackageRendering for CargoFormatter {
     /// fetched elsewhere.
     fn suppress_package_url(&self, source: &DependencySource) -> bool {
         !self.source_is_public_registry_content(source)
+    }
+}
+
+impl DependencyFormatter for CargoFormatter {
+    type Dep = CargoDependency;
+
+    /// Security-fix and cooldown-fallback targets keep the full picked version in a tilde
+    /// requirement (`~0.7` -> `~0.7.3`), so the floor never drops below `version`.
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &CargoDependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        self.render_replacing(version, current, RewriteTarget::Floor)
     }
 }
 

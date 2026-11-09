@@ -306,10 +306,6 @@ impl deps_core::Dependency for CargoDependency {
     fn features_range(&self) -> Option<Range> {
         self.features_range
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 impl deps_core::Version for CargoVersion {

@@ -337,7 +337,7 @@ impl NpmRegistry {
     /// [`DepsError::PackageNotFound`] at fetch time, spec FR-010) rather than evicting an
     /// existing, possibly still-in-use, client.
     ///
-    /// Called only from `NpmEcosystem::parse_manifest` over `NpmParseResult::resolved_registries`
+    /// Called only from `NpmEcosystem::parse` over `NpmParseResult::resolved_registries`
     /// — the one place a per-document `.npmrc` resolution and this long-lived shared router
     /// meet. Registration is parse-time-only; there is no lazy creation on the fetch path
     /// (spec FR-010 dispatch table).

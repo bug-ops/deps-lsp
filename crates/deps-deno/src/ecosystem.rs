@@ -8,15 +8,15 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
-    WatchedConfigEffect, lsp_helpers::EcosystemFormatter,
+    ConfigReach, EcosystemBase, Registry, Result, TypedEcosystem, WatchedConfig,
+    WatchedConfigEffect,
 };
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
 
 use crate::formatter::DenoFormatter;
+use crate::parser::DenoParseResult;
 use crate::registry::DenoRegistry;
 
 use deps_npm::NpmRegistry;
@@ -170,7 +170,7 @@ const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
     ConfigReach::Subtree,
 )];
 
-impl Ecosystem for DenoEcosystem {
+impl EcosystemBase for DenoEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Deno
     }
@@ -189,42 +189,8 @@ impl Ecosystem for DenoEcosystem {
         &WATCHED_CONFIGS
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a url::Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_deno_json_with_context(content, uri, &self.context)?;
-            // Registers `.npmrc`-resolved alternate indices (#1227), mirroring `NpmEcosystem`.
-            for index in result.resolved_registries.clone() {
-                self.registry.register_alternate_npm(index);
-            }
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_package_name<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        prefix: String,
-        range: Range,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn version_operator_chars(&self) -> &'static [char] {
-        VERSION_OPERATOR_CHARS
     }
 
     fn fallback_completion_prefix<'a>(
@@ -261,10 +227,6 @@ impl Ecosystem for DenoEcosystem {
         }
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
     /// `version` (issue #660/#688) from the JSR per-version API. See
     /// [`crate::registry::DenoRegistry::get_license`].
@@ -284,6 +246,45 @@ impl Ecosystem for DenoEcosystem {
     }
 }
 
+impl TypedEcosystem for DenoEcosystem {
+    type Parsed = DenoParseResult;
+    type Formatter = DenoFormatter;
+
+    fn own_formatter(&self) -> &DenoFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a url::Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<DenoParseResult>> {
+        Box::pin(async move {
+            let result = crate::parser::parse_deno_json_with_context(content, uri, &self.context)?;
+            // Registers `.npmrc`-resolved alternate indices (#1227), mirroring `NpmEcosystem`.
+            for index in result.resolved_registries.clone() {
+                self.registry.register_alternate_npm(index);
+            }
+            Ok(result)
+        })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_package_name<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, Self::Parsed>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
+    }
+}
+
 /// Checks if `line_number` of `content` is inside deno.json's `imports` mapping, for
 /// `deps-lsp`'s raw-text fallback completion (parse-failure path).
 fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
@@ -299,7 +300,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::VersionData;
+    use deps_core::{ParsedView, VersionData};
     use std::assert_matches;
     use std::collections::HashMap;
 
@@ -323,7 +324,8 @@ mod tests {
     /// (not auto-following), so FR-025's rule is unconditional — one assertion suffices.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
-        let ecosystem = DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(DenoEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let uri = deps_core::test_util::test_uri("/test/deno.json");
         for (requirement, expected) in [
             (
@@ -408,12 +410,12 @@ mod tests {
 
         let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0"}}"#;
 
-        let result = ecosystem.parse_manifest(content, &uri).await;
+        let result = ecosystem.parse(content, &uri).await;
         assert!(result.is_ok());
-        assert!(!result.unwrap().dependencies().is_empty());
+        assert!(!result.unwrap().dependencies.is_empty());
     }
 
-    /// S2 (task #11): proves `DenoEcosystem::parse_manifest`'s own registration loop
+    /// S2 (task #11): proves `DenoEcosystem::parse`'s own registration loop
     /// (`ecosystem.rs:205-210`) — not a manually-called `register_alternate_npm` — is what
     /// wires an `.npmrc`-resolved alternate registry into the shared router. No test called
     /// `register_alternate_npm` from `parse_manifest` before this: deleting that loop left
@@ -461,10 +463,12 @@ mod tests {
 
         // No manual `register_alternate_npm` call — the registration under test must come
         // solely from `parse_manifest`'s own loop.
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let deps = parse_result.dependencies();
-        let dep = deps.first().expect("one npm: dependency");
-        let source = dep.source();
+        let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+        let dep = parse_result
+            .dependencies
+            .first()
+            .expect("one npm: dependency");
+        let source = dep.source.clone();
         assert_matches!(
             source,
             deps_core::parser::DependencySource::AlternateRegistry { .. },
@@ -473,7 +477,7 @@ mod tests {
 
         let versions = Registry::get_versions_from(
             ecosystem.registry.as_ref(),
-            dep.name(),
+            &dep.name,
             &source,
             deps_core::FreshnessSettings::default(),
         )
@@ -491,7 +495,7 @@ mod tests {
         let ecosystem = DenoEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/deno.json");
 
-        let result = ecosystem.parse_manifest("{ not valid !!", &uri).await;
+        let result = ecosystem.parse("{ not valid !!", &uri).await;
         assert!(result.is_err());
     }
 
@@ -511,7 +515,7 @@ mod tests {
             "ts": "npm:typescript@^2.0.0",
             "fmt": "jsr:@std/fmt@^3.0.0"
         }}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = ecosystem.parse(content, &uri).await.unwrap();
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
@@ -537,8 +541,8 @@ mod tests {
         let resolved_versions = HashMap::new();
 
         let diagnostics = ecosystem
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -594,7 +598,7 @@ mod tests {
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
         }
-        fn as_any(&self) -> &dyn Any {
+        fn as_any(&self) -> &dyn std::any::Any {
             self
         }
     }
@@ -685,12 +689,12 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/deno.json");
 
             let content = r#"{"name": "test"}"#;
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position::new(0, 0);
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),

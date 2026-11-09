@@ -24,7 +24,10 @@ tokio = { version = "1.0", features = ["full"] }
 "#;
 
     let ecosystem = state.ecosystem_registry.get(EcosystemId::Cargo).unwrap();
-    let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+    let parse_result = Arc::clone(&ecosystem)
+        .parse_manifest(content, &url)
+        .await
+        .unwrap();
 
     let doc =
         DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse_result);
@@ -137,8 +140,14 @@ serde = "1.0.0"
 
     let ecosystem = state.ecosystem_registry.get(EcosystemId::Cargo).unwrap();
 
-    let parse1 = ecosystem.parse_manifest(content, &url1).await.unwrap();
-    let parse2 = ecosystem.parse_manifest(content, &url2).await.unwrap();
+    let parse1 = Arc::clone(&ecosystem)
+        .parse_manifest(content, &url1)
+        .await
+        .unwrap();
+    let parse2 = Arc::clone(&ecosystem)
+        .parse_manifest(content, &url2)
+        .await
+        .unwrap();
 
     let mut doc1 =
         DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse1);

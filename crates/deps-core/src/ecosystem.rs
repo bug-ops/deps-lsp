@@ -1,20 +1,18 @@
-use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, DocumentLink, InlayHint, Position, TextEdit,
-};
 
-#[cfg(feature = "lsp-responses")]
-use crate::completion::Completions;
-#[cfg(feature = "lsp-responses")]
-use crate::hover::Hover;
+mod manifest;
+pub mod typed;
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) use manifest::EcosystemManifest;
+pub use manifest::ParsedManifest;
+pub use typed::TypedEcosystem;
+
 use crate::{
     Registry,
-    diagnostic::Diagnostic,
-    lsp_helpers::{EcosystemFormatter, VersionData},
+    lsp_helpers::EcosystemFormatter,
     position::Range,
     registry::Metadata,
     selection::{InvalidStabilityOccurrence, SelectionContext},
@@ -51,7 +49,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// Runs `ecosystem.parse_manifest(content, uri)` on the blocking-thread pool instead of the
 /// calling tokio worker.
 ///
-/// Every [`Ecosystem::parse_manifest`] implementation is synchronous work wrapped in an
+/// Every [`TypedEcosystem::parse`] implementation is synchronous work wrapped in an
 /// immediately-ready `async move` block (verified: no implementation contains a real
 /// `.await`). Driving that future to completion via [`tokio::runtime::Handle::block_on`]
 /// from inside [`tokio::task::spawn_blocking`] moves the CPU-bound parse off the tokio
@@ -79,14 +77,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// (`LockFileCache::get_or_parse` → `tokio::fs::metadata`) when the manifest declares a bare
 /// vcs/path/artifact repository and a `composer.lock` exists. `block_on` still resolves
 /// correctly here since it runs inside `spawn_blocking` on a real tokio worker thread, but an
-/// unoverridden [`Ecosystem::parse_manifest_sync`] default's `now_or_never()` cannot drive that
+/// unoverridden [`TypedEcosystem::parse_sync`] default's `now_or_never()` cannot drive that
 /// same await to completion — [`parse_manifest_now`] uses that method rather than
-/// [`Ecosystem::parse_manifest`] directly for exactly this reason (issue #1570): Composer
+/// [`TypedEcosystem::parse`] directly for exactly this reason (issue #1570): Composer
 /// overrides it instead of racing the await, see its own doc.
 ///
 /// # Errors
 ///
-/// Returns whatever [`Ecosystem::parse_manifest`] returns for a malformed manifest, or a
+/// Returns whatever [`TypedEcosystem::parse`] returns for a malformed manifest, or a
 /// [`crate::error::DepsError::ParseError`] if the blocking task panics or is cancelled.
 ///
 /// # Examples
@@ -106,32 +104,27 @@ pub async fn parse_manifest_blocking(
     ecosystem: &Arc<dyn Ecosystem>,
     content: &str,
     uri: &url::Url,
-) -> crate::error::Result<Box<dyn ParseResult>> {
+) -> crate::error::Result<Box<dyn ParsedManifest>> {
     let ecosystem = Arc::clone(ecosystem);
     let owned_content = content.to_owned();
     let owned_uri = uri.clone();
     let handle = tokio::runtime::Handle::current();
-    let parsed = tokio::task::spawn_blocking(move || {
+    // Single chokepoint for #796: `parse_manifest` wraps every ecosystem's parse result in a
+    // manifest that caps its dependencies, once, rather than each ecosystem crate's own parser
+    // bounding its dependency count independently.
+    tokio::task::spawn_blocking(move || {
         handle.block_on(ecosystem.parse_manifest(&owned_content, &owned_uri))
     })
     .await
-    .map_err(|e| crate::error::DepsError::parse_error(format!("manifest at {uri:?}"), &e))??;
-
-    // Single chokepoint for #796: every ecosystem's parse result is capped here, once,
-    // rather than each ecosystem crate's own parser bounding its dependency count
-    // independently.
-    Ok(crate::dependency_cap::cap_dependencies(
-        parsed,
-        crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
-    ))
+    .map_err(|e| crate::error::DepsError::parse_error(format!("manifest at {uri:?}"), &e))?
 }
 
 /// Synchronous sibling of [`parse_manifest_blocking`], for a caller that cannot `.await`.
 ///
 /// Spec 076 FR-024: the fallback-edit re-parse guard, evaluated inside `deps-cli`'s synchronous
-/// planner. Drives [`Ecosystem::parse_manifest_sync`] instead of spawning onto the
-/// blocking-thread pool, then applies the SAME [`crate::dependency_cap::cap_dependencies`]
-/// chokepoint [`parse_manifest_blocking`] applies — a raw `now_or_never()` call site with no cap
+/// planner. Drives [`TypedEcosystem::parse_sync`] instead of spawning onto the
+/// blocking-thread pool; the returned manifest applies the SAME dependency cap
+/// [`parse_manifest_blocking`] applies — a raw `now_or_never()` call site with no cap
 /// would otherwise be a second, uncapped parse entry point (round-3 critic M2, #796).
 ///
 /// Returns `None` when called outside a tokio runtime context, when
@@ -161,17 +154,17 @@ pub async fn parse_manifest_blocking(
 /// use deps_core::Ecosystem;
 /// use url::Url;
 ///
-/// # fn example(ecosystem: &dyn Ecosystem, uri: Url) {
+/// # fn example(ecosystem: &std::sync::Arc<dyn Ecosystem>, uri: Url) {
 /// if let Some(parsed) = deps_core::ecosystem::parse_manifest_now(ecosystem, "content", &uri) {
 ///     println!("{} dependencies", parsed.dependencies().len());
 /// }
 /// # }
 /// ```
 pub fn parse_manifest_now(
-    ecosystem: &dyn Ecosystem,
+    ecosystem: &Arc<dyn Ecosystem>,
     content: &str,
     uri: &url::Url,
-) -> Option<Box<dyn ParseResult>> {
+) -> Option<Box<dyn ParsedManifest>> {
     // Fail closed instead of panicking when called outside a tokio runtime context (fix-cycle
     // security LOW-1): an unoverridden `parse_manifest_sync` default drives a real future via
     // `now_or_never()`, which panics ("there is no reactor running") if that future touches
@@ -179,11 +172,7 @@ pub fn parse_manifest_now(
     // crash.
     tokio::runtime::Handle::try_current().ok()?;
 
-    let parsed = ecosystem.parse_manifest_sync(content, uri)?;
-    Some(crate::dependency_cap::cap_dependencies(
-        parsed,
-        crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
-    ))
+    Arc::clone(ecosystem).parse_manifest_sync(content, uri)
 }
 
 /// Defines [`EcosystemId`] together with [`EcosystemId::ALL`], [`EcosystemId::id`] and its
@@ -195,7 +184,7 @@ macro_rules! ecosystem_ids {
     ( $( $(#[$vmeta:meta])* $variant:ident => $id:literal ),+ $(,)? ) => {
         /// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
         ///
-        /// [`Ecosystem::id`] returns a `&'static str` for registry lookups and document
+        /// [`EcosystemBase::id`] returns a `&'static str` for registry lookups and document
         /// storage, but any code that needs to *branch* on ecosystem identity should match on
         /// this enum instead of re-deriving its own partial match over that string: an
         /// unhandled variant here is a compile error, while an unhandled string is a silent
@@ -231,7 +220,7 @@ macro_rules! ecosystem_ids {
             /// missing-match compile error, not a silently incomplete set.
             pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
 
-            /// Returns the canonical string identifier, matching [`Ecosystem::id`] for the
+            /// Returns the canonical string identifier, matching [`EcosystemBase::id`] for the
             /// corresponding ecosystem implementation.
             #[must_use]
             pub const fn id(self) -> &'static str {
@@ -541,6 +530,10 @@ impl RejectedSourceClass {
 ///
 /// Implementations hold ecosystem-specific dependency types
 /// but expose them through trait object interfaces.
+///
+/// A new provided method must also be forwarded by `ParsedView`'s and the internal
+/// `EcosystemManifest`'s impls (both deny `clippy::missing_trait_methods`), or it silently
+/// falls back to the default on every document.
 pub trait ParseResult: Send + Sync {
     /// All dependencies found in the manifest
     fn dependencies(&self) -> Vec<&dyn Dependency>;
@@ -632,15 +625,12 @@ pub trait ParseResult: Send + Sync {
         Vec::new()
     }
 
-    /// Downcast to concrete type for ecosystem-specific operations
-    fn as_any(&self) -> &dyn Any;
-
     /// Dependency-count ceiling info (#796): `Some((kept, total))` once this document's
     /// dependency count was truncated to [`crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT`]
     /// by [`parse_manifest_blocking`], `None` otherwise.
     ///
     /// The default (and every concrete ecosystem parser) returns `None` — only the
-    /// wrapper [`parse_manifest_blocking`] installs when truncating overrides it, so this
+    /// [`ParsedManifest`] [`parse_manifest_blocking`] returns reports a truncation, so this
     /// needs no per-ecosystem implementation. Read by
     /// `deps_core::lsp_helpers::diagnostics`' truncation notice.
     fn dependency_truncation(&self) -> Option<(usize, usize)> {
@@ -743,9 +733,6 @@ pub trait Dependency: Send + Sync {
     fn name_range_is_synthetic(&self) -> bool {
         false
     }
-
-    /// Downcast to concrete type
-    fn as_any(&self) -> &dyn Any;
 }
 
 /// Configuration for LSP inlay hints feature.
@@ -1262,7 +1249,7 @@ impl WatchedConfig {
 /// identifiers before hover displays it or a [`crate::licenses::LicensePolicy`]
 /// evaluates it, which only applies to [`Self::PomFreeText`]; and, via
 /// [`Self::requires_dedicated_fetch`] (issue #697), whether
-/// [`Ecosystem::fetch_license`] is a dedicated async fetch or a no-op because the
+/// [`EcosystemBase::fetch_license`] is a dedicated async fetch or a no-op because the
 /// license already arrived in the hot-path registry response.
 ///
 /// # Examples
@@ -1278,7 +1265,7 @@ impl WatchedConfig {
 pub enum LicenseSource {
     /// Author-declared SPDX identifier(s) already present in the hot-path registry
     /// response — the default for every ecosystem that doesn't override
-    /// [`Ecosystem::license_source`], and the only variant for which
+    /// [`EcosystemBase::license_source`], and the only variant for which
     /// [`Self::requires_dedicated_fetch`] is `false`.
     #[default]
     RegistryDeclaredSpdx,
@@ -1298,12 +1285,12 @@ pub enum LicenseSource {
 }
 
 impl LicenseSource {
-    /// Whether this source requires [`Ecosystem::fetch_license`]'s dedicated async
+    /// Whether this source requires [`EcosystemBase::fetch_license`]'s dedicated async
     /// fetch, as opposed to arriving for free in the hot-path registry response.
     ///
     /// This is the single answer to "is this a tier-3 license ecosystem" (issue #697):
     /// capability and shape can no longer disagree, because both come from the same
-    /// [`Ecosystem::license_source`] call.
+    /// [`EcosystemBase::license_source`] call.
     ///
     /// # Examples
     ///
@@ -1324,16 +1311,12 @@ impl LicenseSource {
     }
 }
 
-/// Main trait that all ecosystem implementations must implement.
+/// The parse-result-free surface of a package ecosystem: identity, manifest routing, registry
+/// access, lock files, fallback completion and license sourcing.
 ///
-/// Each ecosystem (Cargo, npm, PyPI, etc.) provides its own implementation.
-/// This trait defines the contract for parsing manifests, fetching registry data,
-/// and generating LSP responses.
-///
-/// # Type Erasure
-///
-/// This trait uses `Box<dyn Trait>` instead of associated types to allow
-/// runtime polymorphism and dynamic ecosystem registration.
+/// Every ecosystem implements this trait directly, next to [`TypedEcosystem`], which carries
+/// everything that reads a parsed document. Type-erased consumers reach both through
+/// [`Ecosystem`], whose supertrait this is.
 ///
 /// # Sealing
 ///
@@ -1344,134 +1327,12 @@ impl LicenseSource {
 /// `private` to be `pub`; Rust has no visibility level that admits sibling crates while
 /// excluding a truly external one, so this guarantee cannot be enforced any harder than that
 /// without inverting the crate's whole multi-crate extension-point architecture. See
-/// [`private::Sealed`]'s own doc for the full reasoning, and the `impl private::Sealed`
-/// line in the example below for what implementing it in practice looks like.
+/// [`private::Sealed`]'s own doc for the full reasoning.
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion, Metadata};
-/// use deps_core::completion::{Completions, build_feature_completion};
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
-///     PackageRendering, RequirementResolution, SourcePolicy,
-/// };
-/// use std::sync::Arc;
-/// use std::any::Any;
-/// use tower_lsp_server::ls_types::{
-///     CompletionItem, CompletionTextEdit, Position, Range, TextEdit,
-/// };
-/// use url::Url;
-///
-/// struct MyFormatter;
-/// impl PackageNaming for MyFormatter {}
-/// impl PackageRendering for MyFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
-///     fn package_url(&self, name: &PackageName) -> String { format!("https://example.com/{}", name.as_str()) }
-/// }
-/// impl RequirementResolution for MyFormatter {}
-/// impl DiagnosticMessages for MyFormatter {}
-/// impl DiagnosticPolicy for MyFormatter {}
-/// impl SourcePolicy for MyFormatter {}
-/// impl OsvNaming for MyFormatter {}
-///
-/// struct MyEcosystem {
-///     registry: Arc<dyn Registry>,
-///     formatter: MyFormatter,
-/// }
-///
-/// // Real in-workspace ecosystem crates implement `Sealed` exactly like this. This line
-/// // compiling here, out-of-crate, is not a bug: as the `# Sealing` section above explains,
-/// // `private::Sealed` is a documented contract, not a compiler-enforced wall — Rust has no
-/// // visibility level that admits sibling workspace crates while excluding a truly external
-/// // one, so any crate that names this path can technically do the same.
-/// impl deps_core::ecosystem::private::Sealed for MyEcosystem {}
-///
-/// impl Ecosystem for MyEcosystem {
-///     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
-///     fn display_name(&self) -> &'static str { "My Ecosystem" }
-///     fn manifest_filenames(&self) -> &[&'static str] { &["my-manifest.toml"] }
-///
-///     fn parse_manifest<'a>(
-///         &'a self,
-///         _content: &'a str,
-///         _uri: &'a Url,
-///     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::error::Result<Box<dyn ParseResult>>> {
-///         Box::pin(async move { todo!() })
-///     }
-///
-///     fn registry(&self) -> Arc<dyn Registry> { self.registry.clone() }
-///
-///     fn formatter(&self) -> &dyn EcosystemFormatter { &self.formatter }
-///
-///     // Hook for `CompletionContext::PackageName` — called by `generate_completions`'s
-///     // default dispatch (below) whenever the cursor sits in a package-name token. A
-///     // real ecosystem would search `self.registry` for `prefix` and build one item per
-///     // match, e.g. via `deps_core::completion::complete_package_names_generic`.
-///     fn complete_package_name<'a>(
-///         &'a self,
-///         _request: deps_core::completion::CompletionRequest<'a>,
-///         prefix: String,
-///         range: Range,
-///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-///         Box::pin(async move {
-///             let item = CompletionItem {
-///                 label: prefix.clone(),
-///                 text_edit: Some(CompletionTextEdit::Edit(TextEdit { range, new_text: prefix })),
-///                 ..Default::default()
-///             };
-///             Completions::new(vec![item])
-///         })
-///     }
-///
-///     // Hook for `CompletionContext::Version` — called by `generate_completions`'s
-///     // default dispatch whenever the cursor sits in a version-requirement token.
-///     fn complete_version<'a>(
-///         &'a self,
-///         _request: deps_core::completion::CompletionRequest<'a>,
-///         _package_name: PackageName,
-///         _prefix: String,
-///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-///         Box::pin(async move { Completions::default() })
-///     }
-///
-///     // Hook for `CompletionContext::Feature` — called by `generate_completions`'s
-///     // default dispatch whenever the cursor sits in a feature-flag array entry. Reuses
-///     // the shared `build_feature_completion` helper rather than hand-building the item.
-///     fn complete_feature<'a>(
-///         &'a self,
-///         _request: deps_core::completion::CompletionRequest<'a>,
-///         package_name: PackageName,
-///         prefix: String,
-///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-///         Box::pin(async move {
-///             let items = build_feature_completion(&prefix, &package_name, None)
-///                 .into_iter()
-///                 .collect();
-///             Completions::new(items)
-///         })
-///     }
-///
-///     fn completion_insert_text(&self, metadata: &dyn Metadata) -> Option<String> {
-///         Some(format!("\"{}\" = \"{}\"", metadata.name().as_str(), metadata.latest_version()))
-///     }
-///
-///     fn as_any(&self) -> &dyn Any { self }
-/// }
-///
-/// // `generate_completions` is not overridden above, so `MyEcosystem` inherits this
-/// // trait's default implementation: it detects the `CompletionContext` at `position` and
-/// // dispatches to whichever of the three hooks above matches — the "three-hook pattern".
-/// # async fn dispatch_demo(ecosystem: &MyEcosystem, parse_result: &dyn ParseResult) {
-/// let freshness = deps_core::FreshnessSettings::default();
-/// let position = Position { line: 0, character: 0 };
-/// let content = r#"serde = "1.0""#;
-/// let _completions = ecosystem
-///     .generate_completions(parse_result, position, content, freshness)
-///     .await;
-/// # }
-/// ```
-pub trait Ecosystem: Send + Sync + private::Sealed {
+/// See [`TypedEcosystem`] for a complete implementation.
+pub trait EcosystemBase: Send + Sync + private::Sealed {
     /// Exhaustively typed ecosystem identity.
     ///
     /// Every implementor lives in this sealed trait's own workspace, so the enum is
@@ -1508,7 +1369,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// not fixed (e.g. `[".csproj", ".fsproj"]` for NuGet project files).
     ///
     /// Consulted by [`crate::EcosystemRegistry::for_filename`] only after
-    /// an exact [`manifest_filenames`](Ecosystem::manifest_filenames) match
+    /// an exact [`manifest_filenames`](EcosystemBase::manifest_filenames) match
     /// fails. Empty by default, indicating this ecosystem is routed solely by
     /// exact filename.
     fn manifest_extensions(&self) -> &[&'static str] {
@@ -1520,8 +1381,8 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Consulted by [`crate::EcosystemRegistry::for_filename`] as a third
     /// routing stage, tried after an exact
-    /// [`manifest_filenames`](Ecosystem::manifest_filenames) match fails and
-    /// before [`manifest_extensions`](Ecosystem::manifest_extensions) — for
+    /// [`manifest_filenames`](EcosystemBase::manifest_filenames) match fails and
+    /// before [`manifest_extensions`](EcosystemBase::manifest_extensions) — for
     /// basenames that are neither fixed nor identified by extension alone
     /// (e.g. `requirements.txt`, `requirements-dev.txt`). Empty by default.
     /// Matching is case-sensitive, unlike the extension stage: these patterns
@@ -1545,8 +1406,8 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// no ecosystem signal.
     ///
     /// Consulted by [`crate::EcosystemRegistry::for_uri`] only, after both
-    /// [`manifest_patterns`](Ecosystem::manifest_patterns) and
-    /// [`manifest_extensions`](Ecosystem::manifest_extensions) miss on the
+    /// [`manifest_patterns`](EcosystemBase::manifest_patterns) and
+    /// [`manifest_extensions`](EcosystemBase::manifest_extensions) miss on the
     /// basename — it needs the full path, so it is never reachable from
     /// [`crate::EcosystemRegistry::for_filename`]. Empty by default.
     fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
@@ -1566,7 +1427,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
-    /// Non-lockfile config files this ecosystem resolves *during* [`Self::parse_manifest`]
+    /// Non-lockfile config files this ecosystem resolves *during* [`TypedEcosystem::parse`]
     /// (e.g. `pnpm-workspace.yaml` and `.npmrc` for npm's catalog and registry resolution),
     /// whose values end up baked into a manifest's `ParseResult` rather than looked up
     /// separately the way a [`Self::lockfile_provider`] is.
@@ -1583,45 +1444,6 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Returns an empty slice: no config files are watched.
     fn watched_configs(&self) -> &[WatchedConfig] {
         &[]
-    }
-
-    /// Parse a manifest file and return parsed result
-    ///
-    /// # Arguments
-    ///
-    /// * `content` - Raw file content
-    /// * `uri` - Document URI for position tracking
-    ///
-    /// # Errors
-    ///
-    /// Returns error if manifest cannot be parsed
-    ///
-    /// # Invariant
-    ///
-    /// Implementations must not contain a real `.await` (no network/file I/O, no yielding to
-    /// the scheduler) — the body must be synchronous work wrapped in an immediately-ready
-    /// `async move` block. [`parse_manifest_blocking`] relies on this to drive the future via
-    /// `Handle::block_on` on the blocking-thread pool; violating it doesn't deadlock, but
-    /// silently reintroduces the exact worker-thread stall #743 fixed.
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a url::Url,
-    ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>;
-
-    /// Synchronous variant of [`Self::parse_manifest`] for [`parse_manifest_now`]'s FR-024
-    /// fallback-edit-guard re-parse (spec 076, issue #1570), which only needs the re-parsed
-    /// requirement's text/shape, never fully resolved source classification.
-    ///
-    /// The default drives [`Self::parse_manifest`]'s future via `now_or_never()`, relying on
-    /// this trait's documented no-real-`.await` invariant. Override this — never make
-    /// [`Self::parse_manifest`] itself lie about that invariant — when a genuine await exists
-    /// (Composer's `ComposerEcosystem` overrides this for its bare vcs/path/artifact repository
-    /// plus a `composer.lock` case) so this guard-only call can skip whatever that await would
-    /// have resolved instead of racing `now_or_never()` against it.
-    fn parse_manifest_sync(&self, content: &str, uri: &url::Url) -> Option<Box<dyn ParseResult>> {
-        use futures::FutureExt;
-        self.parse_manifest(content, uri).now_or_never()?.ok()
     }
 
     /// Get the registry client for this ecosystem
@@ -1656,420 +1478,9 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         None
     }
 
-    /// Whether `parse_result` consulted the parse input `input` names, so a
-    /// [`RefreshEvent::ReparseOpenDocuments`](crate::RefreshEvent::ReparseOpenDocuments) for it
-    /// must re-parse the document.
-    ///
-    /// Only the ecosystem that mints [`ParseInputKey`](crate::ParseInputKey)s implements this
-    /// meaningfully. The default is `true`, the safe direction: an ecosystem without an
-    /// override gets every open document re-parsed, as before targeted re-parsing existed. A
-    /// lagged receiver re-parses every document without asking.
-    fn parse_depends_on(
-        &self,
-        parse_result: &dyn ParseResult,
-        input: &crate::ParseInputKey,
-    ) -> bool {
-        let _ = (parse_result, input);
-        true
-    }
-
-    /// Gathers evidence in the background that synchronous, network-free diagnostics cannot
-    /// (a branch of a partial tag ref, the lineage of a SHA pin, a registry identity of a
-    /// source dependency), and reports whether anything changed.
-    ///
-    /// Called by the server from a spawned task after a document opens or changes and after a
-    /// [`RefreshEvent::TagIndex`](crate::RefreshEvent::TagIndex) for a repository the document
-    /// references, and by the CLI once per run. `phase` says whether the registry fetch of the
-    /// document has run: a probe that decides what to fetch belongs to
-    /// [`ProbePhase::PreFetch`](crate::lsp_helpers::ProbePhase::PreFetch), one that needs the
-    /// fetched tag index to
-    /// [`ProbePhase::PostFetch`](crate::lsp_helpers::ProbePhase::PostFetch). An implementor
-    /// stores only authoritative answers, draws every optional request from its rate budget
-    /// and never blocks a handler.
-    ///
-    /// The default does nothing and reports
-    /// [`ProbeEffect::Unchanged`](crate::lsp_helpers::ProbeEffect::Unchanged).
-    fn background_probes<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        phase: crate::lsp_helpers::ProbePhase,
-    ) -> BoxFuture<'a, crate::lsp_helpers::ProbeReport> {
-        let _ = (parse_result, phase);
-        Box::pin(std::future::ready(
-            crate::lsp_helpers::ProbeReport::default(),
-        ))
-    }
-
-    /// Get the ecosystem-specific formatter for LSP response generation.
-    ///
-    /// The formatter handles version comparison, package URLs, and text formatting.
-    /// Override this to customize LSP response generation.
-    fn formatter(&self) -> &dyn EcosystemFormatter;
-
-    /// Generate inlay hints for the document.
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_inlay_hints`
-    /// using `self.formatter()`. Override only if custom behavior is needed.
-    #[cfg(feature = "lsp-responses")]
-    fn generate_inlay_hints<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        versions: VersionData<'a>,
-        loading_state: crate::LoadingState,
-        config: &'a EcosystemConfig,
-    ) -> BoxFuture<'a, Vec<InlayHint>> {
-        Box::pin(async move {
-            crate::lsp_helpers::generate_inlay_hints(
-                parse_result,
-                versions,
-                loading_state,
-                config,
-                self.formatter(),
-            )
-        })
-    }
-
-    /// Generate hover information for a position.
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_hover`
-    /// using `self.formatter()` and `self.registry()`. `versions.license_source` is
-    /// attached by the caller (`deps-lsp::handlers::hover`), not here — the single
-    /// `VersionData` construction site every path funnels through, override or not
-    /// (issue #688 critic M1: attaching it in this default only would silently drop it
-    /// for the ecosystems that override `generate_hover` instead of using this default).
-    #[cfg(feature = "lsp-responses")]
-    fn generate_hover<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        position: Position,
-        versions: VersionData<'a>,
-        freshness: crate::freshness::FreshnessSettings,
-    ) -> BoxFuture<'a, Option<Hover>> {
-        Box::pin(async move {
-            let registry = self.registry();
-            crate::lsp_helpers::generate_hover(
-                parse_result,
-                position,
-                versions,
-                registry.as_ref(),
-                self.formatter(),
-                freshness,
-                crate::freshness::PublishTime::now(),
-            )
-            .await
-        })
-    }
-
-    /// Generate code actions for a position.
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_code_actions`
-    /// using `self.formatter()` and `self.registry()`. `versions` carries the
-    /// same OSV scan results `generate_hover` and `generate_diagnostics` use,
-    /// so a vulnerable dependency at `position` gets a "fix vulnerability"
-    /// quickfix alongside the plain version-update actions. `content` is the
-    /// manifest source, needed to guard against rewriting a `version_range`
-    /// that no longer slices to its declared requirement text (see
-    /// `lsp_helpers::literal_span_matches`).
-    #[cfg(feature = "lsp-responses")]
-    fn generate_code_actions<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        position: Position,
-        uri: &'a url::Url,
-        versions: VersionData<'a>,
-        content: &'a str,
-    ) -> BoxFuture<'a, Vec<CodeAction>> {
-        Box::pin(async move {
-            let registry = self.registry();
-            crate::lsp_helpers::generate_code_actions(
-                parse_result,
-                position,
-                uri,
-                versions,
-                content,
-                registry.as_ref(),
-                self.formatter(),
-            )
-            .await
-        })
-    }
-
-    /// Generate diagnostics for the document.
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_diagnostics_from_cache`
-    /// using `self.formatter()`. `versions.license_source` is attached by the caller
-    /// (`deps-lsp::handlers::diagnostics`), not here — see [`Self::generate_hover`]'s doc
-    /// for why (issue #688 critic M1).
-    ///
-    /// The typosquat-suspect diagnostic (issue #1437) needs no special handling from an
-    /// override: it is evaluated directly inside `generate_diagnostics_from_cache` itself,
-    /// reading `versions.typosquat_prefetch` — a background pre-fetch merged in by the
-    /// caller, the same way `versions.license_prefetch` already is — so every override that
-    /// calls `generate_diagnostics_from_cache` (this default impl included) gets it
-    /// automatically, with no `.await` on this path (NFR-002).
-    fn generate_diagnostics<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        versions: VersionData<'a>,
-        uri: &'a url::Url,
-        freshness: crate::freshness::FreshnessSettings,
-        severities: crate::lsp_helpers::DiagnosticSeverities,
-    ) -> BoxFuture<'a, Vec<Diagnostic>> {
-        Box::pin(async move {
-            crate::lsp_helpers::generate_diagnostics_from_cache(
-                parse_result,
-                versions,
-                self.formatter(),
-                uri,
-                freshness,
-                severities,
-                crate::freshness::PublishTime::now(),
-            )
-        })
-    }
-
-    /// Generate `textDocument/documentLink` targets for the document.
-    ///
-    /// A document link is a clickable reference from a byte range in this
-    /// manifest to another resource — e.g. a `-r other.txt` / `-c
-    /// constraints.txt` reference inside a pip requirements file, resolved
-    /// to the absolute file it points at. Purely local (no registry access),
-    /// so unlike the other `generate_*` methods this is synchronous rather
-    /// than a [`BoxFuture`]. Empty by default: most ecosystems' manifest
-    /// formats have no such intra-file-graph references.
-    #[cfg(feature = "lsp-responses")]
-    fn generate_document_links(
-        &self,
-        _parse_result: &dyn ParseResult,
-        _uri: &url::Url,
-    ) -> Vec<DocumentLink> {
-        Vec::new()
-    }
-
-    /// Generate the "Update N outdated dependencies" code lens for the document.
-    ///
-    /// The shared "update all outdated" lens has no enable/disable toggle of its own —
-    /// that's `code_lens.enabled` in `deps-lsp`'s config, gating the whole handler before
-    /// this method is ever called. An ecosystem-specific bulk lens gated on a
-    /// `DiagnosticSeverities` flag (e.g. GitHub Actions' "Pin N actions to commit SHA",
-    /// issue #633) is wired directly in `deps-lsp`'s `handlers::code_lens`, not through an
-    /// override of this method — see [`Self::collect_pin_all_to_sha_edits`].
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_code_lenses` using
-    /// `self.formatter()`. Override only if custom behavior is needed.
-    #[cfg(feature = "lsp-responses")]
-    fn generate_code_lenses<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        content: &'a str,
-        versions: VersionData<'a>,
-        uri: &'a url::Url,
-        command_id: &'a str,
-    ) -> BoxFuture<'a, Vec<CodeLens>> {
-        Box::pin(async move {
-            crate::lsp_helpers::generate_code_lenses(
-                parse_result,
-                content,
-                versions,
-                self.formatter(),
-                uri,
-                command_id,
-            )
-        })
-    }
-
-    /// Lifecycle hook run synchronously, once per [`Self::generate_completions`] call,
-    /// before context detection — for setup that must happen regardless of which
-    /// [`crate::completion::CompletionContext`] the request turns out to be (e.g. warming a
-    /// local search index that a later `PackageName` completion in the *same* manifest will
-    /// want ready, even though this specific call might resolve to a different context).
-    ///
-    /// Must return immediately: it runs inside the async dispatch before any `.await`, so
-    /// any real work (an index rebuild, a network warm-up) must be spawned rather than
-    /// awaited here — never block the dispatch. Default no-op; the sole override today is
-    /// `deps-pypi`'s `warm_search_index()`.
-    fn prepare_completions(&self) {}
-
-    /// Generate completions for a position.
-    ///
-    /// Provides autocomplete suggestions for package names, versions, and features by
-    /// detecting the [`crate::completion::CompletionContext`] at `position` and dispatching
-    /// to the matching hook — [`Self::complete_package_name`], [`Self::complete_version`], or
-    /// [`Self::complete_feature`].
-    ///
-    /// The exhaustive `match` over [`crate::completion::CompletionContext`] lives here, in
-    /// the crate that defines the enum, so `#[non_exhaustive]` does not apply and a new
-    /// variant is a compile error in this one place instead of a silent no-op downstream
-    /// (issue #793). An ecosystem that overrides this default opts out of that guarantee and
-    /// takes the obligation on itself — `deps-maven` and `deps-gradle` do, because they route
-    /// on their own XML/Groovy context type instead of
-    /// [`crate::completion::CompletionContext`].
-    ///
-    /// `freshness.is_enabled()` gates whether version completion items carry a
-    /// relative-age `label_details` suffix (issue #145); implementations that
-    /// delegate to [`crate::completion::complete_versions_at_position`] get this for
-    /// free by threading `freshness` through.
-    ///
-    /// The returned [`Completions::is_incomplete`] must reflect *this specific call*
-    /// (the completion context actually served), not a static worst case for the
-    /// ecosystem as a whole (#427): a package-name search over an unranked,
-    /// truncated index should report `true`, while a version completion or any
-    /// other exhaustive context in the same manifest must report `false`, even for
-    /// an ecosystem where some contexts are incomplete and others are not.
-    #[cfg(feature = "lsp-responses")]
-    fn generate_completions<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResult,
-        position: Position,
-        content: &'a str,
-        freshness: crate::FreshnessSettings,
-    ) -> BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.prepare_completions();
-            let request =
-                crate::completion::CompletionRequest::new(parse_result, position, freshness);
-            // Exhaustive on purpose (#793): no wildcard arm, so a new
-            // `CompletionContext` variant is a compile error right here.
-            match crate::completion::detect_completion_context(parse_result, position, content) {
-                crate::completion::CompletionContext::PackageName { prefix, range } => self
-                    .complete_package_name(request, prefix, range)
-                    .await
-                    .with_origin(crate::completion::CompletionOrigin::PackageName),
-                crate::completion::CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => self
-                    .complete_version(request, package_name, prefix)
-                    .await
-                    .with_origin(crate::completion::CompletionOrigin::Version),
-                crate::completion::CompletionContext::Feature {
-                    package_name,
-                    prefix,
-                } => self
-                    .complete_feature(request, package_name, prefix)
-                    .await
-                    .with_origin(crate::completion::CompletionOrigin::Feature),
-                crate::completion::CompletionContext::None => Completions::default(),
-            }
-        })
-    }
-
-    /// Completion hook for a [`crate::completion::CompletionContext::PackageName`]
-    /// context — called only by [`Self::generate_completions`]'s default dispatch.
-    ///
-    /// `_request` is unused by most implementations (a package-name search is driven purely
-    /// by `prefix`/`range`), but kept uniform with [`Self::complete_version`]/
-    /// [`Self::complete_feature`] rather than dropped per-hook — a future input costs one
-    /// field on [`crate::completion::CompletionRequest`] instead of a signature break on only
-    /// the hooks that happen to need it today.
-    ///
-    /// Default: no package-name search (`Completions::default()`) — correct for an ecosystem
-    /// with no package-name index (`deps-github-actions`, `deps-gitlab-ci`). Says nothing
-    /// about an ecosystem that overrides [`Self::generate_completions`] wholesale
-    /// (`deps-maven`, `deps-gradle`) and so never calls this hook at all — both actually do
-    /// serve package-name completion (`groupId`/`artifactId`, a Gradle coordinate), just not
-    /// through this method.
-    #[cfg(feature = "lsp-responses")]
-    fn complete_package_name<'a>(
-        &'a self,
-        _request: crate::completion::CompletionRequest<'a>,
-        _prefix: String,
-        _range: tower_lsp_server::ls_types::Range,
-    ) -> BoxFuture<'a, Completions> {
-        Box::pin(std::future::ready(Completions::default()))
-    }
-
-    /// Leading version-constraint operators this ecosystem's syntax allows before a bare
-    /// version (e.g. npm's `^`/`~`, PyPI's `>=`/`!=`, NuGet's bracket-interval `[`/`(`),
-    /// stripped from a completion prefix before matching it against registry versions.
-    ///
-    /// Consumed by [`Self::complete_version`]'s default implementation, which threads it
-    /// into [`crate::completion::complete_versions_at_position`]. Empty by default —
-    /// correct for an ecosystem whose version requirements are bare version strings with no
-    /// operator prefix (e.g. `deps-go`, `deps-swift`). An ecosystem overriding
-    /// [`Self::complete_version`] directly instead of using the default is free to ignore
-    /// this method entirely.
-    ///
-    /// A `&self` method rather than an associated const: an unconstrained associated const
-    /// would make [`Ecosystem`] dyn-incompatible (it would have to appear in every
-    /// implementor's vtable, which a bare `&'static [char]` value cannot), and a
-    /// `where Self: Sized`-bounded const to opt back out of the vtable needs the unstable
-    /// `generic_const_items` feature — not available on this workspace's stable toolchain.
-    /// `dyn Ecosystem` is exactly how [`crate::ecosystem_registry`] stores every registered
-    /// ecosystem, so this method mirrors [`Self::formatter`]/[`Self::registry`] instead.
-    #[cfg(feature = "lsp-responses")]
-    fn version_operator_chars(&self) -> &'static [char] {
-        &[]
-    }
-
-    /// Completion hook for a [`crate::completion::CompletionContext::Version`] context —
-    /// called only by [`Self::generate_completions`]'s default dispatch.
-    ///
-    /// Required in spirit: every ecosystem serves version completion (the one property this
-    /// method preserves from before #793 — requiredness is orthogonal to the wildcard-match
-    /// bug class itself, which is fixed by the dispatch match's *location*, not by which hook
-    /// is required). `package_name`/`prefix` come from the resolved context; several
-    /// implementations ignore them and instead re-derive the dependency at
-    /// `request.position` from `request.parse_result` (cursor-position-based routing, issue
-    /// #593) — deliberate divergence between ecosystems, not a mistake to unify, since the
-    /// two lookups can disagree (see `deps-cargo`'s position-based migration history).
-    ///
-    /// Default implementation delegates to
-    /// [`crate::completion::complete_versions_at_position`] using `self.registry()`,
-    /// `self.formatter()`, and [`Self::version_operator_chars`] — the pattern `deps-npm`,
-    /// `deps-pypi`, `deps-go`, `deps-composer`, `deps-swift`, `deps-nuget`, `deps-cargo`,
-    /// `deps-dart`, `deps-bundler`, and `deps-deno` all hand-implemented identically before
-    /// this default existed (#1223). Only `deps-gradle` and `deps-maven` (both route by
-    /// dependency *name* through [`crate::completion::complete_versions_generic_from`]
-    /// directly, not by cursor position) and `deps-github-actions`/`deps-gitlab-ci` (each
-    /// wraps [`crate::completion::complete_versions_at_position`] in ecosystem-specific
-    /// guard logic — GitHub Actions withholds completion past a SHA pin's trailing comment;
-    /// GitLab CI re-derives its own position-based dependency lookup with an extra
-    /// literal-range check) have genuinely different version-completion behavior and
-    /// override this method instead of `version_operator_chars`.
-    #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: crate::completion::CompletionRequest<'a>,
-        _package_name: crate::PackageName,
-        prefix: String,
-    ) -> BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            let registry = self.registry();
-            crate::completion::complete_versions_at_position(
-                self.ecosystem_id(),
-                registry.as_ref(),
-                self.formatter(),
-                request.parse_result,
-                request.position,
-                &prefix,
-                self.version_operator_chars(),
-                request.freshness,
-            )
-            .await
-            .into()
-        })
-    }
-
-    /// Completion hook for a [`crate::completion::CompletionContext::Feature`] context —
-    /// called only by [`Self::generate_completions`]'s default dispatch.
-    ///
-    /// Default: no feature completion (`Completions::default()`) — correct for every
-    /// ecosystem without a feature-flag concept. Overridden today by `deps-cargo` and
-    /// `deps-go`.
-    #[cfg(feature = "lsp-responses")]
-    fn complete_feature<'a>(
-        &'a self,
-        _request: crate::completion::CompletionRequest<'a>,
-        _package_name: crate::PackageName,
-        _prefix: String,
-    ) -> BoxFuture<'a, Completions> {
-        Box::pin(std::future::ready(Completions::default()))
-    }
-
     /// Raw-text search prefix at `position` for `deps-lsp`'s fallback (parse-failure)
     /// completion path, used when the manifest failed to parse (typically mid-edit) so
-    /// [`Self::generate_completions`]'s parsed-AST path has no [`ParseResult`] to work
+    /// [`TypedEcosystem::completions`]'s parsed-AST path has no [`ParseResult`] to work
     /// from.
     ///
     /// `content` is the whole manifest text; the implementation locates the line at
@@ -2189,8 +1600,8 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Whether this ecosystem's package-name search may return a truncated view of
     /// a larger candidate set (see e.g. `PypiRegistry::search`'s doc comment).
     ///
-    /// [`generate_completions`](Ecosystem::generate_completions) already reports
-    /// this precisely per call via [`Completions::is_incomplete`] whenever a real
+    /// [`generate_completions`](TypedEcosystem::completions) already reports
+    /// this precisely per call via [`crate::completion::Completions::is_incomplete`] whenever a real
     /// completion context is available. This method exists only for the two
     /// `deps-lsp` code paths that cannot compute that precise per-call signal
     /// because no context has been resolved yet:
@@ -2245,37 +1656,9 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         LicenseSource::RegistryDeclaredSpdx
     }
 
-    /// Support for downcasting to concrete ecosystem type
-    ///
-    /// This allows ecosystem-specific operations when needed.
-    fn as_any(&self) -> &dyn Any;
-
-    /// Builds the edits for this ecosystem's bulk "Pin N {noun} to commit SHA" code lens
-    /// and `deps-lsp.pinAllToSha` command (issue #633, generalized cross-ecosystem in
-    /// #640) — one [`TextEdit`] per mutable-ref pin resolvable to a commit SHA from
-    /// already-in-hand data, mirroring [`crate::collect_update_all_edits`]'s
-    /// recompute-at-click-time contract for the sibling "Update N outdated
-    /// dependencies" lens.
-    ///
-    /// `versions` is threaded through for an ecosystem (e.g. `deps-gitlab-ci`) whose
-    /// dynamic pin forms need the caller's already-fetched version data to resolve
-    /// without an extra network round trip — a lens is push-based and must never block
-    /// on, or trigger, a fetch. Empty by default: most ecosystems have no mutable-ref
-    /// pin concept at all. The lens/command wiring itself lives in `deps-lsp`'s
-    /// `handlers::code_lens` (not a trait default here), so no override of
-    /// [`Self::generate_code_lenses`] can accidentally suppress it.
-    #[cfg(feature = "lsp-responses")]
-    fn collect_pin_all_to_sha_edits(
-        &self,
-        _parse_result: &dyn ParseResult,
-        _versions: VersionData<'_>,
-    ) -> Vec<TextEdit> {
-        Vec::new()
-    }
-
     /// Singular/plural noun for this ecosystem's bulk "Pin N {noun} to commit SHA" lens
     /// title (e.g. `{ singular: "action", plural: "actions" }` for GitHub Actions),
-    /// consulted only when [`Self::collect_pin_all_to_sha_edits`] returns at least one
+    /// consulted only when [`TypedEcosystem::pin_all_to_sha_edits`] returns at least one
     /// edit. Default `{ "ref", "refs" }` is a generic fallback; override to match the
     /// ecosystem's own vocabulary.
     #[cfg(feature = "lsp-responses")]
@@ -2287,11 +1670,53 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     }
 }
 
+/// The type-erased view of a package ecosystem, as stored in [`crate::EcosystemRegistry`] and
+/// handed to consumers as `Arc<dyn Ecosystem>`.
+///
+/// Its only implementation is the blanket `impl<T: TypedEcosystem> Ecosystem for T`, so an
+/// ecosystem is written as an [`EcosystemBase`] plus a [`TypedEcosystem`] and can never
+/// implement this trait directly. Parsing returns a [`ParsedManifest`], a document paired with
+/// the ecosystem that parsed it, so no erased code ever holds a parse result apart from the
+/// ecosystem and formatter that understand it.
+///
+/// The parse-result-free methods are inherited from [`EcosystemBase`].
+pub trait Ecosystem: EcosystemBase + typed::BlanketOnly {
+    /// The dependency-free formatter of this ecosystem.
+    ///
+    /// For anything that reads a single dependency, use the formatter bound to it by
+    /// [`ParsedManifest::for_each_formatted_dependency`] instead.
+    fn formatter(&self) -> &dyn EcosystemFormatter;
+
+    /// Parses a manifest into a [`ParsedManifest`] that owns an `Arc` of this ecosystem.
+    ///
+    /// See [`TypedEcosystem::parse`] for the contract of the underlying parse.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`TypedEcosystem::parse`] reports for a malformed manifest.
+    fn parse_manifest<'a>(
+        self: Arc<Self>,
+        content: &'a str,
+        uri: &'a url::Url,
+    ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParsedManifest>>>;
+
+    /// Synchronous variant of [`Self::parse_manifest`], see [`TypedEcosystem::parse_sync`].
+    fn parse_manifest_sync(
+        self: Arc<Self>,
+        content: &str,
+        uri: &url::Url,
+    ) -> Option<Box<dyn ParsedManifest>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "lsp-responses")]
+    use crate::completion::Completions;
     use std::assert_matches;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
 
     fn owner(dir: &str, reach: ConfigReach) -> ConfigOwner {
         ConfigOwner::new(PathBuf::from(dir), reach)
@@ -2462,84 +1887,25 @@ mod tests {
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
         }
 
         let dep = MockDep;
         assert_eq!(dep.features(), &[] as &[String]);
     }
 
-    /// Minimal [`Dependency`] repeated `dep_count` times by [`StubParseResult`] (#796
-    /// `parse_manifest_blocking` capping test) — identical instances are fine here since
-    /// only the *count* `parse_manifest_blocking` sees is under test, not per-dependency
-    /// identity.
-    struct StubDep;
-
-    impl Dependency for StubDep {
-        fn name(&self) -> &crate::PackageName {
-            static NAME: std::sync::LazyLock<crate::PackageName> =
-                std::sync::LazyLock::new(|| crate::PackageName::new("stub-dep"));
-            &NAME
-        }
-        fn name_range(&self) -> Range {
-            Range::default()
-        }
-        fn version_requirement(&self) -> Option<&crate::VersionReq> {
-            None
-        }
-        fn version_range(&self) -> Option<Range> {
-            None
-        }
-        fn source(&self) -> crate::parser::DependencySource {
-            crate::parser::DependencySource::Registry
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    /// Minimal [`ParseResult`] returned by [`StubEcosystem::parse_manifest`] below —
-    /// only [`parse_manifest_blocking`] tests need it, so it carries nothing beyond a URI
-    /// and a synthetic dependency count.
-    struct StubParseResult {
-        uri: url::Url,
-        dep_count: usize,
-    }
-
-    impl ParseResult for StubParseResult {
-        fn dependencies(&self) -> Vec<&dyn Dependency> {
-            static STUB_DEP: StubDep = StubDep;
-            vec![&STUB_DEP as &dyn Dependency; self.dep_count]
-        }
-
-        fn workspace_root(&self) -> Option<&std::path::Path> {
-            None
-        }
-
-        fn uri(&self) -> &url::Url {
-            &self.uri
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// Ecosystem stub for [`parse_manifest_blocking`] tests: `parse_manifest` either
-    /// asserts it runs off `calling_thread` or panics, per `should_panic`.
+    /// Ecosystem stub for [`parse_manifest_blocking`] tests: `parse` either asserts it runs
+    /// off `calling_thread` or panics, per `should_panic`.
     struct StubEcosystem {
         calling_thread: std::thread::ThreadId,
         should_panic: bool,
-        /// Dependency count [`StubParseResult`] reports — `0` for every test except
+        /// Dependency count the parse result reports — `0` for every test except
         /// [`test_parse_manifest_blocking_caps_dependencies_over_the_ceiling`] (#796).
         dep_count: usize,
     }
 
     impl private::Sealed for StubEcosystem {}
 
-    impl Ecosystem for StubEcosystem {
+    impl EcosystemBase for StubEcosystem {
         fn id(&self) -> &'static str {
             "stub"
         }
@@ -2556,11 +1922,28 @@ mod tests {
             &[]
         }
 
-        fn parse_manifest<'a>(
+        fn registry(&self) -> Arc<dyn crate::Registry> {
+            unimplemented!()
+        }
+
+        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+            unimplemented!()
+        }
+    }
+
+    impl TypedEcosystem for StubEcosystem {
+        type Parsed = crate::test_util::StubParseResult;
+        type Formatter = crate::test_util::StubFormatter;
+
+        fn own_formatter(&self) -> &Self::Formatter {
+            &crate::test_util::StubFormatter::DEFAULT
+        }
+
+        fn parse<'a>(
             &'a self,
             _content: &'a str,
             uri: &'a url::Url,
-        ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+        ) -> BoxFuture<'a, crate::error::Result<Self::Parsed>> {
             Box::pin(async move {
                 assert!(!self.should_panic, "boom");
                 assert_ne!(
@@ -2568,52 +1951,15 @@ mod tests {
                     self.calling_thread,
                     "parse must run on the blocking pool, not the calling thread"
                 );
-                Ok(Box::new(StubParseResult {
-                    uri: uri.clone(),
-                    dep_count: self.dep_count,
-                }) as Box<dyn ParseResult>)
+                Ok(crate::test_util::StubParseResult::new(
+                    uri.clone(),
+                    self.dep_count,
+                ))
             })
-        }
-
-        fn registry(&self) -> Arc<dyn crate::Registry> {
-            unimplemented!()
-        }
-
-        fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
-            unimplemented!()
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn generate_completions<'a>(
-            &'a self,
-            _parse_result: &'a dyn ParseResult,
-            _position: Position,
-            _content: &'a str,
-            _freshness: crate::FreshnessSettings,
-        ) -> BoxFuture<'a, crate::completion::Completions> {
-            unimplemented!()
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        fn complete_version<'a>(
-            &'a self,
-            _request: crate::completion::CompletionRequest<'a>,
-            _package_name: crate::PackageName,
-            _prefix: String,
-        ) -> BoxFuture<'a, crate::completion::Completions> {
-            unimplemented!()
-        }
-
-        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
-            unimplemented!()
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 
-    /// #1195: the default [`Ecosystem::generate_completions`] dispatch — not an ecosystem
+    /// #1195: the default [`TypedEcosystem::completions`] dispatch — not an ecosystem
     /// override — must stamp [`crate::completion::CompletionOrigin::PackageName`]/`Version`/
     /// `Feature` on whichever hook it dispatches to, and `Unresolved` when no
     /// [`crate::completion::CompletionContext`] resolves. This is the mapping every
@@ -2623,6 +1969,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_completions_default_dispatch_stamps_origin_per_context() {
         use crate::completion::CompletionOrigin;
+        use crate::typed_boundary::{ParsedView, TypedParseResult};
 
         struct OriginMockDep {
             name: Range,
@@ -2652,18 +1999,15 @@ mod tests {
             fn features_range(&self) -> Option<Range> {
                 Some(self.features)
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct OriginMockParseResult {
-            dep: OriginMockDep,
+            deps: [OriginMockDep; 1],
             uri: url::Url,
         }
         impl ParseResult for OriginMockParseResult {
             fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![&self.dep]
+                vec![&self.deps[0]]
             }
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
@@ -2671,14 +2015,17 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+        impl TypedParseResult for OriginMockParseResult {
+            type Dep = OriginMockDep;
+            fn own_dependencies(&self) -> &[OriginMockDep] {
+                &self.deps
             }
         }
 
         struct OriginMockEcosystem;
         impl private::Sealed for OriginMockEcosystem {}
-        impl Ecosystem for OriginMockEcosystem {
+        impl EcosystemBase for OriginMockEcosystem {
             fn ecosystem_id(&self) -> EcosystemId {
                 EcosystemId::Cargo
             }
@@ -2688,32 +2035,36 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &[]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn crate::Registry> {
                 unimplemented!()
-            }
-            fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
-                unimplemented!()
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: crate::completion::CompletionRequest<'a>,
-                _package_name: crate::PackageName,
-                _prefix: String,
-            ) -> BoxFuture<'a, Completions> {
-                Box::pin(std::future::ready(Completions::new(vec![])))
             }
             fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
                 unimplemented!()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+        impl TypedEcosystem for OriginMockEcosystem {
+            type Parsed = OriginMockParseResult;
+            type Formatter = crate::test_util::StubFormatter<OriginMockDep>;
+
+            fn own_formatter(&self) -> &Self::Formatter {
+                const FORMATTER: crate::test_util::StubFormatter<OriginMockDep> =
+                    crate::test_util::StubFormatter::new().for_dependency();
+                &FORMATTER
+            }
+            fn parse<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a url::Url,
+            ) -> BoxFuture<'a, crate::error::Result<Self::Parsed>> {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: crate::completion::CompletionRequest<'a, Self::Parsed>,
+                _package_name: crate::PackageName,
+                _prefix: String,
+            ) -> BoxFuture<'a, Completions> {
+                Box::pin(std::future::ready(Completions::new(vec![])))
             }
         }
         // `complete_package_name`/`complete_feature` use the trait defaults
@@ -2735,11 +2086,12 @@ mod tests {
             ),
         };
         let parse_result = OriginMockParseResult {
-            dep,
+            deps: [dep],
             uri: crate::test_util::test_uri("/test/manifest.toml"),
         };
         let eco = OriginMockEcosystem;
         let freshness = crate::FreshnessSettings::default();
+        let _: &dyn crate::lsp_helpers::EcosystemFormatter = eco.own_formatter();
 
         for (position, expected) in [
             (Position::new(0, 2), CompletionOrigin::PackageName),
@@ -2748,7 +2100,7 @@ mod tests {
             (Position::new(3, 0), CompletionOrigin::Unresolved),
         ] {
             let result = eco
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(
                 result.origin, expected,
@@ -2793,17 +2145,19 @@ mod tests {
             should_panic: false,
             dep_count: 0,
         };
-        let parsed = StubParseResult {
-            uri: crate::test_util::test_uri("/test/manifest.toml"),
-            dep_count: 0,
-        };
-        assert!(ecosystem.parse_depends_on(&parsed, &crate::ParseInputKey::new("any")));
+        let parsed = crate::test_util::StubParseResult::new(
+            crate::test_util::test_uri("/test/manifest.toml"),
+            0,
+        );
+        assert!(ecosystem.depends_on(
+            crate::typed_boundary::ParsedView::new(&parsed),
+            &crate::ParseInputKey::new("any")
+        ));
     }
 
     /// #796: `parse_manifest_blocking` is the single chokepoint every ecosystem's parse
-    /// result flows through — proves it actually applies
-    /// `dependency_cap::cap_dependencies`, not just that the wrapper type behaves
-    /// correctly in isolation (covered by `dependency_cap`'s own tests).
+    /// result flows through — proves it actually caps the returned manifest, not just that the
+    /// manifest behaves correctly in isolation (covered by `manifest`'s own tests).
     #[tokio::test]
     async fn test_parse_manifest_blocking_caps_dependencies_over_the_ceiling() {
         let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
@@ -2830,7 +2184,7 @@ mod tests {
         );
     }
 
-    /// A panicking `parse_manifest` must surface as `Err(DepsError::ParseError)` with the
+    /// A panicking `parse` must surface as `Err(DepsError::ParseError)` with the
     /// panic message preserved, mirroring `lockfile.rs`'s
     /// `test_read_and_parse_lockfile_panic_in_parse_becomes_parse_error`.
     #[tokio::test]
@@ -2860,8 +2214,8 @@ mod tests {
         }
     }
 
-    /// Spec 076 SC-016 (T002): `parse_manifest_now` applies the SAME `cap_dependencies`
-    /// chokepoint `parse_manifest_blocking`'s async path applies — a raw `now_or_never()` call
+    /// Spec 076 SC-016 (T002): `parse_manifest_now` applies the SAME cap
+    /// `parse_manifest_blocking`'s async path applies — a raw `now_or_never()` call
     /// site with no cap would otherwise be a second, uncapped parse entry point (round-3 critic
     /// M2, #796).
     // `#[tokio::test]` (fix-cycle security LOW-1 follow-up), not a plain `#[test]`: the new
@@ -2875,11 +2229,11 @@ mod tests {
         let foreign_thread = std::thread::spawn(|| std::thread::current().id())
             .join()
             .unwrap();
-        let ecosystem = StubEcosystem {
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
             calling_thread: foreign_thread,
             should_panic: false,
             dep_count: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
-        };
+        });
         let uri = crate::test_util::test_uri("/test/manifest.toml");
 
         let parsed = parse_manifest_now(&ecosystem, "content", &uri)
@@ -2898,7 +2252,7 @@ mod tests {
         );
     }
 
-    /// Spec 076 FR-024 known limitation (Composer's genuinely-awaiting `parse_manifest`):
+    /// Spec 076 FR-024 known limitation (Composer's genuinely-awaiting `parse`):
     /// `parse_manifest_now` fails closed (`None`) rather than blocking, when the future does
     /// not resolve on its first poll. Deliberately `#[tokio::test]` (fix-cycle security LOW-1
     /// follow-up), not a plain `#[test]`: a bare `#[test]` has no current tokio runtime handle
@@ -2909,7 +2263,7 @@ mod tests {
     async fn test_parse_manifest_now_returns_none_for_a_pending_future() {
         struct PendingEcosystem;
         impl private::Sealed for PendingEcosystem {}
-        impl Ecosystem for PendingEcosystem {
+        impl EcosystemBase for PendingEcosystem {
             fn ecosystem_id(&self) -> EcosystemId {
                 EcosystemId::Composer
             }
@@ -2919,36 +2273,30 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &[]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
-                Box::pin(std::future::pending())
-            }
             fn registry(&self) -> Arc<dyn crate::Registry> {
-                unimplemented!()
-            }
-            fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
-                unimplemented!()
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: crate::completion::CompletionRequest<'a>,
-                _package_name: crate::PackageName,
-                _prefix: String,
-            ) -> BoxFuture<'a, Completions> {
                 unimplemented!()
             }
             fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
                 unimplemented!()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+        impl TypedEcosystem for PendingEcosystem {
+            type Parsed = crate::test_util::StubParseResult;
+            type Formatter = crate::test_util::StubFormatter;
+
+            fn own_formatter(&self) -> &Self::Formatter {
+                &crate::test_util::StubFormatter::DEFAULT
+            }
+            fn parse<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a url::Url,
+            ) -> BoxFuture<'a, crate::error::Result<Self::Parsed>> {
+                Box::pin(std::future::pending())
             }
         }
 
-        let ecosystem = PendingEcosystem;
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(PendingEcosystem);
         let uri = crate::test_util::test_uri("/test/manifest.toml");
 
         assert!(parse_manifest_now(&ecosystem, "content", &uri).is_none());
@@ -2973,7 +2321,7 @@ mod tests {
             "this test must run with no ambient tokio runtime for the assertion below to mean \
              anything"
         );
-        assert!(parse_manifest_now(ecosystem.as_ref(), "content", &uri).is_none());
+        assert!(parse_manifest_now(&ecosystem, "content", &uri).is_none());
     }
 
     crate::debug_redaction_conformance!(

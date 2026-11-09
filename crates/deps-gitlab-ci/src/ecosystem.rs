@@ -1,11 +1,10 @@
 //! GitLab CI ecosystem implementation for deps-lsp.
 
-#[cfg(feature = "lsp-responses")]
-use deps_core::NarrowDependency;
-#[cfg(feature = "lsp-responses")]
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use deps_core::PackageName;
+#[cfg(any(feature = "lsp-responses", test))]
+use deps_core::ParseResult;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
@@ -14,21 +13,19 @@ use deps_core::hover::Hover;
 use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{
-    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest, PackageRendering,
+    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
     await_interactive_fetch,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
-    Ecosystem, HttpCache, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait,
-    Registry, Result,
+    EcosystemBase, HttpCache, ParsedView, Registry, Result, TypedEcosystem,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{
-        CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
+        CommentCheck, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
         sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
         unknown_ref_diagnostics,
     },
 };
-use std::any::Any;
 use std::sync::{Arc, RwLock};
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
@@ -192,11 +189,7 @@ impl GitlabCiEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for GitlabCiEcosystem {}
 
-impl OwnParseResult for GitlabCiEcosystem {
-    type Parsed = GitlabCiParseResult;
-}
-
-impl Ecosystem for GitlabCiEcosystem {
+impl EcosystemBase for GitlabCiEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::GitlabCi
     }
@@ -222,16 +215,49 @@ impl Ecosystem for GitlabCiEcosystem {
         &[]
     }
 
+    fn registry(&self) -> Arc<dyn Registry> {
+        self.registry.clone() as Arc<dyn Registry>
+    }
+
+    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
+        Some(self.registry.subscribe_tag_refreshes())
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // `search()` always returns `Ok(vec![])` (spec NFR-002 — no cheap GitLab
+        // search endpoint under the rate-limit budget), so this is unreachable in
+        // practice; it exists only to keep the trait implementation total. GitLab CI
+        // has two structurally different include forms (`project:`+`ref:` vs.
+        // `component:` `name@ref`), so there is no single insertable snippet shape —
+        // this mirrors GitHub Actions' bare `name`/`name@version` fallback.
+        if latest.is_empty() {
+            Some(name.as_str().to_string())
+        } else {
+            Some(format!("{}@{latest}", name.as_str()))
+        }
+    }
+}
+
+impl TypedEcosystem for GitlabCiEcosystem {
+    type Parsed = GitlabCiParseResult;
+    type Formatter = GitlabCiFormatter;
+
+    fn own_formatter(&self) -> &GitlabCiFormatter {
+        &self.formatter
+    }
+
     /// Parses the manifest, then registers its routes into the shared registry and
     /// downgrades any dependency whose route the process-wide cap refused to
     /// `CustomRegistry` + [`HostRef::CapacityRefused`] (spec §3.2/§4.6) before returning —
     /// the same downgrade shape (#466 review M-a) [`crate::parser`]'s per-document host cap
     /// already produces, so the two capacity-refusal paths agree.
-    fn parse_manifest<'a>(
+    fn parse<'a>(
         &'a self,
         content: &'a str,
         uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<GitlabCiParseResult>> {
         Box::pin(async move {
             let mut result = crate::parser::parse_gitlab_ci_yaml(
                 content,
@@ -263,28 +289,19 @@ impl Ecosystem for GitlabCiEcosystem {
                     }
                 }
             }
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+            Ok(result)
         })
-    }
-
-    fn registry(&self) -> Arc<dyn Registry> {
-        self.registry.clone() as Arc<dyn Registry>
     }
 
     /// Emits a project's name whenever a tags or releases fetch first populates its tag index
     /// or observably changes it; see [`GitlabCiRegistry::subscribe_tag_refreshes`].
-    fn background_probes<'a>(
+    fn probes<'a>(
         &'a self,
-        parse_result: &'a dyn deps_core::ParseResult,
+        parsed: ParsedView<'a, GitlabCiParseResult>,
         phase: ProbePhase,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
         let plans = (phase == ProbePhase::PostFetch)
-            .then(|| {
-                self.own_parse_result(parse_result)
-                    .map_or_else(Vec::new, |parsed| {
-                        probe_plans(&self.registry, &self.formatter, &parsed.dependencies)
-                    })
-            })
+            .then(|| probe_plans(&self.registry, &self.formatter, parsed.dependencies_slice()))
             .filter(|plans| !plans.is_empty());
         Box::pin(async move {
             match plans {
@@ -292,14 +309,6 @@ impl Ecosystem for GitlabCiEcosystem {
                 None => ProbeReport::default(),
             }
         })
-    }
-
-    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
-        Some(self.registry.subscribe_tag_refreshes())
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
     }
 
     // No override for `complete_package_name`: GitLab CI has no package-name search
@@ -317,13 +326,13 @@ impl Ecosystem for GitlabCiEcosystem {
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
+        request: deps_core::completion::CompletionRequest<'a, GitlabCiParseResult>,
         _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            let Some(dep) = request.parse_result.dependencies().into_iter().find(|d| {
-                d.version_range()
+            let Some(gl_dep) = request.parsed.dependencies_slice().iter().find(|d| {
+                d.version_range
                     .is_some_and(|r| deps_core::position_in_range(request.position.into(), r))
             }) else {
                 return Completions::default();
@@ -339,13 +348,11 @@ impl Ecosystem for GitlabCiEcosystem {
             // — is never reached in the first place. This local check is kept as explicit
             // defense-in-depth (and as FR-011's literal specification), not as the
             // load-bearing gate.
-            let gl_dep = self.formatter.own_dependency(dep);
-            if gl_dep.is_some_and(|gl_dep| gl_dep.is_alias_occurrence) {
+            if gl_dep.is_alias_occurrence {
                 return Completions::default();
             }
 
-            if gl_dep.is_some_and(|gl_dep| position_in_sha_comment(gl_dep, request.position.into()))
-            {
+            if position_in_sha_comment(gl_dep, request.position.into()) {
                 return Completions::default();
             }
 
@@ -353,12 +360,12 @@ impl Ecosystem for GitlabCiEcosystem {
                 self.ecosystem_id(),
                 self.registry.as_ref(),
                 &self.formatter,
-                dep.name(),
-                &dep.source(),
+                &gl_dep.name,
+                &gl_dep.source,
                 &prefix,
                 VERSION_OPERATOR_CHARS,
                 request.freshness,
-                &request.parse_result.selection_context(),
+                &request.parsed.selection_context(),
             )
             .await
             .into()
@@ -372,9 +379,9 @@ impl Ecosystem for GitlabCiEcosystem {
     /// The mutable-ref-pin diagnostic is gated on `severities.mutable_ref_pin_enabled`,
     /// mirroring `deps_github_actions`'s identical gate: `severities.mutable_ref_pin` alone
     /// cannot silence it, since `DiagnosticSeverity` has no suppression value.
-    fn generate_diagnostics<'a>(
+    fn diagnostics<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GitlabCiParseResult>,
         versions: deps_core::VersionData<'a>,
         uri: &'a Url,
         freshness: deps_core::FreshnessSettings,
@@ -382,31 +389,29 @@ impl Ecosystem for GitlabCiEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                parse_result,
+                &parsed,
                 versions,
-                self.formatter(),
+                self.own_formatter(),
                 uri,
                 freshness,
                 severities,
                 deps_core::PublishTime::now(),
             );
-            let Some(parsed) = self.own_parse_result(parse_result) else {
-                return diagnostics;
-            };
-            diagnostics.extend(unresolved_host_diagnostics(&parsed.dependencies));
+            let dependencies = parsed.dependencies_slice();
+            diagnostics.extend(unresolved_host_diagnostics(dependencies));
             diagnostics.extend(sha_comment_mismatch_diagnostics(
-                &parsed.dependencies,
+                dependencies,
                 severities.sha_comment_mismatch,
                 &self.formatter,
             ));
             diagnostics.extend(unknown_ref_diagnostics(
-                &parsed.dependencies,
+                dependencies,
                 severities.unknown_ref,
                 |gl_dep| unknown_ref_target(&self.formatter, gl_dep),
             ));
             if severities.mutable_ref_pin_enabled {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
-                    &parsed.dependencies,
+                    dependencies,
                     severities.mutable_ref_pin,
                     &self.formatter,
                 ));
@@ -418,7 +423,7 @@ impl Ecosystem for GitlabCiEcosystem {
     /// Appends the "Pin to commit SHA" quickfix (issue #634) to the shared default's
     /// output when the position's dependency is a `PinStyle::Tag` include with a
     /// resolvable `TagIndex` entry, mirroring
-    /// `deps_github_actions::ecosystem::GithubActionsEcosystem::generate_code_actions`.
+    /// `deps_github_actions::ecosystem::GithubActionsEcosystem::code_actions`.
     ///
     /// Also offers the same quickfix for a `component:` include pinned via
     /// `PinStyle::Latest`/`PinStyle::Partial` (validation follow-up C2/S2): unlike `Tag`,
@@ -426,9 +431,9 @@ impl Ecosystem for GitlabCiEcosystem {
     /// resolves it against the project's published releases through the same FR-007
     /// priority ladder `generate_hover`'s `**Resolved**` splice already drives.
     #[cfg(feature = "lsp-responses")]
-    fn generate_code_actions<'a>(
+    fn code_actions<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GitlabCiParseResult>,
         position: Position,
         uri: &'a Url,
         versions: deps_core::VersionData<'a>,
@@ -437,41 +442,43 @@ impl Ecosystem for GitlabCiEcosystem {
         Box::pin(async move {
             let registry = self.registry();
             let mut actions = deps_core::lsp_helpers::generate_code_actions(
-                parse_result,
+                &parsed,
                 position,
                 uri,
                 versions,
                 content,
                 registry.as_ref(),
-                self.formatter(),
+                self.own_formatter(),
             )
             .await;
             actions.extend(build_sha_pin_action(
-                parse_result,
+                &parsed,
                 position,
                 uri,
                 &self.formatter,
             ));
-            let parsed = self.own_parse_result(parse_result);
-            actions.extend(parsed.and_then(|parsed| {
-                build_sha_comment_fix_action(parsed, position, uri, &self.formatter)
-            }));
+            let dependencies = parsed.dependencies_slice();
+            actions.extend(build_sha_comment_fix_action(
+                dependencies,
+                position,
+                uri,
+                &self.formatter,
+            ));
             actions.extend(build_unknown_ref_fix_action(
-                parse_result,
+                &parsed,
                 position,
                 uri,
                 &self.formatter,
             ));
-            if let Some(parsed) = parsed
-                && let Some(action) = build_dynamic_component_pin_action(
-                    parsed,
-                    position,
-                    uri,
-                    &self.formatter,
-                    self.registry.as_ref(),
-                    versions,
-                )
-                .await
+            if let Some(action) = build_dynamic_component_pin_action(
+                dependencies,
+                position,
+                uri,
+                &self.formatter,
+                self.registry.as_ref(),
+                versions,
+            )
+            .await
             {
                 actions.push(action);
             }
@@ -483,9 +490,9 @@ impl Ecosystem for GitlabCiEcosystem {
     /// `component:` include only, a `**Project**` link line — the one NFR-004 hover
     /// divergence this ecosystem has (spec §8.1/§8.2).
     #[cfg(feature = "lsp-responses")]
-    fn generate_hover<'a>(
+    fn hover<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GitlabCiParseResult>,
         position: Position,
         versions: deps_core::VersionData<'a>,
         freshness: deps_core::FreshnessSettings,
@@ -493,21 +500,18 @@ impl Ecosystem for GitlabCiEcosystem {
         Box::pin(async move {
             let registry = self.registry.clone();
             let base_hover = deps_core::lsp_generate_hover(
-                parse_result,
+                &parsed,
                 position,
                 versions,
                 registry.as_ref(),
-                self.formatter(),
+                self.own_formatter(),
                 freshness,
                 deps_core::PublishTime::now(),
             )
             .await;
             let mut hover = base_hover?;
 
-            let Some(parsed) = self.own_parse_result(parse_result) else {
-                return Some(hover);
-            };
-            let Some(gl_dep) = parsed.dependencies.iter().find(|d| {
+            let Some(gl_dep) = parsed.dependencies_slice().iter().find(|d| {
                 deps_core::position_in_range(position.into(), d.name_range)
                     || d.version_range
                         .is_some_and(|r| deps_core::position_in_range(position.into(), r))
@@ -560,7 +564,7 @@ impl Ecosystem for GitlabCiEcosystem {
                     registry.resolve_component_pin(&gl_dep.name, &route, pin, raw),
                     InteractiveFetchRequest::for_dependency(
                         versions,
-                        parse_result.uri(),
+                        parsed.uri(),
                         gl_dep,
                         &self.formatter,
                         FetchContext::Hover,
@@ -585,26 +589,6 @@ impl Ecosystem for GitlabCiEcosystem {
         })
     }
 
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        // `search()` always returns `Ok(vec![])` (spec NFR-002 — no cheap GitLab
-        // search endpoint under the rate-limit budget), so this is unreachable in
-        // practice; it exists only to keep the trait implementation total. GitLab CI
-        // has two structurally different include forms (`project:`+`ref:` vs.
-        // `component:` `name@ref`), so there is no single insertable snippet shape —
-        // this mirrors GitHub Actions' bare `name`/`name@version` fallback.
-        if latest.is_empty() {
-            Some(name.as_str().to_string())
-        } else {
-            Some(format!("{}@{latest}", name.as_str()))
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// One [`TextEdit`] per mutable-ref dependency in `parse_result` resolvable to a
     /// commit SHA without a network fetch (issue #640) — the bulk counterpart of
     /// `build_sha_pin_action`/`build_dynamic_component_pin_action`'s per-position
@@ -613,15 +597,12 @@ impl Ecosystem for GitlabCiEcosystem {
     /// `collect_pin_all_to_sha_edits` free function this delegates to): a lens is
     /// push-based and must never itself trigger a fetch.
     #[cfg(feature = "lsp-responses")]
-    fn collect_pin_all_to_sha_edits(
+    fn pin_all_to_sha_edits(
         &self,
-        parse_result: &dyn ParseResultTrait,
+        parsed: ParsedView<'_, GitlabCiParseResult>,
         versions: deps_core::VersionData<'_>,
     ) -> Vec<TextEdit> {
-        self.own_parse_result(parse_result)
-            .map_or_else(Vec::new, |parsed| {
-                collect_pin_all_to_sha_edits(&parsed.dependencies, &self.formatter, versions)
-            })
+        collect_pin_all_to_sha_edits(parsed.dependencies_slice(), &self.formatter, versions)
     }
 
     // `pin_all_to_sha_noun` is deliberately left at the trait default (`{"ref", "refs"}`,
@@ -935,10 +916,10 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_a0_uncompilable() {
         let cache = Arc::new(HttpCache::new());
-        let ecosystem = GitlabCiEcosystem::new(cache);
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(GitlabCiEcosystem::new(cache));
         let content = "include:\n  - component: gitlab.com/org/proj/comp@1.0.0\n".to_string();
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let parsed = ecosystem
+        let parsed = Arc::clone(&ecosystem)
             .parse_manifest(&content, &uri)
             .await
             .expect("manifest must parse");
@@ -1066,7 +1047,7 @@ mod tests {
         let eco = GitlabCiEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        let result = eco.parse(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }
 
@@ -1246,13 +1227,13 @@ mod tests {
         let eco = GitlabCiEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1281,13 +1262,13 @@ mod tests {
         let eco = GitlabCiEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
         let content = "include:\n  - component: 10.0.0.1/org/proj/comp@1.0.0\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1329,13 +1310,13 @@ mod tests {
         let eco = GitlabCiEcosystem::with_context(cache, policy, gitlab_instance_host_raw);
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1377,11 +1358,11 @@ mod tests {
     async fn diagnostics_for(content: &str, uri: &Url) -> Vec<Diagnostic> {
         let cache = Arc::new(HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);
-        let parse_result = eco.parse_manifest(content, uri).await.unwrap();
+        let parse_result = eco.parse(content, uri).await.unwrap();
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
-        eco.generate_diagnostics(
-            parse_result.as_ref(),
+        eco.diagnostics(
+            ParsedView::new(&parse_result),
             deps_core::VersionData::new(&cached, &resolved),
             uri,
             deps_core::FreshnessSettings::default(),
@@ -1640,13 +1621,13 @@ mod tests {
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let cache = Arc::new(HttpCache::new());
         let eco = GitlabCiEcosystem::new(cache);
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1869,7 +1850,7 @@ mod tests {
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
             }
-            fn as_any(&self) -> &dyn Any {
+            fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
         }
@@ -2083,7 +2064,13 @@ mod tests {
                 .unwrap()
                 .start;
             assert!(
-                build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none(),
+                build_sha_pin_action(
+                    &ParsedView::new(&parse_result),
+                    position.into(),
+                    &uri,
+                    &formatter
+                )
+                .is_none(),
                 "a cold TagIndex must still withhold the quickfix even though the message \
              omits the suffix — the one accepted message/quickfix divergence"
             );
@@ -2188,8 +2175,13 @@ mod tests {
                 .unwrap()
                 .start;
 
-            let action = build_sha_pin_action(&parse_result, position.into(), &uri, &formatter)
-                .expect("expected a Pin-to-commit-SHA quickfix");
+            let action = build_sha_pin_action(
+                &ParsedView::new(&parse_result),
+                position.into(),
+                &uri,
+                &formatter,
+            )
+            .expect("expected a Pin-to-commit-SHA quickfix");
             assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
             let edit = action.edit.as_ref().unwrap();
             let text_edits = edit
@@ -2223,7 +2215,13 @@ mod tests {
                 .start;
 
             assert!(
-                build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none()
+                build_sha_pin_action(
+                    &ParsedView::new(&parse_result),
+                    position.into(),
+                    &uri,
+                    &formatter
+                )
+                .is_none()
             );
         }
 
@@ -2260,7 +2258,13 @@ mod tests {
                 .start;
 
             assert!(
-                build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none()
+                build_sha_pin_action(
+                    &ParsedView::new(&parse_result),
+                    position.into(),
+                    &uri,
+                    &formatter
+                )
+                .is_none()
             );
         }
 
@@ -2307,10 +2311,20 @@ mod tests {
                 .unwrap()
                 .start;
 
-            let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
-                .expect("expected a quickfix for the first include");
-            let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
-                .expect("expected a quickfix for the second include");
+            let action0 = build_sha_pin_action(
+                &ParsedView::new(&parse_result),
+                position0.into(),
+                &uri,
+                &formatter,
+            )
+            .expect("expected a quickfix for the first include");
+            let action1 = build_sha_pin_action(
+                &ParsedView::new(&parse_result),
+                position1.into(),
+                &uri,
+                &formatter,
+            )
+            .expect("expected a quickfix for the second include");
 
             let edit0 = action0.edit.as_ref().unwrap();
             let edit1 = action1.edit.as_ref().unwrap();
@@ -2386,10 +2400,20 @@ mod tests {
                 .unwrap()
                 .start;
 
-            let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
-                .expect("expected a quickfix for the project: include");
-            let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
-                .expect("expected a quickfix for the component: include");
+            let action0 = build_sha_pin_action(
+                &ParsedView::new(&parse_result),
+                position0.into(),
+                &uri,
+                &formatter,
+            )
+            .expect("expected a quickfix for the project: include");
+            let action1 = build_sha_pin_action(
+                &ParsedView::new(&parse_result),
+                position1.into(),
+                &uri,
+                &formatter,
+            )
+            .expect("expected a quickfix for the component: include");
             let ls_uri = deps_core::to_ls_uri(&uri);
 
             assert_eq!(
@@ -2502,7 +2526,7 @@ mod tests {
             );
 
             let action = build_dynamic_component_pin_action(
-                &parse_result,
+                &parse_result.dependencies,
                 position,
                 &uri,
                 &formatter,
@@ -2540,7 +2564,7 @@ mod tests {
                 component_pin_test_setup(&server, PinStyle::Latest, "~latest");
 
             let action = build_dynamic_component_pin_action(
-                &parse_result,
+                &parse_result.dependencies,
                 position,
                 &uri,
                 &formatter,
@@ -2575,7 +2599,7 @@ mod tests {
                 component_pin_test_setup(&server, PinStyle::Partial, "1.2");
 
             let action = build_dynamic_component_pin_action(
-                &parse_result,
+                &parse_result.dependencies,
                 position,
                 &uri,
                 &formatter,
@@ -2668,7 +2692,7 @@ mod tests {
             };
 
             let action = build_dynamic_component_pin_action(
-                &parse_result,
+                &parse_result.dependencies,
                 range.start,
                 &uri,
                 &formatter,
@@ -2707,7 +2731,7 @@ mod tests {
 
             assert!(
                 build_dynamic_component_pin_action(
-                    &parse_result,
+                    &parse_result.dependencies,
                     position,
                     &uri,
                     &formatter,
@@ -2759,7 +2783,7 @@ mod tests {
                 .with_interactive_fetch_gate(&gate);
 
             let first = build_dynamic_component_pin_action(
-                &parse_result,
+                &parse_result.dependencies,
                 position,
                 &uri,
                 &formatter,
@@ -2779,7 +2803,7 @@ mod tests {
             .create_async()
             .await;
             let second = build_dynamic_component_pin_action(
-                &parse_result,
+                &parse_result.dependencies,
                 position,
                 &uri,
                 &formatter,
@@ -2825,8 +2849,8 @@ mod tests {
                 .with_interactive_fetch_gate(&gate);
 
             let first = eco
-                .generate_hover(
-                    &parse_result,
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     versions,
                     deps_core::FreshnessSettings::Disabled,
@@ -2844,8 +2868,8 @@ mod tests {
             .create_async()
             .await;
             let second = eco
-                .generate_hover(
-                    &parse_result,
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     versions,
                     deps_core::FreshnessSettings::Disabled,
@@ -2867,7 +2891,7 @@ mod tests {
 
             assert!(
                 build_dynamic_component_pin_action(
-                    &parse_result,
+                    &parse_result.dependencies,
                     position,
                     &uri,
                     &formatter,
@@ -2893,8 +2917,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - project: org/proj1\n    ref: v1.0.0\n  - project: org/proj2\n    ref: v2.0.0\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(&parse_result);
             let sha1 = "1".repeat(40);
             let sha2 = "2".repeat(40);
             let index1 = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha1).unwrap())]);
@@ -2910,7 +2934,7 @@ mod tests {
 
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
 
             assert_eq!(edits.len(), 2);
             assert!(
@@ -2936,11 +2960,11 @@ mod tests {
              \x20 - project: org/norefs\n"
             );
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
 
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
 
             assert!(
                 edits.is_empty(),
@@ -2954,12 +2978,12 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             // No `tag_index` seed: a genuine cache miss must be skipped gracefully.
 
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
 
             assert!(edits.is_empty());
         }
@@ -2970,8 +2994,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(&parse_result)[0]
                 .name()
                 .clone();
 
@@ -2989,7 +3013,7 @@ mod tests {
             let resolved = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert_eq!(edits.len(), 1);
             assert_eq!(edits[0].new_text, format!("{sha} # 2.0.0"));
         }
@@ -3000,8 +3024,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - component: gitlab.com/org/proj/comp@1.2\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(&parse_result)[0]
                 .name()
                 .clone();
 
@@ -3025,7 +3049,7 @@ mod tests {
             let resolved = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert_eq!(edits.len(), 1);
             assert_eq!(
                 edits[0].new_text,
@@ -3045,8 +3069,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(&parse_result)[0]
                 .name()
                 .clone();
 
@@ -3066,7 +3090,7 @@ mod tests {
             let resolved = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert!(
                 edits.is_empty(),
                 "the unresolvable winner must be skipped outright, never silently replaced by \
@@ -3085,8 +3109,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(&parse_result)[0]
                 .name()
                 .clone();
 
@@ -3110,7 +3134,7 @@ mod tests {
             let resolved = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert_eq!(edits.len(), 1);
             assert_eq!(
                 edits[0].new_text,
@@ -3130,8 +3154,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = "include:\n  - project: org/proj\n    ref: \"v1.0.0\"\n";
             let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(&parse_result)[0]
                 .name()
                 .clone();
             let sha = "a".repeat(40);
@@ -3142,7 +3166,7 @@ mod tests {
 
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
 
             assert_eq!(edits.len(), 1);
             assert_eq!(edits[0].new_text, sha);
@@ -3160,7 +3184,7 @@ mod tests {
                 new_content.contains(&format!("\"{sha}\"")),
                 "the surrounding quotes must survive the edit: {new_content}"
             );
-            eco.parse_manifest(&new_content, &uri)
+            eco.parse(&new_content, &uri)
                 .await
                 .expect("resulting text must still parse");
         }
@@ -3232,8 +3256,8 @@ mod tests {
             let eco = GitlabCiEcosystem::new(cache);
 
             let result = eco
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     name_range.start,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -3274,8 +3298,8 @@ mod tests {
 
             // Line 0 falls outside every dependency's name/version range.
             let result = eco
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 0),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -3320,7 +3344,12 @@ mod tests {
             let freshness = deps_core::FreshnessSettings::default();
 
             let via_dispatch = eco
-                .generate_completions(&parse_result, Position::new(2, 13), content, freshness)
+                .completions(
+                    ParsedView::new(&parse_result),
+                    Position::new(2, 13),
+                    content,
+                    freshness,
+                )
                 .await;
             let direct = deps_core::completion::complete_versions_generic_from(
                 eco.ecosystem_id(),
@@ -3371,8 +3400,8 @@ mod tests {
             let resolved = std::collections::HashMap::new();
 
             let actions = eco
-                .generate_code_actions(
-                    &parse_result,
+                .code_actions(
+                    ParsedView::new(&parse_result),
                     Position::new(2, 11),
                     &uri,
                     deps_core::VersionData::new(&cached, &resolved),
@@ -3414,8 +3443,8 @@ mod tests {
 
             // Cursor inside the alias token's `version_range`.
             let result = eco
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(2, 11),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -3452,7 +3481,7 @@ mod tests {
             let cache = Arc::new(HttpCache::new());
             let eco = GitlabCiEcosystem::new(cache);
             let request = deps_core::completion::CompletionRequest::new(
-                &parse_result,
+                ParsedView::new(&parse_result),
                 Position::new(2, 11),
                 deps_core::FreshnessSettings::default(),
             );
@@ -3485,8 +3514,8 @@ mod tests {
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
 
-            let edits = eco.collect_pin_all_to_sha_edits(
-                &parse_result,
+            let edits = eco.pin_all_to_sha_edits(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
             );
             assert!(edits.is_empty());
@@ -3509,8 +3538,8 @@ mod tests {
                  \x20 - component: gitlab.com/org/latest/comp@~latest\n\
                  \x20 - component: gitlab.com/org/partial/comp@1.0\n";
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(&parse_result);
             assert_eq!(deps.len(), 4);
 
             let mut cached = std::collections::HashMap::new();
@@ -3522,7 +3551,7 @@ mod tests {
             }
             let resolved = std::collections::HashMap::new();
             let edits = deps_core::lsp_helpers::collect_update_all_edits(
-                parse_result.as_ref(),
+                &parse_result,
                 content,
                 deps_core::VersionData::new(&cached, &resolved),
                 &eco.formatter,
@@ -3557,8 +3586,8 @@ mod tests {
                  \x20 - component: gitlab.com/org/other/comp@{latest_sha}\n"
             );
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(&parse_result);
             assert_eq!(deps.len(), 3);
 
             let mut cached = std::collections::HashMap::new();
@@ -3583,8 +3612,8 @@ mod tests {
             let control_line = 4_u32;
 
             let diagnostics = eco
-                .generate_diagnostics(
-                    parse_result.as_ref(),
+                .diagnostics(
+                    ParsedView::new(&parse_result),
                     versions(),
                     &uri,
                     deps_core::FreshnessSettings::default(),
@@ -3600,7 +3629,7 @@ mod tests {
             assert_eq!(diagnostic_lines, outdated_lines, "{diagnostics:?}");
 
             let edits = deps_core::lsp_helpers::collect_update_all_edits(
-                parse_result.as_ref(),
+                &parse_result,
                 &content,
                 versions(),
                 &eco.formatter,
@@ -3612,8 +3641,8 @@ mod tests {
             assert!(edits.iter().all(|e| e.new_text == rewritten), "{edits:?}");
 
             let hints = eco
-                .generate_inlay_hints(
-                    parse_result.as_ref(),
+                .inlay_hints(
+                    ParsedView::new(&parse_result),
                     versions(),
                     deps_core::LoadingState::Loaded,
                     &deps_core::EcosystemConfig::default(),
@@ -3632,8 +3661,8 @@ mod tests {
 
             for line in outdated_lines {
                 let hover = eco
-                    .generate_hover(
-                        parse_result.as_ref(),
+                    .hover(
+                        ParsedView::new(&parse_result),
                         Position::new(line, 30),
                         versions().with_network(deps_core::NetworkMode::Offline),
                         deps_core::FreshnessSettings::default(),
@@ -3659,7 +3688,7 @@ mod tests {
             eco: GitlabCiEcosystem,
             uri: Url,
             content: String,
-            parse_result: Box<dyn ParseResultTrait>,
+            parse_result: GitlabCiParseResult,
             cached: deps_core::CachedVersionsMap,
         }
 
@@ -3671,24 +3700,20 @@ mod tests {
                     Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
                 );
                 let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-                let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+                let parse_result = eco.parse(content, &uri).await.unwrap();
                 let commits: Vec<(&str, CommitSha)> = tags
                     .iter()
                     .map(|(tag, sha)| (*tag, CommitSha::parse(sha).unwrap()))
                     .collect();
                 let mut cached = std::collections::HashMap::new();
-                for dep in deps_core::ParseResult::dependencies(parse_result.as_ref()) {
-                    let kind = dep
-                        .as_any()
-                        .downcast_ref::<GitlabCiDependency>()
-                        .unwrap()
-                        .kind;
+                for dep in &parse_result.dependencies {
+                    let kind = dep.kind;
                     let index = TagIndex::from_tags(commits.iter().map(|(t, s)| (*t, s)));
                     eco.formatter
                         .tag_index
-                        .insert((kind.endpoint(), dep.name().clone()), Arc::new(index));
+                        .insert((kind.endpoint(), dep.name.clone()), Arc::new(index));
                     cached.insert(
-                        deps_core::NormalizedName::for_test(dep.name().as_str()),
+                        deps_core::NormalizedName::for_test(dep.name.as_str()),
                         deps_core::PackageVersions::latest_only(latest),
                     );
                 }
@@ -3704,7 +3729,7 @@ mod tests {
             fn update_all(&self) -> Vec<TextEdit> {
                 let resolved = std::collections::HashMap::new();
                 deps_core::lsp_helpers::collect_update_all_edits(
-                    self.parse_result.as_ref(),
+                    &self.parse_result,
                     &self.content,
                     deps_core::VersionData::new(&self.cached, &resolved),
                     &self.eco.formatter,
@@ -3722,8 +3747,8 @@ mod tests {
             ) -> Vec<Diagnostic> {
                 let resolved = std::collections::HashMap::new();
                 self.eco
-                    .generate_diagnostics(
-                        self.parse_result.as_ref(),
+                    .diagnostics(
+                        ParsedView::new(&self.parse_result),
                         deps_core::VersionData::new(&self.cached, &resolved),
                         &self.uri,
                         deps_core::FreshnessSettings::default(),
@@ -3735,9 +3760,7 @@ mod tests {
 
         impl CommentFixture {
             fn own(&self) -> &GitlabCiParseResult {
-                self.eco
-                    .own_parse_result(self.parse_result.as_ref())
-                    .unwrap()
+                &self.parse_result
             }
 
             fn pin_all(&self) -> Vec<TextEdit> {
@@ -3751,7 +3774,7 @@ mod tests {
 
             fn pin_action(&self, line: u32, column: u32) -> Option<CodeAction> {
                 build_sha_pin_action(
-                    self.parse_result.as_ref(),
+                    &ParsedView::new(&self.parse_result),
                     Position::new(line, column),
                     &self.uri,
                     &self.eco.formatter,
@@ -3760,7 +3783,7 @@ mod tests {
 
             fn fix_action(&self, line: u32, column: u32) -> Option<CodeAction> {
                 build_sha_comment_fix_action(
-                    self.own(),
+                    &self.own().dependencies,
                     Position::new(line, column),
                     &self.uri,
                     &self.eco.formatter,
@@ -3769,7 +3792,7 @@ mod tests {
 
             fn unknown_ref_fix(&self, line: u32, column: u32) -> Option<CodeAction> {
                 build_unknown_ref_fix_action(
-                    self.parse_result.as_ref(),
+                    &ParsedView::new(&self.parse_result),
                     Position::new(line, column),
                     &self.uri,
                     &self.eco.formatter,
@@ -3777,13 +3800,9 @@ mod tests {
             }
 
             fn only_dep(&self) -> GitlabCiDependency {
-                let deps = deps_core::ParseResult::dependencies(self.parse_result.as_ref());
+                let deps = &self.parse_result.dependencies;
                 assert_eq!(deps.len(), 1);
-                deps[0]
-                    .as_any()
-                    .downcast_ref::<GitlabCiDependency>()
-                    .unwrap()
-                    .clone()
+                deps[0].clone()
             }
         }
 
@@ -3976,8 +3995,8 @@ mod tests {
             let resolved = std::collections::HashMap::new();
             let hover = fixture
                 .eco
-                .generate_hover(
-                    fixture.parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&fixture.parse_result),
                     Position::new(2, 30),
                     deps_core::VersionData::new(&fixture.cached, &resolved)
                         .with_network(deps_core::NetworkMode::Offline),
@@ -4152,9 +4171,8 @@ mod tests {
                 ),
             ];
             for (content, line, sha_start) in manifests {
-                let parsed = eco.parse_manifest(&content, &uri).await.unwrap();
-                let dep = deps_core::ParseResult::dependencies(parsed.as_ref()).remove(0);
-                let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>().unwrap();
+                let parsed = eco.parse(&content, &uri).await.unwrap();
+                let gl_dep = &parsed.dependencies[0];
                 let at = |column: u32| {
                     position_in_sha_comment(
                         gl_dep,
@@ -4178,9 +4196,8 @@ mod tests {
             );
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = format!("include:\n  - project: org/proj\n    ref: {sha}\n");
-            let parsed = eco.parse_manifest(&content, &uri).await.unwrap();
-            let dep = deps_core::ParseResult::dependencies(parsed.as_ref()).remove(0);
-            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>().unwrap();
+            let parsed = eco.parse(&content, &uri).await.unwrap();
+            let gl_dep = &parsed.dependencies[0];
             assert!(!position_in_sha_comment(
                 gl_dep,
                 deps_core::position::Position::new(2, 49)
@@ -4199,9 +4216,8 @@ mod tests {
             );
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
             let content = format!("include:\n  - project: org/proj\n    ref: \"{sha}\" # v1.0.0\n");
-            let parsed = eco.parse_manifest(&content, &uri).await.unwrap();
-            let dep = deps_core::ParseResult::dependencies(parsed.as_ref()).remove(0);
-            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>().unwrap();
+            let parsed = eco.parse(&content, &uri).await.unwrap();
+            let gl_dep = &parsed.dependencies[0];
             let at = |column: u32| {
                 position_in_sha_comment(gl_dep, deps_core::position::Position::new(2, column))
             };

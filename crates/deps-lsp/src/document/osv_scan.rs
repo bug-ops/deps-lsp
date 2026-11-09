@@ -110,12 +110,11 @@ fn scan_inputs(
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::VulnerabilityMap,
 )> {
-    let parse_result = doc.parse_result()?;
+    let manifest = doc.manifest()?;
     Some(deps_engine::classify::osv::build_scan_targets(
-        parse_result,
+        manifest,
         &doc.signals.resolved_versions,
         &doc.signals.resolved_version_candidates,
-        ecosystem.formatter(),
         ecosystem.ecosystem_id(),
     ))
 }
@@ -328,7 +327,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
 }
 
 /// Background pre-fetch of each dependency's license, for whichever ecosystems
-/// override [`deps_core::Ecosystem::fetch_license`] (issue #660/#688, spec 010 plan §1
+/// override [`deps_core::EcosystemBase::fetch_license`] (issue #660/#688, spec 010 plan §1
 /// tier 3) — today, pub.dev's `/score` endpoint (Dart), the GitHub repository API
 /// (Swift), a Maven Central POM fetch (Gradle), and the JSR per-version API (Deno).
 /// Mirrors
@@ -371,7 +370,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
 /// version the way Gradle/Deno's is).
 ///
 /// No-op (returns immediately) for every ecosystem whose
-/// <code>ecosystem.[license_source](deps_core::Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
+/// <code>ecosystem.[license_source](deps_core::EcosystemBase::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
 /// is `false` (issue #697) — every ecosystem except the four above — or whenever
 /// `state`'s current [`ServerState::license_policy`] is empty (issue #1407 code-review
 /// should-fix). This check is *load-bearing*, not defense-in-depth: as noted above, this
@@ -404,14 +403,13 @@ pub(crate) async fn run_license_prefetch(
         let Some(doc) = state.get_document(&uri) else {
             return;
         };
-        let Some(parse_result) = doc.parse_result() else {
+        let Some(manifest) = doc.manifest() else {
             return;
         };
         let targets = deps_engine::classify::license::tier3_license_targets(
-            parse_result,
+            manifest,
             &doc.signals.resolved_versions,
             &doc.signals.resolved_version_candidates,
-            ecosystem.formatter(),
             ecosystem.ecosystem_id(),
         );
         (
@@ -535,44 +533,34 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         let Some(doc) = state.get_document(uri) else {
             return;
         };
-        let Some(parse_result) = doc.parse_result() else {
+        let Some(manifest) = doc.manifest() else {
             return;
         };
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            parse_result,
+        let vuln_keys = manifest.vulnerability_keys(
             &doc.signals.resolved_versions,
             Some(&doc.signals.resolved_version_candidates),
-            formatter,
-            ecosystem_id,
         );
-        let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
-            parse_result,
-            &vuln_keys,
-            formatter,
-            ecosystem_id,
-        );
+        let candidate_tags =
+            deps_engine::classify::osv::candidate_tag_sources(manifest, &vuln_keys, ecosystem_id);
         let (targets, latest_status) = deps_engine::classify::osv::build_latest_check_targets(
-            parse_result,
+            manifest,
             &doc.signals.cached_versions,
             &vuln_keys,
             &candidate_tags,
-            formatter,
         );
         let (candidate_rounds, candidate_status) =
             deps_engine::classify::osv::build_candidate_check_targets(
-                parse_result,
+                manifest,
                 &doc.signals.cached_versions,
                 &vuln_keys,
                 &candidate_tags,
-                formatter,
             );
         // Snapshotted in this same read: the guard is released before the awaits below, and a
         // later re-read could pair a fresher cache with this scan's keys (#1832).
         let fix_target_registry = deps_engine::classify::osv::fix_target_registry(
-            parse_result,
+            manifest,
             &vuln_keys,
             &doc.signals.cached_versions,
-            formatter,
         );
         (
             targets,
@@ -948,7 +936,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Dart ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Dart,
                 content.to_string(),
@@ -998,7 +989,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Swift ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Swift,
                 content.to_string(),
@@ -1068,7 +1062,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Gradle ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Gradle,
                 content.to_string(),
@@ -1125,7 +1122,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Gradle ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Gradle,
                 content.to_string(),
@@ -1179,7 +1179,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Deno ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Deno,
                 content.to_string(),
@@ -1227,16 +1230,15 @@ mod tests {
         use deps_core::Dependency;
         use deps_core::LicenseSource;
         use deps_core::Metadata;
-        use deps_core::ParseResult;
         use deps_core::Registry;
         use deps_core::VersionReq;
         use deps_core::ecosystem::BoxFuture;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::lsp_helpers::EcosystemFormatter;
+
         use deps_core::parser::DependencySource;
         use deps_core::policy_config::FetchTimeout;
         use deps_core::position::{Position, Range};
-        use std::any::Any;
+
         use tokio::sync::Barrier;
 
         struct FakeTier3Dep {
@@ -1260,9 +1262,6 @@ mod tests {
             fn source(&self) -> DependencySource {
                 DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct FakeTier3ParseResult {
@@ -1280,10 +1279,17 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedParseResult for FakeTier3ParseResult {
+            type Dep = FakeTier3Dep;
+            fn own_dependencies(&self) -> &[FakeTier3Dep] {
+                std::slice::from_ref(&self.dep)
             }
         }
+
+        const FAKE_TIER3_FORMATTER: deps_core::test_util::StubFormatter<FakeTier3Dep> =
+            deps_core::test_util::StubFormatter::new().for_dependency();
 
         /// A single `=`-pinned, registry-sourced dependency (`dep-0`) whose `fetch_license`
         /// is fully controlled by the barriers below — mirrors
@@ -1298,7 +1304,7 @@ mod tests {
         }
 
         impl Sealed for SignalingLicenseEcosystem {}
-        impl Ecosystem for SignalingLicenseEcosystem {
+        impl deps_core::EcosystemBase for SignalingLicenseEcosystem {
             fn ecosystem_id(&self) -> EcosystemId {
                 EcosystemId::Dart
             }
@@ -1308,38 +1314,11 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &[]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                uri: &'a url::Url,
-            ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
-                let uri = uri.clone();
-                Box::pin(async move {
-                    Ok(Box::new(FakeTier3ParseResult {
-                        dep: FakeTier3Dep {
-                            name: PackageName::new("dep-0"),
-                            version_req: VersionReq::new("=1.0.0"),
-                        },
-                        uri,
-                    }) as Box<dyn ParseResult>)
-                })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::new(crate::test_utils::blocking_ecosystem::NoopRegistry)
             }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
             fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {
                 None
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: PackageName,
-                _prefix: String,
-            ) -> BoxFuture<'a, deps_core::completion::Completions> {
-                unimplemented!()
             }
             fn fetch_license<'a>(
                 &'a self,
@@ -1355,8 +1334,31 @@ mod tests {
             fn license_source(&self) -> LicenseSource {
                 LicenseSource::DetectedSpdx
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedEcosystem for SignalingLicenseEcosystem {
+            type Parsed = FakeTier3ParseResult;
+            type Formatter = deps_core::test_util::StubFormatter<FakeTier3Dep>;
+
+            fn own_formatter(&self) -> &Self::Formatter {
+                &FAKE_TIER3_FORMATTER
+            }
+
+            fn parse<'a>(
+                &'a self,
+                _content: &'a str,
+                uri: &'a url::Url,
+            ) -> BoxFuture<'a, deps_core::Result<FakeTier3ParseResult>> {
+                let uri = uri.clone();
+                Box::pin(async move {
+                    Ok(FakeTier3ParseResult {
+                        dep: FakeTier3Dep {
+                            name: PackageName::new("dep-0"),
+                            version_req: VersionReq::new("=1.0.0"),
+                        },
+                        uri,
+                    })
+                })
             }
         }
 
@@ -1368,12 +1370,9 @@ mod tests {
             ecosystem: &Arc<dyn Ecosystem>,
             url: &url::Url,
         ) {
-            let parse_result = ecosystem.parse_manifest("", url).await.unwrap();
-            let doc_state = DocumentState::new_from_parse_result(
-                EcosystemId::Dart,
-                String::new(),
-                parse_result,
-            );
+            let manifest = Arc::clone(ecosystem).parse_manifest("", url).await.unwrap();
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Dart, String::new(), manifest);
             state.update_document(uri.clone(), doc_state);
         }
 
@@ -1538,7 +1537,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Cargo ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             doc_state.update_resolved_versions(
@@ -1629,7 +1631,7 @@ mod tests {
 
         async fn setup(state: &Arc<ServerState>, uri: &Uri, url: &url::Url) -> Arc<dyn Ecosystem> {
             let ecosystem = state.ecosystem_registry.for_uri(url).unwrap();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(git_dep_content(), url)
                 .await
                 .unwrap();
@@ -1876,7 +1878,10 @@ mod tests {
             let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
                 deps_core::HttpCache::new(),
             )));
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::GithubActions,
                 content,
@@ -2002,7 +2007,10 @@ mod tests {
             let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
                 deps_core::HttpCache::new(),
             )));
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::GithubActions,
                 content,
@@ -2083,7 +2091,10 @@ mod tests {
             let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
                 deps_core::HttpCache::new(),
             )));
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(
@@ -2198,7 +2209,10 @@ mod tests {
             let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
                 deps_core::HttpCache::new(),
             )));
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(
@@ -2345,7 +2359,10 @@ mod tests {
             let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
                 deps_core::HttpCache::new(),
             )));
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(
@@ -2791,7 +2808,10 @@ mod tests {
                 signals
                     .vulnerabilities
                     .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
-                let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+                let parse_result = Arc::clone(&ecosystem)
+                    .parse_manifest(content, &url)
+                    .await
+                    .unwrap();
                 let mut edited = DocumentState::new_from_parse_result(
                     EcosystemId::GithubActions,
                     content.to_string(),
@@ -2862,7 +2882,10 @@ mod tests {
             let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
                 deps_core::HttpCache::new(),
             )));
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(
@@ -3342,7 +3365,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Cargo ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             state.update_document(uri.clone(), doc_state);
@@ -3418,7 +3444,10 @@ mod tests {
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let state = Arc::new(ServerState::new());
             let ecosystem = state.ecosystem_registry.for_uri(&url).unwrap();
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result),

@@ -5,6 +5,7 @@
 //! `requirements.txt`/`constraints.txt` files (pip's requirements file
 //! format).
 
+#[cfg(test)]
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -12,13 +13,10 @@ use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Range, Uri};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
-use deps_core::NarrowParseResult;
+use deps_core::ParsedView;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, OwnParseResult, ParseResult as ParseResultTrait, Registry, Result,
-    lsp_helpers::EcosystemFormatter,
-};
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 
 use crate::formatter::PypiFormatter;
 use crate::parser::PypiParser;
@@ -127,9 +125,9 @@ impl PypiEcosystem {
     }
 
     /// True when `uri`'s basename matches neither an exact
-    /// [`Ecosystem::manifest_filenames`] entry nor a
-    /// [`Ecosystem::manifest_patterns`] glob — i.e. this file was routed to PyPI
-    /// purely via the [`Ecosystem::manifest_directory_patterns`] fallback
+    /// [`EcosystemBase::manifest_filenames`] entry nor a
+    /// [`EcosystemBase::manifest_patterns`] glob — i.e. this file was routed to PyPI
+    /// purely via the [`EcosystemBase::manifest_directory_patterns`] fallback
     /// (`requirements/*.txt`, matched by `EcosystemRegistry::for_uri` on
     /// directory name alone), not a primary basename match.
     ///
@@ -153,11 +151,7 @@ impl PypiEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for PypiEcosystem {}
 
-impl OwnParseResult for PypiEcosystem {
-    type Parsed = crate::parser::ParseResult;
-}
-
-impl Ecosystem for PypiEcosystem {
+impl EcosystemBase for PypiEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Pypi
     }
@@ -187,11 +181,82 @@ impl Ecosystem for PypiEcosystem {
         &["poetry.lock", "uv.lock"]
     }
 
-    fn parse_manifest<'a>(
+    fn registry(&self) -> Arc<dyn Registry> {
+        self.registry.clone() as Arc<dyn Registry>
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(Arc::new(crate::lockfile::PypiLockParser))
+    }
+
+    fn package_search_is_incomplete(&self) -> bool {
+        // Same unranked, alphabetically-truncated index `PackageName`'s
+        // `is_incomplete: true` above covers for the primary path — see
+        // `Ecosystem::package_search_is_incomplete`'s doc for why this only
+        // matters for `deps-lsp`'s context-less fallback paths.
+        true
+    }
+
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: deps_core::position::Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn fallback_completion_is_bare(
+        &self,
+        content: &str,
+        position: deps_core::position::Position,
+    ) -> bool {
+        // A genuinely still-open quoted string — an odd, escape-aware real-quote count
+        // via `open_quoted_tail` (the same primitive `extract_prefix` uses below, so
+        // the two methods always agree on the same `content`/`position`) — means the
+        // opening quote already exists in the manifest: the bare package name is the
+        // correct insert there, same as today. Zero real quotes (nothing typed yet, or
+        // only an escaped `\"`) means nothing has opened a quote to insert into: e.g.
+        // `req` alone on its own line under `dependencies = [...]`.
+        // `completion_insert_text` must then supply both quotes itself, or the
+        // fallback insert produces an unquoted, invalid TOML array element (#737). An
+        // already-closed value (an even, non-zero count, e.g. `"pytest"`) also reports
+        // `false` here, but that state is unreachable in practice: `extract_prefix`
+        // already collapses it to an empty prefix, which the caller rejects before
+        // this method is ever invoked.
+        let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
+            return false;
+        };
+        let raw = deps_core::fallback_completion::raw_prefix(line, position.character);
+        deps_core::fallback_completion::open_quoted_tail(raw).is_some()
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        // Only reached when `fallback_completion_is_bare` reports no quote typed at
+        // all — see that method. Both real PEP 621 shapes (`dependencies = [...]` and
+        // an `[project.optional-dependencies]` group) are TOML string-array elements,
+        // not a key=value table entry like Cargo's, so the full insert here is the
+        // quoted array element itself rather than a `key = value` pair.
+        Some(format!("\"{}\"", metadata.name().as_str()))
+    }
+}
+
+impl TypedEcosystem for PypiEcosystem {
+    type Parsed = crate::parser::ParseResult;
+    type Formatter = PypiFormatter;
+
+    fn own_formatter(&self) -> &PypiFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
         &'a self,
         content: &'a str,
         uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<crate::parser::ParseResult>> {
         Box::pin(async move {
             let kind = PypiManifestKind::from_uri(uri);
             let result = match kind {
@@ -230,20 +295,8 @@ impl Ecosystem for PypiEcosystem {
             for chain in &result.resolved_chains {
                 PypiRegistry::register_alternate(&self.registry, chain);
             }
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+            Ok(result)
         })
-    }
-
-    fn registry(&self) -> Arc<dyn Registry> {
-        self.registry.clone() as Arc<dyn Registry>
-    }
-
-    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
-        Some(Arc::new(crate::lockfile::PypiLockParser))
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
     }
 
     /// Warms the package-name search index lazily on the first completion request in this
@@ -265,7 +318,7 @@ impl Ecosystem for PypiEcosystem {
     #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
+        _request: deps_core::completion::CompletionRequest<'a, crate::parser::ParseResult>,
         prefix: String,
         range: Range,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
@@ -280,23 +333,13 @@ impl Ecosystem for PypiEcosystem {
         VERSION_OPERATOR_CHARS
     }
 
-    fn package_search_is_incomplete(&self) -> bool {
-        // Same unranked, alphabetically-truncated index `PackageName`'s
-        // `is_incomplete: true` above covers for the primary path — see
-        // `Ecosystem::package_search_is_incomplete`'s doc for why this only
-        // matters for `deps-lsp`'s context-less fallback paths.
-        true
-    }
-
     #[cfg(feature = "lsp-responses")]
-    fn generate_document_links(
+    fn document_links(
         &self,
-        parse_result: &dyn ParseResultTrait,
+        parsed: ParsedView<'_, crate::parser::ParseResult>,
         uri: &Url,
     ) -> Vec<DocumentLink> {
-        let Some(result) = self.own_parse_result(parse_result) else {
-            return Vec::new();
-        };
+        let result = parsed.typed();
         if result.document_links.is_empty() {
             return Vec::new();
         }
@@ -394,56 +437,6 @@ impl Ecosystem for PypiEcosystem {
                 })
             })
             .collect()
-    }
-
-    fn fallback_completion_prefix<'a>(
-        &self,
-        content: &'a str,
-        position: deps_core::position::Position,
-    ) -> Option<&'a str> {
-        let line = deps_core::fallback_completion::line_at(content, position)?;
-        if !is_in_dependencies_section(content, position.line as usize) {
-            return None;
-        }
-        Some(extract_prefix(line, position.character))
-    }
-
-    fn fallback_completion_is_bare(
-        &self,
-        content: &str,
-        position: deps_core::position::Position,
-    ) -> bool {
-        // A genuinely still-open quoted string — an odd, escape-aware real-quote count
-        // via `open_quoted_tail` (the same primitive `extract_prefix` uses below, so
-        // the two methods always agree on the same `content`/`position`) — means the
-        // opening quote already exists in the manifest: the bare package name is the
-        // correct insert there, same as today. Zero real quotes (nothing typed yet, or
-        // only an escaped `\"`) means nothing has opened a quote to insert into: e.g.
-        // `req` alone on its own line under `dependencies = [...]`.
-        // `completion_insert_text` must then supply both quotes itself, or the
-        // fallback insert produces an unquoted, invalid TOML array element (#737). An
-        // already-closed value (an even, non-zero count, e.g. `"pytest"`) also reports
-        // `false` here, but that state is unreachable in practice: `extract_prefix`
-        // already collapses it to an empty prefix, which the caller rejects before
-        // this method is ever invoked.
-        let Some(line) = deps_core::fallback_completion::line_at(content, position) else {
-            return false;
-        };
-        let raw = deps_core::fallback_completion::raw_prefix(line, position.character);
-        deps_core::fallback_completion::open_quoted_tail(raw).is_some()
-    }
-
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        // Only reached when `fallback_completion_is_bare` reports no quote typed at
-        // all — see that method. Both real PEP 621 shapes (`dependencies = [...]` and
-        // an `[project.optional-dependencies]` group) are TOML string-array elements,
-        // not a key=value table entry like Cargo's, so the full insert here is the
-        // quoted array element itself rather than a `key = value` pair.
-        Some(format!("\"{}\"", metadata.name().as_str()))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -580,7 +573,9 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::{VersionData, parser::DependencySource};
+    use deps_core::{
+        ParseResult as ParseResultTrait, ParsedView, VersionData, parser::DependencySource,
+    };
     use std::assert_matches;
     use std::collections::HashMap;
 
@@ -597,7 +592,8 @@ mod tests {
         fallback: &str,
         available: &[&str],
     ) -> deps_core::lsp_helpers::FallbackEditVerdict {
-        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem = Arc::new(PypiEcosystem::new(Arc::new(deps_core::HttpCache::new())))
+            as Arc<dyn deps_core::Ecosystem>;
         let content = "pkg~=0.9\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/requirements.txt");
         deps_core::test_util::fallback_edit_outcome(
@@ -638,7 +634,8 @@ mod tests {
     /// this hole. The naive fallback candidate must not be approved as `fallback` = 1.5.0.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback() {
-        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem = Arc::new(PypiEcosystem::new(Arc::new(deps_core::HttpCache::new())))
+            as Arc<dyn deps_core::Ecosystem>;
         let content = "pkg>=1.0,!=1.5.0,<2.0\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/requirements.txt");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -665,7 +662,8 @@ mod tests {
     /// `Pep440Matcher::explicitly_excludes` asks the `!=` specifier directly.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
-        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem = Arc::new(PypiEcosystem::new(Arc::new(deps_core::HttpCache::new())))
+            as Arc<dyn deps_core::Ecosystem>;
         let content = "pkg>=1.0,!=1.5.0,<2.0\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/requirements.txt");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -784,7 +782,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/project/requirements/base.txt");
 
         let result = ecosystem
-            .parse_manifest(
+            .parse(
                 "Introduction\n\nScope\n\nThis document defines the requirements.\n",
                 &uri,
             )
@@ -801,7 +799,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/requirements.txt");
 
         let result = ecosystem
-            .parse_manifest("requests==2.31.0\nflask>=3.0\n", &uri)
+            .parse("requests==2.31.0\nflask>=3.0\n", &uri)
             .await
             .unwrap();
 
@@ -815,7 +813,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let result = ecosystem
-            .parse_manifest("[project]\ndependencies = [\"requests>=2.0.0\"]\n", &uri)
+            .parse("[project]\ndependencies = [\"requests>=2.0.0\"]\n", &uri)
             .await
             .unwrap();
 
@@ -843,9 +841,7 @@ mod tests {
         let ecosystem = PypiEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
-        let result = ecosystem
-            .parse_manifest("[project\nname = invalid", &uri)
-            .await;
+        let result = ecosystem.parse("[project\nname = invalid", &uri).await;
 
         let Err(err) = result else {
             panic!("expected a parse error");
@@ -867,7 +863,7 @@ name = "test"
 dependencies = ["requests>=2.0.0"]
 "#;
 
-        let result = ecosystem.parse_manifest(content, &uri).await;
+        let result = ecosystem.parse(content, &uri).await;
         assert!(result.is_ok());
 
         let parse_result = result.unwrap();
@@ -882,7 +878,7 @@ dependencies = ["requests>=2.0.0"]
 
         let invalid_content = "[project\nname = invalid";
 
-        let result = ecosystem.parse_manifest(invalid_content, &uri).await;
+        let result = ecosystem.parse(invalid_content, &uri).await;
         assert!(result.is_err());
     }
 
@@ -897,7 +893,7 @@ name = "test"
 dependencies = []
 "#;
 
-        let result = ecosystem.parse_manifest(content, &uri).await;
+        let result = ecosystem.parse(content, &uri).await;
         assert!(result.is_ok());
 
         let parse_result = result.unwrap();
@@ -924,13 +920,13 @@ name = "test"
 dependencies = []
 "#;
 
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = ecosystem.parse(content, &uri).await.unwrap();
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
         let diagnostics = ecosystem
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -944,7 +940,7 @@ dependencies = []
     // --- T010: ecosystem wiring — parse_manifest registers resolved chains ---
 
     fn parsed_dependencies(
-        result: &dyn ParseResultTrait,
+        result: &crate::parser::ParseResult,
     ) -> Vec<(String, deps_core::parser::DependencySource)> {
         result
             .dependencies()
@@ -961,12 +957,9 @@ dependencies = []
         let ecosystem = PypiEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/project/requirements.txt");
 
-        let result = ecosystem
-            .parse_manifest("requests==2.31.0\n", &uri)
-            .await
-            .unwrap();
+        let result = ecosystem.parse("requests==2.31.0\n", &uri).await.unwrap();
 
-        for (_, source) in parsed_dependencies(result.as_ref()) {
+        for (_, source) in parsed_dependencies(&result) {
             assert_eq!(source, DependencySource::Registry);
         }
     }
@@ -993,9 +986,9 @@ dependencies = []
         let content = "--index-url https://pypi.mycorp.example/simple\n\
                         --extra-index-url https://10.0.0.5/simple\n\
                         requests==2.31.0\n";
-        let result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let result = ecosystem.parse(content, &uri).await.unwrap();
 
-        let deps = parsed_dependencies(result.as_ref());
+        let deps = parsed_dependencies(&result);
         let (_, source) = deps.iter().find(|(name, _)| name == "requests").unwrap();
         let DependencySource::AlternateRegistry { index, .. } = source else {
             panic!("expected AlternateRegistry, got {source:?}");
@@ -1022,18 +1015,14 @@ dependencies = []
         let uri = deps_core::test_util::test_uri("/project/requirements.txt");
 
         let content = "--extra-index-url https://extra.example/simple\nrequests==2.31.0\n";
-        let result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let result = ecosystem.parse(content, &uri).await.unwrap();
 
-        let deps = parsed_dependencies(result.as_ref());
+        let deps = parsed_dependencies(&result);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].1, DependencySource::Registry);
 
         // Nothing was registered — a zero-hop config has no chain to register at all.
-        let downcast = result
-            .as_any()
-            .downcast_ref::<crate::parser::ParseResult>()
-            .unwrap();
-        assert!(downcast.resolved_chains.is_empty());
+        assert!(result.resolved_chains.is_empty());
     }
 
     #[test]
@@ -1439,12 +1428,9 @@ dependencies = []
             let ecosystem = PypiEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/project/requirements.txt");
 
-            let parse_result = ecosystem
-                .parse_manifest("-r base.txt\n", &uri)
-                .await
-                .unwrap();
+            let parse_result = ecosystem.parse("-r base.txt\n", &uri).await.unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert_eq!(links.len(), 1);
             let target = links[0].target.as_ref().unwrap();
             assert!(target.path().as_str().ends_with("/project/base.txt"));
@@ -1482,12 +1468,9 @@ dependencies = []
             let prefix = "https://attacker.example";
             let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
 
-            let parse_result = ecosystem
-                .parse_manifest("-r base.txt\n", &uri)
-                .await
-                .unwrap();
+            let parse_result = ecosystem.parse("-r base.txt\n", &uri).await.unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert!(
                 links.is_empty(),
                 "a malicious-scheme/host URI ({prefix}) must not resolve document link targets \
@@ -1504,12 +1487,9 @@ dependencies = []
             let ecosystem = PypiEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/project/requirements.txt");
 
-            let parse_result = ecosystem
-                .parse_manifest("-r /etc/shadow\n", &uri)
-                .await
-                .unwrap();
+            let parse_result = ecosystem.parse("-r /etc/shadow\n", &uri).await.unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert!(links.is_empty());
         }
 
@@ -1523,11 +1503,11 @@ dependencies = []
             let uri = deps_core::test_util::test_uri("/project/requirements.txt");
 
             let parse_result = ecosystem
-                .parse_manifest("-r C:\\Windows\\System32\\config\\SAM\n", &uri)
+                .parse("-r C:\\Windows\\System32\\config\\SAM\n", &uri)
                 .await
                 .unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert!(links.is_empty());
         }
 
@@ -1542,11 +1522,11 @@ dependencies = []
             let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
 
             let parse_result = ecosystem
-                .parse_manifest("-r ../requirements-base.txt\n", &uri)
+                .parse("-r ../requirements-base.txt\n", &uri)
                 .await
                 .unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert_eq!(links.len(), 1);
             let target = links[0].target.as_ref().unwrap();
             assert!(
@@ -1615,7 +1595,7 @@ dependencies = []
                 "../../../../etc/shadow",
             );
 
-            let links = ecosystem.generate_document_links(&parse_result, &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert!(links.is_empty());
         }
 
@@ -1640,7 +1620,7 @@ dependencies = []
                 "../../../project/x.txt",
             );
 
-            let links = ecosystem.generate_document_links(&parse_result, &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert_eq!(links.len(), 1);
             let target = links[0].target.as_ref().unwrap();
             assert!(target.path().as_str().ends_with("/project/x.txt"));
@@ -1662,7 +1642,7 @@ dependencies = []
                 "../shared/req.txt",
             );
 
-            let links = ecosystem.generate_document_links(&parse_result, &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert_eq!(links.len(), 1);
             let target = links[0].target.as_ref().unwrap();
             assert!(target.path().as_str().ends_with("/project/shared/req.txt"));
@@ -1678,11 +1658,11 @@ dependencies = []
             let uri = deps_core::test_util::test_uri("/project/requirements.txt");
 
             let parse_result = ecosystem
-                .parse_manifest("-r safe.txt\u{202E}txt.evil\n", &uri)
+                .parse("-r safe.txt\u{202E}txt.evil\n", &uri)
                 .await
                 .unwrap();
 
-            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            let links = ecosystem.document_links(ParsedView::new(&parse_result), &uri);
             assert!(links.is_empty());
         }
 
@@ -1755,14 +1735,11 @@ dependencies = []
             let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
 
             match context {
                 deps_core::completion::CompletionContext::PackageName { prefix, range } => {
@@ -1789,12 +1766,12 @@ dependencies = []
             let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1918,7 +1895,7 @@ dependencies = []
 
         /// #419 §4.6/Q2 regression: a *version* completion request (not a
         /// package-name one) inside a Python manifest must warm the search index —
-        /// `PypiEcosystem::generate_completions` calls `warm_search_index` before
+        /// `PypiEcosystem::completions` calls `warm_search_index` before
         /// dispatching on completion context — and repeated requests must still
         /// produce exactly one index-build fetch (single-flight + build-once).
         #[tokio::test]
@@ -1938,7 +1915,7 @@ dependencies = []
 
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             let content = "[project]\ndependencies = [\"requests>=2.0\"]\n";
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
 
             // Locate a cursor position that `detect_completion_context` actually
             // resolves to a Version context, rather than hand-computing a column
@@ -1949,7 +1926,7 @@ dependencies = []
                 .find(|&position| {
                     matches!(
                         deps_core::completion::detect_completion_context(
-                            parse_result.as_ref(),
+                            &parse_result,
                             position,
                             content,
                         ),
@@ -1962,8 +1939,8 @@ dependencies = []
             for _ in 0..3 {
                 last_completions = Some(
                     ecosystem
-                        .generate_completions(
-                            parse_result.as_ref(),
+                        .completions(
+                            ParsedView::new(&parse_result),
                             version_position,
                             content,
                             deps_core::FreshnessSettings::default(),
@@ -2443,14 +2420,14 @@ dependencies = []
 dependencies = []
 ";
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
             let config = EcosystemConfig::default();
 
             let hints = ecosystem
-                .generate_inlay_hints(
-                    parse_result.as_ref(),
+                .inlay_hints(
+                    ParsedView::new(&parse_result),
                     VersionData::new(&cached_versions, &resolved_versions),
                     deps_core::LoadingState::Loaded,
                     &config,
@@ -2470,15 +2447,15 @@ dependencies = []
 name = "test"
 "#;
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position {
                 line: 0,
                 character: 0,
             };
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -2514,7 +2491,7 @@ name = "test"
 dependencies = ["requests"]
 "#;
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
 
             let position = Position {
                 line: 1,
@@ -2522,8 +2499,8 @@ dependencies = ["requests"]
             };
 
             let cold_start = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -2537,8 +2514,8 @@ dependencies = ["requests"]
             let completions = poll_until_nonempty(
                 || async {
                     ecosystem
-                        .generate_completions(
-                            parse_result.as_ref(),
+                        .completions(
+                            ParsedView::new(&parse_result),
                             position,
                             content,
                             deps_core::FreshnessSettings::default(),
@@ -2570,7 +2547,7 @@ dependencies = ["requests"]
 
             let content = format!("{UNKNOWN_PACKAGE}>2.0\n");
             let uri = deps_core::test_util::test_uri("/test/requirements.txt");
-            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(&content, &uri).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 1,
@@ -2585,8 +2562,8 @@ dependencies = ["requests"]
             };
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     &content,
                     deps_core::FreshnessSettings::default(),
@@ -2613,7 +2590,7 @@ dependencies = ["requests"]
 name = "test"
 "#;
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position {
                 line: 0,
                 character: 0,
@@ -2622,8 +2599,8 @@ name = "test"
             let resolved_versions = HashMap::new();
 
             let hover = ecosystem
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     VersionData::new(&cached_versions, &resolved_versions),
                     deps_core::FreshnessSettings::default(),
@@ -2643,7 +2620,7 @@ name = "test"
 name = "test"
 "#;
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position {
                 line: 0,
                 character: 0,
@@ -2651,8 +2628,8 @@ name = "test"
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
             let actions = ecosystem
-                .generate_code_actions(
-                    parse_result.as_ref(),
+                .code_actions(
+                    ParsedView::new(&parse_result),
                     position,
                     &uri,
                     VersionData::new(&cached_versions, &resolved_versions),

@@ -321,7 +321,6 @@ mod tests {
             Some("3.14.0")
         );
         assert!(dep.features().is_empty());
-        assert!(dep.as_any().is::<MavenDependency>());
         assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 

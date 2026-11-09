@@ -12,15 +12,15 @@
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use deps_core::lsp_helpers::{
-    AuxiliaryLookup, CommentCheck, FetchContext, InteractiveFetch, InteractiveFetchRequest,
-    ShaPinTail, await_interactive_fetch, sha_pin_rewrite, truncate_for_diagnostic,
+    AuxiliaryLookup, CommentCheck, DependencyFormatter, FetchContext, InteractiveFetch,
+    InteractiveFetchRequest, ShaPinTail, await_interactive_fetch, sha_pin_rewrite,
+    truncate_for_diagnostic,
 };
-use deps_core::{NarrowDependency, PackageKey, PackageName};
+use deps_core::{PackageKey, PackageName, ParsedView};
 
 use super::{
     GitlabCiDependency, GitlabCiFormatter, GitlabCiParseResult, GitlabCiRegistry,
-    MAX_DIAGNOSTIC_VALUE_CHARS, PackageRendering, ParseResultTrait, ShaPinQuickfixKind, Url,
-    sha_pin_quickfix_kind,
+    MAX_DIAGNOSTIC_VALUE_CHARS, ShaPinQuickfixKind, Url, sha_pin_quickfix_kind,
 };
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
@@ -38,9 +38,8 @@ pub(super) const VERSION_OPERATOR_CHARS: &[char] = &[];
 impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
     fn resolve_static_sha_pin(
         &self,
-        dep: &dyn deps_core::Dependency,
+        gl_dep: &GitlabCiDependency,
     ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
-        let gl_dep = self.own_dependency(dep)?;
         if !matches!(
             sha_pin_quickfix_kind(gl_dep, self),
             Some(ShaPinQuickfixKind::StaticTagIndex)
@@ -87,7 +86,7 @@ impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
 /// [`GitlabCiFormatter`]'s [`deps_core::lsp_helpers::ShaPinning`] impl, which carries this
 /// guard (restricted to `ShaPinQuickfixKind::StaticTagIndex`).
 pub(super) fn build_sha_pin_action(
-    parse_result: &dyn ParseResultTrait,
+    parse_result: &ParsedView<'_, GitlabCiParseResult>,
     position: Position,
     uri: &Url,
     formatter: &GitlabCiFormatter,
@@ -108,15 +107,14 @@ pub(super) fn build_sha_pin_action(
 /// [`deps_core::lsp_helpers::build_sha_comment_fix_action`], which offers a fix only for a
 /// comment naming another tag of the pinned commit.
 pub(super) fn build_sha_comment_fix_action(
-    parsed: &GitlabCiParseResult,
+    dependencies: &[GitlabCiDependency],
     position: Position,
     uri: &Url,
     formatter: &GitlabCiFormatter,
 ) -> Option<CodeAction> {
-    let gl_dep = parsed
-        .dependencies
+    let gl_dep = dependencies
         .iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
     let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
         return None;
     };
@@ -135,14 +133,13 @@ pub(super) fn build_sha_comment_fix_action(
 /// `project:` Tags list ever qualifies (never a `component:` Releases list), then delegates to
 /// [`deps_core::lsp_helpers::UnknownRefTarget::fix_action`].
 pub(super) fn build_unknown_ref_fix_action(
-    parse_result: &dyn ParseResultTrait,
+    parse_result: &ParsedView<'_, GitlabCiParseResult>,
     position: Position,
     uri: &Url,
     formatter: &GitlabCiFormatter,
 ) -> Option<CodeAction> {
-    let dep =
+    let gl_dep =
         deps_core::lsp_helpers::dependency_at_position(parse_result, position.into(), formatter)?;
-    let gl_dep = formatter.own_dependency(dep)?;
     super::unknown_ref_target(formatter, gl_dep)?.fix_action(uri)
 }
 
@@ -166,7 +163,7 @@ pub(super) fn build_unknown_ref_fix_action(
 /// #643) — the single source of truth this and `mutable_ref_pin_diagnostics`'s message
 /// both consult, so they cannot independently drift about whether a quickfix exists.
 pub(super) async fn build_dynamic_component_pin_action(
-    parsed: &GitlabCiParseResult,
+    dependencies: &[GitlabCiDependency],
     position: Position,
     uri: &Url,
     formatter: &GitlabCiFormatter,
@@ -176,10 +173,9 @@ pub(super) async fn build_dynamic_component_pin_action(
     // M2 (#640): the same `formatter.is_position_on_dependency` lookup
     // `build_sha_pin_action` uses, rather than a bare `version_range` check — a
     // consistency unification, not a behavior change for this pin shape.
-    let gl_dep = parsed
-        .dependencies
+    let gl_dep = dependencies
         .iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
     if !matches!(
         sha_pin_quickfix_kind(gl_dep, formatter),
         Some(ShaPinQuickfixKind::DynamicComponentPin)

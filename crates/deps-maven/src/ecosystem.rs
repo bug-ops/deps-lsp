@@ -3,16 +3,18 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
-    lsp_helpers::{EcosystemFormatter, warn_rejected_value},
+    EcosystemBase, Registry, Result, TypedEcosystem, is_safe_maven_coordinate_segment,
+    lsp_helpers::warn_rejected_value,
 };
-use std::any::Any;
+#[cfg(feature = "lsp-responses")]
+use deps_core::{ParseResult as ParseResultTrait, ParsedView};
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range as LspRange};
 use url::Url;
 
 use crate::formatter::MavenFormatter;
+use crate::parser::MavenParseResult;
 use crate::registry::MavenCentralRegistry;
 
 #[cfg(feature = "lsp-responses")]
@@ -35,7 +37,7 @@ use lsp::{
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionTextEdit, TextEdit};
 
-/// [`Ecosystem`] implementation for Maven (`pom.xml`).
+/// [`deps_core::Ecosystem`] implementation for Maven (`pom.xml`).
 pub struct MavenEcosystem {
     registry: Arc<MavenCentralRegistry>,
     formatter: MavenFormatter,
@@ -263,7 +265,7 @@ impl MavenEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for MavenEcosystem {}
 
-impl Ecosystem for MavenEcosystem {
+impl EcosystemBase for MavenEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Maven
     }
@@ -280,131 +282,8 @@ impl Ecosystem for MavenEcosystem {
         &[]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_pom_xml(content, uri)?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    /// This is a full override, not the shared [`Ecosystem::generate_completions`] default
-    /// dispatch: Maven routes on its own `MavenXmlContext` (`Self::detect_xml_context`),
-    /// detected from raw manifest text rather than
-    /// [`deps_core::completion::detect_completion_context`]'s parsed-AST dependency ranges
-    /// (see `MavenXmlContext`'s doc for why that source difference, plus `groupId`/
-    /// `artifactId` having no counterpart at all, is why this crate can't reuse the shared
-    /// dispatch). Opting out of it means this ecosystem takes on #793's wildcard-match
-    /// obligation itself; see `deps_core::Ecosystem::generate_completions`'s doc.
-    #[cfg(feature = "lsp-responses")]
-    fn generate_completions<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            let (ctx_type, value, value_range) =
-                Self::detect_xml_context(content, position, parse_result);
-
-            // Exhaustive on purpose (#819/#793); each arm also picks the CompletionOrigin it maps to (#1195).
-            let (items, origin) = match ctx_type {
-                MavenXmlContext::Version => {
-                    // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`.
-                    let items = match deps_core::completion::literal_version_dependency(
-                        parse_result,
-                        position,
-                        content,
-                        value_range,
-                    ) {
-                        Some(dep) => {
-                            deps_core::completion::complete_versions_generic_from(
-                                self.ecosystem_id(),
-                                self.registry.as_ref(),
-                                &self.formatter,
-                                dep.name(),
-                                &dep.source(),
-                                value,
-                                VERSION_OPERATOR_CHARS,
-                                freshness,
-                                &parse_result.selection_context(),
-                            )
-                            .await
-                        }
-                        None => vec![],
-                    };
-                    (items, deps_core::completion::CompletionOrigin::Version)
-                }
-                MavenXmlContext::ArtifactId => {
-                    let items = self
-                        .complete_package_names_for_field(
-                            value,
-                            MavenNameField::ArtifactId,
-                            value_range,
-                        )
-                        .await;
-                    (items, deps_core::completion::CompletionOrigin::PackageName)
-                }
-                MavenXmlContext::GroupId => {
-                    let items = self
-                        .complete_package_names_for_field(
-                            value,
-                            MavenNameField::GroupId,
-                            value_range,
-                        )
-                        .await;
-                    (items, deps_core::completion::CompletionOrigin::PackageName)
-                }
-                MavenXmlContext::SelfClosingVersion { tag_span } => {
-                    let items = complete_self_closing_version(
-                        self.ecosystem_id(),
-                        self.registry.as_ref(),
-                        &self.formatter,
-                        parse_result,
-                        position,
-                        content,
-                        tag_span,
-                        value,
-                        freshness,
-                    )
-                    .await;
-                    (items, deps_core::completion::CompletionOrigin::Version)
-                }
-                MavenXmlContext::None => {
-                    (vec![], deps_core::completion::CompletionOrigin::Unresolved)
-                }
-            };
-            Completions::from(items).with_origin(origin)
-        })
-    }
-
-    /// Required by [`Ecosystem`]; called only from this crate's own
-    /// [`Self::generate_completions`] override (Maven does not use the shared default
-    /// dispatch — see that method's doc), for the `"version"` XML context.
-    #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(&package_name, &prefix, request.freshness)
-                .await
-                .into()
-        })
     }
 
     fn fallback_completion_prefix<'a>(
@@ -501,9 +380,131 @@ impl Ecosystem for MavenEcosystem {
             },
         ))
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TypedEcosystem for MavenEcosystem {
+    type Parsed = MavenParseResult;
+    type Formatter = MavenFormatter;
+
+    fn own_formatter(&self) -> &MavenFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<MavenParseResult>> {
+        Box::pin(async move { crate::parser::parse_pom_xml(content, uri) })
+    }
+
+    /// This is a full override, not the shared [`TypedEcosystem::completions`] default
+    /// dispatch: Maven routes on its own `MavenXmlContext` (`Self::detect_xml_context`),
+    /// detected from raw manifest text rather than
+    /// [`deps_core::completion::detect_completion_context`]'s parsed-AST dependency ranges
+    /// (see `MavenXmlContext`'s doc for why that source difference, plus `groupId`/
+    /// `artifactId` having no counterpart at all, is why this crate can't reuse the shared
+    /// dispatch). Opting out of it means this ecosystem takes on #793's wildcard-match
+    /// obligation itself; see `deps_core::TypedEcosystem::completions`'s doc.
+    #[cfg(feature = "lsp-responses")]
+    fn completions<'a>(
+        &'a self,
+        parsed: ParsedView<'a, MavenParseResult>,
+        position: Position,
+        content: &'a str,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            let parse_result: &dyn ParseResultTrait = &parsed;
+            let (ctx_type, value, value_range) =
+                Self::detect_xml_context(content, position, parse_result);
+
+            // Exhaustive on purpose (#819/#793); each arm also picks the CompletionOrigin it maps to (#1195).
+            let (items, origin) = match ctx_type {
+                MavenXmlContext::Version => {
+                    // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`.
+                    let items = match deps_core::completion::literal_version_dependency(
+                        parse_result,
+                        position,
+                        content,
+                        value_range,
+                    ) {
+                        Some(dep) => {
+                            deps_core::completion::complete_versions_generic_from(
+                                self.ecosystem_id(),
+                                self.registry.as_ref(),
+                                &self.formatter,
+                                dep.name(),
+                                &dep.source(),
+                                value,
+                                VERSION_OPERATOR_CHARS,
+                                freshness,
+                                &parse_result.selection_context(),
+                            )
+                            .await
+                        }
+                        None => vec![],
+                    };
+                    (items, deps_core::completion::CompletionOrigin::Version)
+                }
+                MavenXmlContext::ArtifactId => {
+                    let items = self
+                        .complete_package_names_for_field(
+                            value,
+                            MavenNameField::ArtifactId,
+                            value_range,
+                        )
+                        .await;
+                    (items, deps_core::completion::CompletionOrigin::PackageName)
+                }
+                MavenXmlContext::GroupId => {
+                    let items = self
+                        .complete_package_names_for_field(
+                            value,
+                            MavenNameField::GroupId,
+                            value_range,
+                        )
+                        .await;
+                    (items, deps_core::completion::CompletionOrigin::PackageName)
+                }
+                MavenXmlContext::SelfClosingVersion { tag_span } => {
+                    let items = complete_self_closing_version(
+                        self.ecosystem_id(),
+                        self.registry.as_ref(),
+                        &self.formatter,
+                        parse_result,
+                        position,
+                        content,
+                        tag_span,
+                        value,
+                        freshness,
+                    )
+                    .await;
+                    (items, deps_core::completion::CompletionOrigin::Version)
+                }
+                MavenXmlContext::None => {
+                    (vec![], deps_core::completion::CompletionOrigin::Unresolved)
+                }
+            };
+            Completions::from(items).with_origin(origin)
+        })
+    }
+
+    /// Required by [`TypedEcosystem`]; called only from this crate's own
+    /// [`Self::completions`] override (Maven does not use the shared default
+    /// dispatch — see that method's doc), for the `"version"` XML context.
+    #[cfg(feature = "lsp-responses")]
+    fn complete_version<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a, MavenParseResult>,
+        package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.complete_versions(&package_name, &prefix, request.freshness)
+                .await
+                .into()
+        })
     }
 }
 
@@ -528,6 +529,7 @@ fn extract_prefix(line: &str, character: u32) -> (&str, Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Maven's REAL
     /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes a bare
@@ -535,7 +537,8 @@ mod tests {
     /// FR-025's rule is unconditional, one assertion suffices.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
-        let ecosystem = MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(MavenEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = "<project><dependencies><dependency><groupId>com.acme</groupId>\
              <artifactId>pkg</artifactId><version>1.0.0</version></dependency></dependencies>\
              </project>"
@@ -567,7 +570,8 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_disjoint_range_excluded_fallback_vacuous_case()
      {
-        let ecosystem = MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(MavenEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = "<project><dependencies><dependency><groupId>com.acme</groupId>\
              <artifactId>pkg</artifactId><version>[1.0,1.5),(1.5,2.0)</version></dependency>\
              </dependencies></project>"
@@ -643,8 +647,8 @@ mod tests {
         let path = "/test/pom.xml";
         let uri = Url::from_file_path(path).unwrap();
 
-        let result = eco.parse_manifest(xml, &uri).await.unwrap();
-        assert_eq!(result.dependencies().len(), 1);
+        let result = eco.parse(xml, &uri).await.unwrap();
+        assert_eq!(result.dependencies.len(), 1);
     }
 
     #[test]
@@ -891,9 +895,6 @@ mod tests {
             }
             fn uri(&self) -> &url::Url {
                 unimplemented!()
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
             }
         }
 
@@ -1232,12 +1233,11 @@ mod tests {
   </m:dependencies>
 </m:project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let position: Position = dep.version_range().unwrap().start.into();
 
-            let (ctx, _, _) =
-                MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+            let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, &parse_result);
             assert_eq!(
                 ctx,
                 MavenXmlContext::Version,
@@ -2003,7 +2003,7 @@ mod tests {
             assert!(!eco.fallback_completion_is_bare(content, position.into()));
         }
 
-        // --- #793 characterization: `MavenEcosystem::generate_completions` keeps its own
+        // --- #793 characterization: `MavenEcosystem::completions` keeps its own
         // full override (crate-local `MavenXmlContext`-typed XML context, out of #793's scope —
         // see the plan), but the "version" arm's body moves into the new required
         // `complete_version` hook. This pins the arm's observable output before that move.
@@ -2031,14 +2031,11 @@ mod tests {
             let eco = MavenEcosystem::new(cache);
             let xml = "<project>\n  <version>1.0.0</version>\n</project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             assert!(parse_result.dependencies().is_empty());
 
-            let (ctx, _, _) = MavenEcosystem::detect_xml_context(
-                xml,
-                Position::new(1, 13),
-                parse_result.as_ref(),
-            );
+            let (ctx, _, _) =
+                MavenEcosystem::detect_xml_context(xml, Position::new(1, 13), &parse_result);
             assert_eq!(
                 ctx,
                 MavenXmlContext::None,
@@ -2047,8 +2044,8 @@ mod tests {
             );
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(1, 13),
                     xml,
                     deps_core::FreshnessSettings::default(),
@@ -2072,16 +2069,16 @@ mod tests {
             let eco = MavenEcosystem::new(cache);
             let xml = "<project>\n  <name>demo</name>\n</project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
 
             // Cursor sits inside `<name>`, a tag `detect_xml_context` does not recognize.
             let (ctx, _, _) =
-                MavenEcosystem::detect_xml_context(xml, Position::new(1, 8), parse_result.as_ref());
+                MavenEcosystem::detect_xml_context(xml, Position::new(1, 8), &parse_result);
             assert_eq!(ctx, MavenXmlContext::None);
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(1, 8),
                     xml,
                     deps_core::FreshnessSettings::default(),
@@ -2104,21 +2101,18 @@ mod tests {
             let eco = MavenEcosystem::new(cache);
             let xml = "<project>\n  <artifactId>junit</artifactId>\n</project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
 
             // Only "j" typed: too short for `complete_package_names_for_field` to search the
             // registry, so this stays network-free while still exercising the `ArtifactId` arm.
-            let (ctx, value, _) = MavenEcosystem::detect_xml_context(
-                xml,
-                Position::new(1, 15),
-                parse_result.as_ref(),
-            );
+            let (ctx, value, _) =
+                MavenEcosystem::detect_xml_context(xml, Position::new(1, 15), &parse_result);
             assert_eq!(ctx, MavenXmlContext::ArtifactId);
             assert_eq!(value, "j");
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(1, 15),
                     xml,
                     deps_core::FreshnessSettings::default(),
@@ -2141,21 +2135,18 @@ mod tests {
             let eco = MavenEcosystem::new(cache);
             let xml = "<project>\n  <groupId>org.example</groupId>\n</project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
 
             // Only "o" typed: too short for `complete_package_names_for_field` to search the
             // registry, so this stays network-free while still exercising the `GroupId` arm.
-            let (ctx, value, _) = MavenEcosystem::detect_xml_context(
-                xml,
-                Position::new(1, 12),
-                parse_result.as_ref(),
-            );
+            let (ctx, value, _) =
+                MavenEcosystem::detect_xml_context(xml, Position::new(1, 12), &parse_result);
             assert_eq!(ctx, MavenXmlContext::GroupId);
             assert_eq!(value, "o");
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(1, 12),
                     xml,
                     deps_core::FreshnessSettings::default(),
@@ -2190,7 +2181,7 @@ mod tests {
   </dependencies>
 </project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             assert_eq!(
                 dep.version_requirement().map(deps_core::VersionReq::as_str),
@@ -2215,7 +2206,7 @@ mod tests {
             );
 
             let result = eco
-                .generate_completions(parse_result.as_ref(), position, xml, freshness)
+                .completions(ParsedView::new(&parse_result), position, xml, freshness)
                 .await;
             assert_eq!(
                 result,
@@ -2243,14 +2234,14 @@ mod tests {
   </dependencies>
 </project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let position: Position = dep.version_range().unwrap().start.into();
             let freshness = deps_core::FreshnessSettings::default();
 
             let direct = eco.complete_versions(dep.name(), "", freshness).await;
             let via_dispatch = eco
-                .generate_completions(parse_result.as_ref(), position, xml, freshness)
+                .completions(ParsedView::new(&parse_result), position, xml, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
         }
@@ -2279,7 +2270,7 @@ mod tests {
   </dependencies>
 </project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let version_range = dep
                 .version_range()
@@ -2296,12 +2287,12 @@ mod tests {
             let position: Position = version_range.start.into();
 
             let (ctx, value, value_range) =
-                MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+                MavenEcosystem::detect_xml_context(xml, position, &parse_result);
             assert_eq!(ctx, MavenXmlContext::Version);
             assert_eq!(value, "");
 
             let resolved = deps_core::completion::literal_version_dependency(
-                parse_result.as_ref(),
+                &parse_result,
                 position,
                 xml,
                 value_range,
@@ -2396,7 +2387,7 @@ mod tests {
             // matches this position, keeping `complete_self_closing_version` registry-free.
             let xml = "<project>\n  <dependencies>\n    <dependency>\n      <version/>\n    </dependency>\n  </dependencies>\n</project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             assert!(
                 parse_result.dependencies().is_empty(),
                 "fixture must not parse a <dependency>: {xml}"
@@ -2407,8 +2398,7 @@ mod tests {
                 u32::try_from(line.find("<version").unwrap() + "<version".len()).unwrap();
             let position = Position::new(3, interior_col);
 
-            let (ctx, _, _) =
-                MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+            let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, &parse_result);
             assert_matches!(
                 ctx,
                 MavenXmlContext::SelfClosingVersion { .. },
@@ -2416,7 +2406,7 @@ mod tests {
             );
             assert!(
                 deps_core::completion::literal_version_dependency(
-                    parse_result.as_ref(),
+                    &parse_result,
                     position,
                     xml,
                     LspRange::default(),
@@ -2426,8 +2416,8 @@ mod tests {
             );
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     xml,
                     deps_core::FreshnessSettings::default(),
@@ -2468,7 +2458,7 @@ mod tests {
   </dependencies>
 </project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let version_range = dep
                     .version_range()
@@ -2479,15 +2469,14 @@ mod tests {
             );
             let position: Position = version_range.start.into();
 
-            let (ctx, _, _) =
-                MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+            let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, &parse_result);
             let MavenXmlContext::SelfClosingVersion { tag_span } = ctx else {
                 panic!("self-closing <version/> must be a completion trigger, got {ctx:?}");
             };
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     xml,
                     deps_core::FreshnessSettings::default(),
@@ -2555,7 +2544,7 @@ mod tests {
                     <groupId>com.example</groupId><artifactId>foo</artifactId>\
                     <version>1.0.0</version></dependency></dependencies></project>";
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
-            let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+            let parse_result = eco.parse(xml, &uri).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 1,
@@ -2568,8 +2557,7 @@ mod tests {
             let position =
                 Position::new(0, u32::try_from(project_version_value_start + 2).unwrap());
 
-            let (ctx, _, _) =
-                MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+            let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, &parse_result);
             assert_eq!(
                 ctx,
                 MavenXmlContext::None,
@@ -2578,8 +2566,8 @@ mod tests {
             );
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     xml,
                     deps_core::FreshnessSettings::default(),

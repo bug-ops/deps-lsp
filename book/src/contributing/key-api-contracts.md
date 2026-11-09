@@ -6,22 +6,22 @@ All trait methods use `BoxFuture` instead of `#[async_trait]`:
 
 ```rust
 // Correct
-fn parse_manifest<'a>(
+fn parse<'a>(
     &'a self,
     content: &'a str,
     uri: &'a url::Url,
-) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResult>>> {
+) -> deps_core::ecosystem::BoxFuture<'a, Result<MyParseResult>> {
     Box::pin(async move { ... })
 }
 
 // Wrong — do not use
 #[async_trait]
-async fn parse_manifest(&self, content: &str, uri: &url::Url) -> Result<Box<dyn ParseResult>> { ... }
+async fn parse(&self, content: &str, uri: &url::Url) -> Result<MyParseResult> { ... }
 ```
 
 > **Note:** manifest/lock-file URIs are plain [`url::Url`](https://docs.rs/url), not
 > `tower_lsp_server::ls_types::Uri` — `deps-lsp` converts an LSP `Uri` to a `url::Url` once at
-> the document boundary, so every `Ecosystem`/`ParseResult`/`LockFileProvider` method below
+> the document boundary, so every `EcosystemBase`/`TypedEcosystem`/`ParseResult`/`LockFileProvider` method below
 > works with `url::Url` throughout.
 
 ## Position Tracking

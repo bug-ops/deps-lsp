@@ -64,7 +64,7 @@ async fn diagnostics_snapshot_for(
         .get(ecosystem_id)
         .unwrap_or_else(|| panic!("{ecosystem_id} ecosystem not registered"));
 
-    let parse_result = ecosystem
+    let parse_result = Arc::clone(&ecosystem)
         .parse_manifest(content, &uri)
         .await
         .unwrap_or_else(|e| panic!("{ecosystem_id} manifest failed to parse: {e}"));
@@ -89,9 +89,8 @@ async fn diagnostics_snapshot_for(
 
     let cached = HashMap::new();
     let resolved = HashMap::new();
-    let diagnostics = ecosystem
+    let diagnostics = parse_result
         .generate_diagnostics(
-            parse_result.as_ref(),
             VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities),
             &uri,
             deps_core::FreshnessSettings::default(),

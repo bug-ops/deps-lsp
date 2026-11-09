@@ -71,7 +71,7 @@ async fn setup_document(state: &ServerState, uri: &Uri, content: &str) {
         .get(EcosystemId::Cargo)
         .expect("Cargo ecosystem not found");
 
-    let parse_result = ecosystem
+    let parse_result = Arc::clone(&ecosystem)
         .parse_manifest(
             content,
             &deps_lsp::lsp_types_interop::from_lsp_uri(uri).unwrap(),
@@ -386,7 +386,7 @@ fn bench_cold_start_loading(c: &mut Criterion) {
                         .get(EcosystemId::Cargo)
                         .expect("Cargo ecosystem not found");
 
-                    let parse_result = ecosystem
+                    let parse_result = Arc::clone(&ecosystem)
                         .parse_manifest(black_box(content), &uri)
                         .await
                         .expect("Parse failed");

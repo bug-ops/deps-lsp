@@ -180,6 +180,9 @@ pub struct FetchPreparation {
 
 /// Builds a [`FetchPreparation`] from a parsed manifest and its resolved lock-file state.
 ///
+/// `formatter` must be the document's own formatter (the one of the ecosystem that parsed `parsed`);
+/// the dependency-free methods read through it cannot detect a mismatch.
+///
 /// # Examples
 ///
 /// ```
@@ -187,7 +190,7 @@ pub struct FetchPreparation {
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
 /// };
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
+/// use deps_core::test_util::{stub_document, stub_parse_result};
 /// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
 /// use deps_engine::classify::fetch::prepare_fetch;
 /// use std::collections::HashMap;
@@ -208,7 +211,7 @@ pub struct FetchPreparation {
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
 ///
-/// let parsed = stub_parse_result_with_dependencies(2);
+/// let parsed = stub_document(stub_parse_result(2));
 /// let prep = prepare_fetch(
 ///     parsed.as_ref(),
 ///     &SimpleFormatter,
@@ -221,25 +224,24 @@ pub struct FetchPreparation {
 /// assert!(prep.selection_context.minimum_stability().is_none());
 /// ```
 pub fn prepare_fetch(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: deps_core::EcosystemId,
     resolved_versions: &ResolvedVersionsMap,
     resolved_version_candidates: &ResolvedCandidatesMap,
 ) -> FetchPreparation {
-    let (sources_map, collided_names) = dedup_dependencies_by_source(parse_result, formatter);
+    let (sources_map, collided_names) = dedup_dependencies_by_source(document, formatter);
     let dep_sources: DepSources = sources_map.into_values().collect();
     let in_use = crate::classify::resolved::collect_in_use_versions(
-        parse_result,
+        document,
         resolved_versions,
         resolved_version_candidates,
-        formatter,
         ecosystem,
     );
     FetchPreparation {
         dep_sources,
         in_use,
-        selection_context: parse_result.selection_context(),
+        selection_context: document.selection_context(),
         collided_names,
     }
 }
@@ -1653,7 +1655,6 @@ mod tests {
         use deps_core::Dependency;
         use deps_core::position::{Position, Range};
         use deps_core::test_util::StubFormatter;
-        use std::any::Any;
 
         /// Treats both `Registry` and `AlternateRegistry` as resolvable, mirroring the real
         /// `CargoFormatter`'s own `resolves_alternate_registry` override — needed so two
@@ -1687,9 +1688,6 @@ mod tests {
             fn source(&self) -> DependencySource {
                 self.source.clone()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct MockParseResult {
@@ -1707,8 +1705,13 @@ mod tests {
                 static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedParseResult for MockParseResult {
+            type Dep = MockDep;
+
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -3757,8 +3760,13 @@ mod tests {
             let parse_result = crate::setup::parse_composer_json(json, &uri).unwrap();
             let formatter = deps_composer::ComposerFormatter;
 
+            let document = deps_core::test_util::stub_document_with(
+                parse_result,
+                deps_composer::ComposerFormatter,
+                deps_core::EcosystemId::Composer,
+            );
             let prep = prepare_fetch(
-                &parse_result as &dyn deps_core::ParseResult,
+                document.as_ref(),
                 &formatter,
                 deps_core::EcosystemId::Composer,
                 &HashMap::new(),
@@ -3780,8 +3788,13 @@ mod tests {
             let parse_result = crate::setup::parse_composer_json(json, &uri).unwrap();
             let formatter = deps_composer::ComposerFormatter;
 
+            let document = deps_core::test_util::stub_document_with(
+                parse_result,
+                deps_composer::ComposerFormatter,
+                deps_core::EcosystemId::Composer,
+            );
             let prep = prepare_fetch(
-                &parse_result as &dyn deps_core::ParseResult,
+                document.as_ref(),
                 &formatter,
                 deps_core::EcosystemId::Composer,
                 &HashMap::new(),
@@ -5849,9 +5862,6 @@ mod tests {
             fn source(&self) -> DependencySource {
                 self.source.clone()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct MockParseResult {
@@ -5869,8 +5879,13 @@ mod tests {
                 static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/requirements.txt"))
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedParseResult for MockParseResult {
+            type Dep = MockDep;
+
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -5973,8 +5988,13 @@ mod tests {
             let parse_result = MockParseResult {
                 deps: vec![registry_dep("Django", 0), registry_dep("django", 1)],
             };
+            let document = deps_core::test_util::stub_document_with(
+                parse_result,
+                LOWERCASE_FORMATTER.for_dependency::<MockDep>(),
+                deps_core::EcosystemId::Cargo,
+            );
             let prep = prepare_fetch(
-                &parse_result,
+                document.as_ref(),
                 &LOWERCASE_FORMATTER,
                 deps_core::EcosystemId::Cargo,
                 &HashMap::new(),

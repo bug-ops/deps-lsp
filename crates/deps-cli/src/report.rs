@@ -1,7 +1,7 @@
 //! `CheckReport`/`CheckFinding`/`Category`/`FailOnPolicy` and the classification
 //! orchestrator that assembles one manifest's [`deps_core::VersionData`].
 //!
-//! It then calls its ecosystem's [`deps_core::Ecosystem::generate_diagnostics`] — the
+//! It then calls its ecosystem's [`deps_core::ParsedManifest::generate_diagnostics`] — the
 //! identical call `deps-lsp`'s `handlers/diagnostics.rs` makes.
 //!
 //! Every outdated/yanked/vulnerable/unsatisfiable/deprecated verdict is decided by
@@ -18,7 +18,7 @@ use deps_core::osv::{
 };
 use deps_core::policy_config::{OsvChecks, PolicyConfig};
 use deps_core::position::Range;
-use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache};
+use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache, ParsedManifest};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -869,9 +869,9 @@ pub async fn check_manifest(
     };
 
     let severities = ctx.policy.diagnostics.to_severities();
-    let diagnostics = ecosystem
+    let diagnostics = analysis
+        .parse_result
         .generate_diagnostics(
-            analysis.parse_result.as_ref(),
             analysis
                 .version_data()
                 .with_suppression(&ctx.policy.diagnostics.suppress),
@@ -885,14 +885,11 @@ pub async fn check_manifest(
     let advisory_facts = advisory_index(analysis.vulnerabilities.as_ref());
     // Same per-occurrence key `vulnerabilities` was built under, so a shared advisory id
     // across two dependencies can never resolve to the wrong one's severity (issue #1077 review #4).
-    let vuln_keys = deps_core::osv::vulnerability_keys(
-        analysis.parse_result.as_ref(),
+    let vuln_keys = analysis.parse_result.vulnerability_keys(
         &analysis.resolved_versions,
         Some(&analysis.resolved_version_candidates),
-        formatter,
-        analysis.ecosystem_id,
     );
-    let unlocked = unlocked_keys(analysis.parse_result.as_ref(), &vuln_keys, formatter);
+    let unlocked = unlocked_keys(analysis.parse_result.as_ref(), &vuln_keys);
     let mut osv_coverage =
         OsvCoverage::from_vulnerabilities(analysis.vulnerabilities.as_ref(), lock, &unlocked);
     if analysis.vulnerabilities.is_some()
@@ -940,20 +937,17 @@ async fn lock_presence(uri: &url::Url, ecosystem: &Arc<dyn Ecosystem>) -> LockPr
 /// Scan keys whose every occurrence is declared where no lock file lists it (an npm peer
 /// dependency), so a missing concrete version there is not a coverage gap. A key shared with a
 /// lockable occurrence is not exempt.
-fn unlocked_keys(
-    parse_result: &dyn deps_core::ParseResult,
-    vuln_keys: &VulnKeys,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
-) -> HashSet<VulnKey> {
+fn unlocked_keys(parse_result: &dyn ParsedManifest, vuln_keys: &VulnKeys) -> HashSet<VulnKey> {
     let mut all_unlocked: HashMap<VulnKey, bool> = HashMap::new();
-    for dep in parse_result.dependencies() {
-        let key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
-        let unlocked = formatter.lock_resolution(dep) == LockResolution::NotLocked;
+    parse_result.for_each_formatted_dependency(&mut |bound| {
+        let key =
+            deps_core::osv::vuln_key_for(bound.dependency(), Some(vuln_keys), bound.formatter());
+        let unlocked = bound.lock_resolution() == LockResolution::NotLocked;
         all_unlocked
             .entry(key)
             .and_modify(|all| *all &= unlocked)
             .or_insert(unlocked);
-    }
+    });
     all_unlocked
         .into_iter()
         .filter_map(|(key, unlocked)| unlocked.then_some(key))
@@ -1416,8 +1410,8 @@ mod tests {
     /// (both the same `deps_core::position::Range` `DependencyIndex` is keyed on), so
     /// `DependencyIndex::lookup` resolves it for tests that need a real, non-`None`
     /// dependency occurrence.
-    fn dep_index_with_one_dependency() -> Box<dyn deps_core::ParseResult> {
-        deps_core::test_util::stub_parse_result_with_dependencies(1)
+    fn dep_index_with_one_dependency() -> Box<dyn deps_core::ParsedManifest> {
+        deps_core::test_util::stub_document(deps_core::test_util::stub_parse_result(1))
     }
 
     fn empty_dep_index() -> Box<dyn deps_core::ParseResult> {
@@ -1450,9 +1444,6 @@ mod tests {
         fn source(&self) -> deps_core::parser::DependencySource {
             deps_core::parser::DependencySource::Registry
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     struct NamedFixtureParseResult {
@@ -1469,9 +1460,6 @@ mod tests {
         }
         fn uri(&self) -> &url::Url {
             &self.uri
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 
@@ -1876,13 +1864,7 @@ mod tests {
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
 
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            parse_result.as_ref(),
-            &HashMap::new(),
-            None,
-            &STUB_FORMATTER,
-            EcosystemId::Cargo,
-        );
+        let vuln_keys = parse_result.vulnerability_keys(&HashMap::new(), None);
         let mut severities = HashMap::new();
         severities.insert(
             (
@@ -1919,13 +1901,7 @@ mod tests {
         let parse_result = dep_index_with_one_dependency();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            parse_result.as_ref(),
-            &HashMap::new(),
-            None,
-            &STUB_FORMATTER,
-            EcosystemId::Cargo,
-        );
+        let vuln_keys = parse_result.vulnerability_keys(&HashMap::new(), None);
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -2171,7 +2147,6 @@ mod tests {
         use deps_core::position::{Position, Range as PosRange};
         use deps_core::test_util::stub_gossip_findings;
         use deps_core::{Dependency, GossipCooldown, GossipRiskLevel, PublishTime};
-        use std::any::Any;
         use std::collections::HashSet;
 
         struct FixtureDep {
@@ -2195,9 +2170,6 @@ mod tests {
             fn source(&self) -> deps_core::parser::DependencySource {
                 deps_core::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct FixtureParseResult {
@@ -2214,20 +2186,26 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+        impl deps_core::TypedParseResult for FixtureParseResult {
+            type Dep = FixtureDep;
+            fn own_dependencies(&self) -> &[FixtureDep] {
+                std::slice::from_ref(&self.dep)
             }
         }
 
         let uri: url::Url = "file:///project/Cargo.toml".parse().expect("valid URI");
-        let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FixtureParseResult {
+        let fixture = || FixtureParseResult {
             dep: FixtureDep {
                 name: PackageName::new("serde"),
                 version_req: deps_core::VersionReq::new("1.0"),
                 version_range: PosRange::new(Position::new(0, 10), Position::new(0, 20)),
             },
             uri: uri.clone(),
-        });
+        };
+        let formatter = STUB_FORMATTER.for_dependency::<FixtureDep>();
+        let parse_result =
+            deps_core::test_util::stub_document_with(fixture(), formatter, EcosystemId::Cargo);
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
@@ -2272,9 +2250,9 @@ mod tests {
         };
 
         let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-            analysis.parse_result.as_ref(),
+            &fixture(),
             analysis.version_data(),
-            &STUB_FORMATTER,
+            &formatter,
             &uri,
             deps_core::FreshnessSettings::default(),
             deps_core::lsp_helpers::DiagnosticSeverities::default(),

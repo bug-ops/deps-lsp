@@ -312,7 +312,7 @@ impl OsvPackageName {
     }
 
     /// Like [`Self::new`], but maps an empty name to `None` after logging that the dependency
-    /// is skipped — the shared handling for `OsvNaming::osv_package_name` implementations,
+    /// is skipped — the shared handling for `DependencyFormatter::osv_package_name` implementations,
     /// so one empty key never poisons a whole batch (issue #1678).
     ///
     /// # Examples
@@ -1935,7 +1935,7 @@ impl StructuralSkipReason {
 }
 
 /// How an ecosystem classifies a dependency whose source is not public registry content
-/// (see [`crate::lsp_helpers::OsvNaming::non_public_route`]).
+/// (see [`crate::lsp_helpers::DependencyFormatter::non_public_route`]).
 ///
 /// Exhaustive on purpose: adding a variant forces every `match` to decide how it surfaces.
 ///
@@ -2294,9 +2294,6 @@ impl VulnKeys {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// struct SimpleFormatter;
@@ -2368,13 +2365,15 @@ pub fn vuln_key_for(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy,
+///     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+///     PackageRendering, RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::osv::vulnerability_keys;
 /// use deps_core::position::{Position, Range};
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageName, ParseResult, VersionReq};
-/// use std::any::Any;
+/// use deps_core::{
+///     ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageName, ParseResult,
+///     TypedParseResult, VersionReq,
+/// };
 /// use std::collections::HashMap;
 /// use url::Url;
 ///
@@ -2400,9 +2399,6 @@ pub fn vuln_key_for(
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// struct SimpleParseResult {
@@ -2420,8 +2416,12 @@ pub fn vuln_key_for(
 ///     fn uri(&self) -> &Url {
 ///         &self.uri
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
+/// }
+///
+/// impl TypedParseResult for SimpleParseResult {
+///     type Dep = SimpleDep;
+///     fn own_dependencies(&self) -> &[SimpleDep] {
+///         &self.deps
 ///     }
 /// }
 ///
@@ -2440,6 +2440,9 @@ pub fn vuln_key_for(
 /// impl DiagnosticPolicy for SimpleFormatter {}
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
+/// impl DependencyFormatter for SimpleFormatter {
+///     type Dep = SimpleDep;
+/// }
 ///
 /// // `time` declared twice, pinned to two different versions.
 /// let parse_result = SimpleParseResult {
@@ -2465,16 +2468,21 @@ pub fn vuln_key_for(
 /// let key1 = deps_core::osv::vuln_key_for(deps[1], Some(&keys), &SimpleFormatter);
 /// assert_ne!(key0, key1, "differently-pinned occurrences of one name get distinct keys");
 /// ```
-pub fn vulnerability_keys(
-    parse_result: &dyn crate::ParseResult,
+pub fn vulnerability_keys<P, F>(
+    parse_result: &P,
     resolved: &HashMap<crate::NormalizedName, crate::ConcreteVersion>,
     resolved_candidates: Option<&HashMap<crate::NormalizedName, Vec<crate::ConcreteVersion>>>,
-    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    formatter: &F,
     ecosystem: crate::EcosystemId,
-) -> VulnKeys {
+) -> VulnKeys
+where
+    P: crate::TypedParseResult,
+    F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
+{
+    use crate::Dependency;
     use crate::lsp_helpers::resolve_in_use_versions;
 
-    let deps = parse_result.dependencies();
+    let deps = parse_result.own_dependencies();
 
     // One signature per occurrence: public-registry-content deps (F1b) carry their own
     // in-use version ("u" when undeterminable); every other source always carries "n"
@@ -2487,9 +2495,9 @@ pub fn vulnerability_keys(
         .iter()
         .map(|dep| {
             let key = crate::PackageKey::new(dep.name(), formatter);
-            let signature = if formatter.public_content(*dep).is_some() {
+            let signature = if formatter.public_content(dep).is_some() {
                 match resolve_in_use_versions(
-                    *dep,
+                    dep,
                     &key,
                     resolved,
                     resolved_candidates,
@@ -4085,8 +4093,11 @@ mod vulnerability_keys_candidates_tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+        impl crate::TypedParseResult for TwoOccurrenceParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -4165,7 +4176,7 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &resolved,
             None,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             EcosystemId::Cargo,
         );
 
@@ -4181,10 +4192,14 @@ mod vulnerability_keys_candidates_tests {
     }
 
     /// Resolves each occurrence's `version_requirement()` text to a fixed tag set on one commit.
-    struct PinByRequirementFormatter;
+    struct PinByRequirementFormatter<D>(std::marker::PhantomData<fn() -> D>);
 
-    impl crate::lsp_helpers::PackageNaming for PinByRequirementFormatter {}
-    impl crate::lsp_helpers::PackageRendering for PinByRequirementFormatter {
+    impl<D> PinByRequirementFormatter<D> {
+        const NEW: Self = Self(std::marker::PhantomData);
+    }
+
+    impl<D: 'static> crate::lsp_helpers::PackageNaming for PinByRequirementFormatter<D> {}
+    impl<D: 'static> crate::lsp_helpers::PackageRendering for PinByRequirementFormatter<D> {
         fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
             version.to_string()
         }
@@ -4192,11 +4207,17 @@ mod vulnerability_keys_candidates_tests {
             name.as_str().to_string()
         }
     }
-    impl crate::lsp_helpers::RequirementResolution for PinByRequirementFormatter {
-        fn resolved_pin_version(
-            &self,
-            dep: &dyn crate::Dependency,
-        ) -> crate::lsp_helpers::PinResolution {
+    impl<D: 'static> crate::lsp_helpers::RequirementResolution for PinByRequirementFormatter<D> {}
+    impl<D: 'static> crate::lsp_helpers::DiagnosticMessages for PinByRequirementFormatter<D> {}
+    impl<D: 'static> crate::lsp_helpers::DiagnosticPolicy for PinByRequirementFormatter<D> {}
+    impl<D: 'static> crate::lsp_helpers::SourcePolicy for PinByRequirementFormatter<D> {}
+    impl<D: 'static> crate::lsp_helpers::OsvNaming for PinByRequirementFormatter<D> {}
+    impl<D: crate::Dependency + 'static> crate::lsp_helpers::DependencyFormatter
+        for PinByRequirementFormatter<D>
+    {
+        type Dep = D;
+
+        fn resolved_pin_version(&self, dep: &D) -> crate::lsp_helpers::PinResolution {
             let Some(req) = dep.version_requirement() else {
                 return crate::lsp_helpers::PinResolution::Unresolved;
             };
@@ -4218,10 +4239,6 @@ mod vulnerability_keys_candidates_tests {
             index.pin_resolution(&sha, None)
         }
     }
-    impl crate::lsp_helpers::DiagnosticMessages for PinByRequirementFormatter {}
-    impl crate::lsp_helpers::DiagnosticPolicy for PinByRequirementFormatter {}
-    impl crate::lsp_helpers::SourcePolicy for PinByRequirementFormatter {}
-    impl crate::lsp_helpers::OsvNaming for PinByRequirementFormatter {}
 
     /// #1709 (M6): synthetic-range occurrences of one name have no per-occurrence key, so they
     /// share the plain normalized-name key however their sibling sets differ (known caveat).
@@ -4244,11 +4261,17 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &std::collections::HashMap::new(),
             None,
-            &PinByRequirementFormatter,
+            &PinByRequirementFormatter::<Box<dyn crate::Dependency>>::NEW,
             EcosystemId::GithubActions,
         );
         let deps = parse_result.dependencies();
-        let key = |i: usize| vuln_key_for(deps[i], Some(&keys), &PinByRequirementFormatter);
+        let key = |i: usize| {
+            vuln_key_for(
+                deps[i],
+                Some(&keys),
+                &PinByRequirementFormatter::<Box<dyn crate::Dependency>>::NEW,
+            )
+        };
         assert_eq!(key(0), key(1));
         assert_eq!(key(0).as_str(), "actions/checkout");
     }
@@ -4274,7 +4297,7 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &std::collections::HashMap::new(),
             None,
-            &PinByRequirementFormatter,
+            &PinByRequirementFormatter::NEW,
             EcosystemId::GithubActions,
         );
         let deps = parse_result.dependencies();
@@ -4305,7 +4328,7 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &std::collections::HashMap::new(),
             None,
-            &PinByRequirementFormatter,
+            &PinByRequirementFormatter::NEW,
             EcosystemId::GithubActions,
         );
         let deps = parse_result.dependencies();
@@ -4335,7 +4358,7 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &std::collections::HashMap::new(),
             None,
-            &PinByRequirementFormatter,
+            &PinByRequirementFormatter::NEW,
             EcosystemId::GithubActions,
         );
         let deps = parse_result.dependencies();

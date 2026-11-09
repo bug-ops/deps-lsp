@@ -5,9 +5,8 @@
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
+#[cfg(test)]
 use std::any::Any;
 #[cfg(feature = "lsp-responses")]
 use std::future::Future;
@@ -94,7 +93,7 @@ impl GoEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for GoEcosystem {}
 
-impl Ecosystem for GoEcosystem {
+impl EcosystemBase for GoEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Go
     }
@@ -111,55 +110,12 @@ impl Ecosystem for GoEcosystem {
         &["go.sum"]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_go_mod_with_context(content, uri, &self.context)?;
-            // Registers every `GOPROXY`/`GOPRIVATE`-bypass chain this parse resolved from the
-            // process environment and `$GOENV` (spec 034) into the shared router — the only
-            // point where a per-document resolution and the long-lived `GoRegistry` this
-            // ecosystem shares across every document ever meet. See
-            // `GoParseResult::resolved_chains`.
-            for chain in &result.resolved_chains {
-                GoRegistry::register_alternate(&self.registry, chain);
-            }
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
         Some(Arc::new(crate::lockfile::GoSumParser))
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_package_name<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        prefix: String,
-        _range: Range,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move { self.complete_package_names(&prefix).await.into() })
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_feature<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move { self.complete_features(&package_name, &prefix).await.into() })
     }
 
     fn fallback_completion_prefix<'a>(
@@ -179,9 +135,53 @@ impl Ecosystem for GoEcosystem {
         let latest = metadata.latest_version().as_str();
         Some(format!("{} {latest}", name.as_str()))
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TypedEcosystem for GoEcosystem {
+    type Parsed = crate::parser::GoParseResult;
+    type Formatter = GoFormatter;
+
+    fn own_formatter(&self) -> &GoFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<crate::parser::GoParseResult>> {
+        Box::pin(async move {
+            let result = crate::parser::parse_go_mod_with_context(content, uri, &self.context)?;
+            // Registers every `GOPROXY`/`GOPRIVATE`-bypass chain this parse resolved from the
+            // process environment and `$GOENV` (spec 034) into the shared router — the only
+            // point where a per-document resolution and the long-lived `GoRegistry` this
+            // ecosystem shares across every document ever meet. See
+            // `GoParseResult::resolved_chains`.
+            for chain in &result.resolved_chains {
+                GoRegistry::register_alternate(&self.registry, chain);
+            }
+            Ok(result)
+        })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_package_name<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, Self::Parsed>,
+        prefix: String,
+        _range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix).await.into() })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_feature<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, Self::Parsed>,
+        package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_features(&package_name, &prefix).await.into() })
     }
 }
 
@@ -228,7 +228,7 @@ mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
     use deps_core::position::{Position as DomainPosition, Range as DomainRange};
-    use deps_core::{Dependency, VersionData};
+    use deps_core::{Dependency, ParseResult, ParsedView, VersionData};
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
@@ -246,6 +246,7 @@ mod tests {
         let content =
             "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.0.0\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/go.mod");
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ecosystem);
         let verdict = deps_core::test_util::fallback_edit_outcome(
             &ecosystem,
             &GoFormatter,
@@ -280,30 +281,19 @@ mod tests {
         }
     }
 
-    /// Mock parse result for testing
-    struct MockParseResult {
+    fn mock_parse_result(
         dependencies: Vec<GoDependency>,
         uri: Url,
-    }
-
-    impl deps_core::ParseResult for MockParseResult {
-        fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-            self.dependencies
-                .iter()
-                .map(|d| d as &dyn deps_core::Dependency)
-                .collect()
-        }
-
-        fn workspace_root(&self) -> Option<&std::path::Path> {
-            None
-        }
-
-        fn uri(&self) -> &Url {
-            &self.uri
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
+    ) -> crate::parser::GoParseResult {
+        crate::parser::GoParseResult {
+            dependencies,
+            module_path: None,
+            go_version: None,
+            uri,
+            resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
+            dependency_truncation: None,
         }
     }
 
@@ -357,22 +347,22 @@ mod tests {
         let ecosystem = GoEcosystem::new(cache);
 
         let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
+        let parse_result = mock_parse_result(
+            vec![mock_dependency(
                 "github.com/gin-gonic/gin",
                 Some("v1.9.1"),
                 5,
             )],
             uri,
-        };
+        );
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            ecosystem.generate_diagnostics(
-                &parse_result,
+            ecosystem.diagnostics(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 parse_result.uri(),
                 deps_core::FreshnessSettings::default(),
@@ -398,7 +388,7 @@ require github.com/gin-gonic/gin v1.9.1
 
         let uri = deps_core::test_util::test_uri("/test/go.mod");
 
-        let result = ecosystem.parse_manifest(content, &uri).await;
+        let result = ecosystem.parse(content, &uri).await;
         assert!(result.is_ok());
 
         let parse_result = result.unwrap();
@@ -417,7 +407,7 @@ require github.com/gin-gonic/gin v1.9.1
         let content = "";
         let uri = deps_core::test_util::test_uri("/test/go.mod");
 
-        let result = ecosystem.parse_manifest(content, &uri).await;
+        let result = ecosystem.parse(content, &uri).await;
         assert!(result.is_ok());
 
         let parse_result = result.unwrap();
@@ -566,14 +556,14 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::new(cache);
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency(
+            let parse_result = mock_parse_result(
+                vec![mock_dependency(
                     "github.com/gin-gonic/gin",
                     Some("v1.9.1"),
                     5,
                 )],
                 uri,
-            };
+            );
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -588,8 +578,8 @@ require github.com/gin-gonic/gin v1.9.1
                 NormalizedName::for_test("github.com/gin-gonic/gin"),
                 "v1.9.1".into(),
             );
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -608,14 +598,14 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::new(cache);
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency(
+            let parse_result = mock_parse_result(
+                vec![mock_dependency(
                     "github.com/gin-gonic/gin",
                     Some("v1.9.0"),
                     5,
                 )],
                 uri,
-            };
+            );
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -626,8 +616,8 @@ require github.com/gin-gonic/gin v1.9.1
             let config = EcosystemConfig::default();
 
             let resolved_versions = HashMap::new();
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -646,14 +636,14 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::new(cache);
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency(
+            let parse_result = mock_parse_result(
+                vec![mock_dependency(
                     "github.com/gin-gonic/gin",
                     Some("v1.9.1"),
                     5,
                 )],
                 uri,
-            };
+            );
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -668,8 +658,8 @@ require github.com/gin-gonic/gin v1.9.1
                 NormalizedName::for_test("github.com/gin-gonic/gin"),
                 "v1.9.1".into(),
             );
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -687,10 +677,7 @@ require github.com/gin-gonic/gin v1.9.1
             dep.version_range = None;
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-                uri,
-            };
+            let parse_result = mock_parse_result(vec![dep], uri);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -701,8 +688,8 @@ require github.com/gin-gonic/gin v1.9.1
             let config = EcosystemConfig::default();
 
             let resolved_versions = HashMap::new();
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -727,10 +714,8 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::new(cache);
             let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9"), 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-                uri: deps_core::test_util::test_uri("/test/go.mod"),
-            };
+            let parse_result =
+                mock_parse_result(vec![dep], deps_core::test_util::test_uri("/test/go.mod"));
 
             let results = ecosystem
                 .complete_versions(
@@ -776,10 +761,8 @@ require github.com/gin-gonic/gin v1.9.1
 
             let dep = mock_dependency("github.com/nonexistent/package12345", Some("v1.0"), 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-                uri: deps_core::test_util::test_uri("/test/go.mod"),
-            };
+            let parse_result =
+                mock_parse_result(vec![dep], deps_core::test_util::test_uri("/test/go.mod"));
 
             let results = ecosystem
                 .complete_versions(
@@ -833,10 +816,8 @@ require github.com/gin-gonic/gin v1.9.1
             // Test that we respect the display cap, not just some loose upper bound.
             let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.0"), 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-                uri: deps_core::test_util::test_uri("/test/go.mod"),
-            };
+            let parse_result =
+                mock_parse_result(vec![dep], deps_core::test_util::test_uri("/test/go.mod"));
             let results = ecosystem
                 .complete_versions(
                     &parse_result,
@@ -870,22 +851,22 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency(
+            let parse_result = mock_parse_result(
+                vec![mock_dependency(
                     "github.com/gin-gonic/gin",
                     Some("v1.9.1"),
                     5,
                 )],
                 uri,
-            };
+            );
 
             let position = Position::new(5, 5);
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
             let hover = ecosystem
-                .generate_hover(
-                    &parse_result,
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     VersionData::new(&cached_versions, &resolved_versions),
                     deps_core::FreshnessSettings::default(),
@@ -932,10 +913,10 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("golang.org/x/net", Some("v0.17.0"), 5)],
+            let parse_result = mock_parse_result(
+                vec![mock_dependency("golang.org/x/net", Some("v0.17.0"), 5)],
                 uri,
-            };
+            );
 
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
@@ -962,8 +943,8 @@ require github.com/gin-gonic/gin v1.9.1
                 .with_vulnerabilities(&vulnerabilities);
 
             let hover = ecosystem
-                .generate_hover(
-                    &parse_result,
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     versions,
                     deps_core::FreshnessSettings::default(),
@@ -990,22 +971,22 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::new(cache);
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency(
+            let parse_result = mock_parse_result(
+                vec![mock_dependency(
                     "github.com/gin-gonic/gin",
                     Some("v1.9.1"),
                     5,
                 )],
                 uri,
-            };
+            );
 
             let position = Position::new(0, 0);
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
             let hover = ecosystem
-                .generate_hover(
-                    &parse_result,
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     VersionData::new(&cached_versions, &resolved_versions),
                     deps_core::FreshnessSettings::default(),
@@ -1041,14 +1022,14 @@ require github.com/gin-gonic/gin v1.9.1
             let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency(
+            let parse_result = mock_parse_result(
+                vec![mock_dependency(
                     "github.com/gin-gonic/gin",
                     Some("v1.9.0"),
                     5,
                 )],
-                uri: uri.clone(),
-            };
+                uri.clone(),
+            );
 
             let position = Position::new(5, 5);
             let cached_versions = HashMap::new();
@@ -1060,8 +1041,8 @@ require github.com/gin-gonic/gin v1.9.1
             let content = "\n\n\n\n\nv1.9.0    \n";
 
             let actions = ecosystem
-                .generate_code_actions(
-                    &parse_result,
+                .code_actions(
+                    ParsedView::new(&parse_result),
                     position,
                     &uri,
                     VersionData::new(&cached_versions, &resolved_versions),
@@ -1107,16 +1088,13 @@ require github.com/
 ";
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![],
-                uri,
-            };
+            let parse_result = mock_parse_result(vec![], uri);
 
             let position = Position::new(4, 19);
 
             let completions = ecosystem
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1137,16 +1115,13 @@ go 1.21
 ";
 
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = MockParseResult {
-                dependencies: vec![],
-                uri,
-            };
+            let parse_result = mock_parse_result(vec![], uri);
 
             let position = Position::new(0, 0);
 
             let completions = ecosystem
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1182,7 +1157,7 @@ go 1.21
 
             let content = "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/nonexistent/package12345 v1.2.3\n";
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 1,
@@ -1193,8 +1168,8 @@ go 1.21
             let position: Position = version_range.start.into();
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1233,10 +1208,10 @@ go 1.21
                 1,
             );
             let alternate_position = alternate_dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![registry_dep, alternate_dep],
-                uri: deps_core::test_util::test_uri("/test/go.mod"),
-            };
+            let parse_result = mock_parse_result(
+                vec![registry_dep, alternate_dep],
+                deps_core::test_util::test_uri("/test/go.mod"),
+            );
 
             // The alternate occurrence resolves deterministically without network: its index was
             // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
@@ -1271,10 +1246,8 @@ go 1.21
                 0,
             );
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-                uri: deps_core::test_util::test_uri("/test/go.mod"),
-            };
+            let parse_result =
+                mock_parse_result(vec![dep], deps_core::test_util::test_uri("/test/go.mod"));
             let results = ecosystem
                 .complete_versions(
                     &parse_result,
@@ -1333,10 +1306,8 @@ go 1.21
                 0,
             );
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-                uri: deps_core::test_util::test_uri("/test/go.mod"),
-            };
+            let parse_result =
+                mock_parse_result(vec![dep], deps_core::test_util::test_uri("/test/go.mod"));
             let results = ecosystem
                 .complete_versions(
                     &parse_result,

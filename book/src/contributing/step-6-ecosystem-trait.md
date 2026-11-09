@@ -1,32 +1,39 @@
-# Step 6: Implement the Ecosystem Trait
+# Step 6: Implement `EcosystemBase` and `TypedEcosystem`
 
 > **Note:** everything below that touches `tower-lsp-server` types (`Range`, `CompletionItem`,
-> the `generate_completions`/`complete_version` methods) belongs behind this crate's
+> the `completions`/`complete_version` methods) belongs behind this crate's
 > `lsp-responses` feature (see [Step 1](step-1-crate.md)) in the real implementation — e.g.
 > `#[cfg(feature = "lsp-responses")] use tower_lsp_server::ls_types::Range;`. Omitted from the
 > snippet below for readability; see `crates/deps-maven/src/ecosystem.rs` for the full
 > `#[cfg(feature = "lsp-responses")]`-gated shape.
 
-Create the main ecosystem implementation in `ecosystem.rs`:
+An ecosystem crate never implements the erased `deps_core::Ecosystem` trait. It implements
+`EcosystemBase` (identity, routing, registry, lock files, fallback completion) and
+`TypedEcosystem` (the parser, its parse result, the formatter, and the typed LSP hooks); a
+blanket impl turns the pair into the erased `Ecosystem`, and `parse_manifest` returns an erased
+`ParsedManifest` that carries the parse result together with its ecosystem. The formatter's
+`DependencyFormatter::Dep` must equal the parse result's `TypedParseResult::Dep`, so a mismatched
+pairing does not compile.
+
+Create the implementation in `ecosystem.rs`:
 
 ```rust
 //! {Ecosystem} implementation for deps-lsp.
 
-use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::Range;
 use url::Url;
 
 use deps_core::{
-    Ecosystem, HttpCache, PackageName, ParseResult as ParseResultTrait, Registry, Result,
+    EcosystemBase, HttpCache, PackageName, Registry, Result, TypedEcosystem,
     completion::{Completions, CompletionRequest, complete_package_names_generic, complete_versions_at_position},
     ecosystem::BoxFuture,
     lockfile::LockFileProvider,
-    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::{Ecosystem}Formatter;
 use crate::lockfile::{Ecosystem}LockfileParser;
+use crate::parser::{Ecosystem}ParseResult;
 use crate::parser::parse_{manifest};
 use crate::registry::{Ecosystem}Registry;
 
@@ -46,11 +53,11 @@ impl {Ecosystem}Ecosystem {
 }
 
 // Required sealed trait impl — a documented contract (code review, not the compiler)
-// restricting `Ecosystem` implementations to crates in this workspace; see
+// restricting ecosystem implementations to crates in this workspace; see
 // `deps_core::ecosystem::private`'s doc for why Rust cannot enforce this any harder.
 impl deps_core::ecosystem::private::Sealed for {Ecosystem}Ecosystem {}
 
-impl Ecosystem for {Ecosystem}Ecosystem {
+impl EcosystemBase for {Ecosystem}Ecosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::{Ecosystem}
     }
@@ -67,17 +74,6 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         &["{lockfile_filename}"]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = parse_{manifest}(content, uri)?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
@@ -85,69 +81,6 @@ impl Ecosystem for {Ecosystem}Ecosystem {
     fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
         Some(Arc::new({Ecosystem}LockfileParser))
     }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    // generate_inlay_hints, generate_hover, generate_code_actions, generate_diagnostics,
-    // generate_completions all have default implementations in the Ecosystem trait that
-    // delegate to lsp_helpers / dispatch to the complete_* hooks below. Override only if
-    // custom behavior is needed (issue #793: generate_completions's default is the
-    // exhaustive match over CompletionContext — do NOT hand-write that match again in a
-    // new ecosystem crate; implement the three hooks it dispatches to instead).
-
-    // Required — every ecosystem serves version completion, and this is the one hook with
-    // no default. Resolved by cursor position, not by name (issue #593):
-    // complete_versions_at_position re-derives the dependency at `request.position` from
-    // `request.parse_result` and gates the lookup on that dependency's own
-    // `Dependency::source()` via the formatter's `SourcePolicy::can_resolve_source` — do NOT
-    // call a registry directly from `package_name`/`prefix` alone (issue #1136: doing so
-    // skips that gate and can leak a private/non-registry dependency's name to the public
-    // registry on every keystroke).
-    fn complete_version<'a>(
-        &'a self,
-        request: CompletionRequest<'a>,
-        _package_name: PackageName,
-        prefix: String,
-    ) -> BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            complete_versions_at_position(
-                self.registry.as_ref(),
-                &self.formatter,
-                request.parse_result,
-                request.position,
-                &prefix,
-                &[],
-                request.freshness,
-            )
-            .await
-            .into()
-        })
-    }
-
-    // Optional — default is `Completions::default()` (no package-name search), correct
-    // for an ecosystem with no package-name index. Override to search a registry:
-    //
-    // fn complete_package_name<'a>(
-    //     &'a self,
-    //     _request: CompletionRequest<'a>,
-    //     prefix: String,
-    //     range: Range,
-    // ) -> BoxFuture<'a, Completions> {
-    //     Box::pin(async move {
-    //         complete_package_names_generic(self.registry.as_ref(), &prefix, 20, range)
-    //             .await
-    //             .into()
-    //     })
-    // }
-    //
-    // `is_incomplete` should stay `false` unless this ecosystem serves completions from a
-    // capped/unranked index (see PyPI's `complete_package_name` override, which returns
-    // `Completions::new(items).with_incomplete(true)`).
-
-    // Optional — default is `Completions::default()` (no feature-flag concept). Override
-    // only for a manifest format with a feature/flag array (e.g. Cargo, Go).
 
     // Raw-text fallback completion (parse-failure path, issue #722): override
     // `fallback_completion_prefix` only if this manifest format has a cheap raw-text
@@ -164,10 +97,86 @@ impl Ecosystem for {Ecosystem}Ecosystem {
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         Some(format!("\"{}\" = \"{}\"", metadata.name(), metadata.latest_version()))
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TypedEcosystem for {Ecosystem}Ecosystem {
+    type Parsed = {Ecosystem}ParseResult;
+    type Formatter = {Ecosystem}Formatter;
+
+    fn own_formatter(&self) -> &{Ecosystem}Formatter {
+        &self.formatter
     }
+
+    // `parse` must not contain a real `.await`: parse_manifest_blocking relies on it.
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> BoxFuture<'a, Result<{Ecosystem}ParseResult>> {
+        Box::pin(async move { parse_{manifest}(content, uri) })
+    }
+
+    // inlay_hints, hover, code_actions, diagnostics and completions all have default
+    // implementations in TypedEcosystem that delegate to lsp_helpers / dispatch to the
+    // complete_* hooks below. Override only if custom behavior is needed (issue #793:
+    // completions's default is the exhaustive match over CompletionContext — do NOT
+    // hand-write that match again in a new ecosystem crate; implement the three hooks it
+    // dispatches to instead).
+
+    // Required — every ecosystem serves version completion, and this is the one hook with
+    // no default. Resolved by cursor position, not by name (issue #593):
+    // complete_versions_at_position re-derives the dependency at `request.position` from
+    // `request.parsed` and gates the lookup on that dependency's own
+    // `Dependency::source()` via the formatter's `SourcePolicy::can_resolve_source` — do NOT
+    // call a registry directly from `package_name`/`prefix` alone (issue #1136: doing so
+    // skips that gate and can leak a private/non-registry dependency's name to the public
+    // registry on every keystroke).
+    fn complete_version<'a>(
+        &'a self,
+        request: CompletionRequest<'a, {Ecosystem}ParseResult>,
+        _package_name: PackageName,
+        prefix: String,
+    ) -> BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            complete_versions_at_position(
+                self.registry.as_ref(),
+                &self.formatter,
+                request.parsed,
+                request.position,
+                &prefix,
+                &[],
+                request.freshness,
+            )
+            .await
+            .into()
+        })
+    }
+
+    // Optional — default is `Completions::default()` (no package-name search), correct
+    // for an ecosystem with no package-name index. Override to search a registry:
+    //
+    // fn complete_package_name<'a>(
+    //     &'a self,
+    //     _request: CompletionRequest<'a, {Ecosystem}ParseResult>,
+    //     prefix: String,
+    //     range: Range,
+    // ) -> BoxFuture<'a, Completions> {
+    //     Box::pin(async move {
+    //         complete_package_names_generic(self.registry.as_ref(), &prefix, 20, range)
+    //             .await
+    //             .into()
+    //     })
+    // }
+    //
+    // `is_incomplete` should stay `false` unless this ecosystem serves completions from a
+    // capped/unranked index (see PyPI's `complete_package_name` override, which returns
+    // `Completions::new(items).with_incomplete(true)`).
+
+    // Optional — default is `Completions::default()` (no feature-flag concept). Override
+    // only for a manifest format with a feature/flag array (e.g. Cargo, Go).
 }
 ```
 
+`as_any` is gone from `Ecosystem`, `ParseResult` and `Dependency`: no ecosystem implements it, and
+production code must not downcast. Only `Registry`, `Version` and `Metadata` keep `as_any`, and
+clippy's `disallowed-methods` (see `clippy.toml`) rejects calling it outside test code.

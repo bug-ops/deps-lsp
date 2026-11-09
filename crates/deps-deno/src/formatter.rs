@@ -8,9 +8,10 @@
 //! `deps-npm`'s wording outright (yanked messages, S2).
 
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
+use crate::types::DenoDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     up_to_date_via_compiled_matcher, warn_rejected_value,
 };
 use deps_core::osv::{NonPublicRoute, OsvPackageName};
@@ -80,15 +81,6 @@ impl PackageRendering for DenoFormatter {
     /// Same shape-preserving policy as `deps-npm` (#1885, #1895).
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
         deps_npm::NpmFormatter.format_version_replacing(version, current)
-    }
-
-    fn format_version_replacing_floor_for(
-        &self,
-        dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        deps_npm::NpmFormatter.format_version_replacing_floor_for(dep, version, current)
     }
 
     fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
@@ -172,7 +164,35 @@ impl DiagnosticMessages for DenoFormatter {
     }
 }
 
-impl DiagnosticPolicy for DenoFormatter {
+impl SourcePolicy for DenoFormatter {
+    /// Widens [`SourcePolicy::can_resolve_source`] so an `.npmrc`-resolved
+    /// `AlternateRegistry` `npm:` specifier is resolvable, matching
+    /// [`deps_npm::NpmFormatter`]'s override — without this, `dedup_dependencies_by_source`
+    /// drops every `AlternateRegistry`-classified Deno dependency from the fetch queue
+    /// before a request is ever made (#1227).
+    fn resolves_alternate_registry(&self) -> bool {
+        true
+    }
+}
+
+impl DiagnosticPolicy for DenoFormatter {}
+
+impl OsvNaming for DenoFormatter {}
+
+impl DependencyFormatter for DenoFormatter {
+    type Dep = DenoDependency;
+
+    /// Same floor-safe policy as `deps-npm`: a bare partial requirement must not truncate below
+    /// the fix version.
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &DenoDependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        deps_npm::format_node_semver_replacing_floor(version, current)
+    }
+
     /// Scheme-aware (#448, fixing the #436 M1 divergence): for `npm:` specifiers, returns
     /// `false` unconditionally, mirroring `NpmFormatter::yanked_diagnostic_applies_to`'s
     /// post-#436 behavior — an exact-pin `npm:` dependency in `deno.json` (e.g.
@@ -192,7 +212,7 @@ impl DiagnosticPolicy for DenoFormatter {
     /// fetch, identical whether the manifest requirement is a range or an exact pin.
     fn yanked_diagnostic_applies_to(
         &self,
-        dep: &dyn Dependency,
+        dep: &DenoDependency,
         _requirement: &VersionReq,
     ) -> bool {
         match split_scheme(dep.name().as_str()) {
@@ -204,26 +224,13 @@ impl DiagnosticPolicy for DenoFormatter {
             Some((Scheme::Jsr, _)) | None => true,
         }
     }
-}
 
-impl SourcePolicy for DenoFormatter {
-    /// Widens [`SourcePolicy::can_resolve_source`] so an `.npmrc`-resolved
-    /// `AlternateRegistry` `npm:` specifier is resolvable, matching
-    /// [`deps_npm::NpmFormatter`]'s override — without this, `dedup_dependencies_by_source`
-    /// drops every `AlternateRegistry`-classified Deno dependency from the fetch queue
-    /// before a request is ever made (#1227).
-    fn resolves_alternate_registry(&self) -> bool {
-        true
-    }
-}
-
-impl OsvNaming for DenoFormatter {
     /// `npm:` dependencies map to OSV's `npm` ecosystem via their bare name (D5);
     /// `jsr:` dependencies return `None` — OSV has no JSR ecosystem (live-verified:
     /// `POST api.osv.dev/v1/query` with `{"ecosystem":"JSR"}` returns `code 3, invalid
     /// ecosystem`) — which cleanly skips them from the scan rather than risking a
     /// cross-registry name collision.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
+    fn osv_package_name(&self, dep: &DenoDependency) -> Option<OsvPackageName> {
         match split_scheme(dep.name().as_str()) {
             Some((Scheme::Npm, rest)) => OsvPackageName::new_or_skip(rest),
             _ => None,
@@ -233,14 +240,11 @@ impl OsvNaming for DenoFormatter {
     /// An `npm:` import routed by the top-level `.npmrc` `registry=` is an unverified mirror
     /// of npmjs, exactly as for `package.json`; a scope entry and every other source stay
     /// private and silent (#1965).
-    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        dep.as_any()
-            .downcast_ref::<crate::types::DenoDependency>()
-            .and_then(|dep| dep.registry_entry)
-            .map_or(
-                NonPublicRoute::Private,
-                deps_npm::types::NpmRegistryEntry::non_public_route,
-            )
+    fn non_public_route(&self, dep: &DenoDependency) -> NonPublicRoute {
+        dep.registry_entry.map_or(
+            NonPublicRoute::Private,
+            deps_npm::types::NpmRegistryEntry::non_public_route,
+        )
     }
 }
 
@@ -301,7 +305,6 @@ mod tests {
 
     #[test]
     fn test_floor_safe_rendering_never_truncates_partial_requirement() {
-        use deps_core::lsp_helpers::PackageRendering;
         let dep = test_dep("npm:lodash", "3");
         let fix = ConcreteVersion::new("4.17.21");
         assert_eq!(
@@ -623,35 +626,13 @@ mod tests {
     fn test_osv_package_name_npm_maps_to_bare_name() {
         let formatter = DenoFormatter;
 
-        struct FakeDep(deps_core::PackageName);
-        impl Dependency for FakeDep {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.0
-            }
-            fn name_range(&self) -> deps_core::position::Range {
-                deps_core::position::Range::default()
-            }
-            fn version_requirement(&self) -> Option<&VersionReq> {
-                None
-            }
-            fn version_range(&self) -> Option<deps_core::position::Range> {
-                None
-            }
-            fn source(&self) -> deps_core::parser::DependencySource {
-                deps_core::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let npm_dep = FakeDep(PackageName::new("npm:react"));
+        let npm_dep = test_dep("npm:react", "^18");
         assert_eq!(
             formatter.osv_package_name(&npm_dep),
             Some(OsvPackageName::new("react").unwrap())
         );
 
-        let jsr_dep = FakeDep(PackageName::new("jsr:@std/fs"));
+        let jsr_dep = test_dep("jsr:@std/fs", "^1");
         assert_eq!(formatter.osv_package_name(&jsr_dep), None);
     }
 
@@ -761,30 +742,8 @@ mod tests {
 
     #[test]
     fn test_osv_package_name_empty_npm_specifier_is_skipped() {
-        struct FakeDep(deps_core::PackageName);
-        impl Dependency for FakeDep {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.0
-            }
-            fn name_range(&self) -> deps_core::position::Range {
-                deps_core::position::Range::default()
-            }
-            fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-                None
-            }
-            fn version_range(&self) -> Option<deps_core::position::Range> {
-                None
-            }
-            fn source(&self) -> deps_core::parser::DependencySource {
-                deps_core::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
         assert_eq!(
-            DenoFormatter.osv_package_name(&FakeDep(deps_core::PackageName::new("npm:"))),
+            DenoFormatter.osv_package_name(&test_dep("npm:", "^1")),
             None
         );
     }

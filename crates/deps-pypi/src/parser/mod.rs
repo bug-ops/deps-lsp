@@ -391,7 +391,7 @@ pub struct RequirementRef {
     /// The target as written in the file (e.g. `"constraints.txt"`), not yet
     /// resolved to an absolute URI — resolution happens against the
     /// containing document's URI in `PypiEcosystem`'s
-    /// [`Ecosystem::generate_document_links`](deps_core::Ecosystem::generate_document_links) override.
+    /// [`TypedEcosystem::document_links`](deps_core::TypedEcosystem::document_links) override.
     #[redact(key)]
     pub target: String,
 }
@@ -415,7 +415,7 @@ pub struct ParseResult {
     /// uv-index declarations imply (spec FR-002/003/005/007/013), ready for
     /// `PypiRegistry::register_alternate` — the only point where this per-document
     /// resolution and the long-lived, shared `PypiRegistry` router meet (see
-    /// `PypiEcosystem::parse_manifest`). Empty for a file with no such declaration (US-004).
+    /// `PypiEcosystem::parse`). Empty for a file with no such declaration (US-004).
     pub resolved_chains: Vec<crate::config::ResolvedChain>,
     /// Dependency lines whose `--index-url`/Poetry `source =`/uv `index =` resolution was
     /// blocked by the current `registries.workspace_registries` policy (#925, mirrors

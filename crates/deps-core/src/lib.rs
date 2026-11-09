@@ -3,6 +3,7 @@
 // error under `-D warnings` (rust-lang/rust#159228). Same fix as deps-cargo #745, deps-nuget
 // #696, deps-swift #673.
 #![recursion_limit = "256"]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! Core abstractions for deps-lsp.
 //!
@@ -133,7 +134,7 @@ pub mod detached_flight;
 /// The domain-level replacement for `tower_lsp_server::ls_types::{Diagnostic,
 /// DiagnosticSeverity, DiagnosticRelatedInformation, CodeDescription}` returned by
 /// [`lsp_helpers::generate_diagnostics_from_cache`] and
-/// [`ecosystem::Ecosystem::generate_diagnostics`].
+/// [`ecosystem::ParsedManifest::generate_diagnostics`].
 pub mod diagnostic;
 /// The [`ecosystem::Ecosystem`] trait: the sealed extension point every package
 /// ecosystem crate implements to plug into the LSP server.
@@ -151,7 +152,7 @@ pub mod github;
 /// Protocol-agnostic [`hover::Hover`] type (issue #1277).
 ///
 /// The domain-level replacement for `tower_lsp_server::ls_types::Hover` returned by
-/// [`lsp_helpers::generate_hover`] and [`ecosystem::Ecosystem::generate_hover`]. Gated
+/// [`lsp_helpers::generate_hover`] and [`ecosystem::ParsedManifest::generate_hover`]. Gated
 /// behind the `lsp-responses` feature, unlike [`diagnostic`] — see this module's own doc
 /// for why.
 #[cfg(feature = "lsp-responses")]
@@ -257,9 +258,10 @@ pub use deps_dev::{
 pub use detached_flight::{FlightHandle, SingleFlight};
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
-    EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult, RegistryOccurrence,
-    RejectedRegistryOccurrence, RejectedSourceClass, UserHome, WatchedConfig, WatchedConfigEffect,
-    parse_manifest_blocking, parse_manifest_now,
+    EcosystemBase, EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult,
+    ParsedManifest, RegistryOccurrence, RejectedRegistryOccurrence, RejectedSourceClass,
+    TypedEcosystem, UserHome, WatchedConfig, WatchedConfigEffect, parse_manifest_blocking,
+    parse_manifest_now,
 };
 pub use ecosystem_registry::{EcosystemRegistry, WatchedConfigMatch};
 pub use edit::{
@@ -289,8 +291,9 @@ pub use lockfile::{
     read_lockfile_content,
 };
 pub use lsp_helpers::{
-    CachedVersionsMap, DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,
-    DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS,
+    BoundDependency, CachedVersionsMap, DependencyFormatter, DependencyGate, DependencyOutcome,
+    DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, DiagnosticSeverities,
+    EcosystemFormatter, FormattedDependency, HOVER_RECENT_VERSIONS,
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, LookupMiss, NormalizeName,
     OsvNaming, PackageNaming, PackageRendering, PackageVersions, RequirementMatcher,
     RequirementResolution, RequirementStatus, ResolvedCandidatesMap, ResolvedVersionsMap,
@@ -332,7 +335,7 @@ pub use selection::{
 };
 pub use swr_store::{Recency, Refreshed, SwrPolicy, SwrRead, SwrStore, Upserted};
 pub use tag_index_refresh::{ParseInputKey, RefreshEvent, RefreshEvents, RefreshSender};
-pub use typed_boundary::{NarrowDependency, NarrowParseResult, OwnDependency, OwnParseResult};
+pub use typed_boundary::{ParsedView, TypedParseResult};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,

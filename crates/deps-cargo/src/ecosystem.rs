@@ -3,7 +3,6 @@
 //! This module implements the `Ecosystem` trait for Cargo/Rust projects,
 //! providing LSP functionality for `Cargo.toml` files.
 
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::Range;
@@ -11,12 +10,10 @@ use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 
 use crate::formatter::CargoFormatter;
-use crate::parser::CargoParseContext;
+use crate::parser::{CargoParseContext, CargoParseResult};
 use crate::registry::CargoRegistry;
 
 #[cfg(feature = "lsp-responses")]
@@ -83,7 +80,7 @@ impl CargoEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for CargoEcosystem {}
 
-impl Ecosystem for CargoEcosystem {
+impl EcosystemBase for CargoEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Cargo
     }
@@ -100,60 +97,12 @@ impl Ecosystem for CargoEcosystem {
         &["Cargo.lock"]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
-            // Registers every alternate index this parse resolved (FR-002), including its
-            // credential. See `CargoParseResult::resolved_registries`'s docs.
-            for index in result.resolved_registries.clone() {
-                self.registry.register_alternate(index);
-            }
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
         Some(Arc::new(crate::lockfile::CargoLockParser))
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_package_name<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        prefix: String,
-        range: Range,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn version_operator_chars(&self) -> &'static [char] {
-        VERSION_OPERATOR_CHARS
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_feature<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_features(request.parse_result, &package_name, &prefix)
-                .await
-        })
     }
 
     fn fallback_completion_prefix<'a>(
@@ -176,9 +125,58 @@ impl Ecosystem for CargoEcosystem {
         // instead of a dependency entry — quoting closes that dotted-key injection.
         Some(format!("\"{}\" = \"{latest}\"", name.as_str()))
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TypedEcosystem for CargoEcosystem {
+    type Parsed = CargoParseResult;
+    type Formatter = CargoFormatter;
+
+    fn own_formatter(&self) -> &CargoFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<CargoParseResult>> {
+        Box::pin(async move {
+            let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
+            // Registers every alternate index this parse resolved (FR-002), including its
+            // credential. See `CargoParseResult::resolved_registries`'s docs.
+            for index in result.resolved_registries.clone() {
+                self.registry.register_alternate(index);
+            }
+            Ok(result)
+        })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_package_name<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, CargoParseResult>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_feature<'a>(
+        &'a self,
+        request: deps_core::completion::CompletionRequest<'a, CargoParseResult>,
+        package_name: deps_core::PackageName,
+        prefix: String,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            self.complete_features(&request.parsed, &package_name, &prefix)
+                .await
+        })
     }
 }
 
@@ -198,6 +196,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
 
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests. Does
     // not replace registry.rs's `test_registry_creation`, which constructs `CratesIoRegistry`
@@ -252,7 +251,8 @@ mod tests {
         fallback: &str,
         available: &[&str],
     ) -> deps_core::lsp_helpers::FallbackEditVerdict {
-        let ecosystem = CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(CargoEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = format!("[dependencies]\npkg = \"{req}\"\n");
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         deps_core::test_util::fallback_edit_outcome(
@@ -396,7 +396,8 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
-        use deps_core::NormalizedName;
+        use crate::parser::CargoParseResult;
+        use deps_core::{NormalizedName, ParsedView};
 
         use crate::registry::CratesIoRegistry;
 
@@ -497,42 +498,24 @@ mod tests {
             }
         }
 
-        /// Mock parse result for testing
-        struct MockParseResult {
-            dependencies: Vec<CargoDependency>,
-        }
-
-        impl deps_core::ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-                self.dependencies
-                    .iter()
-                    .map(|d| d as &dyn deps_core::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-
-            fn uri(&self) -> &Url {
-                static URI: std::sync::LazyLock<Url> =
-                    std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/Cargo.toml"));
-                &URI
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
+        fn parse_result(dependencies: Vec<CargoDependency>) -> CargoParseResult {
+            CargoParseResult {
+                dependencies,
+                workspace_root: None,
+                uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+                resolved_registries: vec![],
+                blocked_registries: vec![],
+                rejected_registries: vec![],
+                dependency_truncation: None,
             }
         }
 
-        /// A `MockParseResult` with no dependencies — `resolve_completion_source` reports
+        /// A parse result with no dependencies — `resolve_completion_source` reports
         /// `NotInManifest` for any name against it, so `complete_features` falls back to its
         /// pre-existing crates.io-only behavior. Used by tests below that only exercise
         /// `complete_features` (`complete_versions` is now position-based; see `mock_dependency`).
-        fn empty_parse_result() -> MockParseResult {
-            MockParseResult {
-                dependencies: vec![],
-            }
+        fn empty_parse_result() -> CargoParseResult {
+            parse_result(vec![])
         }
 
         #[test]
@@ -540,9 +523,7 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("serde", Some("1.0.214"), 5, 5)],
-            };
+            let parse_result = parse_result(vec![mock_dependency("serde", Some("1.0.214"), 5, 5)]);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -554,8 +535,8 @@ mod tests {
 
             let mut resolved_versions = HashMap::new();
             resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -573,9 +554,7 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("serde", Some("^1.0"), 5, 5)],
-            };
+            let parse_result = parse_result(vec![mock_dependency("serde", Some("^1.0"), 5, 5)]);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -587,8 +566,8 @@ mod tests {
 
             let mut resolved_versions = HashMap::new();
             resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -606,9 +585,7 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("serde", Some("1.0.100"), 5, 5)],
-            };
+            let parse_result = parse_result(vec![mock_dependency("serde", Some("1.0.100"), 5, 5)]);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -619,8 +596,8 @@ mod tests {
             let config = EcosystemConfig::default();
 
             let resolved_versions = HashMap::new();
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -638,9 +615,7 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("serde", Some("1.0.214"), 5, 5)],
-            };
+            let parse_result = parse_result(vec![mock_dependency("serde", Some("1.0.214"), 5, 5)]);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -653,8 +628,8 @@ mod tests {
             // Up to date, but show_up_to_date_hints is false — hint must still be suppressed.
             let mut resolved_versions = HashMap::new();
             resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -671,9 +646,7 @@ mod tests {
             let mut dep = mock_dependency("serde", Some("1.0.214"), 5, 5);
             dep.version_range = None;
 
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -684,8 +657,8 @@ mod tests {
             let config = EcosystemConfig::default();
 
             let resolved_versions = HashMap::new();
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -702,9 +675,7 @@ mod tests {
             // "^" alone, with no version number, must not panic and must still yield a hint.
             let dep = mock_dependency("serde", Some("^"), 5, 5);
 
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -715,8 +686,8 @@ mod tests {
             let config = EcosystemConfig::default();
 
             let resolved_versions = HashMap::new();
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
@@ -738,14 +709,11 @@ mod tests {
             let content = "[dependencies]\nserd = \"1.0\"\n";
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position::new(1, 3); // cursor after "ser" in "serd"
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
 
             match context {
                 deps_core::completion::CompletionContext::PackageName { prefix, range } => {
@@ -777,9 +745,7 @@ mod tests {
             let ecosystem = CargoEcosystem::new(cache);
             let dep = mock_dependency("serde", Some("1.0"), 0, 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
 
             let results = ecosystem
                 .complete_versions(
@@ -800,9 +766,7 @@ mod tests {
             let ecosystem = CargoEcosystem::new(cache);
             let dep = mock_dependency("serde", Some("^1.0"), 0, 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
 
             let results = ecosystem
                 .complete_versions(
@@ -860,9 +824,7 @@ mod tests {
                 mirrors_public_registry: false,
             };
             let alternate_position = alternate_dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![registry_dep, alternate_dep],
-            };
+            let parse_result = parse_result(vec![registry_dep, alternate_dep]);
 
             // Resolves deterministically without network: the unregistered index fails closed
             // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
@@ -914,9 +876,7 @@ mod tests {
                 mirrors_public_registry: false,
             };
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
 
             let results = ecosystem
                 .complete_versions(
@@ -946,9 +906,7 @@ mod tests {
                 index: "https://index.mycorp.dev".into(),
                 mirrors_public_registry: false,
             };
-            let parse_result = MockParseResult {
-                dependencies: vec![registry_dep, alternate_dep],
-            };
+            let parse_result = parse_result(vec![registry_dep, alternate_dep]);
 
             let results = ecosystem
                 .complete_features(&parse_result, &pkg("shared-name"), "")
@@ -978,9 +936,7 @@ mod tests {
             let ecosystem = CargoEcosystem::with_registry_for_test(registry);
             let dep = mock_dependency("this-package-does-not-exist-12345", Some("1.0"), 0, 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
 
             let results = ecosystem
                 .complete_versions(
@@ -1194,9 +1150,7 @@ mod tests {
 
             let dep = mock_dependency("serde", Some("1.0"), 0, 0);
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
             let results = ecosystem
                 .complete_versions(
                     &parse_result,
@@ -1241,9 +1195,7 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("tokio", Some("1.0"), 5, 5)],
-            };
+            let parse_result = parse_result(vec![mock_dependency("tokio", Some("1.0"), 5, 5)]);
 
             // Empty caches - simulating loading state
             let cached_versions = HashMap::new();
@@ -1251,8 +1203,8 @@ mod tests {
 
             let config = EcosystemConfig::default();
 
-            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-                &parse_result,
+            let hints = tokio_test::block_on(ecosystem.inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loading,
                 &config,
@@ -1302,9 +1254,7 @@ mod tests {
             // A 1-char prefix ("s") is below `is_valid_completion_prefix_len`'s 2-char minimum —
             // deterministic without touching crates.io.
             let content = "s";
-            let parse_result = MockParseResult {
-                dependencies: vec![mock_dependency("s", None, 0, 0)],
-            };
+            let parse_result = parse_result(vec![mock_dependency("s", None, 0, 0)]);
             let position = Position::new(0, 1);
             let freshness = deps_core::FreshnessSettings::default();
 
@@ -1316,7 +1266,7 @@ mod tests {
             };
             let direct = ecosystem.complete_package_names(&prefix, range).await;
             let via_dispatch = ecosystem
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(direct.is_empty());
@@ -1339,9 +1289,7 @@ mod tests {
                 mirrors_public_registry: false,
             };
             let position = dep.version_range.unwrap().start.into();
-            let parse_result = MockParseResult {
-                dependencies: vec![dep],
-            };
+            let parse_result = parse_result(vec![dep]);
             // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
             // slice of `content` to actually match the declared `version_req` ("1.0") — padded
             // to `mock_dependency`'s fixed 10-char-wide range, whitespace-insensitively equal.
@@ -1357,7 +1305,7 @@ mod tests {
                 .complete_versions(&parse_result, position, &prefix, freshness)
                 .await;
             let via_dispatch = ecosystem
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(direct.is_empty());
@@ -1383,9 +1331,7 @@ mod tests {
             alternate_dep.features_range =
                 Some(Range::new(Position::new(2, 0), Position::new(2, 5)).into());
             let position = Position::new(2, 2);
-            let parse_result = MockParseResult {
-                dependencies: vec![registry_dep, alternate_dep],
-            };
+            let parse_result = parse_result(vec![registry_dep, alternate_dep]);
             let content = "";
             let freshness = deps_core::FreshnessSettings::default();
 
@@ -1402,7 +1348,7 @@ mod tests {
                 .complete_features(&parse_result, &package_name, &prefix)
                 .await;
             let via_dispatch = ecosystem
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct.items);
             assert!(direct.items.is_empty());
@@ -1417,7 +1363,6 @@ mod credential_binding_tests {
     use super::*;
     use crate::config::ConfigFileCache;
     use crate::config::RegistryTrust;
-    use deps_core::Ecosystem;
     use deps_core::net_policy::{MapEnv, RegistryAccessPolicy, WorkspaceRegistryAccess};
 
     const OPERATOR_URL: &str = "https://corp.example/index";
@@ -1467,7 +1412,7 @@ mod credential_binding_tests {
             let path = self.project.path().join("Cargo.toml");
             std::fs::write(&path, &content).unwrap();
             let uri = url::Url::from_file_path(&path).unwrap();
-            ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            ecosystem.parse(&content, &uri).await.unwrap();
         }
     }
 

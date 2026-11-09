@@ -1,17 +1,19 @@
 //! Swift ecosystem implementation for deps-lsp.
 
+#[cfg(any(test, feature = "lsp-responses"))]
+use deps_core::ParseResult as ParseResultTrait;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use deps_core::{
-    ConfigReach, Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait,
-    Registry, Result, WatchedConfig, WatchedConfigEffect, is_safe_registry_url,
+    ConfigReach, EcosystemBase, ParsedView, Registry, Result, TypedEcosystem, WatchedConfig,
+    WatchedConfigEffect, is_safe_registry_url,
     lsp_helpers::{
-        DiagnosticSeverities, EcosystemFormatter, ProbeEffect, ProbePhase, ProbeReport,
-        warn_rejected_value,
+        DiagnosticSeverities, ProbeEffect, ProbePhase, ProbeReport, warn_rejected_value,
     },
 };
 use futures::StreamExt;
+#[cfg(test)]
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
@@ -178,10 +180,7 @@ impl SwiftEcosystem {
     /// run that waits for every lookup (the CLI) and one that does not (a later LSP re-parse)
     /// end on the same forms. Stale entries refresh in the background and are never awaited.
     /// Does nothing unless `Replace` is on and the document has an eligible dependency.
-    async fn warm_identities(&self, parse_result: &dyn ParseResultTrait) -> ProbeReport {
-        let Some(parsed) = self.own_parse_result(parse_result) else {
-            return ProbeReport::default();
-        };
+    async fn warm_identities(&self, parsed: &SwiftParseResult) -> ProbeReport {
         let mode = self.context.scm_mode();
         match mode {
             ScmSwizzleMode::Replace => {}
@@ -322,13 +321,7 @@ impl SwiftEcosystem {
 
     /// One information notice per eligible dependency that stayed on source control because its
     /// identity lookup failed (spec 088 US-002).
-    pub(crate) fn lookup_failed_notices(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-    ) -> Vec<Diagnostic> {
-        let Some(parsed) = self.own_parse_result(parse_result) else {
-            return Vec::new();
-        };
+    pub(crate) fn lookup_failed_notices(&self, parsed: &SwiftParseResult) -> Vec<Diagnostic> {
         match self.context.scm_mode() {
             ScmSwizzleMode::Replace => {}
             ScmSwizzleMode::Disabled => return Vec::new(),
@@ -398,17 +391,13 @@ impl SwiftEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
 
-impl OwnParseResult for SwiftEcosystem {
-    type Parsed = SwiftParseResult;
-}
-
 const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
     crate::config::PROJECT_REGISTRIES_SUFFIX,
     WatchedConfigEffect::ChangesRouting,
     ConfigReach::OwnerDirectory,
 )];
 
-impl Ecosystem for SwiftEcosystem {
+impl EcosystemBase for SwiftEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Swift
     }
@@ -429,11 +418,74 @@ impl Ecosystem for SwiftEcosystem {
         &WATCHED_CONFIGS
     }
 
-    fn parse_manifest<'a>(
+    fn registry(&self) -> Arc<dyn Registry> {
+        self.registry.clone() as Arc<dyn Registry>
+    }
+
+    /// `ReparseOpenDocuments` whenever a repository URL's identity answer changes.
+    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
+        Some(self.registry.identity_memo().subscribe())
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(self.lockfile_provider.clone() as Arc<dyn deps_core::lockfile::LockFileProvider>)
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        let url = metadata.repository().map_or_else(
+            || format!("https://github.com/{}", name.as_str()),
+            str::to_string,
+        );
+        if !is_safe_registry_url(&url) {
+            warn_rejected_value(
+                "is_safe_registry_url",
+                "swift package name completion item",
+                &url,
+            );
+            return None;
+        }
+        if latest.is_empty() {
+            Some(format!(".package(url: \"{url}\")"))
+        } else {
+            Some(format!(".package(url: \"{url}\", from: \"{latest}\")"))
+        }
+    }
+
+    /// Fetches `name`'s (`owner/repo`) SPDX license identifier from GitHub (issue
+    /// #660/#688) — `version` is unused, since GitHub's `GET /repos/{owner}/{repo}`
+    /// reflects the repository's default branch, not a resolved tag. See
+    /// [`crate::registry::SwiftRegistry::get_license`].
+    fn fetch_license<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        _version: &'a deps_core::ConcreteVersion,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
+        Box::pin(self.registry.get_license(name.as_str()))
+    }
+
+    /// GitHub's `license.spdx_id` is `licensee` detector output on the repo's default
+    /// branch, not an author-declared registry field — see
+    /// [`deps_core::LicenseSource::DetectedSpdx`].
+    fn license_source(&self) -> deps_core::LicenseSource {
+        deps_core::LicenseSource::DetectedSpdx
+    }
+}
+
+impl TypedEcosystem for SwiftEcosystem {
+    type Parsed = SwiftParseResult;
+    type Formatter = SwiftFormatter;
+
+    fn own_formatter(&self) -> &SwiftFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
         &'a self,
         content: &'a str,
         uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<SwiftParseResult>> {
         Box::pin(async move {
             let mut result =
                 crate::parser::parse_package_swift_with_context(content, uri, &self.context)?;
@@ -459,52 +511,40 @@ impl Ecosystem for SwiftEcosystem {
                     }
                 }
             }
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+            Ok(result)
         })
-    }
-
-    fn registry(&self) -> Arc<dyn Registry> {
-        self.registry.clone() as Arc<dyn Registry>
-    }
-
-    /// `ReparseOpenDocuments` whenever a repository URL's identity answer changes.
-    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
-        Some(self.registry.identity_memo().subscribe())
     }
 
     /// A document depends on a repository's identity answer when one of its swappable
     /// dependencies (a version requirement on an `http(s)` URL, swizzled or not) names it.
-    fn parse_depends_on(
+    fn depends_on(
         &self,
-        parse_result: &dyn ParseResultTrait,
+        parsed: ParsedView<'_, SwiftParseResult>,
         input: &deps_core::ParseInputKey,
     ) -> bool {
-        let Some(parsed) = self.own_parse_result(parse_result) else {
-            return true;
-        };
-        eligible_dependencies(parsed)
+        eligible_dependencies(parsed.typed())
             .iter()
             .any(|(_, scm)| scm.canonical().to_parse_input() == *input)
     }
 
     /// Before the fetch, warms the SCM-to-registry identity memo and reports `Reparse` when a
     /// dependency's form changed; nothing to do after it.
-    fn background_probes<'a>(
+    fn probes<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, SwiftParseResult>,
         phase: ProbePhase,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
         match phase {
-            ProbePhase::PreFetch => Box::pin(self.warm_identities(parse_result)),
+            ProbePhase::PreFetch => Box::pin(self.warm_identities(parsed.typed())),
             ProbePhase::PostFetch => Box::pin(std::future::ready(ProbeReport::default())),
         }
     }
 
     /// The shared diagnostics plus a notice for each eligible dependency whose identity lookup
     /// failed.
-    fn generate_diagnostics<'a>(
+    fn diagnostics<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, SwiftParseResult>,
         versions: deps_core::VersionData<'a>,
         uri: &'a Url,
         freshness: deps_core::FreshnessSettings,
@@ -512,35 +552,27 @@ impl Ecosystem for SwiftEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                parse_result,
+                &parsed,
                 versions,
-                self.formatter(),
+                self.own_formatter(),
                 uri,
                 freshness,
                 severities,
                 deps_core::PublishTime::now(),
             );
-            diagnostics.extend(self.lookup_failed_notices(parse_result));
+            diagnostics.extend(self.lookup_failed_notices(parsed.typed()));
             diagnostics
         })
-    }
-
-    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
-        Some(self.lockfile_provider.clone() as Arc<dyn deps_core::lockfile::LockFileProvider>)
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
     }
 
     #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
+        request: deps_core::completion::CompletionRequest<'a, SwiftParseResult>,
         prefix: String,
         range: LspRange,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        let is_url_literal = name_completion_targets_url(request.parse_result, request.position);
+        let is_url_literal = name_completion_targets_url(&request.parsed, request.position);
         // `range` (the dependency's `name_range()`, computed by `detect_completion_context`)
         // is already the exact span the completion must replace.
         Box::pin(async move {
@@ -551,51 +583,6 @@ impl Ecosystem for SwiftEcosystem {
                 .await
                 .into()
         })
-    }
-
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        let url = metadata.repository().map_or_else(
-            || format!("https://github.com/{}", name.as_str()),
-            str::to_string,
-        );
-        if !is_safe_registry_url(&url) {
-            warn_rejected_value(
-                "is_safe_registry_url",
-                "swift package name completion item",
-                &url,
-            );
-            return None;
-        }
-        if latest.is_empty() {
-            Some(format!(".package(url: \"{url}\")"))
-        } else {
-            Some(format!(".package(url: \"{url}\", from: \"{latest}\")"))
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Fetches `name`'s (`owner/repo`) SPDX license identifier from GitHub (issue
-    /// #660/#688) — `version` is unused, since GitHub's `GET /repos/{owner}/{repo}`
-    /// reflects the repository's default branch, not a resolved tag. See
-    /// [`crate::registry::SwiftRegistry::get_license`].
-    fn fetch_license<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-        _version: &'a deps_core::ConcreteVersion,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
-        Box::pin(self.registry.get_license(name.as_str()))
-    }
-
-    /// GitHub's `license.spdx_id` is `licensee` detector output on the repo's default
-    /// branch, not an author-declared registry field — see
-    /// [`deps_core::LicenseSource::DetectedSpdx`].
-    fn license_source(&self) -> deps_core::LicenseSource {
-        deps_core::LicenseSource::DetectedSpdx
     }
 }
 
@@ -616,7 +603,8 @@ mod tests {
         fallback: &str,
         available: &[&str],
     ) -> deps_core::lsp_helpers::FallbackEditVerdict {
-        let ecosystem = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
         deps_core::test_util::fallback_edit_outcome(
             &ecosystem,
@@ -767,7 +755,7 @@ mod tests {
             );
         }
 
-        let parsed = ecosystem.parse_manifest(manifest, &uri).await.unwrap();
+        let parsed = ecosystem.parse(manifest, &uri).await.unwrap();
         assert_eq!(
             parsed.dependencies()[0].source(),
             DependencySource::CustomRegistry {
@@ -812,7 +800,7 @@ mod tests {
         let uri = Url::from_file_path(dir.path().join("Package.swift")).unwrap();
 
         let parsed = ecosystem
-            .parse_manifest(r#".package(id: "Acme.Net", from: "1.0.0")"#, &uri)
+            .parse(r#".package(id: "Acme.Net", from: "1.0.0")"#, &uri)
             .await
             .unwrap();
         let dependency = &parsed.dependencies()[0];
@@ -875,7 +863,7 @@ mod tests {
         let eco = SwiftEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
         let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
-        let result = eco.parse_manifest(content, &uri).await;
+        let result = eco.parse(content, &uri).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().dependencies().len(), 1);
     }
@@ -891,7 +879,7 @@ mod tests {
             .package(url: "https://github.com/apple/swift-branch", branch: "main"),
             .package(url: "git@github.com:apple/swift-ssh.git", from: "1.0.0"),
         "#;
-        let parsed = eco.parse_manifest(content, &uri).await.unwrap();
+        let parsed = eco.parse(content, &uri).await.unwrap();
         let input = |written: &str| {
             ScmLookupUrl::parse(written)
                 .unwrap()
@@ -899,10 +887,22 @@ mod tests {
                 .to_parse_input()
         };
 
-        assert!(eco.parse_depends_on(&*parsed, &input("https://github.com/apple/swift-nio")));
-        assert!(eco.parse_depends_on(&*parsed, &input("https://github.com/apple/swift-log.git")));
-        assert!(!eco.parse_depends_on(&*parsed, &input("https://github.com/apple/swift-branch")));
-        assert!(!eco.parse_depends_on(&*parsed, &input("https://github.com/apple/other")));
+        assert!(eco.depends_on(
+            ParsedView::new(&parsed),
+            &input("https://github.com/apple/swift-nio")
+        ));
+        assert!(eco.depends_on(
+            ParsedView::new(&parsed),
+            &input("https://github.com/apple/swift-log.git")
+        ));
+        assert!(!eco.depends_on(
+            ParsedView::new(&parsed),
+            &input("https://github.com/apple/swift-branch")
+        ));
+        assert!(!eco.depends_on(
+            ParsedView::new(&parsed),
+            &input("https://github.com/apple/other")
+        ));
     }
 
     #[tokio::test]
@@ -911,7 +911,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
-        let result = eco.parse_manifest("// empty file", &uri).await;
+        let result = eco.parse("// empty file", &uri).await;
         assert!(result.is_ok());
         assert!(result.unwrap().dependencies().is_empty());
     }
@@ -1293,8 +1293,8 @@ mod tests {
             // Cursor right after "a" — inside the name range, one prefix character past the
             // stripped scheme, below `is_valid_completion_prefix_len`'s 2-char minimum.
             let result = eco
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 29),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1315,8 +1315,8 @@ mod tests {
             .unwrap();
             let offset = content.find(needle).unwrap() + 1;
             let eco = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-            eco.generate_completions(
-                &parse_result,
+            eco.completions(
+                ParsedView::new(&parse_result),
                 Position::new(0, u32::try_from(offset).unwrap()),
                 content,
                 deps_core::FreshnessSettings::default(),
@@ -1400,8 +1400,8 @@ mod tests {
             let eco = SwiftEcosystem::new(cache);
 
             let result = eco
-                .generate_completions(
-                    &parse_result,
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 0),
                     "",
                     deps_core::FreshnessSettings::default(),
@@ -1481,7 +1481,7 @@ mod tests {
                 return;
             }
             let via_dispatch = eco
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             // #924 critic S3: without this, a rate-limited/offline run where the live GitHub
             // API returns nothing would make `direct` and `via_dispatch` both trivially empty,
@@ -1531,7 +1531,7 @@ mod tests {
             let eco = SwiftEcosystem::new(cache);
             let freshness = deps_core::FreshnessSettings::default();
             let result = eco
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(result, Completions::default());
         }

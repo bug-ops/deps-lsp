@@ -18,10 +18,11 @@ use tower_lsp_server::ls_types::{CodeAction, CodeActionKind};
 /// Formatter stub mirroring `GoFormatter`'s override: reports the manifest
 /// version-requirement line (go.mod's `require`) as itself the resolved
 /// version, since it is already the exact MVS-selected version (#235).
-pub(crate) const MOCK_GO_FORMATTER: crate::test_util::StubFormatter =
+pub(crate) const MOCK_GO_FORMATTER: crate::test_util::StubFormatter<MockDep> =
     crate::test_util::StubFormatter::new()
         .with_package_url_prefix("https://pkg.go.dev/")
-        .with_manifest_requirement_as_resolved_version();
+        .with_manifest_requirement_as_resolved_version()
+        .for_dependency();
 
 /// Formatter stub mirroring `deps-cargo`'s `CargoFormatter`: widens
 /// `can_resolve_source` to accept `AlternateRegistry` (any private/internal
@@ -31,8 +32,10 @@ pub(crate) const MOCK_GO_FORMATTER: crate::test_util::StubFormatter =
 /// resolvable without its content being safe to treat as a public
 /// registry's (e.g. for the deps.dev trust-signal gate, which must use the
 /// latter, never the former).
-pub(crate) const MOCK_WIDENED_RESOLVE_FORMATTER: crate::test_util::StubFormatter =
-    crate::test_util::StubFormatter::new().with_alternate_registry_resolution();
+pub(crate) const MOCK_WIDENED_RESOLVE_FORMATTER: crate::test_util::StubFormatter<MockDep> =
+    crate::test_util::StubFormatter::new()
+        .with_alternate_registry_resolution()
+        .for_dependency();
 
 pub(crate) struct MockRegistry;
 
@@ -738,8 +741,8 @@ pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
 /// A formatter whose `format_version_for_text_edit` is the identity —
 /// unlike [`super::test_support::MOCK_FORMATTER`], which wraps the version in quotes and
 /// would otherwise confound the N1 no-op-edit guard's own test.
-pub(crate) const IDENTITY_FORMATTER: crate::test_util::StubFormatter =
-    crate::test_util::StubFormatter::DEFAULT;
+pub(crate) const IDENTITY_FORMATTER: crate::test_util::StubFormatter<MockDep> =
+    crate::test_util::StubFormatter::DEFAULT.for_dependency();
 
 /// A formatter mimicking `deps-dart`'s non-identity
 /// `format_version_for_text_edit` (wraps the version in a caret
@@ -909,3 +912,18 @@ impl DiagnosticPolicy for TruncatingFormatter {}
 impl SourcePolicy for TruncatingFormatter {}
 
 impl OsvNaming for TruncatingFormatter {}
+
+macro_rules! mock_dependency_formatter {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl DependencyFormatter for $ty {
+            type Dep = MockDep;
+        })+
+    };
+}
+
+mock_dependency_formatter!(
+    CaretWrappingFormatter,
+    PinPreservingFormatter,
+    TrailingSpaceFormatter,
+    TruncatingFormatter,
+);

@@ -32,11 +32,11 @@ pub async fn handle_document_link(
 
     // Release the DashMap shard `Ref` first (#333) — keeps the own-then-release shape used
     // by other handlers even though `generate_document_links` is sync today.
-    let Some((ecosystem, parse_result)) = state
+    let Some((ecosystem, manifest)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
-            let parse_result = doc.parse_result_arc()?;
-            Some((ecosystem, parse_result))
+            let manifest = doc.manifest_arc()?;
+            Some((ecosystem, manifest))
         })
         .flatten()
     else {
@@ -51,7 +51,7 @@ pub async fn handle_document_link(
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
     };
-    ecosystem.generate_document_links(parse_result.as_ref(), &domain_uri)
+    manifest.generate_document_links(&domain_uri)
 }
 
 #[cfg(test)]
@@ -97,7 +97,7 @@ mod tests {
                 .unwrap();
             let content = "-r other-requirements.txt\nrequests==2.31.0\n".to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");

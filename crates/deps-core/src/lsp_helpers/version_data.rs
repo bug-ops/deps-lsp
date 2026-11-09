@@ -177,7 +177,7 @@ pub struct VersionData<'a> {
     /// [`generate_diagnostics_from_cache`]'s license-policy rule to decide whether
     /// [`crate::licenses::resolve_license_entries`] must normalize free text before
     /// evaluation. `None` in most test fixtures and any handler that doesn't go through
-    /// [`crate::Ecosystem::generate_hover`]/[`crate::Ecosystem::generate_diagnostics`]'s
+    /// [`crate::ParsedManifest::generate_hover`]/[`crate::ParsedManifest::generate_diagnostics`]'s
     /// default implementation, which is what actually attaches this field via
     /// `self.license_source()` — falls back to
     /// [`LicenseSource::RegistryDeclaredSpdx`] (`Default`) wherever consumed.
@@ -212,7 +212,7 @@ pub struct VersionData<'a> {
     /// `deps-lsp::document::typosquat::run_typosquat_prefetch`, and merely read
     /// synchronously here — see that function's doc). Consumed directly inside
     /// [`generate_diagnostics_from_cache`] itself (not gated behind
-    /// `Ecosystem::generate_diagnostics`'s default impl), the same way
+    /// `ParsedManifest::generate_diagnostics`'s default impl), the same way
     /// [`Self::license_prefetch`] is, so every ecosystem's `generate_diagnostics`
     /// override — not just the shared default — picks up the diagnostic automatically
     /// (issue #1437 security-review finding: an override that calls

@@ -162,8 +162,8 @@ per-document dependency list it retains — the thing that stays resident in mem
 life of the open document — never grows past `MAX_DEPENDENCIES_PER_DOCUMENT` (5000) in the
 first place, rather than being truncated after an oversized list was already built and kept
 around. `deps_core::ecosystem::parse_manifest_blocking` (the single chokepoint every
-ecosystem's parse result flows through before reaching `deps-lsp`) applies
-`deps_core::dependency_cap`'s view-level cap as a belt-and-braces backstop on top, so hover,
+ecosystem's parse result flows through before reaching `deps-lsp`) wraps the result in a
+`ParsedManifest` whose `dependencies()` is capped at that same limit as a belt-and-braces backstop on top, so hover,
 completion, diagnostics, inlay hints, code lens, and the registry fetch fan-out all only
 ever see the capped subset even if some ecosystem parser were ever added without wiring in
 the budget itself. The largest real-world manifests sit in the low hundreds of dependencies,

@@ -8,12 +8,10 @@ use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
-    Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait, Registry,
-    Result,
+    EcosystemBase, ParsedView, Registry, Result, TypedEcosystem, TypedParseResult,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
-    lsp_helpers::{EcosystemFormatter, unknown_ref_diagnostics},
+    lsp_helpers::unknown_ref_diagnostics,
 };
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
@@ -94,11 +92,7 @@ impl GithubActionsEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for GithubActionsEcosystem {}
 
-impl OwnParseResult for GithubActionsEcosystem {
-    type Parsed = GithubActionsParseResult;
-}
-
-impl Ecosystem for GithubActionsEcosystem {
+impl EcosystemBase for GithubActionsEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::GithubActions
     }
@@ -139,23 +133,8 @@ impl Ecosystem for GithubActionsEcosystem {
         &[]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_workflow_yaml(content, uri)?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
     }
 
     /// Emits a repository's name whenever its tag index is first populated or its tag-to-commit
@@ -164,21 +143,73 @@ impl Ecosystem for GithubActionsEcosystem {
         Some(self.registry.subscribe_tag_refreshes())
     }
 
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: deps_core::position::Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        // Unreachable today since `search()` always returns `Ok(vec![])`; kept total in case
+        // package-name search is added. Plain `contains('/')`, matching pre-#722 behavior.
+        if !name.as_str().contains('/') {
+            deps_core::lsp_helpers::warn_rejected_value(
+                "owner/repo shape",
+                "github actions package name completion item",
+                name.as_str(),
+            );
+            return None;
+        }
+        if latest.is_empty() {
+            Some(name.as_str().to_string())
+        } else {
+            Some(format!("{}@{latest}", name.as_str()))
+        }
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn pin_all_to_sha_noun(&self) -> deps_core::lsp_helpers::PinNoun {
+        deps_core::lsp_helpers::PinNoun {
+            singular: "action",
+            plural: "actions",
+        }
+    }
+}
+
+impl TypedEcosystem for GithubActionsEcosystem {
+    type Parsed = GithubActionsParseResult;
+    type Formatter = GithubActionsFormatter;
+
+    fn own_formatter(&self) -> &GithubActionsFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<GithubActionsParseResult>> {
+        Box::pin(async move { crate::parser::parse_workflow_yaml(content, uri) })
+    }
+
     /// Branch probes for partial tag refs and lineage/membership probes for commentless SHA
     /// pins, within the registry's probe budget (specs 086, 087). Needs the fetched tag
     /// index, so [`ProbePhase::PreFetch`] does nothing.
-    fn background_probes<'a>(
+    fn probes<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GithubActionsParseResult>,
         phase: ProbePhase,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
         let plan = (phase == ProbePhase::PostFetch)
-            .then(|| {
-                self.own_parse_result(parse_result)
-                    .map_or_else(ProbePlan::default, |parsed| {
-                        probe_plan(&self.formatter, &parsed.dependencies)
-                    })
-            })
+            .then(|| probe_plan(&self.formatter, parsed.own_dependencies()))
             .filter(|plan| !plan.is_empty());
         Box::pin(async move {
             match plan {
@@ -196,7 +227,7 @@ impl Ecosystem for GithubActionsEcosystem {
     /// `# vX.Y.Z` comment, on the `#` itself, or inside the comment (issue #1182). That
     /// pin's `version_range` intentionally extends through the comment —
     /// `crate::formatter::GithubActionsFormatter::format_version_replacing_for`'s edit
-    /// range and [`Self::generate_hover`]'s `**Resolved**` splice both depend on it
+    /// range and [`Self::hover`]'s `**Resolved**` splice both depend on it
     /// spanning the full `<sha> # <tag>` text — so `detect_completion_context` still
     /// reports a `Version` context there. `position_past_sha_pin_own_ref` checks the
     /// cursor position directly against the SHA's own end column rather than scanning
@@ -204,8 +235,8 @@ impl Ecosystem for GithubActionsEcosystem {
     /// sitting in the padding gap or exactly on `#` yields a bare-SHA prefix with no
     /// whitespace left for a prefix-content check to catch.
     ///
-    /// The guard lives here rather than in a `generate_completions` override (issue
-    /// #1195): the shared dispatch in `deps-core::Ecosystem::generate_completions`
+    /// The guard lives here rather than in a `completions` override (issue
+    /// #1195): the shared dispatch in `deps-core::TypedEcosystem::completions`
     /// already routes a resolved `Version` context to this hook and stamps
     /// `CompletionOrigin::Version` on whatever it returns — including
     /// `Completions::default()` from this early return — so #1184 Gap 2's "never fall
@@ -215,22 +246,19 @@ impl Ecosystem for GithubActionsEcosystem {
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
+        request: deps_core::completion::CompletionRequest<'a, GithubActionsParseResult>,
         _package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            if self
-                .own_parse_result(request.parse_result)
-                .is_some_and(|parsed| position_past_sha_pin_own_ref(parsed, request.position))
-            {
+            if position_past_sha_pin_own_ref(request.parsed, request.position) {
                 return Completions::default();
             }
             deps_core::completion::complete_versions_at_position(
                 self.ecosystem_id(),
                 self.registry.as_ref(),
                 &self.formatter,
-                request.parse_result,
+                &request.parsed,
                 request.position,
                 &prefix,
                 VERSION_OPERATOR_CHARS,
@@ -253,9 +281,9 @@ impl Ecosystem for GithubActionsEcosystem {
     /// Also appends the SHA-comment-mismatch diagnostic (issue #1722), which is not gated on
     /// `mutable_ref_pin_enabled`: it only fires for a provable mismatch, and the unknown-ref
     /// diagnostic (#1766) for a tag pin that is a full release no published tag matches.
-    fn generate_diagnostics<'a>(
+    fn diagnostics<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GithubActionsParseResult>,
         versions: deps_core::VersionData<'a>,
         uri: &'a Url,
         freshness: deps_core::FreshnessSettings,
@@ -263,31 +291,28 @@ impl Ecosystem for GithubActionsEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                parse_result,
+                &parsed,
                 versions,
-                self.formatter(),
+                &self.formatter,
                 uri,
                 freshness,
                 severities,
                 deps_core::PublishTime::now(),
             );
-            let Some(parsed) = self.own_parse_result(parse_result) else {
-                return diagnostics;
-            };
             if severities.mutable_ref_pin_enabled {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
-                    &parsed.dependencies,
+                    parsed.own_dependencies(),
                     severities.mutable_ref_pin,
                     &self.formatter.tag_index,
                 ));
             }
             diagnostics.extend(sha_comment_mismatch_diagnostics(
-                &parsed.dependencies,
+                parsed.own_dependencies(),
                 severities.sha_comment_mismatch,
                 &self.formatter,
             ));
             diagnostics.extend(unknown_ref_diagnostics(
-                &parsed.dependencies,
+                parsed.own_dependencies(),
                 severities.unknown_ref,
                 |dep| unknown_ref_target(&self.formatter, dep),
             ));
@@ -299,9 +324,9 @@ impl Ecosystem for GithubActionsEcosystem {
     /// output when the position's dependency is a `PinStyle::Tag` step with a resolvable
     /// `TagIndex` entry.
     #[cfg(feature = "lsp-responses")]
-    fn generate_code_actions<'a>(
+    fn code_actions<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GithubActionsParseResult>,
         position: Position,
         uri: &'a Url,
         versions: deps_core::VersionData<'a>,
@@ -310,29 +335,24 @@ impl Ecosystem for GithubActionsEcosystem {
         Box::pin(async move {
             let registry = self.registry();
             let mut actions = deps_core::lsp_helpers::generate_code_actions(
-                parse_result,
+                &parsed,
                 position,
                 uri,
                 versions,
                 content,
                 registry.as_ref(),
-                self.formatter(),
+                &self.formatter,
             )
             .await;
-            actions.extend(build_sha_pin_action(
-                parse_result,
-                position,
-                uri,
-                &self.formatter,
-            ));
+            actions.extend(build_sha_pin_action(parsed, position, uri, &self.formatter));
             actions.extend(build_sha_comment_fix_action(
-                parse_result,
+                parsed,
                 position,
                 uri,
                 &self.formatter,
             ));
             actions.extend(build_unknown_ref_fix_action(
-                parse_result,
+                parsed,
                 position,
                 uri,
                 &self.formatter,
@@ -360,9 +380,9 @@ impl Ecosystem for GithubActionsEcosystem {
     /// reusable-workflow call, `./local`, `docker://…`) still matches the shared helper's
     /// own hover-target predicate and must not have a `**Resolved**` line spliced onto it.
     #[cfg(feature = "lsp-responses")]
-    fn generate_hover<'a>(
+    fn hover<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GithubActionsParseResult>,
         position: Position,
         versions: deps_core::VersionData<'a>,
         freshness: deps_core::FreshnessSettings,
@@ -370,21 +390,18 @@ impl Ecosystem for GithubActionsEcosystem {
         Box::pin(async move {
             let registry = self.registry.clone();
             let base_hover = deps_core::lsp_generate_hover(
-                parse_result,
+                &parsed,
                 position,
                 versions,
                 registry.as_ref(),
-                self.formatter(),
+                &self.formatter,
                 freshness,
                 deps_core::PublishTime::now(),
             )
             .await;
             let mut hover = base_hover?;
 
-            let Some(parsed) = self.own_parse_result(parse_result) else {
-                return Some(hover);
-            };
-            let Some(gha_dep) = parsed.dependencies.iter().find(|d| {
+            let Some(gha_dep) = parsed.own_dependencies().iter().find(|d| {
                 deps_core::position_in_range(position.into(), d.name_range)
                     || d.version_range
                         .is_some_and(|r| deps_core::position_in_range(position.into(), r))
@@ -412,7 +429,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 return Some(hover);
             };
 
-            use deps_core::lsp_helpers::{PinResolution, RequirementResolution};
+            use deps_core::lsp_helpers::{DependencyFormatter, PinResolution};
             let resolved_tag = match self.formatter.resolved_pin_version(gha_dep) {
                 PinResolution::Resolved { pin, .. } => Some(pin.version().as_str().to_string()),
                 PinResolution::Unresolved
@@ -451,61 +468,17 @@ impl Ecosystem for GithubActionsEcosystem {
         })
     }
 
-    fn fallback_completion_prefix<'a>(
-        &self,
-        content: &'a str,
-        position: deps_core::position::Position,
-    ) -> Option<&'a str> {
-        let line = deps_core::fallback_completion::line_at(content, position)?;
-        if !is_in_dependencies_section(content, position.line as usize) {
-            return None;
-        }
-        Some(extract_prefix(line, position.character))
-    }
-
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        // Unreachable today since `search()` always returns `Ok(vec![])`; kept total in case
-        // package-name search is added. Plain `contains('/')`, matching pre-#722 behavior.
-        if !name.as_str().contains('/') {
-            deps_core::lsp_helpers::warn_rejected_value(
-                "owner/repo shape",
-                "github actions package name completion item",
-                name.as_str(),
-            );
-            return None;
-        }
-        if latest.is_empty() {
-            Some(name.as_str().to_string())
-        } else {
-            Some(format!("{}@{latest}", name.as_str()))
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// One [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a commit
+    /// One [`TextEdit`] per `PinStyle::Tag` step in `parsed` resolvable to a commit
     /// SHA via this ecosystem's own `TagIndex`-backed formatter (issue #633) — `versions`
     /// is unused: a GHA SHA pin's replacement comes entirely from the shared `TagIndex`,
     /// with no dependency on the caller's fetched version data.
     #[cfg(feature = "lsp-responses")]
-    fn collect_pin_all_to_sha_edits(
+    fn pin_all_to_sha_edits(
         &self,
-        parse_result: &dyn ParseResultTrait,
+        parsed: ParsedView<'_, GithubActionsParseResult>,
         _versions: deps_core::VersionData<'_>,
     ) -> Vec<TextEdit> {
-        collect_pin_all_to_sha_edits(parse_result, &self.formatter)
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn pin_all_to_sha_noun(&self) -> deps_core::lsp_helpers::PinNoun {
-        deps_core::lsp_helpers::PinNoun {
-            singular: "action",
-            plural: "actions",
-        }
+        collect_pin_all_to_sha_edits(parsed, &self.formatter)
     }
 }
 
@@ -544,14 +517,14 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 /// source of truth [`mutable_ref_pin_diagnostics`]'s message-branch selection uses
 /// (issue #1188), and both properties matter there: the message must render identically
 /// in a `deps-cli` build with `lsp-responses` disabled (critic S1 — `deps-cli` never
-/// enables that feature, per `Cargo.toml`, but `generate_diagnostics` still runs there),
+/// enables that feature, per `Cargo.toml`, but `diagnostics` still runs there),
 /// and it must not flip between "automated fix available" and "manual edit" as the cache
 /// warms or goes cold across a session (critic S2 — mirrors `deps-gitlab-ci`'s
 /// `sha_pin_quickfix_kind`/`ecosystem.rs`, whose own doc comment rules the identical
 /// question the same way: a diagnostic's advisory text needs no live cache hit the way
 /// an actual destructive edit does).
 ///
-/// [`GithubActionsEcosystem::generate_hover`]'s footer guard reaches the same predicate
+/// [`GithubActionsEcosystem::hover`]'s footer guard reaches the same predicate
 /// through `resolve_static_sha_pin`.
 pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
     gha_dep.pin == Some(PinStyle::Tag) && gha_dep.is_plain_scalar && gha_dep.is_last_on_line
@@ -703,7 +676,9 @@ mod probe_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::Dependency;
     use deps_core::lsp_helpers::{LowercaseNaming, NormalizeName};
+    use std::any::Any;
 
     fn tag_index_event(name: &PackageName) -> deps_core::RefreshEvent {
         deps_core::RefreshEvent::TagIndex(LowercaseNaming.normalize_package_name(name))
@@ -755,31 +730,32 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_a0_uncompilable() {
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GithubActionsEcosystem::new(cache);
+        let ecosystem = Arc::new(GithubActionsEcosystem::new(cache));
         let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parsed = ecosystem
-            .parse_manifest(&content, &uri)
+            .parse(&content, &uri)
             .await
             .expect("manifest must parse");
         let dep = parsed
-            .dependencies()
-            .into_iter()
+            .dependencies
+            .iter()
             .find(|d| d.name().as_str() == "actions/checkout")
             .expect("dependency present");
         let candidate = deps_core::edit::ManifestEdit {
             range: dep.version_range().expect("version range"),
             new_text: "v5".to_string(),
         };
+        let erased: Arc<dyn deps_core::Ecosystem> = ecosystem.clone();
         let reparse = deps_core::edit::EcosystemReparse {
-            ecosystem: &ecosystem,
+            ecosystem: &erased,
             uri: &uri,
         };
         let fallback = deps_core::ConcreteVersion::new("v5");
         let available = [deps_core::ConcreteVersion::new("v6"), fallback.clone()];
 
         let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
-            ecosystem.formatter(),
+            ecosystem.own_formatter(),
             &reparse,
             &content,
             dep,
@@ -805,12 +781,12 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = HashMap::new();
         let resolved = HashMap::new();
 
-        eco.generate_diagnostics(
-            parse_result.as_ref(),
+        eco.diagnostics(
+            ParsedView::new(&parse_result),
             deps_core::VersionData::new(&cached, &resolved),
             &uri,
             deps_core::FreshnessSettings::default(),
@@ -908,8 +884,8 @@ mod tests {
         let cached = HashMap::new();
         let resolved = HashMap::new();
         let diagnostics = eco
-            .generate_diagnostics(
-                &parse_result,
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &parse_result.uri,
                 deps_core::FreshnessSettings::default(),
@@ -1006,7 +982,7 @@ mod tests {
         let content = "steps:\n\
              \x20 - uses: taiki-e/install-action@cargo-deny\n\
              \x20 - uses: taiki-e/install-action@v2\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
 
         let index = TagIndex::from_tags([
             (
@@ -1030,8 +1006,8 @@ mod tests {
         let cached = HashMap::new();
         let resolved = HashMap::new();
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1135,7 +1111,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let index = TagIndex::from_tags([(
             "v4",
             &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
@@ -1147,8 +1123,8 @@ mod tests {
         let cached = HashMap::new();
         let resolved = HashMap::new();
         let warm = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1174,7 +1150,7 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v3\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
 
         let mut cached = HashMap::new();
         cached.insert(
@@ -1184,8 +1160,8 @@ mod tests {
         let resolved = HashMap::new();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1217,15 +1193,15 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = HashMap::new();
         let resolved = HashMap::new();
         let severities = deps_core::lsp_helpers::DiagnosticSeverities::new()
             .with_mutable_ref_pin(Severity::Error);
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1248,15 +1224,15 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let cached = HashMap::new();
         let resolved = HashMap::new();
         let severities =
             deps_core::lsp_helpers::DiagnosticSeverities::new().with_mutable_ref_pin_enabled(false);
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1352,8 +1328,8 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
-        assert_eq!(result.dependencies().len(), 1);
+        let result = eco.parse(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies.len(), 1);
     }
 
     fn empty_versions() -> (deps_core::CachedVersionsMap, deps_core::ResolvedVersionsMap) {
@@ -1374,12 +1350,12 @@ mod tests {
              \x20 using: composite\n\
              \x20 steps:\n\
              \x20   - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = eco.parse(content, &uri).await.unwrap();
         let (cached, resolved) = empty_versions();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1405,13 +1381,13 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/tools/action.yml");
         let content = "name: Not Actually a GitHub Action\nuses: internal/base-template@stable\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        assert!(parse_result.dependencies().is_empty());
+        let parse_result = eco.parse(content, &uri).await.unwrap();
+        assert!(parse_result.dependencies.is_empty());
         let (cached, resolved) = empty_versions();
 
         let diagnostics = eco
-            .generate_diagnostics(
-                parse_result.as_ref(),
+            .diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -1492,7 +1468,7 @@ mod tests {
         use deps_core::lsp_helpers::splice_resolved_line;
 
         /// Exercises `build_sha_pin_action` directly rather than through
-        /// `GithubActionsEcosystem::generate_code_actions`: the shared default that override
+        /// `GithubActionsEcosystem::code_actions`: the shared default that override
         /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
         /// which would overwrite a hand-seeded `TagIndex` fixture with real GitHub data before
         /// this function ever runs.
@@ -1512,14 +1488,15 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            let position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
 
-            let action = build_sha_pin_action(&parse_result, position, &uri, &formatter)
-                .expect("expected a Pin-to-commit-SHA quickfix");
+            let action =
+                build_sha_pin_action(ParsedView::new(&parse_result), position, &uri, &formatter)
+                    .expect("expected a Pin-to-commit-SHA quickfix");
             assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
             let edit = action.edit.as_ref().unwrap();
             let text_edits = edit
@@ -1552,12 +1529,12 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-                .name_range()
-                .start
-                .into();
+            let position = parse_result.dependencies[0].name_range().start.into();
 
-            assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+            assert!(
+                build_sha_pin_action(ParsedView::new(&parse_result), position, &uri, &formatter)
+                    .is_none()
+            );
         }
 
         /// FR-005: a `TagIndex` cache miss must never offer a destructive/no-op edit.
@@ -1569,13 +1546,16 @@ mod tests {
 
             let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
 
-            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            let position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
 
-            assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+            assert!(
+                build_sha_pin_action(ParsedView::new(&parse_result), position, &uri, &formatter)
+                    .is_none()
+            );
         }
 
         /// FR-005/plan §11: a `PinStyle::Branch` step must never get the SHA-pin quickfix,
@@ -1596,13 +1576,16 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            let position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
 
-            assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+            assert!(
+                build_sha_pin_action(ParsedView::new(&parse_result), position, &uri, &formatter)
+                    .is_none()
+            );
         }
 
         /// FR-010 (security audit finding): a quoted `uses:` scalar must never get the
@@ -1625,14 +1608,15 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            let position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
 
             assert!(
-                build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+                build_sha_pin_action(ParsedView::new(&parse_result), position, &uri, &formatter)
+                    .is_none(),
                 "a quoted uses: scalar must withhold the quickfix even on a TagIndex hit"
             );
         }
@@ -1659,14 +1643,15 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            let position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
 
             assert!(
-                build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+                build_sha_pin_action(ParsedView::new(&parse_result), position, &uri, &formatter)
+                    .is_none(),
                 "a flow-mapping uses: step must withhold the quickfix even on a TagIndex hit"
             );
         }
@@ -1733,7 +1718,7 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             let index = TagIndex::from_tags([(
                 "v4",
@@ -1744,13 +1729,13 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved)
                         .with_network(deps_core::NetworkMode::Offline),
@@ -1779,7 +1764,7 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4\n");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
             let commit = deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap();
             let index =
                 TagIndex::from_tags(["v4", "v4.2.2", "v5.0.0"].into_iter().map(|t| (t, &commit)));
@@ -1789,12 +1774,12 @@ mod tests {
             );
             let expected = index_most_specific(&sha);
 
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
             let md = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved)
                         .with_network(deps_core::NetworkMode::Offline),
@@ -1824,7 +1809,7 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{uses_ref}\n");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
 
             let commits: Vec<(&str, deps_core::lsp_helpers::CommitSha)> = tags
                 .iter()
@@ -1842,11 +1827,11 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
-            eco.generate_hover(
-                parse_result.as_ref(),
+            eco.hover(
+                ParsedView::new(&parse_result),
                 position,
                 deps_core::VersionData::new(&cached, &resolved)
                     .with_network(deps_core::NetworkMode::Offline),
@@ -1892,15 +1877,15 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved)
                         .with_network(deps_core::NetworkMode::Offline),
@@ -1956,14 +1941,14 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved),
                     deps_core::FreshnessSettings::default(),
@@ -2000,7 +1985,7 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             let index = TagIndex::from_tags([(
                 "v4",
@@ -2011,13 +1996,13 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved)
                         .with_network(deps_core::NetworkMode::Offline),
@@ -2048,12 +2033,8 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let gha_dep = parse_result.dependencies()[0]
-                .as_any()
-                .downcast_ref::<GithubActionsDependency>()
-                .unwrap();
-            assert!(!gha_dep.is_last_on_line);
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            assert!(!parse_result.dependencies[0].is_last_on_line);
 
             let index = TagIndex::from_tags([(
                 "v4",
@@ -2064,13 +2045,13 @@ mod tests {
                 Arc::new(index),
             );
 
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let position = parse_result.dependencies[0].name_range.start.into();
             let cached = HashMap::new();
             let resolved = HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved)
                         .with_network(deps_core::NetworkMode::Offline),
@@ -2147,7 +2128,7 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let parse_result = eco
-                .parse_manifest("steps:\n  - uses: actions/checkout@v4.8.0\n", &uri)
+                .parse("steps:\n  - uses: actions/checkout@v4.8.0\n", &uri)
                 .await
                 .unwrap();
             let (cached, resolved) = empty_versions();
@@ -2155,8 +2136,8 @@ mod tests {
                 || deps_core::VersionData::new(&cached, &resolved).with_vulnerabilities(&vulns);
 
             let diagnostics = eco
-                .generate_diagnostics(
-                    parse_result.as_ref(),
+                .diagnostics(
+                    ParsedView::new(&parse_result),
                     versions(),
                     &uri,
                     deps_core::FreshnessSettings::default(),
@@ -2171,8 +2152,8 @@ mod tests {
             );
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     Position::new(1, 30),
                     versions().with_network(deps_core::NetworkMode::Offline),
                     deps_core::FreshnessSettings::default(),
@@ -2215,12 +2196,12 @@ mod tests {
             let content = "steps:\n\
              \x20 - uses: actions/checkout@v4\n\
              \x20 - uses: actions/setup-node@v3\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
             let count = eco
-                .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
+                .pin_all_to_sha_edits(ParsedView::new(&parse_result), versions)
                 .len();
             let lens = deps_core::lsp_helpers::build_pin_all_to_sha_lens(
                 count,
@@ -2244,11 +2225,11 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert_eq!(edits.len(), 1);
         }
 
@@ -2283,7 +2264,7 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4\n");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
 
             let mut cached = HashMap::new();
             cached.insert(
@@ -2294,7 +2275,7 @@ mod tests {
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
             let edits = deps_core::lsp_helpers::collect_update_all_edits(
-                parse_result.as_ref(),
+                &ParsedView::new(&parse_result),
                 &content,
                 versions,
                 &eco.formatter,
@@ -2340,7 +2321,7 @@ mod tests {
                  \x20 - uses: {name}@{missing_b} # cargo-deny\n\
                  \x20 - uses: {name}@{latest_sha} # cargo-deny\n"
             );
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
                 deps_core::PackageKey::new(&deps_core::PackageName::new(name), &eco.formatter)
@@ -2354,8 +2335,8 @@ mod tests {
             let control_line = 5_u32;
 
             let diagnostics = eco
-                .generate_diagnostics(
-                    parse_result.as_ref(),
+                .diagnostics(
+                    ParsedView::new(&parse_result),
                     versions(),
                     &uri,
                     deps_core::FreshnessSettings::default(),
@@ -2371,7 +2352,7 @@ mod tests {
             assert_eq!(diagnostic_lines, outdated_lines, "{diagnostics:?}");
 
             let edits = deps_core::lsp_helpers::collect_update_all_edits(
-                parse_result.as_ref(),
+                &ParsedView::new(&parse_result),
                 &content,
                 versions(),
                 &eco.formatter,
@@ -2382,8 +2363,8 @@ mod tests {
             assert!(edits.iter().all(|e| e.new_text.starts_with(&latest_sha)));
 
             let hints = eco
-                .generate_inlay_hints(
-                    parse_result.as_ref(),
+                .inlay_hints(
+                    ParsedView::new(&parse_result),
                     versions(),
                     deps_core::LoadingState::Loaded,
                     &deps_core::EcosystemConfig::default(),
@@ -2402,8 +2383,8 @@ mod tests {
 
             for line in outdated_lines {
                 let hover = eco
-                    .generate_hover(
-                        parse_result.as_ref(),
+                    .hover(
+                        ParsedView::new(&parse_result),
                         Position::new(line, 40),
                         versions().with_network(deps_core::NetworkMode::Offline),
                         deps_core::FreshnessSettings::default(),
@@ -2526,11 +2507,11 @@ mod tests {
             };
             for (line, expected_line) in cases {
                 let content = format!("steps:\n{line}\n");
-                let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+                let parse_result = eco.parse(&content, &uri).await.unwrap();
                 let versions = deps_core::VersionData::new(&cached, &resolved);
                 let diagnostics = eco
-                    .generate_diagnostics(
-                        parse_result.as_ref(),
+                    .diagnostics(
+                        ParsedView::new(&parse_result),
                         versions,
                         &uri,
                         deps_core::FreshnessSettings::default(),
@@ -2538,7 +2519,7 @@ mod tests {
                     )
                     .await;
                 let planned = deps_core::edit::collect_update_edits(
-                    parse_result.as_ref(),
+                    &ParsedView::new(&parse_result),
                     &content,
                     versions,
                     &eco.formatter,
@@ -2554,10 +2535,10 @@ mod tests {
                 let applied = deps_core::edit::apply_edits(&content, &edits);
                 assert_eq!(applied, format!("steps:\n{expected_line}\n"), "{line}");
 
-                let reparsed = eco.parse_manifest(&applied, &uri).await.unwrap();
+                let reparsed = eco.parse(&applied, &uri).await.unwrap();
                 let after = eco
-                    .generate_diagnostics(
-                        reparsed.as_ref(),
+                    .diagnostics(
+                        ParsedView::new(&reparsed),
                         versions,
                         &uri,
                         deps_core::FreshnessSettings::default(),
@@ -2625,11 +2606,11 @@ mod tests {
         ) -> Option<(CodeAction, String)> {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-            let range = deps_core::ParseResult::dependencies(&parse_result)[dep_index]
+            let range = parse_result.dependencies[dep_index]
                 .version_range()
                 .unwrap();
             let action = build_sha_comment_fix_action(
-                &parse_result,
+                ParsedView::new(&parse_result),
                 Position::new(range.start.line, range.start.character),
                 &uri,
                 &eco.formatter,
@@ -2766,15 +2747,15 @@ mod tests {
             code: &str,
         ) -> Vec<Diagnostic> {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
                 deps_core::NormalizedName::for_test("owner/action"),
                 deps_core::PackageVersions::latest_only("v2.87.22"),
             );
             let resolved = HashMap::new();
-            eco.generate_diagnostics(
-                parse_result.as_ref(),
+            eco.diagnostics(
+                ParsedView::new(&parse_result),
                 deps_core::VersionData::new(&cached, &resolved),
                 &uri,
                 deps_core::FreshnessSettings::default(),
@@ -2859,12 +2840,17 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let parse_result = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
             let fix_at = |dep_index: usize, text: &str| {
-                let range = deps_core::ParseResult::dependencies(&parse_result)[dep_index]
+                let range = parse_result.dependencies[dep_index]
                     .version_range()
                     .unwrap();
                 let position = Position::new(range.start.line, range.start.character);
-                build_unknown_ref_fix_action(&parse_result, position, &uri, &eco.formatter)
-                    .map(|action| (action.title.clone(), apply_single_edit(text, &uri, &action)))
+                build_unknown_ref_fix_action(
+                    ParsedView::new(&parse_result),
+                    position,
+                    &uri,
+                    &eco.formatter,
+                )
+                .map(|action| (action.title.clone(), apply_single_edit(text, &uri, &action)))
             };
 
             let (title, fixed) = fix_at(0, &content).expect("2.87.22 has a published spelling");
@@ -3051,9 +3037,9 @@ mod tests {
             let resolved = HashMap::new();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - {{uses: {name}@{old}}}\n");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
             let planned = deps_core::edit::collect_update_edits(
-                parse_result.as_ref(),
+                &ParsedView::new(&parse_result),
                 &content,
                 deps_core::VersionData::new(&cached, &resolved),
                 &eco.formatter,
@@ -3092,7 +3078,7 @@ mod tests {
                 "steps:\n  - uses: {name}@{a} # v2.87.22\n  - uses: {name}@{missing} # v2.87.22\n"
             );
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
                 deps_core::NormalizedName::for_test(&name),
@@ -3106,8 +3092,8 @@ mod tests {
                 let parse_result = &parse_result;
                 let eco = &eco;
                 async move {
-                    eco.generate_hover(
-                        parse_result.as_ref(),
+                    eco.hover(
+                        ParsedView::new(parse_result),
                         Position::new(line, 40),
                         versions,
                         deps_core::FreshnessSettings::default(),
@@ -3162,10 +3148,10 @@ mod tests {
                     format!("steps:\n  - uses: {name}@{a} # v2.87.22\n"),
                 ),
             ] {
-                let parse_result = ecosystem.parse_manifest(&text, &uri).await.unwrap();
+                let parse_result = ecosystem.parse(&text, &uri).await.unwrap();
                 let hover = ecosystem
-                    .generate_hover(
-                        parse_result.as_ref(),
+                    .hover(
+                        ParsedView::new(&parse_result),
                         Position::new(line, 40),
                         deps_core::VersionData::new(&cached, &resolved)
                             .with_network(deps_core::NetworkMode::Offline),
@@ -3199,7 +3185,7 @@ mod tests {
                 "jobs:\n  call:\n    uses: octo-org/repo/.github/workflows/x.yml@{}\n  build:\n    steps:\n      - uses: docker://alpine:3.18\n      - uses: ./local\n",
                 "5".repeat(40)
             );
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
                 deps_core::NormalizedName::for_test("octo-org/repo"),
@@ -3208,8 +3194,8 @@ mod tests {
             let resolved = HashMap::new();
 
             let diagnostics = eco
-                .generate_diagnostics(
-                    parse_result.as_ref(),
+                .diagnostics(
+                    ParsedView::new(&parse_result),
                     deps_core::VersionData::new(&cached, &resolved),
                     &uri,
                     deps_core::FreshnessSettings::default(),
@@ -3223,7 +3209,7 @@ mod tests {
                 "{diagnostics:?}"
             );
             let edits = deps_core::lsp_helpers::collect_update_all_edits(
-                parse_result.as_ref(),
+                &ParsedView::new(&parse_result),
                 &content,
                 deps_core::VersionData::new(&cached, &resolved),
                 &eco.formatter,
@@ -3238,11 +3224,11 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{}\n", "a".repeat(40));
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert!(
                 edits.is_empty(),
                 "an already-SHA-pinned workflow must produce no edits: {edits:?}"
@@ -3257,11 +3243,11 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert!(
                 edits.is_empty(),
                 "a TagIndex cache miss must be skipped gracefully, not promise a no-op edit: \
@@ -3282,11 +3268,11 @@ mod tests {
             let content = "steps:\n\
              \x20 - uses: actions/checkout@v4\n\
              \x20 - uses: some-org/unresolved-action@v1\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert_eq!(
                 edits.len(),
                 1,
@@ -3308,8 +3294,8 @@ mod tests {
             let content = "steps:\n\
              \x20 - uses: actions/checkout@v4\n\
              \x20 - uses: actions/setup-node@v3\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let deps = &parse_result.dependencies;
             let checkout_range = deps
                 .iter()
                 .find(|d| d.name().as_str() == "actions/checkout")
@@ -3323,7 +3309,7 @@ mod tests {
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert_eq!(edits.len(), 2);
             // M1 (critic): the risk here is writing 40+ chars at the wrong span, so each edit's
             // range must be pinned, not just its text — proving the mapping doesn't swap or shift.
@@ -3352,11 +3338,11 @@ mod tests {
             let content = "steps:\n\
              \x20 - uses: some-org/some-action@main\n\
              \x20 - uses: \"actions/checkout@v4\"\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert!(
                 edits.is_empty(),
                 "a branch pin and a quoted-scalar tag pin must both be withheld: {edits:?}"
@@ -3374,11 +3360,11 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = empty_versions();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
-            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            let edits = eco.pin_all_to_sha_edits(ParsedView::new(&parse_result), versions);
             assert!(
                 edits.is_empty(),
                 "a flow-mapping tag pin must be withheld, not corrupted: {edits:?}"
@@ -3398,16 +3384,13 @@ mod tests {
              \x20 using: composite\n\
              \x20 steps:\n\
              \x20   - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let name_position = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-                .name_range()
-                .start
-                .into();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let name_position = parse_result.dependencies[0].name_range().start.into();
             let (cached, resolved) = empty_versions();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     name_position,
                     deps_core::VersionData::new(&cached, &resolved),
                     deps_core::FreshnessSettings::default(),
@@ -3448,12 +3431,12 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let position = parse_result.dependencies()[0].name_range().start.into();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let position = parse_result.dependencies[0].name_range.start.into();
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -3498,16 +3481,16 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let position = parse_result.dependencies()[0]
-                .version_range()
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let position = parse_result.dependencies[0]
+                .version_range
                 .unwrap()
                 .start
                 .into();
             let freshness = deps_core::FreshnessSettings::default();
 
             let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
+                &ParsedView::new(&parse_result),
                 position,
                 content,
             );
@@ -3518,7 +3501,7 @@ mod tests {
                 eco.ecosystem_id(),
                 eco.registry.as_ref(),
                 &eco.formatter,
-                parse_result.as_ref(),
+                &ParsedView::new(&parse_result),
                 position,
                 &prefix,
                 VERSION_OPERATOR_CHARS,
@@ -3526,7 +3509,7 @@ mod tests {
             )
             .await;
             let via_dispatch = eco
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert_eq!(
@@ -3579,16 +3562,16 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha}  # v4.2.0\n");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-            let version_range = parse_result.dependencies()[0].version_range().unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
+            let version_range = parse_result.dependencies[0].version_range.unwrap();
             let sha_end = version_range.start.character + u32::try_from(sha.len()).unwrap();
             let line = version_range.start.line;
             let freshness = deps_core::FreshnessSettings::default();
 
             // Right after the SHA's own last character: still typing the ref, must complete.
             let allowed = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     deps_core::position::Position::new(line, sha_end).into(),
                     &content,
                     freshness,
@@ -3600,8 +3583,8 @@ mod tests {
             // inside the comment past `#` — all three must withhold.
             for character in [sha_end + 1, sha_end + 2, sha_end + 3] {
                 let withheld = eco
-                    .generate_completions(
-                        parse_result.as_ref(),
+                    .completions(
+                        ParsedView::new(&parse_result),
                         deps_core::position::Position::new(line, character).into(),
                         &content,
                         freshness,
@@ -3630,41 +3613,19 @@ mod tests {
                 format!("  - {{uses: 'actions/checkout@{sha}'}} # v4"),
             ] {
                 let content = format!("steps:\n{line}\n");
-                let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-                let start = parse_result.dependencies()[0]
-                    .version_range()
+                let parse_result = eco.parse(&content, &uri).await.unwrap();
+                let start = parse_result.dependencies[0]
+                    .version_range
                     .unwrap()
                     .start
                     .character;
-                let parsed = eco.own_parse_result(parse_result.as_ref()).unwrap();
+                let parsed = ParsedView::new(&parse_result);
                 let past = |character: u32| {
                     position_past_sha_pin_own_ref(parsed, Position::new(1, character))
                 };
                 assert!(!past(start + 40), "{line}");
                 assert!(past(start + 41), "{line}");
             }
-        }
-
-        /// A parse result of another ecosystem reaching a real hook trips the typed boundary's
-        /// `debug_assert`; release builds fall back to an empty probe report.
-        #[cfg(debug_assertions)]
-        #[test]
-        #[should_panic(expected = "parse result is not a ")]
-        fn test_background_probes_asserts_on_a_foreign_parse_result_in_debug_builds() {
-            let eco = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-            let foreign = deps_core::test_util::stub_parse_result_with_dependencies(1);
-            drop(eco.background_probes(foreign.as_ref(), ProbePhase::PostFetch));
-        }
-
-        #[cfg(not(debug_assertions))]
-        #[tokio::test]
-        async fn test_background_probes_ignore_a_foreign_parse_result_in_release_builds() {
-            let eco = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-            let foreign = deps_core::test_util::stub_parse_result_with_dependencies(1);
-            let report = eco
-                .background_probes(foreign.as_ref(), ProbePhase::PostFetch)
-                .await;
-            assert_eq!(report, ProbeReport::default());
         }
 
         /// A commentless SHA pin's `version_range` already ends exactly at the SHA's own end
@@ -3697,13 +3658,13 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha}\n");
-            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-            let version_range = parse_result.dependencies()[0].version_range().unwrap();
+            let parse_result = eco.parse(&content, &uri).await.unwrap();
+            let version_range = parse_result.dependencies[0].version_range.unwrap();
             let freshness = deps_core::FreshnessSettings::default();
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     version_range.end.into(),
                     &content,
                     freshness,

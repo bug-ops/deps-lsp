@@ -11,10 +11,10 @@
 //!
 //! The completion system uses trait objects (`dyn Dependency`, `dyn ParseResult`,
 //! `dyn Version`, `dyn Metadata`) to work generically across ecosystems. See
-//! [`crate::Ecosystem::generate_completions`]'s trait doc for the canonical example of how
+//! [`crate::TypedEcosystem::completions`]'s trait doc for the canonical example of how
 //! an ecosystem plugs into this module's [`CompletionRequest`]/[`CompletionContext`]
-//! machinery via [`crate::Ecosystem::complete_package_name`],
-//! [`crate::Ecosystem::complete_version`], [`crate::Ecosystem::complete_feature`].
+//! machinery via [`crate::TypedEcosystem::complete_package_name`],
+//! [`crate::TypedEcosystem::complete_version`], [`crate::TypedEcosystem::complete_feature`].
 
 use crate::lsp_helpers::{
     CooldownPrecedence, MAX_VERSION_DIAGNOSTIC_CHARS, escape_markdown, is_safe_registry_url,
@@ -23,7 +23,7 @@ use crate::lsp_helpers::{
 };
 use crate::{
     ConcreteVersion, EcosystemId, FreshnessSettings, Metadata, PackageName, ParseResult,
-    PublishTime, Version, format_relative_age,
+    ParsedView, PublishTime, TypedParseResult, Version, format_relative_age,
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
@@ -36,7 +36,7 @@ use tower_lsp_server::ls_types::{
 /// this module is gated behind.
 pub use crate::lsp_helpers::COMPLETION_SEARCH_TIMEOUT;
 
-/// Result of [`Ecosystem::generate_completions`](crate::Ecosystem::generate_completions).
+/// Result of [`TypedEcosystem::completions`](crate::TypedEcosystem::completions).
 ///
 /// Carries the completion items produced for this specific call, plus whether they are
 /// a possibly-truncated view of a larger candidate set that the LSP client should
@@ -123,7 +123,7 @@ impl From<Vec<CompletionItem>> for Completions {
 /// Which [`CompletionContext`] variant a [`Completions`] response was resolved for.
 ///
 /// Stamped by whichever dispatch resolved the completion context — the shared
-/// [`crate::Ecosystem::generate_completions`] default for 11 of 14 ecosystems, or the
+/// [`crate::TypedEcosystem::completions`] default for 11 of 14 ecosystems, or the
 /// ecosystem's own dispatch for the 3 that override it (`deps-maven`, `deps-gradle`,
 /// previously `deps-github-actions`) — so every completion response carries a positive
 /// record of what kind of position it answered, not just whether its author remembered to
@@ -192,7 +192,7 @@ impl CompletionOrigin {
     }
 }
 
-/// Bundles the request-scoped inputs [`crate::Ecosystem`]'s completion hooks need.
+/// Bundles the request-scoped inputs [`crate::TypedEcosystem`]'s completion hooks need.
 ///
 /// Covers `complete_package_name`/`complete_version`/`complete_feature`, so a future input
 /// costs one field here instead of a signature break across every ecosystem crate — mirrors
@@ -202,12 +202,11 @@ impl CompletionOrigin {
 /// `#[non_exhaustive]`: a struct literal only works inside this crate — construct via
 /// [`Self::new`].
 #[non_exhaustive]
-#[derive(Clone, Copy)]
-pub struct CompletionRequest<'a> {
+pub struct CompletionRequest<'a, P: TypedParseResult> {
     /// The manifest's parsed dependencies — used by a hook that re-derives its own
     /// dependency lookup instead of trusting the context's bare `package_name`/`prefix`
     /// (e.g. cursor-position-based version resolution, issue #593).
-    pub parse_result: &'a dyn ParseResult,
+    pub parsed: ParsedView<'a, P>,
     /// Cursor position the completion request fired at.
     pub position: Position,
     /// Freshness display settings, threaded through to
@@ -215,19 +214,35 @@ pub struct CompletionRequest<'a> {
     pub freshness: FreshnessSettings,
 }
 
-impl<'a> CompletionRequest<'a> {
+impl<P: TypedParseResult> Clone for CompletionRequest<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: TypedParseResult> Copy for CompletionRequest<'_, P> {}
+
+impl<P: TypedParseResult> std::fmt::Debug for CompletionRequest<'_, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionRequest")
+            .field("position", &self.position)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, P: TypedParseResult> CompletionRequest<'a, P> {
     /// Constructs a `CompletionRequest` from its fields.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every ecosystem crate goes through this constructor instead.
     #[must_use]
     pub const fn new(
-        parse_result: &'a dyn ParseResult,
+        parsed: ParsedView<'a, P>,
         position: Position,
         freshness: FreshnessSettings,
     ) -> Self {
         Self {
-            parse_result,
+            parsed,
             position,
             freshness,
         }
@@ -242,7 +257,7 @@ impl<'a> CompletionRequest<'a> {
 /// `#[non_exhaustive]`: still blocks out-of-crate construction and forces a wildcard on the
 /// one remaining downstream match (`deps-deno`'s test, a binding catch-all rather than a
 /// contentful arm). The exhaustive dispatch match itself lives in
-/// [`crate::Ecosystem::generate_completions`]'s default implementation, inside this crate —
+/// [`crate::TypedEcosystem::completions`]'s default implementation, inside this crate —
 /// so `#[non_exhaustive]` does not apply there, and adding a variant is a compile error in
 /// that one place instead of a silent no-op downstream (issue #793). An ecosystem that
 /// overrides `generate_completions` wholesale (`deps-maven`, `deps-gradle`) opts out of that
@@ -2136,10 +2151,6 @@ mod tests {
         fn source(&self) -> crate::parser::DependencySource {
             crate::parser::DependencySource::Registry
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     struct MockParseResult {
@@ -2162,10 +2173,6 @@ mod tests {
             static URL: std::sync::LazyLock<url::Url> =
                 std::sync::LazyLock::new(|| "file:///test/Cargo.toml".parse().unwrap());
             &URL
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 
@@ -2616,9 +2623,6 @@ mod tests {
             fn name_range_is_synthetic(&self) -> bool {
                 true
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct SyntheticParseResult {
@@ -2636,9 +2640,6 @@ mod tests {
                 static URI: std::sync::LazyLock<url::Url> =
                     std::sync::LazyLock::new(|| crate::test_util::test_uri("/test/pubspec.yaml"));
                 &URI
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -5284,7 +5285,7 @@ mod tests {
     /// Composer's operator array — `deps-core` cannot depend on `deps-composer` to reference
     /// the real constant directly. #1171:
     /// `deps_composer::ecosystem::tests::test_generate_completions_strips_not_equal_operator_against_real_registry`
-    /// drives the same scenario through the real `ComposerEcosystem::generate_completions`
+    /// drives the same scenario through the real `ComposerEcosystem`'s `TypedEcosystem::completions`
     /// and the real `VERSION_OPERATOR_CHARS`, closing that gap.
     #[tokio::test]
     async fn test_complete_versions_generic_operator_stripping_composer_not_equal() {

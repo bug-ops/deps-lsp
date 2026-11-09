@@ -11,7 +11,7 @@
 //! Shared conformance-test scaffolding for ecosystem crates (#758).
 //!
 //! Every ecosystem crate historically hand-copied the same family of tests — "does
-//! `Ecosystem::id()` match", "does `package_url` produce this exact link", "does locating a
+//! `EcosystemBase::id()` match", "does `package_url` produce this exact link", "does locating a
 //! lock file work in the same directory", "does a too-short completion prefix return no
 //! results", "does JSON nesting beyond the shared depth cap get rejected", "does a registry
 //! actually override `select_latest_matching` instead of inheriting the trait's `None`
@@ -47,8 +47,10 @@
 //! [`crate::test_util::ADVERSARIAL_URL_SEGMENTS`], which guards the unrelated *fetch* sink
 //! (dot-segment/traversal class). See that const's doc for the sink split.
 
+#[cfg(feature = "lsp-responses")]
 use std::any::Any;
 use std::assert_matches;
+use std::sync::Arc;
 
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::CompletionItem;
@@ -85,11 +87,11 @@ pub const HOSTILE_DISPLAY_LINK_PAYLOAD: &str = "evil\n<https://evil%zz.example>)
 // Macro 1: `ecosystem_conformance!` — exact `Ecosystem` identity values.
 // ---------------------------------------------------------------------------------------
 
-/// Asserts [`Ecosystem::id`] equals `expected`, and that [`Ecosystem::ecosystem_id`] agrees
+/// Asserts [`crate::EcosystemBase::id`] equals `expected`, and that [`crate::EcosystemBase::ecosystem_id`] agrees
 /// with it.
 ///
-/// [`Ecosystem::id`] is a *provided* method with a default derived from
-/// [`Ecosystem::ecosystem_id`] — but, being provided, it stays overridable, so nothing else
+/// [`crate::EcosystemBase::id`] is a *provided* method with a default derived from
+/// [`crate::EcosystemBase::ecosystem_id`] — but, being provided, it stays overridable, so nothing else
 /// forces the two to stay in sync for an implementor that overrides `id()` directly. Without
 /// this second assertion, a crate could pass `expected` here via a compensating `id()`
 /// override while its `ecosystem_id()` names the wrong variant — silently wrong for every
@@ -104,7 +106,7 @@ pub fn assert_ecosystem_id(eco: &dyn Ecosystem, expected: &str) {
     );
 }
 
-/// Asserts [`Ecosystem::display_name`] equals `expected`.
+/// Asserts [`crate::EcosystemBase::display_name`] equals `expected`.
 pub fn assert_ecosystem_display_name(eco: &dyn Ecosystem, expected: &str) {
     assert_eq!(
         eco.display_name(),
@@ -113,7 +115,7 @@ pub fn assert_ecosystem_display_name(eco: &dyn Ecosystem, expected: &str) {
     );
 }
 
-/// Asserts [`Ecosystem::manifest_filenames`] equals `expected`.
+/// Asserts [`crate::EcosystemBase::manifest_filenames`] equals `expected`.
 pub fn assert_manifest_filenames(eco: &dyn Ecosystem, expected: &[&str]) {
     assert_eq!(
         eco.manifest_filenames(),
@@ -122,7 +124,7 @@ pub fn assert_manifest_filenames(eco: &dyn Ecosystem, expected: &[&str]) {
     );
 }
 
-/// Asserts [`Ecosystem::lockfile_filenames`] equals `expected`.
+/// Asserts [`crate::EcosystemBase::lockfile_filenames`] equals `expected`.
 pub fn assert_lockfile_filenames(eco: &dyn Ecosystem, expected: &[&str]) {
     assert_eq!(
         eco.lockfile_filenames(),
@@ -131,15 +133,7 @@ pub fn assert_lockfile_filenames(eco: &dyn Ecosystem, expected: &[&str]) {
     );
 }
 
-/// Asserts [`Ecosystem::as_any`] downcasts to `T`.
-pub fn assert_as_any_downcasts<T: Any>(eco: &dyn Ecosystem) {
-    assert!(
-        eco.as_any().is::<T>(),
-        "Ecosystem::as_any() did not downcast to the expected concrete type"
-    );
-}
-
-/// Smoke-checks that [`Ecosystem::registry`] returns without panicking.
+/// Smoke-checks that [`crate::EcosystemBase::registry`] returns without panicking.
 ///
 /// The type system already guarantees the `Arc<dyn Registry>` return type, so there is
 /// nothing further to assert; this exists so `ecosystem_conformance!`-generated coverage has
@@ -151,7 +145,7 @@ pub fn assert_registry_returns_arc(eco: &dyn Ecosystem) {
 
 /// Asserts an ecosystem declares no lock file support at all (#782 gap 2).
 ///
-/// Both [`Ecosystem::lockfile_filenames`] is empty and [`Ecosystem::lockfile_provider`] is
+/// Both [`crate::EcosystemBase::lockfile_filenames`] is empty and [`crate::EcosystemBase::lockfile_provider`] is
 /// `None`. Strictly stronger than the cross-check `deps-lsp`'s
 /// `test_registered_ecosystems_universal_invariants` runs across every *registered* ecosystem —
 /// that check only asserts the two *agree* (`lockfile_filenames().is_empty() ==
@@ -630,12 +624,12 @@ where
 /// `generate_completions` behavior under test.
 #[cfg(feature = "lsp-responses")]
 pub async fn assert_completion_source_gate(
-    eco: &dyn Ecosystem,
+    eco: Arc<dyn Ecosystem>,
     manifest_name: &str,
     content: &str,
 ) -> crate::completion::Completions {
     let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
-    let parse_result = eco
+    let parse_result = Arc::clone(&eco)
         .parse_manifest(content, &uri)
         .await
         .expect("fixture manifest must parse");
@@ -673,13 +667,9 @@ pub async fn assert_completion_source_gate(
          or this test cannot be exercising the #1136 gate at all"
     );
 
-    eco.generate_completions(
-        parse_result.as_ref(),
-        position,
-        content,
-        crate::FreshnessSettings::default(),
-    )
-    .await
+    parse_result
+        .generate_completions(position, content, crate::FreshnessSettings::default())
+        .await
 }
 
 // ---------------------------------------------------------------------------------------
@@ -713,12 +703,12 @@ pub async fn assert_completion_source_gate(
 /// Panics if `content` fails to parse, or if no dependency classifies as a non-`Registry`
 /// source — both indicating a broken fixture, not a genuine gate failure.
 pub async fn assert_non_registry_source_yields_no_fetch(
-    eco: &dyn Ecosystem,
+    eco: Arc<dyn Ecosystem>,
     manifest_name: &str,
     content: &str,
 ) {
     let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
-    let parse_result = eco
+    let parse_result = Arc::clone(&eco)
         .parse_manifest(content, &uri)
         .await
         .expect("fixture manifest must parse");
@@ -757,16 +747,17 @@ pub async fn assert_non_registry_source_yields_no_fetch(
     }
 
     // `public_content` must not diverge from the source gate where an ecosystem does not override it.
-    for dep in parse_result.dependencies() {
+    parse_result.for_each_formatted_dependency(&mut |bound| {
+        let dep = bound.dependency();
         assert_eq!(
-            formatter.public_content(dep).is_some(),
+            bound.public_content().is_some(),
             formatter.source_is_public_registry_content(&dep.source()),
             "public_content must agree with source_is_public_registry_content for {:?} \
              (source {:?})",
             dep.name().as_str(),
             dep.source(),
         );
-    }
+    });
 }
 
 // Note (M9, critic): this used to be its own standalone `non_registry_source_conformance!`
@@ -828,7 +819,7 @@ pub const UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME: &str = "known-good-con
 /// [`UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME`] with an ordinary, resolvable version —
 /// see that constant's doc for why (#1354 critic M3).
 pub async fn assert_unresolved_requirements_never_rewritten(
-    eco: &dyn Ecosystem,
+    eco: Arc<dyn Ecosystem>,
     manifest_name: &str,
     content: &str,
     reachable: bool,
@@ -838,7 +829,7 @@ pub async fn assert_unresolved_requirements_never_rewritten(
     };
 
     let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
-    let parse_result = eco
+    let parse_result = Arc::clone(&eco)
         .parse_manifest(content, &uri)
         .await
         .expect("fixture manifest must parse");
@@ -889,18 +880,19 @@ pub async fn assert_unresolved_requirements_never_rewritten(
     // `plan_vulnerability_fix`/`edit::replacement_text` at all.
     let mut exercised_count = 0usize;
 
-    for dep in &deps {
+    parse_result.for_each_formatted_dependency(&mut |bound| {
+        let dep = bound.dependency();
         if dep.name().as_str() == UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME {
-            continue;
+            return;
         }
         let Some(req) = dep.version_requirement() else {
-            continue;
+            return;
         };
-        if dep.version_range().is_none() {
-            continue;
-        }
+        let Some(version_range) = dep.version_range() else {
+            return;
+        };
         if !formatter.source_is_public_registry_content(&dep.source()) {
-            continue;
+            return;
         }
         exercised_count += 1;
         // #1370 critic S2: the central `requirement_is_placeholder` gate itself must classify
@@ -942,14 +934,11 @@ pub async fn assert_unresolved_requirements_never_rewritten(
                     version: native.clone(),
                 });
 
-            let planned = crate::edit::plan_vulnerability_fix(
-                *dep,
-                dep.version_range().expect("checked above"),
-                current,
-                &dv,
-                FixTargetContext::default(),
-                formatter,
-            );
+            let planned =
+                crate::edit::resolve_verified_fix(&dv, FixTargetContext::default(), formatter)
+                    .and_then(|(_fix, version_native)| {
+                        bound.plan_verified_fix(version_range, current, &version_native)
+                    });
             // #1391: tightened to `UnresolvedPlaceholder` alone — the assertion above already
             // proved `requirement_is_placeholder(req)` is `true` for this fixture, and
             // `plan_verified_fix`'s central gate (`deps_core::edit::requirement_is_placeholder_for`)
@@ -969,16 +958,29 @@ pub async fn assert_unresolved_requirements_never_rewritten(
             // `format_version_replacing`/`format_version_replacing_for` no-op guards this used
             // to assert against directly are gone; the placeholder gate now lives upstream of
             // both methods).
+            assert!(
+                crate::edit::requirement_is_placeholder_for(formatter, dep, current),
+                "edit::requirement_is_placeholder_for must hold for an unresolved requirement \
+                 {current:?} (dependency {:?}) — the gate every replacement path shares",
+                dep.name().as_str()
+            );
             assert_eq!(
-                crate::edit::replacement_text(formatter, *dep, &native, current),
+                bound.replacement_text(&native, current),
                 None,
                 "edit::replacement_text must be None for an unresolved requirement {current:?} \
                  (dependency {:?}) even when called directly, independent of the \
                  plan_vulnerability_fix gate (target {target})",
                 dep.name().as_str()
             );
+            assert_eq!(
+                bound.floor_safe_replacement_text(&native, current),
+                None,
+                "edit::floor_safe_replacement_text must be None for an unresolved requirement \
+                 {current:?} (dependency {:?}) (target {target})",
+                dep.name().as_str()
+            );
         }
-    }
+    });
 
     if reachable {
         assert!(
@@ -1019,10 +1021,6 @@ impl crate::Dependency for PlaceholderProbeDependency {
 
     fn source(&self) -> crate::parser::DependencySource {
         crate::parser::DependencySource::Registry
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -1077,7 +1075,8 @@ pub const GENERIC_TEMPLATE_PLACEHOLDERS: &[&str] = &[
 /// Panics (via `assert!`/`assert_eq!`) if any entry of [`GENERIC_TEMPLATE_PLACEHOLDERS`] is
 /// not classified [`crate::lsp_helpers::RequirementResolution::bounded_requirement_is_placeholder`],
 /// is reported unsatisfiable by [`crate::lsp_helpers::requirement_is_unsatisfiable`], or
-/// produces `Some(_)` from [`crate::edit::replacement_text`].
+/// fails [`crate::edit::requirement_is_placeholder_for`], the gate `replacement_text` returns
+/// `None` on (a typed `replacement_text` cannot take this function's dependency-less probe).
 pub fn assert_generic_template_placeholders_guarded(
     formatter: &dyn EcosystemFormatter,
     context: &str,
@@ -1097,15 +1096,10 @@ pub fn assert_generic_template_placeholders_guarded(
             !crate::lsp_helpers::requirement_is_unsatisfiable(formatter, &req, &available),
             "{context}: {placeholder:?} must never be reported as an unsatisfiable requirement"
         );
-        assert_eq!(
-            crate::edit::replacement_text(
-                formatter,
-                &probe,
-                &ConcreteVersion::new("9.9.9"),
-                placeholder,
-            ),
-            None,
-            "{context}: edit::replacement_text must be None for placeholder {placeholder:?}"
+        assert!(
+            crate::edit::requirement_is_placeholder_for(formatter, &probe, placeholder),
+            "{context}: edit::requirement_is_placeholder_for — the gate in front of \
+             edit::replacement_text — must hold for placeholder {placeholder:?}"
         );
     }
 }
@@ -1170,15 +1164,10 @@ pub fn assert_formatter_guarded_placeholders_never_rewritten(
             !crate::lsp_helpers::requirement_is_unsatisfiable(formatter, &req, &available),
             "{placeholder:?} must never be reported as an unsatisfiable requirement"
         );
-        assert_eq!(
-            crate::edit::replacement_text(
-                formatter,
-                &probe,
-                &ConcreteVersion::new("9.9.9"),
-                placeholder,
-            ),
-            None,
-            "edit::replacement_text must be None for placeholder {placeholder:?}"
+        assert!(
+            crate::edit::requirement_is_placeholder_for(formatter, &probe, placeholder),
+            "edit::requirement_is_placeholder_for — the gate in front of \
+             edit::replacement_text — must hold for placeholder {placeholder:?}"
         );
     }
     for &non_placeholder in non_placeholders {
@@ -1238,7 +1227,7 @@ macro_rules! unresolved_requirement_conformance {
 
             async fn unresolved_requirement_never_rewritten_impl() {
                 $crate::conformance::assert_unresolved_requirements_never_rewritten(
-                    &($build),
+                    ::std::sync::Arc::new($build),
                     $file,
                     $content,
                     true,
@@ -1263,7 +1252,7 @@ macro_rules! unresolved_requirement_conformance {
 
             async fn unresolved_requirement_never_rewritten_impl() {
                 $crate::conformance::assert_unresolved_requirements_never_rewritten(
-                    &($build),
+                    ::std::sync::Arc::new($build),
                     $file,
                     $content,
                     false,
@@ -1432,7 +1421,7 @@ impl<T: ?Sized> NotInherent for T {}
 /// `test_ecosystem_manifest_filenames`/`test_ecosystem_lockfile_filenames`/`test_as_any`/
 /// `test_registry_creation`-shaped tests. `lockfile_filenames` is omitted for an ecosystem
 /// with no lock file format; pair that omission with `no_lockfile_support: true;` (#782 gap
-/// 2) to also assert [`Ecosystem::lockfile_provider`] agrees — replacing the
+/// 2) to also assert [`crate::EcosystemBase::lockfile_provider`] agrees — replacing the
 /// `test_lockfile_filenames_empty`/`test_lockfile_provider_none` pair `deps-maven`/
 /// `deps-gradle` used to hand-copy. Supplying both `lockfile_filenames` and
 /// `no_lockfile_support: true;` on the same invocation is a compile error — the two are
@@ -1481,24 +1470,15 @@ impl<T: ?Sized> NotInherent for T {}
 /// # }
 /// # struct Fake { registry: Arc<FakeRegistry> }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
-/// # impl deps_core::Ecosystem for Fake {
+/// # impl deps_core::EcosystemBase for Fake {
 /// #     fn id(&self) -> &'static str { "fake" }
 /// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
 /// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }
-/// #     fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter { unimplemented!() }
-/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, _uri: &'a url::Url)
-/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
-/// #         unimplemented!()
-/// #     }
-/// #     fn complete_version<'a>(&'a self, _request: deps_core::completion::CompletionRequest<'a>, _package_name: deps_core::PackageName, _prefix: String)
-/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
-/// #         unimplemented!()
-/// #     }
 /// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> { None }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
+/// # deps_core::impl_stub_typed_ecosystem!(Fake);
 /// # fn build_fake() -> Fake { Fake { registry: Arc::new(FakeRegistry) } }
 /// deps_core::ecosystem_conformance! {
 ///     mod fake_ecosystem_conformance;
@@ -1564,7 +1544,7 @@ macro_rules! ecosystem_conformance {
             extra: {
                 async fn ecosystem_non_registry_source_yields_no_fetch_impl() {
                     $crate::conformance::assert_non_registry_source_yields_no_fetch(
-                        &($build),
+                        ::std::sync::Arc::new($build),
                         $nrf_name,
                         $nrf_content,
                     )
@@ -1708,14 +1688,6 @@ macro_rules! ecosystem_conformance_base {
                     ecosystem_has_no_lockfile_support_impl();
                 }
             )?
-
-            fn ecosystem_as_any_downcasts_impl() {
-                $crate::conformance::assert_as_any_downcasts::<$ty>(&($build));
-            }
-            #[test]
-            fn ecosystem_as_any_downcasts() {
-                ecosystem_as_any_downcasts_impl();
-            }
 
             fn ecosystem_registry_returns_arc_impl() {
                 $crate::conformance::assert_registry_returns_arc(&($build));
@@ -2153,9 +2125,9 @@ macro_rules! json_depth_conformance {
 /// [`completion_guard_conformance!`]'s doc on what a directly-constructed fixture cannot
 /// prove): this constructs the registry type directly via `build:`/`build_arc:`, so it
 /// proves that *type* overrides the method — not that the owning
-/// [`Ecosystem::registry()`](crate::Ecosystem::registry) actually wires that type into the
+/// [`EcosystemBase::registry()`](crate::EcosystemBase::registry) actually wires that type into the
 /// LSP fetch path. Where that wiring is itself the risk (a registry type shared across
-/// crates via a facade), invoke with `build_arc:` against the real `Ecosystem::registry()`
+/// crates via a facade), invoke with `build_arc:` against the real `EcosystemBase::registry()`
 /// call instead of `build:` against the type directly.
 ///
 /// Two mutually exclusive forms, chosen by which keyword introduces the fixture:
@@ -2345,7 +2317,7 @@ macro_rules! registry_conformance {
     };
 }
 
-/// Generates a conformance test asserting `Ecosystem::generate_completions` rejects a
+/// Generates a conformance test asserting `TypedEcosystem::completions` rejects a
 /// non-registry-resolvable source.
 ///
 /// #758-shaped macro, closing #1136's coverage gap: the original bug — the old
@@ -2452,14 +2424,12 @@ macro_rules! registry_conformance {
 /// #         Some(Range::new(Position::new(0, 0), Position::new(0, 3)))
 /// #     }
 /// #     fn source(&self) -> DependencySource { DependencySource::Path { path: "../local".into() } }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// # struct FakeParseResult { dep: FakeDep, uri: url::Url }
 /// # impl deps_core::ParseResult for FakeParseResult {
 /// #     fn dependencies(&self) -> Vec<&dyn deps_core::ecosystem::Dependency> { vec![&self.dep] }
 /// #     fn workspace_root(&self) -> Option<&std::path::Path> { None }
 /// #     fn uri(&self) -> &url::Url { &self.uri }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// # struct FakeFormatter;
 /// # impl deps_core::lsp_helpers::PackageNaming for FakeFormatter {}
@@ -2474,25 +2444,33 @@ macro_rules! registry_conformance {
 /// # impl deps_core::lsp_helpers::OsvNaming for FakeFormatter {}
 /// # struct Fake { registry: Arc<FakeRegistry>, formatter: FakeFormatter }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
-/// # impl deps_core::Ecosystem for Fake {
+/// # impl deps_core::TypedParseResult for FakeParseResult {
+/// #     type Dep = FakeDep;
+/// #     fn own_dependencies(&self) -> &[FakeDep] { std::slice::from_ref(&self.dep) }
+/// # }
+/// # impl deps_core::DependencyFormatter for FakeFormatter { type Dep = FakeDep; }
+/// # impl deps_core::EcosystemBase for Fake {
 /// #     fn id(&self) -> &'static str { "fake" }
 /// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
 /// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }
-/// #     fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter { &self.formatter }
-/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, uri: &'a url::Url)
-/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
+/// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> { None }
+/// # }
+/// # impl deps_core::TypedEcosystem for Fake {
+/// #     type Parsed = FakeParseResult;
+/// #     type Formatter = FakeFormatter;
+/// #     fn own_formatter(&self) -> &FakeFormatter { &self.formatter }
+/// #     fn parse<'a>(&'a self, _content: &'a str, uri: &'a url::Url)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<FakeParseResult>> {
 /// #         let dep = FakeDep { name: deps_core::PackageName::new("private-pkg") };
 /// #         let uri = uri.clone();
-/// #         Box::pin(async move { Ok(Box::new(FakeParseResult { dep, uri }) as Box<dyn deps_core::ParseResult>) })
+/// #         Box::pin(async move { Ok(FakeParseResult { dep, uri }) })
 /// #     }
-/// #     fn complete_version<'a>(&'a self, _request: deps_core::completion::CompletionRequest<'a>, _package_name: deps_core::PackageName, _prefix: String)
+/// #     fn complete_version<'a>(&'a self, _request: deps_core::completion::CompletionRequest<'a, FakeParseResult>, _package_name: deps_core::PackageName, _prefix: String)
 /// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
 /// #         Box::pin(std::future::ready(deps_core::completion::Completions::default()))
 /// #     }
-/// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> { None }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// deps_core::completion_source_gate_conformance! {
 ///     mod fake_completion_source_gate_conformance;
@@ -2533,7 +2511,7 @@ macro_rules! completion_source_gate_conformance {
             async fn completion_source_gate_rejects_non_resolvable_source_impl() {
                 let (eco, mock, _server) = { $build }.await;
                 let result = $crate::conformance::assert_completion_source_gate(
-                    &eco,
+                    ::std::sync::Arc::new(eco),
                     $manifest_name,
                     $manifest_content,
                 )
@@ -2656,7 +2634,7 @@ macro_rules! operator_chars_conformance {
 ///
 /// Signature: `(&self, parse_result, position, prefix, freshness) -> Vec<CompletionItem>`,
 /// reproducing the pre-#1223 per-ecosystem private helper's call shape over
-/// [`crate::Ecosystem::complete_version`]'s shared default implementation
+/// [`crate::TypedEcosystem::complete_version`]'s shared default implementation
 /// (`self.registry()`/`self.formatter()`/`self.version_operator_chars()` +
 /// [`crate::completion::complete_versions_at_position`]).
 ///
@@ -2699,20 +2677,15 @@ macro_rules! operator_chars_conformance {
 /// # }
 /// # struct Fake { registry: Arc<FakeRegistry> }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
-/// # impl deps_core::Ecosystem for Fake {
+/// # impl deps_core::EcosystemBase for Fake {
 /// #     fn id(&self) -> &'static str { "fake" }
 /// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
 /// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }
-/// #     fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter { unimplemented!() }
-/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, _uri: &'a url::Url)
-/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
-/// #         unimplemented!()
-/// #     }
 /// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> { None }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
+/// # deps_core::impl_stub_typed_ecosystem!(Fake);
 /// deps_core::complete_versions_test_shim!(Fake);
 /// }
 /// ```
@@ -2722,14 +2695,18 @@ macro_rules! complete_versions_test_shim {
         impl $ecosystem_ty {
             async fn complete_versions(
                 &self,
-                parse_result: &dyn $crate::ParseResult,
+                parse_result: &<$ecosystem_ty as $crate::TypedEcosystem>::Parsed,
                 position: tower_lsp_server::ls_types::Position,
                 prefix: &str,
                 freshness: $crate::FreshnessSettings,
             ) -> Vec<tower_lsp_server::ls_types::CompletionItem> {
-                use $crate::Ecosystem as _;
+                use $crate::TypedEcosystem as _;
                 self.complete_version(
-                    $crate::completion::CompletionRequest::new(parse_result, position, freshness),
+                    $crate::completion::CompletionRequest::new(
+                        $crate::ParsedView::new(parse_result),
+                        position,
+                        freshness,
+                    ),
                     $crate::PackageName::new(""),
                     prefix.to_string(),
                 )

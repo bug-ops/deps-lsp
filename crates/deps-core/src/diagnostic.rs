@@ -5,7 +5,7 @@
 //! the domain-level replacement for `tower_lsp_server::ls_types::{Diagnostic,
 //! DiagnosticSeverity, DiagnosticRelatedInformation, CodeDescription}` in
 //! [`crate::lsp_helpers::generate_diagnostics_from_cache`]'s and
-//! [`crate::ecosystem::Ecosystem::generate_diagnostics`]'s return value: field-for-field
+//! [`crate::ecosystem::ParsedManifest::generate_diagnostics`]'s return value: field-for-field
 //! equivalent, but this module carries no dependency on `tower-lsp-server`, so a consumer that
 //! only needs parsed diagnostic data (e.g. `deps-cli`) never has to name an LSP-protocol type
 //! or link `tower-lsp-server` to run `check`.
@@ -391,7 +391,7 @@ impl RelatedInformation {
 /// Field-for-field identical to `tower_lsp_server::ls_types::Diagnostic`'s commonly used
 /// subset but carrying no dependency on `tower-lsp-server`. Returned by
 /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] and
-/// [`crate::ecosystem::Ecosystem::generate_diagnostics`].
+/// [`crate::ecosystem::ParsedManifest::generate_diagnostics`].
 ///
 /// `deps-lsp` converts this into `tower_lsp_server::ls_types::Diagnostic` at its own boundary
 /// (`crates/deps-lsp/src/lsp_types_interop.rs`); `deps-cli` consumes it directly to build its

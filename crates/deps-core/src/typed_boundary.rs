@@ -1,344 +1,209 @@
-//! The one place a type-erased parse result or dependency becomes the concrete type an ecosystem
-//! crate produced.
+//! The typed side of the parse-result boundary.
 //!
-//! [`ParseResult`] and [`Dependency`] reach an ecosystem's hooks as trait objects. A hook that
-//! needs the ecosystem's own fields used to call `as_any().downcast_ref::<T>()` itself, picking
-//! `T` at every call site. Here `T` is fixed once per ecosystem by an associated type
-//! ([`OwnParseResult::Parsed`], [`OwnDependency::Dep`]), and the downcast lives in exactly two
-//! method bodies, [`NarrowParseResult::own_parse_result`] and
-//! [`NarrowDependency::own_dependency`]. Both extension traits are sealed blanket
-//! implementations, so no crate can override the narrowing.
-//!
-//! A hook narrows the parse result once at its entry and then works on the typed `dependencies`
-//! field, instead of narrowing every dependency of the type-erased view one by one.
+//! An ecosystem's parser produces one concrete [`ParseResult`] holding one concrete
+//! [`Dependency`] type. [`TypedParseResult`] names that dependency type, and [`ParsedView`] hands
+//! it to the ecosystem's hooks and to the generic helpers in `lsp_helpers`, so no code needs to
+//! recover a concrete type from a trait object: the types are carried by the generics instead.
 
-use crate::ecosystem::{Dependency, Ecosystem, ParseResult};
+use crate::ecosystem::{
+    BlockedRegistryOccurrence, Dependency, ParseResult, RejectedRegistryOccurrence,
+};
+use crate::selection::{InvalidStabilityOccurrence, SelectionContext};
 
-mod sealed {
-    pub trait ParseNarrower {}
-    impl<T: super::OwnParseResult> ParseNarrower for T {}
-
-    pub trait DependencyNarrower {}
-    impl<T: super::OwnDependency> DependencyNarrower for T {}
-}
-
-/// An [`Ecosystem`] that names the concrete [`ParseResult`] its own parser produces.
+/// A [`ParseResult`] that also exposes its dependencies as their concrete type.
 ///
-/// Routing hands an ecosystem only documents it parsed itself, so a hook may assume the parse
-/// result it receives is a [`Self::Parsed`]; [`NarrowParseResult::own_parse_result`] is how it
-/// gets one.
-///
-/// Sealed through [`Ecosystem`]: only this workspace's ecosystem types can implement it.
+/// [`Self::Dep`] is what ties a parse result to a formatter: a
+/// [`DependencyFormatter`](crate::lsp_helpers::DependencyFormatter) reads exactly one dependency
+/// type, and generic helpers require the two to be equal. `impl_parse_result!` implements this
+/// trait from the dependencies field, so the field's element type is checked against the
+/// declared dependency type.
 ///
 /// # Examples
 ///
 /// ```
-/// # use std::any::Any;
-/// # use std::sync::Arc;
-/// # use deps_core::{
-/// #     Dependency, Ecosystem, NarrowParseResult, OwnParseResult, ParseResult, Registry,
-/// # };
-/// # use deps_core::lsp_helpers::EcosystemFormatter;
-/// # use url::Url;
-/// # struct MyParsed {
-/// #     uri: Url,
-/// # }
-/// # impl ParseResult for MyParsed {
-/// #     fn dependencies(&self) -> Vec<&dyn Dependency> { Vec::new() }
-/// #     fn workspace_root(&self) -> Option<&std::path::Path> { None }
-/// #     fn uri(&self) -> &Url { &self.uri }
-/// #     fn as_any(&self) -> &dyn Any { self }
-/// # }
-/// # struct MyEcosystem;
-/// # impl deps_core::ecosystem::private::Sealed for MyEcosystem {}
-/// # impl Ecosystem for MyEcosystem {
-/// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
-/// #     fn display_name(&self) -> &'static str { "My Ecosystem" }
-/// #     fn manifest_filenames(&self) -> &[&'static str] { &["my-manifest.toml"] }
-/// #     fn parse_manifest<'a>(
-/// #         &'a self,
-/// #         _content: &'a str,
-/// #         _uri: &'a Url,
-/// #     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::error::Result<Box<dyn ParseResult>>> {
-/// #         Box::pin(async move { todo!() })
-/// #     }
-/// #     fn registry(&self) -> Arc<dyn Registry> { todo!() }
-/// #     fn formatter(&self) -> &dyn EcosystemFormatter { todo!() }
-/// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> {
-/// #         None
-/// #     }
-/// #     fn as_any(&self) -> &dyn Any { self }
-/// # }
-/// impl OwnParseResult for MyEcosystem {
-///     type Parsed = MyParsed;
-/// }
+/// use deps_core::test_util::{StubDependency, stub_parse_result};
+/// use deps_core::TypedParseResult;
 ///
-/// let parsed = MyParsed { uri: Url::parse("file:///proj/my-manifest.toml").unwrap() };
-/// let erased: &dyn ParseResult = &parsed;
-///
-/// let narrowed = MyEcosystem.own_parse_result(erased).unwrap();
-/// assert_eq!(narrowed.uri.as_str(), "file:///proj/my-manifest.toml");
+/// let parsed = stub_parse_result(2);
+/// let deps: &[StubDependency] = parsed.own_dependencies();
+/// assert_eq!(deps.len(), 2);
 /// ```
-pub trait OwnParseResult: Ecosystem {
-    /// The parse result type this ecosystem's `parse_manifest` returns.
-    type Parsed: ParseResult + 'static;
-}
-
-/// A type that names the one concrete [`Dependency`] it reads, typically an ecosystem's
-/// formatter.
-///
-/// Unlike a parse result, a dependency can legitimately be foreign: `NpmFormatter` is also
-/// driven with Deno dependencies. [`NarrowDependency::own_dependency`] therefore reports a
-/// mismatch as `None`, never as an error.
-///
-/// # Examples
-///
-/// ```
-/// use std::any::Any;
-/// use deps_core::{Dependency, NarrowDependency, OwnDependency, PackageName, VersionReq};
-/// use deps_core::parser::DependencySource;
-/// use deps_core::position::Range;
-///
-/// struct Mine(PackageName);
-/// struct Foreign;
-///
-/// macro_rules! stub_dependency {
-///     ($ty:ty, |$s:ident| $name:expr) => {
-///         impl Dependency for $ty {
-///             fn name(&$s) -> &PackageName { $name }
-///             fn name_range(&self) -> Range { Range::default() }
-///             fn version_requirement(&self) -> Option<&VersionReq> { None }
-///             fn version_range(&self) -> Option<Range> { None }
-///             fn source(&self) -> DependencySource { DependencySource::Registry }
-///             fn as_any(&self) -> &dyn Any { self }
-///         }
-///     };
-/// }
-/// stub_dependency!(Mine, |self| &self.0);
-/// stub_dependency!(Foreign, |self| {
-///     static NAME: std::sync::LazyLock<PackageName> =
-///         std::sync::LazyLock::new(|| PackageName::new("foreign"));
-///     &NAME
-/// });
-///
-/// struct MyFormatter;
-/// impl OwnDependency for MyFormatter {
-///     type Dep = Mine;
-/// }
-///
-/// let mine = Mine(PackageName::new("serde"));
-/// let narrowed = MyFormatter.own_dependency(&mine).unwrap();
-/// assert_eq!(narrowed.0.as_str(), "serde");
-/// assert!(MyFormatter.own_dependency(&Foreign).is_none());
-/// ```
-pub trait OwnDependency {
-    /// The dependency type this implementor reads.
+pub trait TypedParseResult: ParseResult {
+    /// The concrete dependency type this parse result holds.
     type Dep: Dependency + 'static;
+
+    /// All dependencies of the document, uncapped and in manifest order.
+    fn own_dependencies(&self) -> &[Self::Dep];
 }
 
-/// Narrows a type-erased [`ParseResult`] to an ecosystem's [`OwnParseResult::Parsed`].
+/// A typed parse result together with its erased, possibly capped view.
 ///
-/// Implemented for every [`OwnParseResult`] by a sealed blanket impl; see its example.
-pub trait NarrowParseResult: OwnParseResult + sealed::ParseNarrower {
-    /// `parse_result` as this ecosystem's own parse result type.
-    ///
-    /// `None` means the document was routed to an ecosystem that did not parse it: a bug in
-    /// routing or a test fixture. It is logged at `error` and trips a `debug_assert!`, while
-    /// release builds fall back to whatever the caller does for `None`, as they did before.
-    fn own_parse_result<'p>(&self, parse_result: &'p dyn ParseResult) -> Option<&'p Self::Parsed> {
-        let narrowed = parse_result.as_any().downcast_ref::<Self::Parsed>();
-        if narrowed.is_none() {
-            let expected = std::any::type_name::<Self::Parsed>();
-            tracing::error!(
-                expected,
-                "parse result routed to an ecosystem that did not produce it"
-            );
-            debug_assert!(narrowed.is_some(), "parse result is not a {expected}");
+/// Hooks and generic helpers receive a `ParsedView`. Through the view's own
+/// [`ParseResult`] (delegating to the erased side) and [`TypedParseResult`] (the capped slice)
+/// implementations they see the first
+/// [`MAX_DEPENDENCIES_PER_DOCUMENT`](crate::MAX_DEPENDENCIES_PER_DOCUMENT) dependencies of a
+/// document, as the erased [`ParseResult`] interface does. [`Self::typed`] is the exception: it is
+/// the parser's own result, already bounded because every parser applies its
+/// [`DependencyBudget`](crate::DependencyBudget). The view is [`Copy`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::stub_parse_result;
+/// use deps_core::{ParsedView, TypedParseResult};
+///
+/// let parsed = stub_parse_result(3);
+/// let view = ParsedView::new(&parsed);
+/// assert_eq!(view.own_dependencies().len(), 3);
+/// assert!(std::ptr::eq(view.typed(), &raw const parsed));
+/// ```
+pub struct ParsedView<'a, P: TypedParseResult> {
+    typed: &'a P,
+    erased: &'a dyn ParseResult,
+    limit: usize,
+}
+
+impl<P: TypedParseResult> Clone for ParsedView<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: TypedParseResult> Copy for ParsedView<'_, P> {}
+
+impl<P: TypedParseResult> std::fmt::Debug for ParsedView<'_, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedView")
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, P: TypedParseResult> ParsedView<'a, P> {
+    /// A view of `typed` whose erased side is `typed` itself, with no dependency cap.
+    #[must_use]
+    pub fn new(typed: &'a P) -> Self {
+        Self {
+            typed,
+            erased: typed,
+            limit: typed.own_dependencies().len(),
         }
-        narrowed
+    }
+
+    /// A view of `typed` whose erased side is `erased` and whose typed dependencies are cut to
+    /// `limit`.
+    pub(crate) fn capped(typed: &'a P, erased: &'a dyn ParseResult, limit: usize) -> Self {
+        Self {
+            typed,
+            erased,
+            limit,
+        }
+    }
+
+    /// The typed parse result, with every dependency the parser retained.
+    ///
+    /// This is the parser's own, already-budgeted result, not the capped set. Code that needs
+    /// the capped dependencies must use [`Self::dependencies_slice`] or
+    /// [`TypedParseResult::own_dependencies`] on the view.
+    #[must_use]
+    pub const fn typed(self) -> &'a P {
+        self.typed
+    }
+
+    /// The capped dependencies, borrowed for the lifetime of the document rather than of this
+    /// view.
+    #[must_use]
+    pub fn dependencies_slice(self) -> &'a [P::Dep] {
+        let all = self.typed.own_dependencies();
+        all.get(..self.limit).unwrap_or(all)
     }
 }
 
-impl<T: OwnParseResult> NarrowParseResult for T {}
+#[deny(clippy::missing_trait_methods)]
+impl<P: TypedParseResult> ParseResult for ParsedView<'_, P> {
+    fn dependencies(&self) -> Vec<&dyn Dependency> {
+        self.erased.dependencies()
+    }
 
-/// Narrows a type-erased [`Dependency`] to an [`OwnDependency::Dep`].
-///
-/// Implemented for every [`OwnDependency`] by a sealed blanket impl.
-pub trait NarrowDependency: OwnDependency + sealed::DependencyNarrower {
-    /// `dep` as this implementor's own dependency type, or `None` for a foreign dependency.
-    fn own_dependency<'d>(&self, dep: &'d dyn Dependency) -> Option<&'d Self::Dep> {
-        dep.as_any().downcast_ref::<Self::Dep>()
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.erased.workspace_root()
+    }
+
+    fn uri(&self) -> &url::Url {
+        self.erased.uri()
+    }
+
+    fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+        self.erased.blocked_registries()
+    }
+
+    fn selection_context(&self) -> SelectionContext {
+        self.erased.selection_context()
+    }
+
+    fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
+        self.erased.invalid_minimum_stability()
+    }
+
+    fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
+        self.erased.rejected_registries()
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.erased.dependency_truncation()
     }
 }
 
-impl<T: OwnDependency> NarrowDependency for T {}
+impl<P: TypedParseResult> TypedParseResult for ParsedView<'_, P> {
+    type Dep = P::Dep;
+
+    fn own_dependencies(&self) -> &[P::Dep] {
+        self.dependencies_slice()
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::sync::{Arc, LazyLock};
-
     use super::*;
-    use crate::ecosystem::{BoxFuture, EcosystemId, private};
-    use crate::parser::DependencySource;
-    use crate::position::Range;
-    use crate::{PackageName, VersionReq};
+    use crate::test_util::stub_parse_result;
 
-    struct MineDep;
-    struct OtherDep;
+    #[test]
+    fn new_view_exposes_the_typed_document_and_every_dependency() {
+        let parsed = stub_parse_result(4);
+        let view = ParsedView::new(&parsed);
 
-    macro_rules! stub_dependency {
-        ($ty:ty) => {
-            impl Dependency for $ty {
-                fn name(&self) -> &PackageName {
-                    static NAME: LazyLock<PackageName> = LazyLock::new(|| PackageName::new("stub"));
-                    &NAME
-                }
-                fn name_range(&self) -> Range {
-                    Range::default()
-                }
-                fn version_requirement(&self) -> Option<&VersionReq> {
-                    None
-                }
-                fn version_range(&self) -> Option<Range> {
-                    None
-                }
-                fn source(&self) -> DependencySource {
-                    DependencySource::Registry
-                }
-                fn as_any(&self) -> &dyn Any {
-                    self
-                }
-            }
+        assert!(std::ptr::eq(view.typed(), &raw const parsed));
+        assert_eq!(view.own_dependencies().len(), 4);
+        assert_eq!(view.dependencies().len(), 4);
+        assert_eq!(view.uri(), parsed.uri());
+    }
+
+    #[test]
+    fn capped_view_cuts_the_typed_slice_but_borrows_it_for_the_document_lifetime() {
+        let parsed = stub_parse_result(5);
+        let slice = {
+            let view = ParsedView::capped(&parsed, &parsed, 2);
+            view.dependencies_slice()
         };
-    }
-    stub_dependency!(MineDep);
-    stub_dependency!(OtherDep);
 
-    struct MineParsed {
-        uri: url::Url,
-    }
-    struct OtherParsed {
-        uri: url::Url,
-    }
-
-    macro_rules! stub_parse_result {
-        ($ty:ty) => {
-            impl ParseResult for $ty {
-                fn dependencies(&self) -> Vec<&dyn Dependency> {
-                    Vec::new()
-                }
-                fn workspace_root(&self) -> Option<&std::path::Path> {
-                    None
-                }
-                fn uri(&self) -> &url::Url {
-                    &self.uri
-                }
-                fn as_any(&self) -> &dyn Any {
-                    self
-                }
-            }
-        };
-    }
-    stub_parse_result!(MineParsed);
-    stub_parse_result!(OtherParsed);
-
-    struct MineEcosystem;
-
-    impl private::Sealed for MineEcosystem {}
-
-    impl Ecosystem for MineEcosystem {
-        fn id(&self) -> &'static str {
-            "mine"
-        }
-        fn ecosystem_id(&self) -> EcosystemId {
-            EcosystemId::Cargo
-        }
-        fn display_name(&self) -> &'static str {
-            "Mine"
-        }
-        fn manifest_filenames(&self) -> &[&'static str] {
-            &[]
-        }
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            _uri: &'a url::Url,
-        ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
-            unimplemented!()
-        }
-        fn registry(&self) -> Arc<dyn crate::Registry> {
-            unimplemented!()
-        }
-        fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
-            unimplemented!()
-        }
-        #[cfg(feature = "lsp-responses")]
-        fn generate_completions<'a>(
-            &'a self,
-            _parse_result: &'a dyn ParseResult,
-            _position: tower_lsp_server::ls_types::Position,
-            _content: &'a str,
-            _freshness: crate::FreshnessSettings,
-        ) -> BoxFuture<'a, crate::completion::Completions> {
-            unimplemented!()
-        }
-        #[cfg(feature = "lsp-responses")]
-        fn complete_version<'a>(
-            &'a self,
-            _request: crate::completion::CompletionRequest<'a>,
-            _package_name: PackageName,
-            _prefix: String,
-        ) -> BoxFuture<'a, crate::completion::Completions> {
-            unimplemented!()
-        }
-        fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
-            unimplemented!()
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    impl OwnParseResult for MineEcosystem {
-        type Parsed = MineParsed;
-    }
-
-    impl OwnDependency for MineEcosystem {
-        type Dep = MineDep;
-    }
-
-    fn uri() -> url::Url {
-        crate::test_util::test_uri("/stub/manifest")
+        assert_eq!(slice.len(), 2);
+        assert!(std::ptr::eq(
+            slice.as_ptr(),
+            parsed.own_dependencies().as_ptr()
+        ));
     }
 
     #[test]
-    fn own_parse_result_returns_the_ecosystems_own_type() {
-        let parsed = MineParsed { uri: uri() };
-        let narrowed = MineEcosystem.own_parse_result(&parsed).unwrap();
-        assert!(std::ptr::eq(narrowed, &raw const parsed));
-    }
+    fn view_reads_the_erased_side_for_erased_queries() {
+        let parsed = stub_parse_result(3);
+        let capped_erased = stub_parse_result(1);
+        let view = ParsedView::capped(&parsed, &capped_erased, 3);
 
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "parse result is not a ")]
-    fn own_parse_result_asserts_on_a_foreign_parse_result_in_debug_builds() {
-        let foreign = OtherParsed { uri: uri() };
-        let _ = MineEcosystem.own_parse_result(&foreign);
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn own_parse_result_is_none_for_a_foreign_parse_result_in_release_builds() {
-        let foreign = OtherParsed { uri: uri() };
-        assert!(MineEcosystem.own_parse_result(&foreign).is_none());
-    }
-
-    #[test]
-    fn own_dependency_returns_its_own_type_and_none_for_a_foreign_one() {
-        let mine = MineDep;
-        let narrowed = MineEcosystem.own_dependency(&mine).unwrap();
-        assert!(std::ptr::eq(narrowed, &raw const mine));
-        assert!(MineEcosystem.own_dependency(&OtherDep).is_none());
+        assert_eq!(view.dependencies().len(), 1, "erased queries delegate");
+        assert_eq!(
+            view.own_dependencies().len(),
+            3,
+            "typed queries use the limit"
+        );
     }
 }

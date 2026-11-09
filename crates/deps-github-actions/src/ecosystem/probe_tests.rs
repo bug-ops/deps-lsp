@@ -6,14 +6,16 @@ use std::sync::Arc;
 use deps_core::diagnostic::Severity;
 use deps_core::lsp_helpers::NormalizeName;
 use deps_core::lsp_helpers::{
-    PackageRendering, ProbePhase, ProbeReport, RequirementGate, RequirementStatus, UnpublishedRef,
+    DependencyFormatter, DependencyGate, ProbePhase, ProbeReport, RequirementStatus, UnpublishedRef,
 };
-use deps_core::{ConcreteVersion, Ecosystem, PackageName, VersionReq};
+use deps_core::{
+    ConcreteVersion, Dependency, EcosystemBase, PackageName, ParsedView, TypedEcosystem, VersionReq,
+};
 
 use super::{GithubActionsEcosystem, unknown_ref_target};
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
-use crate::types::GithubActionsDependency;
+use crate::types::GithubActionsParseResult;
 
 const RELEASE: char = 'a';
 const PIN: char = 'b';
@@ -48,31 +50,28 @@ async fn ecosystem(server: &mut mockito::ServerGuard, has_token: bool) -> Github
     eco
 }
 
-fn workflow(refs: &[&str]) -> Box<dyn deps_core::ParseResult> {
+fn workflow(refs: &[&str]) -> GithubActionsParseResult {
     let content = refs.iter().fold(String::new(), |mut acc, r| {
         let _ = writeln!(acc, "  - uses: o/r@{r}");
         acc
     });
     let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-    Box::new(crate::parser::parse_workflow_yaml(&format!("steps:\n{content}"), &uri).unwrap())
+    crate::parser::parse_workflow_yaml(&format!("steps:\n{content}"), &uri).unwrap()
 }
 
-async fn probe(eco: &GithubActionsEcosystem, parsed: &dyn deps_core::ParseResult) -> ProbeReport {
-    eco.background_probes(parsed, ProbePhase::PostFetch).await
+async fn probe(eco: &GithubActionsEcosystem, parsed: &GithubActionsParseResult) -> ProbeReport {
+    eco.probes(ParsedView::new(parsed), ProbePhase::PostFetch)
+        .await
 }
 
 fn unknown_ref(
     eco: &GithubActionsEcosystem,
-    parsed: &dyn deps_core::ParseResult,
+    parsed: &GithubActionsParseResult,
     n: usize,
 ) -> Option<String> {
-    let dep = parsed.dependencies()[n];
-    let gha_dep = dep
-        .as_any()
-        .downcast_ref::<GithubActionsDependency>()
-        .unwrap();
+    let gha_dep = &parsed.dependencies[n];
     unknown_ref_target(&eco.formatter, gha_dep)?
-        .diagnostic(dep.name(), Severity::Warning)
+        .diagnostic(gha_dep.name(), Severity::Warning)
         .map(|d| d.message().to_string())
 }
 
@@ -88,8 +87,8 @@ async fn partial_ref_with_no_branch_becomes_unknown_ref() {
         .await;
     let parsed = workflow(&["v40"]);
 
-    assert_eq!(unknown_ref(&eco, parsed.as_ref(), 0), None);
-    let report = probe(&eco, parsed.as_ref()).await;
+    assert_eq!(unknown_ref(&eco, &parsed, 0), None);
+    let report = probe(&eco, &parsed).await;
 
     ref_mock.assert_async().await;
     assert_eq!(report.issued, 1);
@@ -98,10 +97,10 @@ async fn partial_ref_with_no_branch_becomes_unknown_ref() {
         deps_core::lsp_helpers::ProbeEffect::Republish
     );
     assert_eq!(
-        unknown_ref(&eco, parsed.as_ref(), 0).as_deref(),
+        unknown_ref(&eco, &parsed, 0).as_deref(),
         Some("`v40` is neither a published tag nor a branch of o/r")
     );
-    let second = probe(&eco, parsed.as_ref()).await;
+    let second = probe(&eco, &parsed).await;
     assert_eq!(
         second,
         ProbeReport::default(),
@@ -121,9 +120,9 @@ async fn documented_branch_pin_stays_silent() {
         .await;
     let parsed = workflow(&["v1"]);
 
-    probe(&eco, parsed.as_ref()).await;
+    probe(&eco, &parsed).await;
 
-    assert_eq!(unknown_ref(&eco, parsed.as_ref(), 0), None);
+    assert_eq!(unknown_ref(&eco, &parsed, 0), None);
 }
 
 #[tokio::test]
@@ -138,10 +137,10 @@ async fn inconclusive_answers_store_nothing_and_stay_silent() {
             .await;
         let parsed = workflow(&["v40"]);
 
-        let report = probe(&eco, parsed.as_ref()).await;
+        let report = probe(&eco, &parsed).await;
 
         assert_eq!(report.inconclusive, 1, "{status}");
-        assert_eq!(unknown_ref(&eco, parsed.as_ref(), 0), None, "{status}");
+        assert_eq!(unknown_ref(&eco, &parsed, 0), None, "{status}");
     }
 }
 
@@ -159,7 +158,7 @@ async fn hostile_refs_issue_no_request() {
         .await;
     let parsed = workflow(&["1/../../../../user", "1?x#y", "1%2F..", "v1@{u}"]);
 
-    let report = probe(&eco, parsed.as_ref()).await;
+    let report = probe(&eco, &parsed).await;
 
     any.assert_async().await;
     assert_eq!(report, ProbeReport::default());
@@ -177,7 +176,7 @@ async fn full_release_and_listed_refs_are_not_probed() {
         .await;
     let parsed = workflow(&["v1.0.0", "1.0.1", "main"]);
 
-    assert_eq!(probe(&eco, parsed.as_ref()).await, ProbeReport::default());
+    assert_eq!(probe(&eco, &parsed).await, ProbeReport::default());
     any.assert_async().await;
 }
 
@@ -195,7 +194,7 @@ async fn anonymous_budget_bounds_the_requests_of_a_large_document() {
         .await;
     let parsed = workflow(&ref_slices);
 
-    let report = probe(&eco, parsed.as_ref()).await;
+    let report = probe(&eco, &parsed).await;
 
     any.assert_async().await;
     assert_eq!(report.issued, 4);
@@ -224,11 +223,10 @@ async fn mock_compare(
 
 fn pin_status(
     eco: &GithubActionsEcosystem,
-    parsed: &dyn deps_core::ParseResult,
+    parsed: &GithubActionsParseResult,
 ) -> RequirementStatus {
-    let dep = parsed.dependencies()[0];
     eco.formatter.requirement_status_for(
-        dep,
+        &parsed.dependencies[0],
         &VersionReq::new(sha(PIN)),
         &ConcreteVersion::new("v1.0.0"),
     )
@@ -241,23 +239,17 @@ async fn commit_ahead_of_release_and_on_default_branch_is_up_to_date() {
     let lineage = mock_compare(&mut server, &sha(RELEASE), "ahead").await;
     let membership = mock_compare(&mut server, "HEAD", "behind").await;
     let parsed = workflow(&[&sha(PIN)]);
-    assert_eq!(
-        pin_status(&eco, parsed.as_ref()),
-        RequirementStatus::Outdated
-    );
+    assert_eq!(pin_status(&eco, &parsed), RequirementStatus::Outdated);
 
-    let report = probe(&eco, parsed.as_ref()).await;
+    let report = probe(&eco, &parsed).await;
 
     lineage.assert_async().await;
     membership.assert_async().await;
     assert_eq!(report.issued, 2);
-    assert_eq!(
-        pin_status(&eco, parsed.as_ref()),
-        RequirementStatus::UpToDate
-    );
+    assert_eq!(pin_status(&eco, &parsed), RequirementStatus::UpToDate);
     let hover = eco
         .formatter
-        .hover_provenance(parsed.dependencies()[0])
+        .hover_provenance(&parsed.dependencies[0])
         .unwrap();
     assert_eq!(
         hover,
@@ -277,15 +269,12 @@ async fn ahead_commit_not_on_the_default_branch_keeps_todays_behavior() {
     let _membership = mock_compare(&mut server, "HEAD", "diverged").await;
     let parsed = workflow(&[&sha(PIN)]);
 
-    probe(&eco, parsed.as_ref()).await;
+    probe(&eco, &parsed).await;
 
-    assert_eq!(
-        pin_status(&eco, parsed.as_ref()),
-        RequirementStatus::Outdated
-    );
+    assert_eq!(pin_status(&eco, &parsed), RequirementStatus::Outdated);
     assert!(
         eco.formatter
-            .hover_provenance(parsed.dependencies()[0])
+            .hover_provenance(&parsed.dependencies[0])
             .is_none()
     );
 }
@@ -304,14 +293,11 @@ async fn commit_not_ahead_costs_one_request() {
         .await;
     let parsed = workflow(&[&sha(PIN)]);
 
-    let report = probe(&eco, parsed.as_ref()).await;
+    let report = probe(&eco, &parsed).await;
 
     membership.assert_async().await;
     assert_eq!(report.issued, 1);
-    assert_eq!(
-        pin_status(&eco, parsed.as_ref()),
-        RequirementStatus::Outdated
-    );
+    assert_eq!(pin_status(&eco, &parsed), RequirementStatus::Outdated);
 }
 
 #[tokio::test]
@@ -326,13 +312,10 @@ async fn oversized_or_unknown_compare_answers_are_inconclusive() {
         .await;
     let parsed = workflow(&[&sha(PIN)]);
 
-    let report = probe(&eco, parsed.as_ref()).await;
+    let report = probe(&eco, &parsed).await;
 
     assert_eq!((report.issued, report.inconclusive), (1, 1));
-    assert_eq!(
-        pin_status(&eco, parsed.as_ref()),
-        RequirementStatus::Outdated
-    );
+    assert_eq!(pin_status(&eco, &parsed), RequirementStatus::Outdated);
 }
 
 #[tokio::test]
@@ -363,7 +346,7 @@ async fn pre_fetch_phase_does_nothing() {
     let eco = ecosystem(&mut server, true).await;
     let parsed = workflow(&["v40"]);
     let report = eco
-        .background_probes(parsed.as_ref(), ProbePhase::PreFetch)
+        .probes(ParsedView::new(&parsed), ProbePhase::PreFetch)
         .await;
     assert_eq!(report, ProbeReport::default());
 }
@@ -380,7 +363,7 @@ async fn new_evidence_is_announced_once_per_repository_as_probe_evidence() {
     let mut events = eco.refresh_events().unwrap();
     let parsed = workflow(&["v40", "v41"]);
 
-    probe(&eco, parsed.as_ref()).await;
+    probe(&eco, &parsed).await;
 
     assert_eq!(
         events.try_recv().unwrap(),
@@ -441,7 +424,7 @@ async fn untagged_filter_keeps_a_tagged_sha_out_of_the_ahead_override() {
 
     assert!(
         eco.formatter
-            .hover_provenance(parsed.dependencies()[0])
+            .hover_provenance(&parsed.dependencies[0])
             .is_none()
     );
 }
@@ -464,9 +447,7 @@ async fn the_probe_budget_is_shared_across_documents() {
             .map(|n| format!("v{}", 100 + doc * 10 + n))
             .collect();
         let slices: Vec<&str> = refs.iter().map(String::as_str).collect();
-        skipped += probe(&eco, workflow(&slices).as_ref())
-            .await
-            .skipped_over_budget;
+        skipped += probe(&eco, &workflow(&slices)).await.skipped_over_budget;
     }
 
     any.assert_async().await;
@@ -487,10 +468,10 @@ async fn concurrent_documents_asking_the_same_question_send_one_request() {
     let docs: Vec<_> = (0..4).map(|_| workflow(&["v40"])).collect();
 
     let (a, b, c, d) = tokio::join!(
-        probe(&eco, docs[0].as_ref()),
-        probe(&eco, docs[1].as_ref()),
-        probe(&eco, docs[2].as_ref()),
-        probe(&eco, docs[3].as_ref()),
+        probe(&eco, &docs[0]),
+        probe(&eco, &docs[1]),
+        probe(&eco, &docs[2]),
+        probe(&eco, &docs[3]),
     );
 
     one.assert_async().await;
@@ -505,11 +486,8 @@ async fn stale_evidence_keeps_a_proven_pin_up_to_date() {
     let _lineage = mock_compare(&mut server, &sha(RELEASE), "ahead").await;
     let _membership = mock_compare(&mut server, "HEAD", "behind").await;
     let parsed = workflow(&[&sha(PIN)]);
-    probe(&eco, parsed.as_ref()).await;
-    assert_eq!(
-        pin_status(&eco, parsed.as_ref()),
-        RequirementStatus::UpToDate
-    );
+    probe(&eco, &parsed).await;
+    assert_eq!(pin_status(&eco, &parsed), RequirementStatus::UpToDate);
 
     // Everything stored is now past its TTL: a zero-TTL store makes every entry stale at once.
     let stale = deps_core::lsp_helpers::ProbeStores::new(std::time::Duration::ZERO);

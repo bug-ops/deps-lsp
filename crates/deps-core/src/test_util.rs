@@ -114,7 +114,7 @@ pub fn test_uri(unix_path: &str) -> url::Url {
 /// ```
 #[cfg(feature = "test-util")]
 pub async fn fallback_edit_outcome(
-    ecosystem: &dyn crate::Ecosystem,
+    ecosystem: &std::sync::Arc<dyn crate::Ecosystem>,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     uri: &url::Url,
     content: &str,
@@ -122,38 +122,40 @@ pub async fn fallback_edit_outcome(
     fallback: &str,
     available: &[&str],
 ) -> crate::lsp_helpers::FallbackEditVerdict {
-    let parsed = ecosystem
+    let parsed = std::sync::Arc::clone(ecosystem)
         .parse_manifest(content, uri)
         .await
         .expect("manifest must parse");
-    let dep = parsed
-        .dependencies()
-        .into_iter()
-        .find(|d| d.name().as_str() == dep_name)
-        .expect("dependency present");
     let fallback = crate::ConcreteVersion::new(fallback);
-    let new_text = crate::edit::replacement_text(
-        formatter,
-        dep,
-        &fallback,
-        dep.version_requirement()
-            .expect("declared requirement")
-            .as_str(),
-    )
-    .expect("replacement text");
-    let candidate = crate::edit::ManifestEdit {
-        range: dep.version_range().expect("version range"),
-        new_text,
-    };
     let reparse = crate::edit::EcosystemReparse { ecosystem, uri };
     let available: Vec<crate::ConcreteVersion> = available
         .iter()
         .map(|v| crate::ConcreteVersion::new(*v))
         .collect();
 
-    crate::lsp_helpers::fallback_edit_excludes_newer(
-        formatter, &reparse, content, dep, &candidate, &fallback, &available,
-    )
+    let mut verdict = None;
+    parsed.for_each_formatted_dependency(&mut |bound| {
+        let dep = bound.dependency();
+        if verdict.is_some() || dep.name().as_str() != dep_name {
+            return;
+        }
+        let new_text = bound
+            .replacement_text(
+                &fallback,
+                dep.version_requirement()
+                    .expect("declared requirement")
+                    .as_str(),
+            )
+            .expect("replacement text");
+        let candidate = crate::edit::ManifestEdit {
+            range: dep.version_range().expect("version range"),
+            new_text,
+        };
+        verdict = Some(crate::lsp_helpers::fallback_edit_excludes_newer(
+            formatter, &reparse, content, dep, &candidate, &fallback, &available,
+        ));
+    });
+    verdict.expect("dependency present")
 }
 
 /// Builds a [`crate::PackageKey`] for `name` through [`StubFormatter::DEFAULT`] (identity
@@ -213,7 +215,7 @@ pub fn osv_id(raw: &str) -> crate::osv::OsvId {
 }
 
 /// Minimal [`crate::Metadata`] fixture for tests that only care about a package's name and
-/// latest version — e.g. exercising [`crate::Ecosystem::completion_insert_text`].
+/// latest version — e.g. exercising [`crate::EcosystemBase::completion_insert_text`].
 ///
 /// Intended to replace the ~25-line `impl Metadata for MockMetadata` block hand-copied
 /// inside individual test bodies (`deps-go`, `deps-gitlab-ci`) — those two crates are not
@@ -1066,11 +1068,33 @@ pub async fn capture_tracing_span_fields_async(
     String::from_utf8(captured).expect("tracing output is valid utf8")
 }
 
-/// Minimal [`crate::Dependency`] fixture used by [`stub_parse_result_with_dependencies`] —
-/// only carries a name, since dependency-count-ceiling tests (#796) don't need version
-/// requirements, ranges, or a real source.
-struct StubDependency {
+/// Minimal [`crate::Dependency`] fixture: a name and nothing else (no version requirement,
+/// ranges or non-registry source).
+///
+/// Dependency-count-ceiling tests (#796) and every stub that only needs *a* dependency type use
+/// it, and it is the default dependency type of [`StubFormatter`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::Dependency;
+/// use deps_core::test_util::StubDependency;
+///
+/// assert_eq!(StubDependency::new("serde").name().as_str(), "serde");
+/// ```
+#[derive(Debug, Clone)]
+pub struct StubDependency {
     name: crate::PackageName,
+}
+
+impl StubDependency {
+    /// A stub dependency named `name`.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: crate::PackageName::new(name),
+        }
+    }
 }
 
 impl crate::Dependency for StubDependency {
@@ -1093,16 +1117,26 @@ impl crate::Dependency for StubDependency {
     fn source(&self) -> crate::parser::DependencySource {
         crate::parser::DependencySource::Registry
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
-/// Minimal [`crate::ParseResult`] fixture built by [`stub_parse_result_with_dependencies`].
-struct StubParseResult {
+/// Minimal [`crate::TypedParseResult`] fixture built by [`stub_parse_result`].
+#[derive(Debug)]
+pub struct StubParseResult {
     dependencies: Vec<StubDependency>,
     uri: url::Url,
+}
+
+impl StubParseResult {
+    /// A stub parse result for `uri` with `count` dependencies named `dep-0`, `dep-1`, ...
+    #[must_use]
+    pub fn new(uri: url::Url, count: usize) -> Self {
+        Self {
+            dependencies: (0..count)
+                .map(|i| StubDependency::new(&format!("dep-{i}")))
+                .collect(),
+            uri,
+        }
+    }
 }
 
 impl crate::ParseResult for StubParseResult {
@@ -1120,9 +1154,13 @@ impl crate::ParseResult for StubParseResult {
     fn uri(&self) -> &url::Url {
         &self.uri
     }
+}
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+impl crate::TypedParseResult for StubParseResult {
+    type Dep = StubDependency;
+
+    fn own_dependencies(&self) -> &[StubDependency] {
+        &self.dependencies
     }
 }
 
@@ -1350,14 +1388,209 @@ impl SelectionContextCapture {
 /// ```
 #[must_use]
 pub fn stub_parse_result_with_dependencies(count: usize) -> Box<dyn crate::ParseResult> {
-    Box::new(StubParseResult {
-        dependencies: (0..count)
-            .map(|i| StubDependency {
-                name: crate::PackageName::new(format!("dep-{i}")),
-            })
-            .collect(),
-        uri: test_uri("/project/manifest.toml"),
-    })
+    Box::new(stub_parse_result(count))
+}
+
+/// A [`StubParseResult`] with `count` dependencies named `dep-0`, `dep-1`, ..., for generic
+/// code that needs a [`crate::TypedParseResult`] without a real ecosystem parser.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ParseResult;
+/// use deps_core::test_util::stub_parse_result;
+///
+/// assert_eq!(stub_parse_result(3).dependencies().len(), 3);
+/// ```
+#[must_use]
+pub fn stub_parse_result(count: usize) -> StubParseResult {
+    StubParseResult::new(test_uri("/project/manifest.toml"), count)
+}
+
+/// A [`TypedEcosystem`](crate::TypedEcosystem) over any [`TypedParseResult`](crate::TypedParseResult)
+/// `P`, reading it through a formatter `F` and serving a [`MockRegistry`].
+///
+/// `F` defaults to a [`StubFormatter`] and the identity to [`EcosystemId::Cargo`](crate::EcosystemId::Cargo);
+/// [`Self::with_formatter`] supplies a real or knobbed formatter and an identity. Its `parse` is
+/// `unimplemented!()`: it exists to wrap an already built parse result in a
+/// [`ParsedManifest`](crate::ParsedManifest), see [`stub_document`] and [`stub_document_with`].
+pub struct StubEcosystem<
+    P: crate::TypedParseResult,
+    F = StubFormatter<<P as crate::TypedParseResult>::Dep>,
+> {
+    formatter: F,
+    id: crate::EcosystemId,
+    parsed: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P: crate::TypedParseResult> StubEcosystem<P> {
+    /// A stub ecosystem with a default [`StubFormatter`] and [`EcosystemId::Cargo`](crate::EcosystemId::Cargo).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            formatter: StubFormatter::new().for_dependency(),
+            id: crate::EcosystemId::Cargo,
+            parsed: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P, F> StubEcosystem<P, F>
+where
+    P: crate::TypedParseResult,
+    F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
+{
+    /// A stub ecosystem reading `P` through `formatter` and reporting `id` as its identity.
+    #[must_use]
+    pub fn with_formatter(formatter: F, id: crate::EcosystemId) -> Self {
+        Self {
+            formatter,
+            id,
+            parsed: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P: crate::TypedParseResult> Default for StubEcosystem<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<P, F> crate::ecosystem::private::Sealed for StubEcosystem<P, F>
+where
+    P: crate::TypedParseResult,
+    F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
+{
+}
+
+impl<P, F> crate::EcosystemBase for StubEcosystem<P, F>
+where
+    P: crate::TypedParseResult,
+    F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
+{
+    fn ecosystem_id(&self) -> crate::EcosystemId {
+        self.id
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Stub"
+    }
+
+    fn manifest_filenames(&self) -> &[&'static str] {
+        &[]
+    }
+
+    fn registry(&self) -> std::sync::Arc<dyn crate::Registry> {
+        std::sync::Arc::new(MockRegistry::new())
+    }
+
+    fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+        None
+    }
+}
+
+impl<P, F> crate::TypedEcosystem for StubEcosystem<P, F>
+where
+    P: crate::TypedParseResult + 'static,
+    F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
+{
+    type Parsed = P;
+    type Formatter = F;
+
+    fn own_formatter(&self) -> &Self::Formatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        _content: &'a str,
+        _uri: &'a url::Url,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<P>> {
+        Box::pin(async move { unimplemented!("StubEcosystem only wraps built parse results") })
+    }
+}
+
+/// Wraps an already built parse result in a [`ParsedManifest`](crate::ParsedManifest) of a
+/// [`StubEcosystem`], capped exactly like a parsed document.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ParseResult;
+/// use deps_core::test_util::{stub_document, stub_parse_result};
+///
+/// let document = stub_document(stub_parse_result(2));
+/// assert_eq!(document.dependencies().len(), 2);
+/// ```
+#[must_use]
+pub fn stub_document<P: crate::TypedParseResult + 'static>(
+    parsed: P,
+) -> Box<dyn crate::ParsedManifest> {
+    Box::new(crate::ecosystem::EcosystemManifest::new(
+        std::sync::Arc::new(StubEcosystem::<P>::new()),
+        parsed,
+    ))
+}
+
+/// [`stub_document`] with a caller-supplied formatter and ecosystem identity.
+///
+/// For tests that drive id-dependent or formatter-dependent behavior through the erased
+/// [`ParsedManifest`](crate::ParsedManifest) surface with a knobbed [`StubFormatter`] or a real
+/// ecosystem formatter, without building a full [`TypedEcosystem`](crate::TypedEcosystem).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::{EcosystemId, ParseResult};
+/// use deps_core::test_util::{StubFormatter, stub_document_with, stub_parse_result};
+///
+/// let formatter = StubFormatter::new().with_alternate_registry_resolution().for_dependency();
+/// let document = stub_document_with(stub_parse_result(2), formatter, EcosystemId::Go);
+/// assert_eq!(document.dependencies().len(), 2);
+/// ```
+#[must_use]
+pub fn stub_document_with<P, F>(
+    parsed: P,
+    formatter: F,
+    id: crate::EcosystemId,
+) -> Box<dyn crate::ParsedManifest>
+where
+    P: crate::TypedParseResult + 'static,
+    F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
+{
+    Box::new(crate::ecosystem::EcosystemManifest::new(
+        std::sync::Arc::new(StubEcosystem::<P, F>::with_formatter(formatter, id)),
+        parsed,
+    ))
+}
+
+/// Implements [`TypedEcosystem`](crate::TypedEcosystem) for a test double that only needs to
+/// exist, not to parse.
+///
+/// The double reads [`StubParseResult`] through a [`StubFormatter`], and its `parse` is
+/// `unimplemented!()`. Implement [`EcosystemBase`](crate::EcosystemBase) for the type
+/// separately; a double that needs a real `parse` or hook writes its own `TypedEcosystem` impl.
+#[macro_export]
+macro_rules! impl_stub_typed_ecosystem {
+    ($ty:ty) => {
+        impl $crate::TypedEcosystem for $ty {
+            type Parsed = $crate::test_util::StubParseResult;
+            type Formatter = $crate::test_util::StubFormatter;
+
+            fn own_formatter(&self) -> &Self::Formatter {
+                &$crate::test_util::StubFormatter::DEFAULT
+            }
+
+            fn parse<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a ::url::Url,
+            ) -> $crate::ecosystem::BoxFuture<'a, $crate::error::Result<Self::Parsed>> {
+                Box::pin(async move { unimplemented!() })
+            }
+        }
+    };
 }
 
 /// Builds a [`crate::GossipFindings`] fixture for one package version, with an optional
@@ -1402,6 +1635,30 @@ mod tests {
     use super::capture_tracing_output;
     use super::{is_configured_token, rate_limit_skip_decision};
     use crate::RateLimitEvidence;
+
+    #[test]
+    fn stub_ecosystem_with_formatter_reports_the_given_identity_and_formatter() {
+        use crate::lsp_helpers::DependencyFormatter as _;
+        use crate::{EcosystemBase as _, EcosystemId, TypedEcosystem as _};
+
+        let formatter = super::StubFormatter::new()
+            .with_manifest_requirement_as_resolved_version()
+            .for_dependency();
+        let eco = super::StubEcosystem::<super::StubParseResult, _>::with_formatter(
+            formatter,
+            EcosystemId::Go,
+        );
+
+        assert_eq!(eco.ecosystem_id(), EcosystemId::Go);
+        assert!(
+            eco.own_formatter()
+                .manifest_requirement_is_resolved_version(&super::StubDependency::new("x"))
+        );
+        assert_eq!(
+            super::StubEcosystem::<super::StubParseResult>::new().ecosystem_id(),
+            EcosystemId::Cargo
+        );
+    }
 
     #[test]
     fn is_configured_token_rejects_missing_and_empty() {

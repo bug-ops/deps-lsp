@@ -1,5 +1,5 @@
 //! Tier-3 license pre-fetch fan-out: adapter-agnostic dispatch to
-//! [`deps_core::Ecosystem::fetch_license`] (issue #660/#688/#697, spec 010 plan §1 tier 3).
+//! [`deps_core::EcosystemBase::fetch_license`] (issue #660/#688/#697, spec 010 plan §1 tier 3).
 //!
 //! Today this covers pub.dev's `/score` endpoint (Dart), the GitHub repository API
 //! (Swift), a Maven Central POM fetch (Gradle), and the JSR per-version API (Deno).
@@ -25,7 +25,6 @@ use deps_core::EcosystemId;
 use deps_core::NormalizedName;
 use deps_core::PackageKey;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::resolve_in_use_version;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -139,7 +138,7 @@ pub struct TierThreeLicenseFetch {
     /// `tokio::time::timeout` (issue #1133 critic S1).
     ///
     /// A **partial**, best-effort "could this result be trusted" signal, not a full
-    /// fetch-failure count: [`deps_core::Ecosystem::fetch_license`] returns a bare
+    /// fetch-failure count: [`deps_core::EcosystemBase::fetch_license`] returns a bare
     /// `Vec<String>` with no error channel, and every one of the four tier-3 implementations
     /// (Dart/Swift/Gradle/Deno) deliberately degrades a network error, a 404, or a GitHub
     /// rate limit to an empty `Vec` internally, before this function ever sees it — that
@@ -205,40 +204,19 @@ impl TierThreeLicenseFetch {
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
+/// use deps_core::test_util::{stub_document, stub_parse_result};
 /// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
 /// use deps_engine::classify::license::tier3_license_targets;
 /// use std::collections::HashMap;
 ///
-/// struct SimpleFormatter;
-/// impl PackageNaming for SimpleFormatter {}
-/// impl PackageRendering for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-///         version.to_string()
-///     }
-///     fn package_url(&self, name: &PackageName) -> String {
-///         name.as_str().to_string()
-///     }
-/// }
-/// impl RequirementResolution for SimpleFormatter {}
-/// impl DiagnosticMessages for SimpleFormatter {}
-/// impl DiagnosticPolicy for SimpleFormatter {}
-/// impl SourcePolicy for SimpleFormatter {}
-/// impl OsvNaming for SimpleFormatter {}
-///
-/// let parsed = stub_parse_result_with_dependencies(1);
+/// let document = stub_document(stub_parse_result(1));
 /// let mut resolved_versions = HashMap::new();
 /// resolved_versions.insert(NormalizedName::for_test("dep-0"), ConcreteVersion::from("1.0.0"));
 ///
 /// let targets = tier3_license_targets(
-///     parsed.as_ref(),
+///     document.as_ref(),
 ///     &resolved_versions,
 ///     &HashMap::new(),
-///     &SimpleFormatter,
 ///     EcosystemId::Dart,
 /// );
 ///
@@ -247,38 +225,39 @@ impl TierThreeLicenseFetch {
 /// assert_eq!(targets[0].version(), &ConcreteVersion::from("1.0.0"));
 /// ```
 pub fn tier3_license_targets(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     resolved_versions: &deps_core::ResolvedVersionsMap,
     resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: EcosystemId,
 ) -> Vec<Tier3Target> {
     let mut seen = std::collections::HashSet::new();
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|d| Some((d, formatter.public_content(d)?)))
-        .filter_map(|(d, content)| {
-            let key = PackageKey::new(d.name(), formatter);
-            let version = resolve_in_use_version(
-                d,
-                &key,
-                resolved_versions,
-                Some(resolved_version_candidates),
-                formatter,
-                ecosystem_id,
-            )?;
-            Some(Tier3Target::new(key, version).requesting(content.name.into_owned()))
-        })
-        .filter(|target| seen.insert(target.key().normalized().clone()))
-        .collect()
+    let mut targets = Vec::new();
+    document.for_each_formatted_dependency(&mut |bound| {
+        let Some(content) = bound.public_content() else {
+            return;
+        };
+        let key = PackageKey::new(bound.dependency().name(), bound.formatter());
+        let Some(version) = bound.resolve_in_use_version(
+            &key,
+            resolved_versions,
+            Some(resolved_version_candidates),
+            ecosystem_id,
+        ) else {
+            return;
+        };
+        let target = Tier3Target::new(key, version).requesting(content.name.into_owned());
+        if seen.insert(target.key().normalized().clone()) {
+            targets.push(target);
+        }
+    });
+    targets
 }
 
 /// Fetches every eligible dependency's tier-3 license, for whichever ecosystems override
-/// [`deps_core::Ecosystem::fetch_license`].
+/// [`deps_core::EcosystemBase::fetch_license`].
 ///
 /// A no-op (returns an empty result immediately) for every other ecosystem, via
-/// <code>ecosystem.[license_source](Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
+/// <code>ecosystem.[license_source](deps_core::EcosystemBase::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
 /// (issue #697) — and likewise a no-op whenever `license_policy` is
 /// [`empty`](deps_core::LicensePolicy::is_empty) (issue #1133 code-review finding #3): the
 /// only consumer of this result is a license-policy evaluation, so an empty policy means
@@ -294,12 +273,12 @@ pub fn tier3_license_targets(
 ///
 /// **What version each source actually reflects is per-ecosystem, not uniform:** Gradle's POM
 /// fetch and Deno's JSR API are genuinely version-specific (fetched at the dependency's
-/// resolved/in-use version, the `version` passed into [`Ecosystem::fetch_license`]). Dart's
+/// resolved/in-use version, the `version` passed into [`deps_core::EcosystemBase::fetch_license`]). Dart's
 /// `fetch_license` calls pub.dev's per-*package* `/score` endpoint, which carries no version
 /// parameter at all — it reflects pana's detection on whatever pub.dev last scored, not
 /// necessarily the resolved version. Swift's `fetch_license` calls GitHub's
 /// `GET /repos/{owner}/{repo}`, which reflects the repository's *default branch*, not the
-/// resolved version's tag. [`resolve_in_use_version`] (inside [`tier3_license_targets`]) is
+/// resolved version's tag. [`deps_core::FormattedDependency::resolve_in_use_version`] (inside [`tier3_license_targets`]) is
 /// still required as a *gate* for all four (no version resolved means nothing to look up), but
 /// for Dart/Swift it does not pin which version's license is actually returned.
 ///
@@ -319,12 +298,12 @@ pub fn tier3_license_targets(
 ///     // `requires_dedicated_fetch()` is `false` — this returns immediately, with no
 ///     // parsed manifest and no network call, mirroring every non-tier-3 ecosystem.
 ///     let ecosystem = CargoEcosystem::new(Arc::new(HttpCache::new()));
-///     let parsed = deps_core::test_util::stub_parse_result_with_dependencies(1);
+///     let document = deps_core::test_util::stub_document(deps_core::test_util::stub_parse_result(1));
 ///     let license_policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
 ///
 ///     let result = prefetch_tier3_licenses(
 ///         &ecosystem,
-///         parsed.as_ref(),
+///         document.as_ref(),
 ///         &HashMap::new(),
 ///         &HashMap::new(),
 ///         &license_policy,
@@ -338,7 +317,7 @@ pub fn tier3_license_targets(
 /// ```
 pub async fn prefetch_tier3_licenses(
     ecosystem: &dyn Ecosystem,
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     resolved_versions: &deps_core::ResolvedVersionsMap,
     resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
     license_policy: &deps_core::LicensePolicy,
@@ -350,10 +329,9 @@ pub async fn prefetch_tier3_licenses(
     }
 
     let targets = tier3_license_targets(
-        parse_result,
+        document,
         resolved_versions,
         resolved_version_candidates,
-        ecosystem.formatter(),
         ecosystem.ecosystem_id(),
     );
 
@@ -379,7 +357,7 @@ pub async fn prefetch_tier3_licenses(
 /// call have different latency budgets and no single constant serves both well.
 ///
 /// Does **not** check
-/// <code>ecosystem.[license_source](Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
+/// <code>ecosystem.[license_source](deps_core::EcosystemBase::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
 /// itself — callers that skip [`prefetch_tier3_licenses`]'s convenience wrapper are expected
 /// to have already gated on it (as `run_license_prefetch` does) before ever computing
 /// `targets`, the same way `run_osv_scan_phase_a` gates on `vulnerabilities_enabled` before
@@ -497,11 +475,12 @@ mod tests {
     }
     use crate::test_util::TestTier3Ecosystem;
     use deps_core::Dependency;
+    use deps_core::EcosystemBase;
     use deps_core::VersionReq;
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
     use deps_core::test_util::StubFormatter;
-    use std::any::Any;
+    use deps_core::test_util::stub_document_with;
     use std::sync::Arc;
 
     struct MockDep {
@@ -529,9 +508,6 @@ mod tests {
         fn source(&self) -> DependencySource {
             self.source.clone()
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     struct MockParseResult {
@@ -549,8 +525,13 @@ mod tests {
             static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
             URI.get_or_init(|| deps_core::test_util::test_uri("/test/pubspec.yaml"))
         }
-        fn as_any(&self) -> &dyn Any {
-            self
+    }
+
+    impl deps_core::TypedParseResult for MockParseResult {
+        type Dep = MockDep;
+
+        fn own_dependencies(&self) -> &[MockDep] {
+            &self.deps
         }
     }
 
@@ -571,10 +552,14 @@ mod tests {
         resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Dart,
+            )
+            .as_ref(),
             &resolved,
             &HashMap::new(),
-            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -603,10 +588,14 @@ mod tests {
         resolved.insert(NormalizedName::for_test("local-fork"), "1.0.0".into());
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Dart,
+            )
+            .as_ref(),
             &resolved,
             &HashMap::new(),
-            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -620,10 +609,14 @@ mod tests {
         };
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Dart,
+            )
+            .as_ref(),
             &HashMap::new(),
             &HashMap::new(),
-            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -643,10 +636,14 @@ mod tests {
         resolved.insert(NormalizedName::for_test("path"), "1.9.0".into());
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Dart,
+            )
+            .as_ref(),
             &resolved,
             &HashMap::new(),
-            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -668,10 +665,14 @@ mod tests {
         resolved.insert(NormalizedName::for_test("okhttp"), "4.12.0".into());
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Gradle,
+            )
+            .as_ref(),
             &resolved,
             &HashMap::new(),
-            &StubFormatter::DEFAULT,
             EcosystemId::Gradle,
         );
 
@@ -691,10 +692,14 @@ mod tests {
         };
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Gradle,
+            )
+            .as_ref(),
             &HashMap::new(),
             &HashMap::new(),
-            &StubFormatter::DEFAULT,
             EcosystemId::Gradle,
         );
 
@@ -715,10 +720,16 @@ mod tests {
         resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
 
         let targets = tier3_license_targets(
-            &parse_result,
+            stub_document_with(
+                parse_result,
+                StubFormatter::new()
+                    .with_lowercase_names()
+                    .for_dependency::<MockDep>(),
+                EcosystemId::Dart,
+            )
+            .as_ref(),
             &resolved,
             &HashMap::new(),
-            &StubFormatter::new().with_lowercase_names(),
             EcosystemId::Dart,
         );
 
@@ -751,11 +762,15 @@ mod tests {
     #[tokio::test]
     async fn prefetch_tier3_licenses_returns_empty_without_network_when_no_targets() {
         let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
-        let parse_result = MockParseResult { deps: vec![] };
+        let document = stub_document_with(
+            MockParseResult { deps: vec![] },
+            StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+            EcosystemId::Dart,
+        );
 
         let result = prefetch_tier3_licenses(
             &ecosystem,
-            &parse_result,
+            document.as_ref(),
             &HashMap::new(),
             &HashMap::new(),
             &non_empty_license_policy(),
@@ -775,15 +790,19 @@ mod tests {
     #[tokio::test]
     async fn prefetch_tier3_licenses_no_op_for_empty_license_policy() {
         let ecosystem = TestTier3Ecosystem::pending();
-        let parse_result = MockParseResult {
-            deps: vec![dep("collection", "1.18.0", DependencySource::Registry)],
-        };
+        let document = stub_document_with(
+            MockParseResult {
+                deps: vec![dep("collection", "1.18.0", DependencySource::Registry)],
+            },
+            StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+            EcosystemId::Dart,
+        );
         let mut resolved = HashMap::new();
         resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
 
         let result = prefetch_tier3_licenses(
             &ecosystem,
-            &parse_result,
+            document.as_ref(),
             &resolved,
             &HashMap::new(),
             &deps_core::LicensePolicy::default(),
@@ -803,7 +822,7 @@ mod tests {
     async fn prefetch_tier3_licenses_no_op_for_non_tier3_ecosystem() {
         struct NonTier3(TestTier3Ecosystem);
         impl deps_core::ecosystem::private::Sealed for NonTier3 {}
-        impl Ecosystem for NonTier3 {
+        impl EcosystemBase for NonTier3 {
             fn ecosystem_id(&self) -> EcosystemId {
                 self.0.ecosystem_id()
             }
@@ -813,53 +832,32 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 self.0.manifest_filenames()
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                content: &'a str,
-                uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Box<dyn deps_core::ParseResult>>,
-            > {
-                self.0.parse_manifest(content, uri)
-            }
             fn registry(&self) -> Arc<dyn deps_core::Registry> {
                 self.0.registry()
             }
-            fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
-                self.0.formatter()
-            }
             fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
                 self.0.completion_insert_text(metadata)
-            }
-            #[cfg(feature = "lsp-responses")]
-            fn complete_version<'a>(
-                &'a self,
-                request: deps_core::completion::CompletionRequest<'a>,
-                package_name: PackageName,
-                prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
-            {
-                self.0.complete_version(request, package_name, prefix)
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
             // `license_source()` and `fetch_license` deliberately keep the trait's own
             // defaults (`RegistryDeclaredSpdx` / unreachable no-op) — this type exists only
             // to prove the gate, not to override them.
         }
+        deps_core::impl_stub_typed_ecosystem!(NonTier3);
 
         let ecosystem = NonTier3(TestTier3Ecosystem::pending());
-        let parse_result = MockParseResult {
-            deps: vec![dep("serde", "1.0.0", DependencySource::Registry)],
-        };
+        let document = stub_document_with(
+            MockParseResult {
+                deps: vec![dep("serde", "1.0.0", DependencySource::Registry)],
+            },
+            StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+            EcosystemId::Dart,
+        );
         let mut resolved = HashMap::new();
         resolved.insert(NormalizedName::for_test("serde"), "1.0.0".into());
 
         let result = prefetch_tier3_licenses(
             &ecosystem,
-            &parse_result,
+            document.as_ref(),
             &resolved,
             &HashMap::new(),
             &non_empty_license_policy(),
@@ -950,7 +948,7 @@ mod tests {
             max_seen: Arc<AtomicUsize>,
         }
         impl deps_core::ecosystem::private::Sealed for ConcurrencyTrackingEcosystem {}
-        impl Ecosystem for ConcurrencyTrackingEcosystem {
+        impl EcosystemBase for ConcurrencyTrackingEcosystem {
             fn ecosystem_id(&self) -> EcosystemId {
                 EcosystemId::Dart
             }
@@ -960,37 +958,14 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &[]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<Box<dyn deps_core::ParseResult>>,
-            > {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn deps_core::Registry> {
                 Arc::new(crate::test_util::StubRegistry)
-            }
-            fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
-                &StubFormatter::DEFAULT
             }
             fn completion_insert_text(
                 &self,
                 _metadata: &dyn deps_core::Metadata,
             ) -> Option<String> {
                 None
-            }
-            #[cfg(feature = "lsp-responses")]
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
-            {
-                Box::pin(async move { deps_core::completion::Completions::default() })
             }
             fn fetch_license<'a>(
                 &'a self,
@@ -1010,10 +985,8 @@ mod tests {
             fn license_source(&self) -> deps_core::LicenseSource {
                 deps_core::LicenseSource::DetectedSpdx
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
+        deps_core::impl_stub_typed_ecosystem!(ConcurrencyTrackingEcosystem);
 
         let current = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));

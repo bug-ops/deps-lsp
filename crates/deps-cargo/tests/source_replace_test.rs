@@ -202,74 +202,20 @@ fn test_mirror_counts_as_public_registry_content_for_osv_gating() {
 /// stale `DependencySource::Registry`-equality gate instead of `source_is_public_registry_content`.
 #[test]
 fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
-    use deps_core::position::{Position, Range};
-    use deps_core::{Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
-    use std::any::Any;
+    use deps_core::{EcosystemId, ParseResult};
     use std::collections::HashMap;
-    use url::Url;
 
-    struct MirrorDep {
-        version_req: VersionReq,
-        name_range: Range,
+    let content = "[dependencies]\ntime = \"=0.1.43\"\n\n[dev-dependencies]\ntime = \"=0.1.44\"\n";
+    let mut parse_result =
+        deps_cargo::parse_cargo_toml(content, &deps_core::test_util::test_uri("/test/Cargo.toml"))
+            .expect("manifest must parse");
+    assert_eq!(parse_result.dependencies.len(), 2);
+    for dep in &mut parse_result.dependencies {
+        dep.source = DependencySource::AlternateRegistry {
+            index: "https://mirror.corp.example".into(),
+            mirrors_public_registry: true,
+        };
     }
-    impl Dependency for MirrorDep {
-        fn name(&self) -> &PackageName {
-            static NAME: std::sync::LazyLock<PackageName> =
-                std::sync::LazyLock::new(|| PackageName::new("time"));
-            &NAME
-        }
-        fn name_range(&self) -> Range {
-            self.name_range
-        }
-        fn version_requirement(&self) -> Option<&VersionReq> {
-            Some(&self.version_req)
-        }
-        fn version_range(&self) -> Option<Range> {
-            None
-        }
-        fn source(&self) -> DependencySource {
-            DependencySource::AlternateRegistry {
-                index: "https://mirror.corp.example".into(),
-                mirrors_public_registry: true,
-            }
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    struct MirrorParseResult {
-        deps: Vec<MirrorDep>,
-        uri: Url,
-    }
-    impl ParseResult for MirrorParseResult {
-        fn dependencies(&self) -> Vec<&dyn Dependency> {
-            self.deps.iter().map(|d| d as &dyn Dependency).collect()
-        }
-        fn workspace_root(&self) -> Option<&std::path::Path> {
-            None
-        }
-        fn uri(&self) -> &Url {
-            &self.uri
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    let parse_result = MirrorParseResult {
-        deps: vec![
-            MirrorDep {
-                version_req: VersionReq::new("=0.1.43"),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 4)),
-            },
-            MirrorDep {
-                version_req: VersionReq::new("=0.1.44"),
-                name_range: Range::new(Position::new(3, 0), Position::new(3, 4)),
-            },
-        ],
-        uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
-    };
 
     // No lockfile-resolved versions; `resolve_in_use_version` falls back to the manifest
     // requirement, which is already concrete (`=X.Y.Z`) for both occurrences.

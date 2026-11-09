@@ -24,6 +24,7 @@ mod code_actions;
 #[cfg(feature = "lsp-responses")]
 mod code_lenses;
 mod diagnostics;
+mod formatted_dependency;
 mod formatter;
 mod git_pin;
 mod git_probe;
@@ -89,13 +90,15 @@ pub use diagnostics::requirement_is_oversized;
 // build (e.g. `fuzz`'s workspace check) sees it as unused.
 #[cfg(feature = "lsp-responses")]
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
+pub use formatted_dependency::{BoundDependency, FormattedDependency};
 pub use formatter::{
-    BareMeaning, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter,
-    LowercaseNaming, NormalizeName, OperatorGrammar, OsvNameAvailability, OsvNaming, PackageNaming,
-    PackageRendering, PublicContent, RequirementGate, RequirementResolution,
-    RequirementRewriteShape, RewriteTarget, SourcePolicy, bare_meaning,
-    classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
-    up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
+    BareMeaning, BuildMetadataPolicy, DependencyFormatter, DependencyGate, DiagnosticMessages,
+    DiagnosticPolicy, EcosystemFormatter, LowercaseNaming, NormalizeName, OperatorGrammar,
+    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, PublicContent,
+    RequirementGate, RequirementResolution, RequirementRewriteShape, RewriteTarget, SourcePolicy,
+    bare_meaning, classify_requirement_rewrite_shape, format_version_replacing_by_shape,
+    requirement_is_compound, up_to_date_for_comparators_via_compiled_matcher,
+    up_to_date_via_compiled_matcher,
 };
 pub use git_pin::{
     GitPinView, git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, resolve_git_pin,
@@ -628,9 +631,6 @@ pub enum FallbackEditRejection {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn std::any::Any {
-///         self
-///     }
 /// }
 ///
 /// let formatter = ExactFormatter;
@@ -1053,7 +1053,6 @@ impl PackageVersions {
 /// #     fn source(&self) -> deps_core::parser::DependencySource {
 /// #         deps_core::parser::DependencySource::Registry
 /// #     }
-/// #     fn as_any(&self) -> &dyn std::any::Any { self }
 /// # }
 /// let dep = Dep(PackageName::new("Monolog/Monolog"));
 /// let mut cached = CachedVersionsMap::new();
@@ -1650,9 +1649,6 @@ pub(crate) fn version_range_is_synthetic_empty(dep: &dyn Dependency) -> bool {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// let dep = SimpleDep {
@@ -1725,9 +1721,6 @@ fn resolve_by_vuln_key<'a, V>(
 ///     }
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
-///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
 ///     }
 /// }
 ///
@@ -1834,16 +1827,13 @@ pub enum LatestVerdict {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// let dep = SimpleDep {
 ///     name: PackageName::new("left-pad"),
 ///     name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
 /// };
-/// let formatter = deps_core::test_util::StubFormatter::new();
+/// let formatter = deps_core::test_util::StubFormatter::new().for_dependency::<SimpleDep>();
 /// let key = deps_core::PackageKey::new(dep.name(), &formatter);
 ///
 /// // No map attached at all (OSV disabled/offline) — not applicable, today's behavior.
@@ -1861,13 +1851,13 @@ pub enum LatestVerdict {
 /// );
 /// ```
 #[must_use]
-pub fn latest_verdict(
+pub fn latest_verdict<F: DependencyFormatter>(
     latest_status: Option<&LatestStatusMap>,
-    dep: &dyn Dependency,
+    dep: &F::Dep,
     keys: Option<&crate::osv::VulnKeys>,
     key: &PackageKey,
     displayed_latest: &str,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
 ) -> LatestVerdict {
     let Some(map) = latest_status else {
         return LatestVerdict::NotApplicable;
@@ -1897,11 +1887,11 @@ pub fn latest_verdict(
 /// `AlternateRegistry { mirrors_public_registry: true }` for a configured crates.io mirror) is
 /// not itself misread as still-non-registry and wrongly kept stale. A mismatch means the entry
 /// is stale, so it fails closed to [`LatestVerdict::Unverified`] instead.
-fn upgrade_status_to_verdict(
+fn upgrade_status_to_verdict<F: DependencyFormatter>(
     status: Option<&UpgradeStatus>,
     expected_version: &str,
-    dep: &dyn Dependency,
-    formatter: &dyn EcosystemFormatter,
+    dep: &F::Dep,
+    formatter: &F,
 ) -> LatestVerdict {
     match status {
         None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
@@ -1983,9 +1973,6 @@ fn upgrade_status_to_verdict(
 ///     }
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
-///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
 ///     }
 /// }
 ///
@@ -2070,16 +2057,13 @@ pub fn resolve_candidate_status<'a>(
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// let dep = SimpleDep {
 ///     name: PackageName::new("left-pad"),
 ///     name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
 /// };
-/// let formatter = deps_core::test_util::StubFormatter::new();
+/// let formatter = deps_core::test_util::StubFormatter::new().for_dependency::<SimpleDep>();
 /// let key = deps_core::PackageKey::new(dep.name(), &formatter);
 ///
 /// // No map attached at all (OSV disabled/offline) — not applicable, mirrors `latest_verdict`.
@@ -2101,13 +2085,13 @@ pub fn resolve_candidate_status<'a>(
 /// );
 /// ```
 #[must_use]
-pub fn candidate_verdict(
+pub fn candidate_verdict<F: DependencyFormatter>(
     candidate_status: Option<&CandidateStatusMap>,
-    dep: &dyn Dependency,
+    dep: &F::Dep,
     keys: Option<&crate::osv::VulnKeys>,
     key: &PackageKey,
     version: &str,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
 ) -> LatestVerdict {
     let Some(map) = candidate_status else {
         return LatestVerdict::NotApplicable;
@@ -3739,9 +3723,6 @@ pub(crate) fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 ///     }
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
-///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
 ///     }
 /// }
 ///
@@ -5779,9 +5760,6 @@ mod tests {
         fn source(&self) -> DependencySource {
             self.source.clone()
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     fn structural_skip_entry() -> UpgradeStatus {
@@ -5819,6 +5797,9 @@ mod tests {
         }
     }
     impl OsvNaming for MockMirrorFormatter {}
+    impl DependencyFormatter for MockMirrorFormatter {
+        type Dep = DepWithSource;
+    }
 
     /// #1531 regression: a dependency whose source is *still* non-registry keeps the existing
     /// structural-fallback behavior — the cached `NonRegistrySource` skip is not stale, so it
@@ -5832,7 +5813,7 @@ mod tests {
                 path: "../vendored-lib".to_string(),
             },
         };
-        let formatter = crate::test_util::StubFormatter::new();
+        let formatter = crate::test_util::StubFormatter::new().for_dependency::<DepWithSource>();
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -5882,7 +5863,7 @@ mod tests {
             name_range: crate::position::Range::default(),
             source: DependencySource::Registry,
         };
-        let formatter = crate::test_util::StubFormatter::new();
+        let formatter = crate::test_util::StubFormatter::new().for_dependency::<DepWithSource>();
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -5985,7 +5966,7 @@ mod tests {
             name_range: crate::position::Range::default(),
             source: DependencySource::Registry,
         };
-        let formatter = crate::test_util::StubFormatter::new();
+        let formatter = crate::test_util::StubFormatter::new().for_dependency::<DepWithSource>();
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -6305,9 +6286,6 @@ mod tests {
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
         }
 
         struct StubParseResult {
@@ -6323,9 +6301,6 @@ mod tests {
             }
             fn uri(&self) -> &url::Url {
                 &self.uri
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
             }
         }
 

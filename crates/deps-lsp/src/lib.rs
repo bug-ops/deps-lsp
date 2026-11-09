@@ -2,6 +2,7 @@
 // limit when proving `Send`, failing the fuzz CI job's `-D warnings` (rust-lang/rust#159228);
 // same class of fix as deps-cargo #745, deps-nuget #696, deps-swift #673, deps-composer.
 #![recursion_limit = "256"]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! The `deps-lsp` binary crate.
 //!

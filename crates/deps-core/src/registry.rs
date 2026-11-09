@@ -329,7 +329,7 @@ pub trait Registry: Send + Sync {
     /// except `deps-pypi`'s `PypiRegistry` (see that crate's own override).
     ///
     /// An implementor returning `true` must be paired with its owning
-    /// `Ecosystem::package_search_is_incomplete` also returning `true`: the client re-issuing a
+    /// `EcosystemBase::package_search_is_incomplete` also returning `true`: the client re-issuing a
     /// fresh search on the very next keystroke (and so discarding this response's rewritten
     /// `filter_text` rather than continuing to filter it locally forever) is what makes the
     /// rewrite in [`crate::completion::apply_raw_prefix_filter_text`] safe. This crate has no

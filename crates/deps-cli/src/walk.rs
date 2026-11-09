@@ -274,7 +274,7 @@ pub enum SymlinkPolicy {
 /// once with `ignore`'s default hidden-file filtering intact (so `.git` — a potentially huge
 /// tree in a real checkout, and never a source of manifests — is never even descended into,
 /// not merely filtered from the results), and once more per registered ecosystem's own
-/// dot-prefixed [`deps_core::Ecosystem::manifest_directory_patterns`] entry (`.github`,
+/// dot-prefixed [`deps_core::EcosystemBase::manifest_directory_patterns`] entry (`.github`,
 /// `.gitlab`, ...) with hidden-ness lifted for that one subtree specifically. This is derived
 /// from the live registry rather than a hardcoded `[".github", ".gitlab"]` list, so a future
 /// ecosystem introducing a new dot-directory pattern is picked up automatically.
@@ -567,7 +567,7 @@ impl DotDirs {
 }
 
 /// The dot-prefixed manifest filenames (`.gitlab-ci.yml`, ...) that at least one registered
-/// ecosystem's [`deps_core::Ecosystem::manifest_filenames`] names — the only hidden *files*
+/// ecosystem's [`deps_core::EcosystemBase::manifest_filenames`] names — the only hidden *files*
 /// a [`DotDirs::Skip`] walk admits. Derived from the live registry, never a literal list, so a
 /// future ecosystem with a hidden manifest name is picked up automatically (issue #1829).
 /// Cheap to clone: the set is shared behind an [`Arc`] for the `'static` `filter_entry` closure.
@@ -873,7 +873,7 @@ fn detect_ignored_manifests(
 }
 
 /// The set of top-level dot-directory names (`.github`, `.gitlab`, ...) that at least one
-/// registered ecosystem's [`deps_core::Ecosystem::manifest_directory_patterns`] names — the
+/// registered ecosystem's [`deps_core::EcosystemBase::manifest_directory_patterns`] names — the
 /// only dot-directories [`walk_with_limit`] walks with hidden-file filtering lifted. Derived
 /// from the live registry (not a hardcoded list) so a future ecosystem's own dot-directory
 /// pattern is picked up automatically; `.git` is never a match here, since no ecosystem's

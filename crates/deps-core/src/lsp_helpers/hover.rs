@@ -10,7 +10,7 @@ use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::{ScanOutcome, UpgradeStatus};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, GossipLowUsage, LicenseSource, PackageKey,
-    ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version,
+    ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, TypedParseResult, Version,
     VersionReq,
 };
 
@@ -22,11 +22,12 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
-    FetchContext, HOVER_RECENT_VERSIONS, HoverProvenance, InteractiveFetchRequest, LatestVerdict,
-    LookupMiss, SiblingMatchNote, VersionData, await_interactive_fetch, await_interactive_versions,
-    cooldown_precedence, escape_markdown, in_use_version, latest_verdict, markdown_code_span,
-    position_in_range, resolve_in_use_version, resolve_scan_outcome,
+    AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DependencyFormatter, DiagnosticMessages,
+    EcosystemFormatter, FetchContext, HOVER_RECENT_VERSIONS, HoverProvenance,
+    InteractiveFetchRequest, LatestVerdict, LookupMiss, SiblingMatchNote, VersionData,
+    await_interactive_fetch, await_interactive_versions, cooldown_precedence, escape_markdown,
+    in_use_version, latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
+    resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -75,19 +76,24 @@ pub const CMD_DOT_FOOTER: &str = "\n---\n⌨️ **Press `Cmd+.` to update versio
 
 /// Builds the hover response for the dependency under `position`, if any.
 ///
-/// Shared by every ecosystem's default [`crate::ecosystem::Ecosystem::generate_hover`]
+/// Shared by every ecosystem's default [`crate::TypedEcosystem::hover`]
 /// implementation: locates the dependency whose name or version range contains
 /// `position`, resolves its version data against `registry`, and renders the
 /// result through `formatter`. Returns `None` when no dependency covers the position.
-pub async fn generate_hover<R: Registry + ?Sized>(
-    parse_result: &dyn ParseResult,
+pub async fn generate_hover<R, P, F>(
+    parse_result: &P,
     position: Position,
     versions: VersionData<'_>,
     registry: &R,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
-) -> Option<Hover> {
+) -> Option<Hover>
+where
+    R: Registry + ?Sized,
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     let dep = find_hovered_dependency(parse_result, position)?;
 
     // A non-resolvable source (`CustomRegistry`, Git, Path) must skip the registry lookup —
@@ -283,11 +289,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     Some(markdown.finish(Some(dep.name_range())))
 }
 
-fn find_hovered_dependency(
-    parse_result: &dyn ParseResult,
+fn find_hovered_dependency<P: TypedParseResult>(
+    parse_result: &P,
     position: Position,
-) -> Option<&dyn Dependency> {
-    parse_result.dependencies().into_iter().find(|d| {
+) -> Option<&P::Dep> {
+    parse_result.own_dependencies().iter().find(|d| {
         // #905: `position_in_range` is inclusive on both ends, so without this guard hovering
         // the document's first character (a synthetic `name_range()`'s `Range::default()`
         // sentinel) would match whichever synthetic-range dependency lists first.
@@ -302,7 +308,7 @@ fn find_hovered_dependency(
         // non-empty `version_range()` (the alias-reference text) with `version_requirement()`
         // still `None`, and hovering it worked before #1161 — the zero-width check keeps that
         // working while still suppressing Maven's genuinely degenerate position.
-        let on_version = !super::version_range_is_synthetic_empty(*d)
+        let on_version = !super::version_range_is_synthetic_empty(*d as &dyn Dependency)
             && d.version_range()
                 .is_some_and(|r| position_in_range(position.into(), r));
         on_name || on_version
@@ -311,11 +317,11 @@ fn find_hovered_dependency(
 
 /// The version the "Current"/"Requirement" line shows: the manifest requirement when the
 /// ecosystem treats it as the resolved version, else the lock-file-resolved occurrence.
-fn current_version_text<'a>(
-    dep: &'a dyn Dependency,
+fn current_version_text<'a, F: DependencyFormatter>(
+    dep: &'a F::Dep,
     key: &PackageKey,
     versions: &VersionData<'a>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
 ) -> Option<&'a str> {
     if formatter.manifest_requirement_is_resolved_version(dep) {
         dep.version_requirement().map(VersionReq::as_str)
@@ -358,11 +364,15 @@ fn latest_cooldown_precedence(
 }
 
 /// The version-qualified OSV keys for the document, when an ecosystem is known.
-pub(super) fn vuln_keys_for(
-    parse_result: &dyn ParseResult,
+pub(super) fn vuln_keys_for<P, F>(
+    parse_result: &P,
     versions: &VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
-) -> Option<crate::osv::VulnKeys> {
+    formatter: &F,
+) -> Option<crate::osv::VulnKeys>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
@@ -515,11 +525,11 @@ async fn await_trust_and_gossip(
 }
 
 /// The inputs [`LicenseContext::resolve`] derives the hover's license section from.
-struct LicenseContext<'a, 'v> {
-    dep: &'a dyn Dependency,
+struct LicenseContext<'a, 'v, F: DependencyFormatter> {
+    dep: &'a F::Dep,
     key: &'a PackageKey,
     versions: &'a VersionData<'v>,
-    formatter: &'a dyn EcosystemFormatter,
+    formatter: &'a F,
     available: Option<&'a [Box<dyn Version>]>,
     trust_signal: Option<&'a SupplyChainTrustSignal>,
     manifest_resolved: Option<&'a str>,
@@ -534,7 +544,7 @@ struct HoverLicenses {
     is_detected: bool,
 }
 
-impl LicenseContext<'_, '_> {
+impl<F: DependencyFormatter> LicenseContext<'_, '_, F> {
     fn resolve(&self) -> HoverLicenses {
         // #204 (spec 010): resolved-version license first tries the already-fetched
         // `available` list, then falls back to `trust_signal`'s `licenses`
@@ -667,10 +677,10 @@ impl LicenseContext<'_, '_> {
 /// doc-test may call it directly. The spawned future captures only owned/`'static`
 /// data (`Arc<DepsDevClient>`, an owned `DepsDevTarget`, owned `String`s) so it satisfies
 /// `Send + 'static` with no borrow from `dep`.
-fn spawn_trust_signal_fetch(
-    dep: &dyn Dependency,
+fn spawn_trust_signal_fetch<F: DependencyFormatter>(
+    dep: &F::Dep,
     versions: &VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     key: &PackageKey,
 ) -> Option<tokio::task::JoinHandle<Option<SupplyChainTrustSignal>>> {
     versions.trust.and_then(|client| {
@@ -701,10 +711,10 @@ fn spawn_trust_signal_fetch(
 /// independently switchable — plus every gate [`spawn_trust_signal_fetch`] already applies
 /// (`network.offline` is not set, the source resolves against a public registry, the
 /// ecosystem is `deps_dev_system`-covered, and a concrete in-use version exists).
-fn spawn_gossip_low_usage_fetch(
-    dep: &dyn Dependency,
+fn spawn_gossip_low_usage_fetch<F: DependencyFormatter>(
+    dep: &F::Dep,
     versions: &VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     key: &PackageKey,
 ) -> Option<tokio::task::JoinHandle<Option<crate::GossipFindings>>> {
     versions.gossip_client.and_then(|client| {
@@ -760,7 +770,7 @@ fn push_header_hover_section(
 
 /// Appends the hover "Current"/"Requirement" line. `resolved` — already selecting
 /// between an ecosystem's resolved manifest requirement and the lockfile-resolved
-/// version, per [`crate::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`] —
+/// version, per [`crate::lsp_helpers::DependencyFormatter::manifest_requirement_is_resolved_version`] —
 /// wins over the bare manifest requirement when present.
 fn push_current_or_requirement_hover_section(
     markdown: &mut HoverMarkdown,
@@ -782,7 +792,7 @@ fn push_current_or_requirement_hover_section(
 }
 
 /// Appends the line explaining where a dependency's data comes from, when its formatter
-/// supplies one (see [`super::PackageRendering::hover_provenance`]).
+/// supplies one (see [`super::DependencyFormatter::hover_provenance`]).
 ///
 /// Every field is formatter- or registry-controlled text, so each goes through the
 /// bounded, escaped `push_code`.
@@ -1632,6 +1642,7 @@ fn push_license_hover_section(
 )]
 mod tests {
     use super::*;
+    use crate::ParseResult;
     use crate::RemovalStatus;
     use crate::deps_dev::DepsDevSystem;
     use crate::lsp_helpers::test_support::*;
@@ -2582,7 +2593,7 @@ mod tests {
             Position::new(0, 0).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2620,7 +2631,7 @@ mod tests {
             version_range.start.into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2658,7 +2669,7 @@ mod tests {
             version_range.start.into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5152,6 +5163,10 @@ mod tests {
 
     impl OsvNaming for NpmLikeFormatter {}
 
+    impl DependencyFormatter for NpmLikeFormatter {
+        type Dep = MockDep;
+    }
+
     /// T7 (S4, accepted redundancy): hover for a deprecated npm-shaped package renders
     /// **both** the new `### Deprecated` section (D6) and the pre-existing per-row
     /// `*(deprecated)*` "Recent versions" labels — pinning the deliberate decision not to
@@ -5237,7 +5252,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5267,7 +5282,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5657,7 +5672,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5705,7 +5720,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6760,7 +6775,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6937,7 +6952,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_network(crate::NetworkMode::Offline),
             &MockRegistry,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -7512,7 +7527,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Cargo)
                 .with_trust(&deps_dev),
             &registry,
-            &MOCK_WIDENED_RESOLVE_FORMATTER,
+            &MOCK_WIDENED_RESOLVE_FORMATTER.for_dependency(),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )

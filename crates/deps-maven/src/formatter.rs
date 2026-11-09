@@ -2,10 +2,11 @@
 
 use std::ops::Bound;
 
+use crate::types::MavenDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
-    bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::{
@@ -299,6 +300,10 @@ impl DiagnosticPolicy for MavenFormatter {}
 impl SourcePolicy for MavenFormatter {}
 
 impl OsvNaming for MavenFormatter {}
+
+impl DependencyFormatter for MavenFormatter {
+    type Dep = MavenDependency;
+}
 
 #[cfg(test)]
 mod tests {

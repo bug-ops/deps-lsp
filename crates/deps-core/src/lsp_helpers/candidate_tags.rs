@@ -108,7 +108,7 @@ pub struct CandidateSiblingsUnknown;
 
 /// Where a dependency's candidate versions get their sibling release tags from.
 ///
-/// Returned by [`super::RequirementResolution::candidate_tag_source`].
+/// Returned by [`super::DependencyFormatter::candidate_tag_source`].
 ///
 /// # Examples
 ///

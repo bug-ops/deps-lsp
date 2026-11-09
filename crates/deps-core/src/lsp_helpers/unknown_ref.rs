@@ -18,9 +18,9 @@ use super::{
 use crate::PackageName;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use crate::position::{Position, Range};
-use crate::{Dependency, ParseResult};
+use crate::{Dependency, TypedParseResult};
 
-use super::EcosystemFormatter;
+use super::DependencyFormatter;
 
 #[cfg(feature = "lsp-responses")]
 use super::{is_tag_shaped, single_file_edit};
@@ -135,15 +135,19 @@ pub fn unknown_ref_diagnostic_for(
 ///
 /// The shared first step of every per-position quick fix of a git-tags ecosystem.
 #[must_use]
-pub fn dependency_at_position<'a>(
-    parse_result: &'a dyn ParseResult,
+pub fn dependency_at_position<'a, P, F>(
+    parse_result: &'a P,
     position: Position,
-    formatter: &dyn EcosystemFormatter,
-) -> Option<&'a dyn Dependency> {
+    formatter: &F,
+) -> Option<&'a P::Dep>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     parse_result
-        .dependencies()
-        .into_iter()
-        .find(|dep| formatter.is_position_on_dependency(*dep, position))
+        .own_dependencies()
+        .iter()
+        .find(|dep| formatter.is_position_on_dependency(dep, position))
 }
 
 /// A tag pin together with the tag index that can speak for it.
@@ -253,7 +257,6 @@ impl<'a> UnknownRefTarget<'a> {
 ///     fn version_requirement(&self) -> Option<&VersionReq> { None }
 ///     fn version_range(&self) -> Option<Range> { None }
 ///     fn source(&self) -> DependencySource { DependencySource::Registry }
-///     fn as_any(&self) -> &dyn std::any::Any { self }
 /// }
 ///
 /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
@@ -372,9 +375,6 @@ mod tests {
         }
         fn source(&self) -> crate::parser::DependencySource {
             crate::parser::DependencySource::Registry
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 

@@ -1211,7 +1211,7 @@ fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, Chec
 
 /// Issue #1133 parity: `deps-cli check` must reach the same license-policy verdict as
 /// `deps-lsp` for the four tier-3 ecosystems (Dart, Swift, Gradle, Deno), whose license
-/// needs a dedicated [`deps_core::Ecosystem::fetch_license`] call beyond the registry's
+/// needs a dedicated [`deps_core::EcosystemBase::fetch_license`] call beyond the registry's
 /// hot-path version-list response. Before this fix, `deps-cli` silently never called it
 /// (spec 062 deviation #2), so a `license_policy` never fired for these ecosystems — a
 /// dependency with a real, denied license would pass `check` cleanly instead of failing it.
@@ -1517,54 +1517,8 @@ mod gossip_prefetch_wiring_regression {
     use deps_core::ecosystem::BoxFuture;
     use deps_core::ecosystem::private::Sealed;
     use deps_core::policy_config::{DiagnosticsConfig, GossipConfig};
-    use deps_core::{
-        Dependency, Ecosystem, EcosystemId, PackageName, ParseResult, Registry, VersionReq,
-    };
+    use deps_core::{Ecosystem, EcosystemBase, EcosystemId, Registry, TypedEcosystem};
     use deps_engine::test_util::{StubRegistry, TestTier3Ecosystem};
-    use std::any::Any;
-
-    struct StubDep {
-        name: PackageName,
-    }
-    impl Dependency for StubDep {
-        fn name(&self) -> &PackageName {
-            &self.name
-        }
-        fn name_range(&self) -> deps_core::position::Range {
-            deps_core::position::Range::default()
-        }
-        fn version_requirement(&self) -> Option<&VersionReq> {
-            None
-        }
-        fn version_range(&self) -> Option<deps_core::position::Range> {
-            None
-        }
-        fn source(&self) -> deps_core::parser::DependencySource {
-            deps_core::parser::DependencySource::Registry
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    struct StubParseResult {
-        dep: StubDep,
-        uri: url::Url,
-    }
-    impl ParseResult for StubParseResult {
-        fn dependencies(&self) -> Vec<&dyn Dependency> {
-            vec![&self.dep]
-        }
-        fn workspace_root(&self) -> Option<&std::path::Path> {
-            None
-        }
-        fn uri(&self) -> &url::Url {
-            &self.uri
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
 
     /// A GOSSIP-covered (`EcosystemId::Cargo`) `Ecosystem` double whose registry never
     /// touches the network (reuses [`StubRegistry`]). [`TestTier3Ecosystem`] can't stand in
@@ -1572,7 +1526,7 @@ mod gossip_prefetch_wiring_regression {
     /// six ecosystems deps.dev deliberately does *not* cover.
     struct CoveredEcosystem;
     impl Sealed for CoveredEcosystem {}
-    impl Ecosystem for CoveredEcosystem {
+    impl EcosystemBase for CoveredEcosystem {
         fn ecosystem_id(&self) -> EcosystemId {
             EcosystemId::Cargo
         }
@@ -1582,32 +1536,27 @@ mod gossip_prefetch_wiring_regression {
         fn manifest_filenames(&self) -> &[&'static str] {
             &[]
         }
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            uri: &'a url::Url,
-        ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
-            let uri = uri.clone();
-            Box::pin(async move {
-                Ok(Box::new(StubParseResult {
-                    dep: StubDep {
-                        name: PackageName::new("dep-0"),
-                    },
-                    uri,
-                }) as Box<dyn ParseResult>)
-            })
-        }
         fn registry(&self) -> Arc<dyn Registry> {
             Arc::new(StubRegistry)
-        }
-        fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
-            &deps_core::test_util::StubFormatter::DEFAULT
         }
         fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {
             None
         }
-        fn as_any(&self) -> &dyn Any {
-            self
+    }
+    impl TypedEcosystem for CoveredEcosystem {
+        type Parsed = deps_core::test_util::StubParseResult;
+        type Formatter = deps_core::test_util::StubFormatter;
+
+        fn own_formatter(&self) -> &Self::Formatter {
+            &deps_core::test_util::StubFormatter::DEFAULT
+        }
+
+        fn parse<'a>(
+            &'a self,
+            _content: &'a str,
+            _uri: &'a url::Url,
+        ) -> BoxFuture<'a, deps_core::Result<Self::Parsed>> {
+            Box::pin(async move { Ok(deps_core::test_util::stub_parse_result(1)) })
         }
     }
 

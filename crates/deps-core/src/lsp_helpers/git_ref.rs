@@ -17,9 +17,9 @@ use yaml_rust2::scanner::{Marker, TScalarStyle};
 #[cfg(feature = "lsp-responses")]
 use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 #[cfg(feature = "lsp-responses")]
-use super::{EcosystemFormatter, markdown_code_span, single_file_edit};
+use super::{DependencyFormatter, markdown_code_span, single_file_edit};
 #[cfg(feature = "lsp-responses")]
-use crate::{Dependency, ParseResult};
+use crate::TypedParseResult;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
@@ -1254,7 +1254,7 @@ impl TagIndex {
 }
 
 /// Whether a dependency's commit pin can be rewritten to a given release version, as returned
-/// by [`super::RequirementResolution::commit_rewrite_for`] (#1779).
+/// by [`super::DependencyFormatter::commit_rewrite_for`] (#1779).
 ///
 /// Exhaustive so each consumer decides what every state means: only
 /// [`Self::NoReleaseTag`] is proof that the fix version has no release tag.
@@ -2261,25 +2261,27 @@ pub struct ResolvedShaPin {
 /// `Latest`/`Partial` pin, resolved against a project's published releases) is out of this
 /// trait's scope and stays ecosystem-specific.
 #[cfg(feature = "lsp-responses")]
-pub trait ShaPinning: Send + Sync {
+pub trait ShaPinning: DependencyFormatter + Send + Sync {
     /// Attempts the static "pin to commit SHA" resolution for `dep`.
     ///
     /// Runs the eligibility check and `TagIndex` lookup in one step, since neither is
     /// meaningful without the other to this trait's callers.
     ///
-    /// Returns a [`ResolvedShaPin`] on success. `None` if `dep` is not this ecosystem's own
-    /// dependency type, is not a statically-pinnable occurrence (e.g. a mutable branch/SHA
-    /// ref, or a non-editable alias token), has no ref span to anchor an edit on, or the
-    /// `TagIndex` lookup misses (a registry fetch still in flight).
+    /// Returns a [`ResolvedShaPin`] on success. `None` if `dep` is not a statically-pinnable
+    /// occurrence (e.g. a mutable branch/SHA ref, or a non-editable alias token), has no ref
+    /// span to anchor an edit on, or the `TagIndex` lookup misses (a registry fetch still in
+    /// flight).
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{ResolvedShaPin, ShaPinning};
+    /// use deps_core::lsp_helpers::{
+    ///     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    ///     PackageRendering, RequirementResolution, ResolvedShaPin, ShaPinning, SourcePolicy,
+    /// };
     /// use deps_core::parser::DependencySource;
     /// use deps_core::position::Range;
-    /// use deps_core::{Dependency, PackageName, VersionReq};
-    /// use std::any::Any;
+    /// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
     ///
     /// struct MockDep {
     ///     name: PackageName,
@@ -2301,15 +2303,29 @@ pub trait ShaPinning: Send + Sync {
     ///     fn source(&self) -> DependencySource {
     ///         DependencySource::Registry
     ///     }
-    ///     fn as_any(&self) -> &dyn Any {
-    ///         self
-    ///     }
     /// }
     ///
     /// struct MockPinning;
+    /// # impl PackageNaming for MockPinning {}
+    /// # impl PackageRendering for MockPinning {
+    /// #     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+    /// #         version.to_string()
+    /// #     }
+    /// #     fn package_url(&self, name: &PackageName) -> String {
+    /// #         format!("https://example.com/{}", name.as_str())
+    /// #     }
+    /// # }
+    /// # impl RequirementResolution for MockPinning {}
+    /// # impl DiagnosticMessages for MockPinning {}
+    /// # impl DiagnosticPolicy for MockPinning {}
+    /// # impl SourcePolicy for MockPinning {}
+    /// # impl OsvNaming for MockPinning {}
+    /// impl DependencyFormatter for MockPinning {
+    ///     type Dep = MockDep;
+    /// }
     ///
     /// impl ShaPinning for MockPinning {
-    ///     fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
+    ///     fn resolve_static_sha_pin(&self, dep: &MockDep) -> Option<ResolvedShaPin> {
     ///         Some(ResolvedShaPin {
     ///             display_name: dep.name().as_str().to_string(),
     ///             version_range: dep.version_range()?,
@@ -2323,7 +2339,7 @@ pub trait ShaPinning: Send + Sync {
     /// assert_eq!(resolved.display_name, "owner/repo");
     /// assert_eq!(resolved.replacement.len(), 40);
     /// ```
-    fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin>;
+    fn resolve_static_sha_pin(&self, dep: &Self::Dep) -> Option<ResolvedShaPin>;
 }
 
 /// Maximum character count of the dependency name interpolated into
@@ -2342,28 +2358,33 @@ const MAX_SHA_PIN_TITLE_NAME_CHARS: usize = 128;
 /// The boilerplate `deps-github-actions`'s and `deps-gitlab-ci`'s own `build_sha_pin_action`
 /// functions each re-derived byte-for-byte before deps-lsp#1138 moved it here: locate the
 /// dependency at `position` through `formatter`'s shared
-/// [`PackageRendering::is_position_on_dependency`](super::PackageRendering::is_position_on_dependency)
+/// [`super::DependencyFormatter::is_position_on_dependency`]
 /// lookup, resolve it via [`ShaPinning::resolve_static_sha_pin`], and wrap the resulting edit
 /// into a `WorkspaceEdit`-carrying quickfix tagged with `diagnostic_code` so a client can
 /// later associate this action back to its diagnostic.
 ///
-/// Takes a single `formatter: &F` bound by both [`EcosystemFormatter`] and [`ShaPinning`]
-/// (review finding M4, #1138) rather than two separate parameters for the same value — every
-/// real implementor is one type that implements both traits, and a two-parameter signature
-/// let a caller pass mismatched formatters at the two call sites with no compile error.
+/// Takes a single `formatter: &F` bound by [`ShaPinning`] (review finding M4, #1138) rather
+/// than two separate parameters for the same value — every real implementor is one type, and
+/// a two-parameter signature let a caller pass mismatched formatters at the two call sites
+/// with no compile error. `F`'s dependency type must equal the parse result's, so a
+/// formatter of another ecosystem does not compile.
 #[cfg(feature = "lsp-responses")]
 #[must_use]
-pub fn build_sha_pin_action<F: EcosystemFormatter + ShaPinning>(
-    parse_result: &dyn ParseResult,
+pub fn build_sha_pin_action<P, F>(
+    parse_result: &P,
     position: Position,
     uri: &url::Url,
     formatter: &F,
     diagnostic_code: &'static str,
-) -> Option<CodeAction> {
+) -> Option<CodeAction>
+where
+    P: TypedParseResult,
+    F: ShaPinning<Dep = P::Dep>,
+{
     let dep = parse_result
-        .dependencies()
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+        .own_dependencies()
+        .iter()
+        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
     let resolved = formatter.resolve_static_sha_pin(dep)?;
     let changes = single_file_edit(uri, resolved.version_range, resolved.replacement);
     let display_name = super::diagnostics::sanitize_and_truncate_for_diagnostic(
@@ -2392,7 +2413,7 @@ pub fn build_sha_pin_action<F: EcosystemFormatter + ShaPinning>(
 /// `dedup_overlapping_edits` pass.
 #[cfg(feature = "lsp-responses")]
 #[must_use]
-pub fn sha_pin_text_edit(pinning: &impl ShaPinning, dep: &dyn Dependency) -> Option<TextEdit> {
+pub fn sha_pin_text_edit<F: ShaPinning>(pinning: &F, dep: &F::Dep) -> Option<TextEdit> {
     let resolved = pinning.resolve_static_sha_pin(dep)?;
     Some(TextEdit {
         range: resolved.version_range.into(),
@@ -4063,14 +4084,14 @@ mod tests {
 
         use crate::test_util::StubFormatter;
 
-        use crate::{PackageName, VersionReq};
+        use crate::{Dependency, PackageName, VersionReq};
 
         /// Resolves a dependency named `"resolvable"` to a fixed SHA; declines everything else
         /// — the minimal [`ShaPinning`] fixture these tests need, layered onto the shared
         /// [`MOCK_FORMATTER`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
         /// rather than hand-rolling a second formatter mock.
-        impl ShaPinning for StubFormatter {
-            fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
+        impl<D: Dependency + 'static> ShaPinning for StubFormatter<D> {
+            fn resolve_static_sha_pin(&self, dep: &D) -> Option<ResolvedShaPin> {
                 if dep.name().as_str() != "resolvable" {
                     return None;
                 }

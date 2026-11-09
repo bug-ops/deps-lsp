@@ -2,16 +2,14 @@
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
-use std::any::Any;
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 use crate::formatter::DartFormatter;
+use crate::parser::DartParseResult;
 use crate::registry::PubDevRegistry;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
@@ -28,7 +26,7 @@ use crate::registry::PubDevRegistry;
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['^', '>', '<', '='];
 
-/// [`Ecosystem`] implementation for Dart/Pub (`pubspec.yaml`).
+/// [`deps_core::Ecosystem`] implementation for Dart/Pub (`pubspec.yaml`).
 pub struct DartEcosystem {
     registry: Arc<PubDevRegistry>,
     formatter: DartFormatter,
@@ -70,7 +68,7 @@ impl DartEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for DartEcosystem {}
 
-impl Ecosystem for DartEcosystem {
+impl EcosystemBase for DartEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Dart
     }
@@ -87,42 +85,12 @@ impl Ecosystem for DartEcosystem {
         &["pubspec.lock"]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_pubspec_yaml(content, uri)?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
         Some(Arc::new(crate::lockfile::PubspecLockParser))
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_package_name<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        prefix: String,
-        range: Range,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn version_operator_chars(&self) -> &'static [char] {
-        VERSION_OPERATOR_CHARS
     }
 
     fn fallback_completion_prefix<'a>(
@@ -146,10 +114,6 @@ impl Ecosystem for DartEcosystem {
         Some(format!("\"{}\": ^{latest}", name.as_str()))
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Fetches `name`'s best-effort detected license (issue #660/#688) — `version` is
     /// unused, since pub.dev's `/score` endpoint is per-*package*, not per-version. See
     /// [`crate::registry::PubDevRegistry::get_license`] for the source and its
@@ -166,6 +130,38 @@ impl Ecosystem for DartEcosystem {
     /// author-declared registry field — see [`deps_core::LicenseSource::DetectedSpdx`].
     fn license_source(&self) -> deps_core::LicenseSource {
         deps_core::LicenseSource::DetectedSpdx
+    }
+}
+
+impl TypedEcosystem for DartEcosystem {
+    type Parsed = DartParseResult;
+    type Formatter = DartFormatter;
+
+    fn own_formatter(&self) -> &DartFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<DartParseResult>> {
+        Box::pin(async move { crate::parser::parse_pubspec_yaml(content, uri) })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_package_name<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, DartParseResult>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 }
 
@@ -215,6 +211,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "lsp-responses")]
     use deps_core::NormalizedName;
+    #[cfg(test)]
+    use std::any::Any;
 
     /// #1687 e2e: a `pubspec.lock`-resolved `0.8.13+1` against pub.dev latest `0.8.13+23`
     /// must render as outdated, not up to date.
@@ -222,14 +220,14 @@ mod tests {
     #[tokio::test]
     async fn test_inlay_hint_lock_resolved_older_build_revision_is_outdated() {
         use deps_core::lsp_helpers::VersionData;
-        use deps_core::{EcosystemConfig, PackageVersions};
+        use deps_core::{EcosystemConfig, PackageVersions, ParsedView};
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::InlayHintLabel;
 
         let ecosystem = DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         let content = "name: app\ndependencies:\n  image_picker_android: ^0.8.0\n";
         let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let parse_result = ecosystem.parse(content, &uri).await.unwrap();
 
         let mut cached = HashMap::new();
         cached.insert(
@@ -243,8 +241,8 @@ mod tests {
         );
 
         let hints = ecosystem
-            .generate_inlay_hints(
-                parse_result.as_ref(),
+            .inlay_hints(
+                ParsedView::new(&parse_result),
                 VersionData::new(&cached, &resolved),
                 deps_core::LoadingState::Loaded,
                 &EcosystemConfig::default(),
@@ -270,7 +268,8 @@ mod tests {
         fallback: &str,
         available: &[&str],
     ) -> deps_core::lsp_helpers::FallbackEditVerdict {
-        let ecosystem = DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(DartEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = "name: app\ndependencies:\n  pkg: ^0.9.0\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
         deps_core::test_util::fallback_edit_outcome(
@@ -364,8 +363,8 @@ dependencies:
         let path = "/test/pubspec.yaml";
         let uri = Url::from_file_path(path).unwrap();
 
-        let result = eco.parse_manifest(yaml, &uri).await.unwrap();
-        assert_eq!(result.dependencies().len(), 1);
+        let result = eco.parse(yaml, &uri).await.unwrap();
+        assert_eq!(result.dependencies.len(), 1);
     }
 
     #[test]
@@ -427,6 +426,7 @@ dependencies:
     mod lsp_tests {
         use super::*;
 
+        use deps_core::ParsedView;
         use tower_lsp_server::ls_types::Position;
 
         deps_core::complete_versions_test_shim!(DartEcosystem);
@@ -490,14 +490,11 @@ dependencies:
             let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
             let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let position = Position::new(2, 4); // cursor after "ht" in "http"
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
 
             match context {
                 deps_core::completion::CompletionContext::PackageName { prefix, range } => {
@@ -534,22 +531,19 @@ dependencies:
             let eco = DartEcosystem::new(cache);
             let content = "name: my_app\ndependencies:\n  h: ^1.0.0\n";
             let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let position = Position::new(2, 3); // cursor right after "h"
             let freshness = deps_core::FreshnessSettings::default();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
             else {
                 panic!("expected PackageName context, got {context:?}");
             };
             let direct = eco.complete_package_names(&prefix, range).await;
             let via_dispatch = eco
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(direct.is_empty());
@@ -561,10 +555,10 @@ dependencies:
             let eco = DartEcosystem::new(cache);
             let content = "name: my_app\n";
             let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 0),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -601,27 +595,24 @@ dependencies:
             let content =
                 "name: my_app\ndependencies:\n  this_package_does_not_exist_12345: ^1.0.0\n";
             let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let position: Position = parse_result.dependencies()[0]
-                .version_range()
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies[0]
+                .version_range
                 .unwrap()
                 .start
                 .into();
             let freshness = deps_core::FreshnessSettings::default();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
                 panic!("expected Version context, got {context:?}");
             };
             let direct = eco
-                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .complete_versions(&parse_result, position, &prefix, freshness)
                 .await;
             let via_dispatch = eco
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             mock.assert_async().await;
             assert_eq!(via_dispatch.items, direct);
@@ -639,27 +630,24 @@ dependencies:
             let eco = DartEcosystem::new(cache);
             let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
             let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let position: Position = parse_result.dependencies()[0]
-                .version_range()
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies[0]
+                .version_range
                 .unwrap()
                 .start
                 .into();
             let freshness = deps_core::FreshnessSettings::default();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
                 panic!("expected Version context, got {context:?}");
             };
             let direct = eco
-                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .complete_versions(&parse_result, position, &prefix, freshness)
                 .await;
             let via_dispatch = eco
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(!direct.is_empty());

@@ -294,7 +294,7 @@ pub fn format_relative_age(age_secs: u64) -> String {
 /// A `Copy` DTO so it can be snapshotted from `deps-lsp`'s
 /// `Arc<RwLock<DepsConfig>>` before an `.await` point (matching the existing
 /// `CacheConfig` snapshot-before-await pattern) and passed by value into
-/// `Ecosystem::generate_hover`/`generate_diagnostics`, without holding the
+/// `ParsedManifest::generate_hover`/`generate_diagnostics`, without holding the
 /// config lock across the call.
 ///
 /// # Examples

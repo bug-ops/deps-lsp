@@ -1,13 +1,11 @@
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     compile_requirement_unless,
 };
 use deps_core::osv::NonPublicRoute;
 use deps_core::parser::DependencySource;
-use deps_core::{
-    ConcreteVersion, Dependency, InvalidPackageName, NarrowDependency, OwnDependency, PackageName,
-};
+use deps_core::{ConcreteVersion, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
 
@@ -60,10 +58,6 @@ impl RequirementMatcher for ExactMatcher {
 /// - Pseudo-versions (v0.0.0-20191109021931-daa7c04131f5)
 /// - +incompatible suffix for v2+ modules without /v2 path
 pub struct GoFormatter;
-
-impl OwnDependency for GoFormatter {
-    type Dep = GoDependency;
-}
 
 impl PackageNaming for GoFormatter {
     /// Reuses `crate::registry::validate_module_path` — the same structural rule that
@@ -148,24 +142,6 @@ impl RequirementResolution for GoFormatter {
             ExactMatcher,
         )
     }
-
-    fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
-        // go.mod's `require` line is already the module version selected by
-        // Go's MVS, never a range — unlike Cargo/npm. go.sum, by contrast,
-        // only ever gets appended to (`go get`/`go build`; only
-        // `go mod tidy` prunes it), so a stale higher version left over from
-        // a downgrade can still be recorded there and win naive
-        // last-occurrence-wins parsing (#235).
-        //
-        // Restricted to `GoDirective::Require`: `exclude`/`replace`
-        // directives are also surfaced as dependencies, but their
-        // `version_requirement()` is not an in-use version (the excluded
-        // version, or the replaced-from version) — treating those as
-        // resolved would fabricate a "current version" claim for a
-        // dependency that isn't actually pinned there (#235 review).
-        self.own_dependency(dep)
-            .is_some_and(|go_dep| go_dep.directive == GoDirective::Require)
-    }
 }
 
 impl DiagnosticMessages for GoFormatter {}
@@ -203,19 +179,6 @@ impl SourcePolicy for GoFormatter {
 }
 
 impl OsvNaming for GoFormatter {
-    /// A fail-closed `CustomRegistry` (every `GOPROXY` hop rejected) is an unverified route
-    /// to public modules and is reported; the `GOPRIVATE` bypass and `GOSUMDB=off`/`GONOSUMDB`
-    /// chains are user-declared "do not verify" routes and stay silent (#1917). A
-    /// `GONOSUMDB`-only module with every hop rejected is still `CustomRegistry`, because
-    /// routing fails closed before the checksum-database check, so it is reported too.
-    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        if matches!(dep.source(), DependencySource::CustomRegistry { .. }) {
-            NonPublicRoute::UnverifiedMirror
-        } else {
-            NonPublicRoute::Private
-        }
-    }
-
     fn osv_version_to_native(&self, version: &deps_core::osv::OsvVersion) -> ConcreteVersion {
         // OSV's `fixed` events for Go are plain semver (`0.3.7`), never
         // carrying the `v` prefix Go module versions require in go.mod.
@@ -233,6 +196,40 @@ impl OsvNaming for GoFormatter {
         // matching forbids it — strip it before sending on the wire.
         let version = version.as_str();
         deps_core::osv::OsvVersion::new(version.strip_prefix('v').unwrap_or(version))
+    }
+}
+
+impl DependencyFormatter for GoFormatter {
+    type Dep = GoDependency;
+
+    fn manifest_requirement_is_resolved_version(&self, dep: &GoDependency) -> bool {
+        // go.mod's `require` line is already the module version selected by
+        // Go's MVS, never a range — unlike Cargo/npm. go.sum, by contrast,
+        // only ever gets appended to (`go get`/`go build`; only
+        // `go mod tidy` prunes it), so a stale higher version left over from
+        // a downgrade can still be recorded there and win naive
+        // last-occurrence-wins parsing (#235).
+        //
+        // Restricted to `GoDirective::Require`: `exclude`/`replace`
+        // directives are also surfaced as dependencies, but their
+        // `version_requirement()` is not an in-use version (the excluded
+        // version, or the replaced-from version) — treating those as
+        // resolved would fabricate a "current version" claim for a
+        // dependency that isn't actually pinned there (#235 review).
+        dep.directive == GoDirective::Require
+    }
+
+    /// A fail-closed `CustomRegistry` (every `GOPROXY` hop rejected) is an unverified route
+    /// to public modules and is reported; the `GOPRIVATE` bypass and `GOSUMDB=off`/`GONOSUMDB`
+    /// chains are user-declared "do not verify" routes and stay silent (#1917). A
+    /// `GONOSUMDB`-only module with every hop rejected is still `CustomRegistry`, because
+    /// routing fails closed before the checksum-database check, so it is reported too.
+    fn non_public_route(&self, dep: &GoDependency) -> NonPublicRoute {
+        if matches!(dep.source, DependencySource::CustomRegistry { .. }) {
+            NonPublicRoute::UnverifiedMirror
+        } else {
+            NonPublicRoute::Private
+        }
     }
 }
 

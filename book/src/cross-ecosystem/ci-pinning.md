@@ -74,7 +74,7 @@ SHA` (GitHub Actions: `Pin N actions to commit SHA`; GitLab CI: `Pin N refs to c
 SHA`). Clicking it rewrites every such pin in one batch edit — the bulk counterpart of
 the per-position "Pin `<name>` to commit SHA" quickfix each ecosystem already offers.
 The lens/command itself is a shared `deps-lsp`/`deps-core` mechanism
-(`Ecosystem::collect_pin_all_to_sha_edits`); an ecosystem with no mutable-ref pin concept
+(`ParsedManifest::collect_pin_all_to_sha_edits`, backed by `TypedEcosystem::pin_all_to_sha_edits`); an ecosystem with no mutable-ref pin concept
 simply never shows it.
 
 **GitHub Actions:** reuses the exact same `TagIndex` lookup the per-step quickfix uses

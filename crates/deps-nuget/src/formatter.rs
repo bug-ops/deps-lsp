@@ -2,16 +2,13 @@
 
 use crate::types::{NuGetDependency, NuGetFeedRoute};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
-    bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::osv::NonPublicRoute;
-use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
-    PackageName,
-};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -60,10 +57,6 @@ impl RequirementMatcher for NuGetMatcher {
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for NuGet.
 pub struct NuGetFormatter;
-
-impl OwnDependency for NuGetFormatter {
-    type Dep = NuGetDependency;
-}
 
 impl PackageNaming for NuGetFormatter {
     /// Lints `name` against NuGet's own `PackageIdValidator` rule (see
@@ -344,15 +337,16 @@ impl SourcePolicy for NuGetFormatter {
     }
 }
 
-impl OsvNaming for NuGetFormatter {
+impl OsvNaming for NuGetFormatter {}
+
+impl DependencyFormatter for NuGetFormatter {
+    type Dep = NuGetDependency;
+
     /// A dependency on a plain feed chain that dropped nuget.org (`<clear/>` or
     /// `<remove key="nuget.org"/>`) is an unverified mirror; chains that still reach nuget.org
     /// and `<packageSourceMapping>` groups stay silent (#1947).
-    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        let route = self
-            .own_dependency(dep)
-            .and_then(NuGetDependency::feed_route);
-        match route {
+    fn non_public_route(&self, dep: &NuGetDependency) -> NonPublicRoute {
+        match dep.feed_route() {
             Some(NuGetFeedRoute::ReplacesPublic) => NonPublicRoute::UnverifiedMirror,
             Some(NuGetFeedRoute::SupplementsPublic | NuGetFeedRoute::Mapped) | None => {
                 NonPublicRoute::Private
@@ -364,6 +358,7 @@ impl OsvNaming for NuGetFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::Dependency;
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
@@ -799,7 +794,6 @@ mod tests {
     /// the real formatter, independent of that caller-level gate.
     #[test]
     fn test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -808,8 +802,7 @@ mod tests {
         let xml = r#"<Project><ItemGroup><PackageReference Include="AutoMapper" Version="$(AutoMapperVersion)" /></ItemGroup></Project>"#;
         let uri = deps_core::test_util::test_uri("/test/real.csproj");
         let result = crate::parser::parse_project_file(xml, &uri).expect("valid xml");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         assert!(
             dep.version_requirement().is_none(),
             "sanity check: parser must degrade $(...) to None"
@@ -830,7 +823,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             "$(AutoMapperVersion)",
             &dv,
@@ -1015,7 +1008,6 @@ mod tests {
     /// generic-template detector.
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -1024,8 +1016,7 @@ mod tests {
         let xml = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="{{ nj_version }}" /></ItemGroup></Project>"#;
         let uri = deps_core::test_util::test_uri("/test/generic-placeholder.csproj");
         let result = crate::parser::parse_project_file(xml, &uri).expect("valid xml");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("parser preserves the raw templated version text")
@@ -1047,7 +1038,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             current,
             &dv,

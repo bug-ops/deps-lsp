@@ -6,6 +6,7 @@
 // warnings` (rust-lang/rust#159228). Same class of fix as deps-cargo (#745), deps-nuget
 // (#696), deps-swift (#673), deps-composer, and deps-lsp (issue #1058, this module's origin).
 #![recursion_limit = "256"]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! The workspace's composition root.
 //!

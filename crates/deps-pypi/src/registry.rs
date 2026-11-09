@@ -323,7 +323,7 @@ impl PypiRegistry {
     /// declaring different `--extra-index-url` combinations against the same primary could
     /// exhaust it faster than a simpler one-registration-per-URL model.
     ///
-    /// Called only from `PypiEcosystem::parse_manifest` over
+    /// Called only from `PypiEcosystem::parse` over
     /// `PypiIndexConfig::resolved_chains()`, at parse time only. Takes `root: &Arc<Self>` as a
     /// plain parameter rather than `&self` (fixes N1, second critic pass) — `self: &Arc<Self>`
     /// receivers are unstable, and building the implicit-public final hop needs an owned
@@ -590,7 +590,7 @@ impl PypiRegistry {
     /// life of the process — there is no TTL (see `crate::search`'s module doc for
     /// why). Because the result set can be a truncated view of a much larger match
     /// set, callers should treat every result (empty or not) as incomplete;
-    /// `PypiEcosystem::generate_completions` does this by reporting
+    /// `PypiEcosystem::completions` does this by reporting
     /// [`deps_core::completion::Completions::is_incomplete`] for the `PackageName`
     /// completion context this method backs.
     ///

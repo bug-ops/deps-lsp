@@ -67,10 +67,6 @@ impl deps_core::Dependency for {Ecosystem}Dependency {
     fn source(&self) -> DependencySource {
         self.source
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 impl deps_core::Version for {Ecosystem}Version {

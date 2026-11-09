@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, ecosystem crates**: `Ecosystem` is split into `EcosystemBase` and `TypedEcosystem`; `Ecosystem` is erased and blanket-only (#TBD)
+- **deps-core**: new `ParsedManifest`, `DependencyFormatter` and `FormattedDependency` replace dyn dependency formatting and helpers (#TBD)
+- **deps-core**: `as_any` is removed from `Ecosystem`, `ParseResult` and `Dependency`, along with the Own/Narrow traits and `cap_dependencies` (#TBD)
+- **deps-core**: `parse_manifest_blocking`/`parse_manifest_now` return `Box<dyn ParsedManifest>`; `EcosystemReparse::ecosystem` is `&Arc<dyn Ecosystem>` (#TBD)
+- **deps-engine, deps-lsp**: classification and probe entry points take `&dyn ParsedManifest`; `parse_result_arc` becomes `manifest_arc` (#TBD)
+- **workspace**: clippy bans `Registry`/`Version`/`Metadata::as_any` outside tests (#TBD)
 - **deps-cli, deps-core**: `deps-cli check` exits 1 when the OSV query fails or times out and `vulnerable` is in `--fail-on` (including the default), and `CoverageGap` gains `QueryFailed` (#1976)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: `unknown_ref_diagnostics` is generic over the dependency type and takes typed dependencies (#1974)
 - **deps-core**: `format_version_replacing_by_shape` takes a `RewriteTarget` argument (#1961)

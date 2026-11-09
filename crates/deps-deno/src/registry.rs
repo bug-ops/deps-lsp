@@ -525,8 +525,8 @@ impl DenoRegistry {
 
     /// Registers an `.npmrc`-resolved alternate registry index (#1227) on this facade's
     /// shared `npm:` half, mirroring [`NpmRegistry::register_alternate`]. `npm` is a private
-    /// field, so this passthrough is the only way `DenoEcosystem::parse_manifest` can reach
-    /// it — the `deno.json` equivalent of `NpmEcosystem::parse_manifest`'s own registration
+    /// field, so this passthrough is the only way `DenoEcosystem::parse` can reach
+    /// it — the `deno.json` equivalent of `NpmEcosystem::parse`'s own registration
     /// loop over `NpmParseResult::resolved_registries`.
     pub fn register_alternate_npm(&self, index: deps_npm::config::DeclaredNpmRegistry) {
         self.npm.register_alternate(index);

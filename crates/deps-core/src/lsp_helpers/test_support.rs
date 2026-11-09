@@ -9,16 +9,18 @@
 
 use super::*;
 use crate::{
-    ConcreteVersion, Dependency, InvalidPackageName, PackageName, ParseResult, VersionReq,
+    ConcreteVersion, Dependency, InvalidPackageName, PackageName, ParseResult, TypedParseResult,
+    VersionReq,
 };
-use std::any::Any;
 
 pub(crate) fn pkg(s: &str) -> PackageName {
     PackageName::new(s)
 }
 
-pub(crate) const MOCK_FORMATTER: crate::test_util::StubFormatter =
-    crate::test_util::StubFormatter::new().with_quoted_text_edit();
+pub(crate) const MOCK_FORMATTER: crate::test_util::StubFormatter<MockDep> =
+    crate::test_util::StubFormatter::new()
+        .with_quoted_text_edit()
+        .for_dependency();
 
 /// Formatter stub that always reports `Unresolved`, mirroring `MavenFormatter` /
 /// `GradleFormatter`'s override for `${property}` / `$var` requirements.
@@ -128,8 +130,12 @@ impl ParseResult for MockParseResult {
     fn uri(&self) -> &url::Url {
         &self.uri
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl TypedParseResult for MockParseResult {
+    type Dep = MockDep;
+    fn own_dependencies(&self) -> &[MockDep] {
+        &self.deps
     }
 }
 
@@ -151,8 +157,50 @@ impl ParseResult for MockMixedParseResult {
     fn uri(&self) -> &url::Url {
         &self.uri
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl TypedParseResult for MockMixedParseResult {
+    type Dep = Box<dyn Dependency>;
+    fn own_dependencies(&self) -> &[Box<dyn Dependency>] {
+        &self.deps
+    }
+}
+
+/// Lets a heterogeneous document be its own typed dependency: every method, including the
+/// provided ones, forwards to the boxed dependency.
+impl Dependency for Box<dyn Dependency> {
+    fn name(&self) -> &PackageName {
+        self.as_ref().name()
+    }
+    fn name_range(&self) -> crate::position::Range {
+        self.as_ref().name_range()
+    }
+    fn version_requirement(&self) -> Option<&VersionReq> {
+        self.as_ref().version_requirement()
+    }
+    fn version_range(&self) -> Option<crate::position::Range> {
+        self.as_ref().version_range()
+    }
+    fn source(&self) -> crate::parser::DependencySource {
+        self.as_ref().source()
+    }
+    fn features(&self) -> &[String] {
+        self.as_ref().features()
+    }
+    fn features_range(&self) -> Option<crate::position::Range> {
+        self.as_ref().features_range()
+    }
+    fn markers(&self) -> Option<&str> {
+        self.as_ref().markers()
+    }
+    fn markers_range(&self) -> Option<crate::position::Range> {
+        self.as_ref().markers_range()
+    }
+    fn version_literal(&self) -> Option<&str> {
+        self.as_ref().version_literal()
+    }
+    fn name_range_is_synthetic(&self) -> bool {
+        self.as_ref().name_range_is_synthetic()
     }
 }
 
@@ -179,9 +227,6 @@ impl Dependency for MockDep {
     fn source(&self) -> crate::parser::DependencySource {
         crate::parser::DependencySource::Registry
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A [`MockDep`] reporting a caller-chosen [`crate::parser::DependencySource`].
@@ -205,9 +250,6 @@ impl Dependency for MockSourcedDep {
     }
     fn source(&self) -> crate::parser::DependencySource {
         self.source.clone()
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -241,9 +283,6 @@ impl Dependency for MockSyntheticRangeDep {
     fn name_range_is_synthetic(&self) -> bool {
         true
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A dependency with a real `name_range()` and a real, non-default `version_range()`, but no
@@ -275,9 +314,6 @@ impl Dependency for MockNoRequirementDep {
     fn source(&self) -> crate::parser::DependencySource {
         crate::parser::DependencySource::Registry
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 pub(crate) struct MockMarkedDep {
@@ -305,9 +341,6 @@ impl Dependency for MockMarkedDep {
     fn markers(&self) -> Option<&str> {
         self.markers.as_deref()
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 pub(crate) struct MockMarkedParseResult {
@@ -324,9 +357,6 @@ impl ParseResult for MockMarkedParseResult {
     }
     fn uri(&self) -> &url::Url {
         &self.uri
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -378,9 +408,6 @@ impl Dependency for NonRegistryDep {
     fn source(&self) -> crate::parser::DependencySource {
         self.1.clone()
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// `ParseResult` holding exactly one dependency of any concrete `Dependency`
@@ -400,8 +427,12 @@ impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
     fn uri(&self) -> &url::Url {
         &self.uri
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl<D: Dependency + 'static> TypedParseResult for SingleDepParseResult<D> {
+    type Dep = D;
+    fn own_dependencies(&self) -> &[D] {
+        std::slice::from_ref(&self.dep)
     }
 }
 
@@ -485,3 +516,95 @@ impl DiagnosticPolicy for StrictSemverFormatter {}
 impl SourcePolicy for StrictSemverFormatter {}
 
 impl OsvNaming for StrictSemverFormatter {}
+
+impl TypedParseResult for MockMarkedParseResult {
+    type Dep = MockMarkedDep;
+    fn own_dependencies(&self) -> &[MockMarkedDep] {
+        std::slice::from_ref(&self.dep)
+    }
+}
+
+macro_rules! mock_dependency_formatter {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl DependencyFormatter for $ty {
+            type Dep = MockDep;
+        })+
+    };
+}
+
+mock_dependency_formatter!(
+    MockUnresolvedFormatter,
+    MockBuildAwareFormatter,
+    RejectingFormatter,
+    ExactMatchFormatter,
+    StrictSemverFormatter,
+);
+
+/// [`ExactMatchFormatter`] paired with [`NonRegistryDep`].
+pub(crate) struct NonRegistryExactFormatter;
+
+impl PackageNaming for NonRegistryExactFormatter {}
+
+impl PackageRendering for NonRegistryExactFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        format!("https://example.com/{}", name.as_str())
+    }
+}
+
+impl RequirementResolution for NonRegistryExactFormatter {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+    }
+}
+
+impl DiagnosticMessages for NonRegistryExactFormatter {}
+
+impl DiagnosticPolicy for NonRegistryExactFormatter {}
+
+impl SourcePolicy for NonRegistryExactFormatter {}
+
+impl OsvNaming for NonRegistryExactFormatter {}
+
+impl DependencyFormatter for NonRegistryExactFormatter {
+    type Dep = NonRegistryDep;
+}
+
+/// [`RejectingFormatter`] paired with [`NonRegistryDep`].
+pub(crate) struct NonRegistryRejectingFormatter;
+
+impl PackageNaming for NonRegistryRejectingFormatter {
+    fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
+        Err(InvalidPackageName::new("name is rejected for testing"))
+    }
+}
+
+impl PackageRendering for NonRegistryRejectingFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        format!("https://example.com/{}", name.as_str())
+    }
+}
+
+impl RequirementResolution for NonRegistryRejectingFormatter {}
+
+impl DiagnosticMessages for NonRegistryRejectingFormatter {}
+
+impl DiagnosticPolicy for NonRegistryRejectingFormatter {}
+
+impl SourcePolicy for NonRegistryRejectingFormatter {}
+
+impl OsvNaming for NonRegistryRejectingFormatter {}
+
+impl DependencyFormatter for NonRegistryRejectingFormatter {
+    type Dep = NonRegistryDep;
+}

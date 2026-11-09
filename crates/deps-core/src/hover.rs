@@ -2,7 +2,7 @@
 //!
 //! [`Hover`](crate::hover::Hover) is the domain-level replacement for
 //! `tower_lsp_server::ls_types::Hover` in [`crate::lsp_helpers::generate_hover`]'s and
-//! [`crate::ecosystem::Ecosystem::generate_hover`]'s return value: `deps-lsp` only ever
+//! [`crate::ecosystem::ParsedManifest::generate_hover`]'s return value: `deps-lsp` only ever
 //! produces `HoverContents::Markup(MarkupKind::Markdown)`, so this type collapses that
 //! 3-variant enum to a single markdown string and lets [`MarkupKind::Markdown`] become an
 //! implementation detail of the `deps-lsp`-side conversion

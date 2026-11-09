@@ -1,14 +1,16 @@
 //! Version formatting for Dart ecosystem.
 
+use crate::types::DartDependency;
 use crate::version::{version_matches_constraint, version_matches_normalized_constraint};
 use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, bare_meaning, format_version_replacing_by_shape,
+    BoundedVersionReq, BuildMetadataPolicy, DependencyFormatter, DiagnosticMessages,
+    DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering, RequirementMatcher,
+    RequirementResolution, RewriteTarget, SourcePolicy, bare_meaning,
+    format_version_replacing_by_shape,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -66,6 +68,10 @@ impl PackageNaming for DartFormatter {
         }
         Ok(())
     }
+}
+
+impl DependencyFormatter for DartFormatter {
+    type Dep = DartDependency;
 }
 
 impl PackageRendering for DartFormatter {

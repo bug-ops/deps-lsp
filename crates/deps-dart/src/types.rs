@@ -173,10 +173,6 @@ impl deps_core::Dependency for DartDependency {
     fn name_range_is_synthetic(&self) -> bool {
         self.name_range_is_synthetic
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 #[cfg(test)]
@@ -238,7 +234,6 @@ mod tests {
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some("^8.1.0")
         );
-        assert!(dep.as_any().is::<DartDependency>());
     }
 
     #[test]

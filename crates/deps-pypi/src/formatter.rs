@@ -5,11 +5,10 @@ use deps_core::InvalidPackageName;
 use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 };
 use deps_core::osv::{NonPublicRoute, OsvPackageName};
-use deps_core::{NarrowDependency, OwnDependency};
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
@@ -45,10 +44,6 @@ impl RequirementMatcher for Pep440Matcher {
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for PyPI.
 pub struct PypiFormatter;
-
-impl OwnDependency for PypiFormatter {
-    type Dep = PypiDependency;
-}
 
 impl PackageNaming for PypiFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
@@ -155,27 +150,6 @@ impl PackageRendering for PypiFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
-
-    fn is_position_on_dependency(
-        &self,
-        dep: &dyn Dependency,
-        position: deps_core::position::Position,
-    ) -> bool {
-        let name_range = dep.name_range();
-
-        if position.line != name_range.start.line {
-            return false;
-        }
-
-        let end_char = dep
-            .version_range()
-            .map_or(name_range.end.character, |r| r.end.character);
-
-        let start_char = name_range.start.character.saturating_sub(2);
-        let end_char = end_char.saturating_add(2);
-
-        position.character >= start_char && position.character <= end_char
-    }
 }
 
 impl RequirementResolution for PypiFormatter {
@@ -270,15 +244,37 @@ impl SourcePolicy for PypiFormatter {
     }
 }
 
-impl OsvNaming for PypiFormatter {
+impl OsvNaming for PypiFormatter {}
+
+impl DependencyFormatter for PypiFormatter {
+    type Dep = PypiDependency;
+
+    fn is_position_on_dependency(
+        &self,
+        dep: &PypiDependency,
+        position: deps_core::position::Position,
+    ) -> bool {
+        let name_range = dep.name_range();
+
+        if position.line != name_range.start.line {
+            return false;
+        }
+
+        let end_char = dep
+            .version_range()
+            .map_or(name_range.end.character, |r| r.end.character);
+
+        let start_char = name_range.start.character.saturating_sub(2);
+        let end_char = end_char.saturating_add(2);
+
+        position.character >= start_char && position.character <= end_char
+    }
+
     /// A dependency whose primary `index-url` or uv `default` index replaces public PyPI is an
     /// unverified mirror; extras, public-containing chains and named sources stay silent
     /// (#1947).
-    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        let route = self
-            .own_dependency(dep)
-            .and_then(PypiDependency::index_route);
-        match route {
+    fn non_public_route(&self, dep: &PypiDependency) -> NonPublicRoute {
+        match dep.index_route() {
             Some(PypiIndexRoute::ReplacesPublic) => NonPublicRoute::UnverifiedMirror,
             Some(PypiIndexRoute::SupplementsPublic | PypiIndexRoute::NamedSource) | None => {
                 NonPublicRoute::Private
@@ -296,7 +292,7 @@ impl OsvNaming for PypiFormatter {
     /// `None` for a name that fails PEP 508 validation (a separator-only Poetry key such as
     /// `---` would normalize to an empty string): OSV rejects an empty query name and fails
     /// the whole batch with it, silently dropping every sibling dependency's advisories.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
+    fn osv_package_name(&self, dep: &PypiDependency) -> Option<OsvPackageName> {
         self.validate_package_name(dep.name().as_str()).ok()?;
         OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()).into_string())
     }
@@ -638,116 +634,100 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     mod is_position_on_dependency_tests {
         use super::*;
-        use deps_core::parser::DependencySource;
         use deps_core::position::{Position as DomainPosition, Range};
-        use std::any::Any;
         use tower_lsp_server::ls_types::Position;
 
-        struct MockDep {
-            name_range: Range,
-            version_range: Option<Range>,
-        }
-
-        impl deps_core::Dependency for MockDep {
-            fn name(&self) -> &deps_core::PackageName {
-                static NAME: std::sync::LazyLock<deps_core::PackageName> =
-                    std::sync::LazyLock::new(|| deps_core::PackageName::new("test-package"));
-                &NAME
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-                static VERSION_REQ: std::sync::LazyLock<deps_core::VersionReq> =
-                    std::sync::LazyLock::new(|| deps_core::VersionReq::new(">=1.0"));
-                Some(&VERSION_REQ)
-            }
-            fn version_range(&self) -> Option<Range> {
-                self.version_range
-            }
-            fn source(&self) -> DependencySource {
-                DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
+        fn mock_dep(name_range: Range, version_range: Option<Range>) -> PypiDependency {
+            PypiDependency {
+                name: "test-package".into(),
+                name_range,
+                version_req: Some(deps_core::VersionReq::new(">=1.0")),
+                version_range,
+                extras: Vec::new(),
+                extras_range: None,
+                markers: None,
+                markers_range: None,
+                section: crate::types::PypiDependencySection::Dependencies,
+                source: crate::types::PypiDependencySource::Registry,
+                index_route: None,
             }
         }
 
         #[test]
         fn test_position_on_name() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: Some(Range::new(
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                Some(Range::new(
                     DomainPosition::new(5, 25),
                     DomainPosition::new(5, 35),
                 )),
-            };
+            );
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 15).into()));
         }
 
         #[test]
         fn test_position_in_padding_before() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: Some(Range::new(
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                Some(Range::new(
                     DomainPosition::new(5, 25),
                     DomainPosition::new(5, 35),
                 )),
-            };
+            );
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 8).into()));
         }
 
         #[test]
         fn test_position_after_version_padding() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: Some(Range::new(
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                Some(Range::new(
                     DomainPosition::new(5, 25),
                     DomainPosition::new(5, 35),
                 )),
-            };
+            );
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 37).into()));
         }
 
         #[test]
         fn test_position_too_far_before() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: Some(Range::new(
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                Some(Range::new(
                     DomainPosition::new(5, 25),
                     DomainPosition::new(5, 35),
                 )),
-            };
+            );
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 5).into()));
         }
 
         #[test]
         fn test_position_too_far_after() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: Some(Range::new(
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                Some(Range::new(
                     DomainPosition::new(5, 25),
                     DomainPosition::new(5, 35),
                 )),
-            };
+            );
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 40).into()));
         }
 
         #[test]
         fn test_position_different_line() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: Some(Range::new(
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                Some(Range::new(
                     DomainPosition::new(5, 25),
                     DomainPosition::new(5, 35),
                 )),
-            };
+            );
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(4, 15).into()));
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(6, 15).into()));
         }
@@ -755,10 +735,10 @@ mod tests {
         #[test]
         fn test_position_without_version_range() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
-                version_range: None,
-            };
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 10), DomainPosition::new(5, 20)),
+                None,
+            );
             // Should use name_range.end for calculation
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 22).into()));
             assert!(!formatter.is_position_on_dependency(&dep, Position::new(5, 25).into()));
@@ -767,10 +747,10 @@ mod tests {
         #[test]
         fn test_saturating_sub_at_column_zero() {
             let formatter = PypiFormatter;
-            let dep = MockDep {
-                name_range: Range::new(DomainPosition::new(5, 0), DomainPosition::new(5, 10)),
-                version_range: None,
-            };
+            let dep = mock_dep(
+                Range::new(DomainPosition::new(5, 0), DomainPosition::new(5, 10)),
+                None,
+            );
             // saturating_sub(2) should give 0, not underflow
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 0).into()));
         }

@@ -383,16 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dependency_trait_as_any() {
-        use deps_core::Dependency;
-
-        let dep = create_test_dependency(DependencySource::Registry);
-        let any = dep.as_any();
-        assert!(any.is::<BundlerDependency>());
-        assert!(any.downcast_ref::<BundlerDependency>().is_some());
-    }
-
-    #[test]
     fn test_dependency_trait_source_conversions() {
         use deps_core::Dependency;
 

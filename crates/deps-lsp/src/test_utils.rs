@@ -144,6 +144,51 @@ pub(crate) mod test_helpers {
     }
 }
 
+/// Implements [`deps_core::TypedEcosystem`] for a test double over [`StubParseResult`] and a
+/// [`StubFormatter`]; the optional braced items (hook overrides) go into the same impl block.
+/// Implement [`deps_core::EcosystemBase`] for the type separately.
+#[cfg(test)]
+macro_rules! impl_parsing_stub_ecosystem {
+    ($ty:ty $(, { $($item:item)* })?) => {
+        impl deps_core::TypedEcosystem for $ty {
+            type Parsed = deps_core::test_util::StubParseResult;
+            type Formatter = deps_core::test_util::StubFormatter;
+
+            fn own_formatter(&self) -> &deps_core::test_util::StubFormatter {
+                &deps_core::test_util::StubFormatter::DEFAULT
+            }
+
+            fn parse<'a>(
+                &'a self,
+                _content: &'a str,
+                uri: &'a url::Url,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<deps_core::test_util::StubParseResult>,
+            > {
+                Box::pin(async move { Ok(deps_core::test_util::StubParseResult::new(uri.clone(), 0)) })
+            }
+
+            $($($item)*)?
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use impl_parsing_stub_ecosystem;
+
+/// A [`deps_core::ParsedManifest`] of `uri` paired with `ecosystem`, so the ecosystem's own
+/// hooks serve it.
+#[cfg(test)]
+pub(crate) fn manifest_of<E: deps_core::TypedEcosystem>(
+    ecosystem: &std::sync::Arc<E>,
+    uri: &url::Url,
+) -> Box<dyn deps_core::ParsedManifest> {
+    use deps_core::Ecosystem;
+    std::sync::Arc::clone(ecosystem)
+        .parse_manifest_sync("", uri)
+        .expect("a stub ecosystem parses synchronously")
+}
+
 /// Shared scaffolding for the `#319`/`#333` DashMap-Ref-across-await regression tests in
 /// `handlers::{hover, completion, inlay_hints, diagnostics, code_lens}`: a no-op
 /// [`Registry`]/[`EcosystemFormatter`]/[`ParseResult`] trio, plus a [`BlockingEcosystem`]
@@ -154,13 +199,12 @@ pub(crate) mod test_helpers {
 pub(crate) mod blocking_ecosystem {
     use deps_core::ecosystem::BoxFuture;
     use deps_core::ecosystem::private::Sealed;
+    use deps_core::test_util::StubParseResult;
     use deps_core::{
-        Dependency, DiagnosticSeverities, Ecosystem, EcosystemConfig, EcosystemFormatter,
-        FreshnessSettings, Metadata, ParseResult, Registry, Version, VersionData,
-        completion::Completions,
+        DiagnosticSeverities, EcosystemBase, EcosystemConfig, FreshnessSettings, Metadata,
+        ParsedManifest, ParsedView, Registry, Version, VersionData, completion::Completions,
     };
     use std::any::Any;
-    use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Barrier;
     use tower_lsp_server::ls_types::{CodeLens, InlayHint, Position};
@@ -193,24 +237,6 @@ pub(crate) mod blocking_ecosystem {
         }
     }
 
-    pub(crate) struct MockParseResult {
-        pub(crate) uri: url::Url,
-    }
-    impl ParseResult for MockParseResult {
-        fn dependencies(&self) -> Vec<&dyn Dependency> {
-            vec![]
-        }
-        fn workspace_root(&self) -> Option<&Path> {
-            None
-        }
-        fn uri(&self) -> &url::Url {
-            &self.uri
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
     /// Which single `Ecosystem::generate_*` method [`BlockingEcosystem`] blocks on its
     /// `started` barrier. Every other `generate_*` method returns an empty result
     /// immediately, so a test selects exactly one hazard to exercise.
@@ -225,8 +251,23 @@ pub(crate) mod blocking_ecosystem {
         pub(crate) started: Arc<Barrier>,
         pub(crate) hook: BlockingHook,
     }
+    impl BlockingEcosystem {
+        /// A paired manifest of `uri` whose hooks are this ecosystem's.
+        pub(crate) fn manifest(self: &Arc<Self>, uri: &url::Url) -> Box<dyn ParsedManifest> {
+            crate::test_utils::manifest_of(self, uri)
+        }
+
+        async fn block_on(&self, hook: BlockingHook) {
+            if std::mem::discriminant(&self.hook) == std::mem::discriminant(&hook) {
+                self.started.wait().await;
+                std::future::pending::<()>().await;
+                unreachable!("test aborts the handler task before this future resolves")
+            }
+        }
+    }
+
     impl Sealed for BlockingEcosystem {}
-    impl Ecosystem for BlockingEcosystem {
+    impl EcosystemBase for BlockingEcosystem {
         fn ecosystem_id(&self) -> deps_core::EcosystemId {
             deps_core::EcosystemId::Cargo
         }
@@ -236,98 +277,67 @@ pub(crate) mod blocking_ecosystem {
         fn manifest_filenames(&self) -> &[&'static str] {
             &["Cargo.toml"]
         }
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            _uri: &'a url::Url,
-        ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
-            Box::pin(async move { unimplemented!() })
-        }
         fn registry(&self) -> Arc<dyn Registry> {
             Arc::new(NoopRegistry)
         }
-        fn formatter(&self) -> &dyn EcosystemFormatter {
-            &deps_core::test_util::StubFormatter::DEFAULT
+        fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {
+            unimplemented!()
         }
-        fn generate_inlay_hints<'a>(
+    }
+
+    crate::test_utils::impl_parsing_stub_ecosystem!(BlockingEcosystem, {
+        fn inlay_hints<'a>(
             &'a self,
-            _parse_result: &'a dyn ParseResult,
+            _parsed: ParsedView<'a, StubParseResult>,
             _versions: VersionData<'a>,
             _loading_state: deps_core::LoadingState,
             _config: &'a EcosystemConfig,
         ) -> BoxFuture<'a, Vec<InlayHint>> {
             Box::pin(async move {
-                if matches!(self.hook, BlockingHook::InlayHints) {
-                    self.started.wait().await;
-                    std::future::pending::<()>().await;
-                    unreachable!("test aborts the handler task before this future resolves")
-                }
+                self.block_on(BlockingHook::InlayHints).await;
                 vec![]
             })
         }
-        fn generate_diagnostics<'a>(
+
+        fn diagnostics<'a>(
             &'a self,
-            _parse_result: &'a dyn ParseResult,
+            _parsed: ParsedView<'a, StubParseResult>,
             _versions: VersionData<'a>,
             _uri: &'a url::Url,
             _freshness: FreshnessSettings,
             _severities: DiagnosticSeverities,
         ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
             Box::pin(async move {
-                if matches!(self.hook, BlockingHook::Diagnostics) {
-                    self.started.wait().await;
-                    std::future::pending::<()>().await;
-                    unreachable!("test aborts the handler task before this future resolves")
-                }
+                self.block_on(BlockingHook::Diagnostics).await;
                 vec![]
             })
         }
-        fn generate_code_lenses<'a>(
+
+        fn code_lenses<'a>(
             &'a self,
-            _parse_result: &'a dyn ParseResult,
+            _parsed: ParsedView<'a, StubParseResult>,
             _content: &'a str,
             _versions: VersionData<'a>,
             _uri: &'a url::Url,
             _command_id: &'a str,
         ) -> BoxFuture<'a, Vec<CodeLens>> {
             Box::pin(async move {
-                if matches!(self.hook, BlockingHook::CodeLenses) {
-                    self.started.wait().await;
-                    std::future::pending::<()>().await;
-                    unreachable!("test aborts the handler task before this future resolves")
-                }
+                self.block_on(BlockingHook::CodeLenses).await;
                 vec![]
             })
         }
-        fn generate_completions<'a>(
+
+        fn completions<'a>(
             &'a self,
-            _parse_result: &'a dyn ParseResult,
+            _parsed: ParsedView<'a, StubParseResult>,
             _position: Position,
             _content: &'a str,
             _freshness: FreshnessSettings,
         ) -> BoxFuture<'a, Completions> {
             Box::pin(async move {
-                if matches!(self.hook, BlockingHook::Completions) {
-                    self.started.wait().await;
-                    std::future::pending::<()>().await;
-                    unreachable!("test aborts the handler task before this future resolves")
-                }
+                self.block_on(BlockingHook::Completions).await;
                 Completions::default()
             })
         }
-        fn complete_version<'a>(
-            &'a self,
-            _request: deps_core::completion::CompletionRequest<'a>,
-            _package_name: deps_core::PackageName,
-            _prefix: String,
-        ) -> BoxFuture<'a, Completions> {
-            unimplemented!()
-        }
-        fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> {
-            unimplemented!()
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
+    });
 }

@@ -11,7 +11,7 @@ use deps_core::ResolvedCandidatesMap;
 use deps_core::ResolvedVersionsMap;
 use deps_core::VersionReq;
 use deps_core::lockfile::{LockFileCache, LockFileProvider};
-use deps_core::lsp_helpers::{PackageNaming, resolve_in_use_version};
+use deps_core::lsp_helpers::PackageNaming;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,41 +32,20 @@ use std::sync::Arc;
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
+/// use deps_core::test_util::{stub_document, stub_parse_result};
+/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName};
 /// use deps_engine::classify::resolved::collect_in_use_versions;
 /// use std::collections::HashMap;
 ///
-/// struct SimpleFormatter;
-/// impl PackageNaming for SimpleFormatter {}
-/// impl PackageRendering for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-///         version.to_string()
-///     }
-///     fn package_url(&self, name: &PackageName) -> String {
-///         name.as_str().to_string()
-///     }
-/// }
-/// impl RequirementResolution for SimpleFormatter {}
-/// impl DiagnosticMessages for SimpleFormatter {}
-/// impl DiagnosticPolicy for SimpleFormatter {}
-/// impl SourcePolicy for SimpleFormatter {}
-/// impl OsvNaming for SimpleFormatter {}
-///
 /// // A single registry-sourced dependency ("dep-0"), with a lock-file-resolved version.
-/// let parsed = stub_parse_result_with_dependencies(1);
+/// let document = stub_document(stub_parse_result(1));
 /// let mut resolved_versions = HashMap::new();
 /// resolved_versions.insert(NormalizedName::for_test("dep-0"), ConcreteVersion::from("1.0.0"));
 ///
 /// let in_use = collect_in_use_versions(
-///     parsed.as_ref(),
+///     document.as_ref(),
 ///     &resolved_versions,
 ///     &HashMap::new(),
-///     &SimpleFormatter,
 ///     EcosystemId::Cargo,
 /// );
 /// assert_eq!(
@@ -75,30 +54,27 @@ use std::sync::Arc;
 /// );
 /// ```
 pub fn collect_in_use_versions(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     resolved_versions: &ResolvedVersionsMap,
     resolved_version_candidates: &ResolvedCandidatesMap,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
     let mut map: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
-    for dep in parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
-    {
+    document.for_each_formatted_dependency(&mut |bound| {
+        let (dep, formatter) = (bound.dependency(), bound.formatter());
+        if !formatter.source_is_public_registry_content(&dep.source()) {
+            return;
+        }
         let key = PackageKey::new(dep.name(), formatter);
-        if let Some(v) = resolve_in_use_version(
-            dep,
+        if let Some(v) = bound.resolve_in_use_version(
             &key,
             resolved_versions,
             Some(resolved_version_candidates),
-            formatter,
             ecosystem,
         ) {
             map.entry(key.normalized().clone()).or_default().push(v);
         }
-    }
+    });
     map
 }
 
@@ -331,7 +307,7 @@ impl LockfileLoad {
 /// # Examples
 ///
 /// ```
-/// use deps_core::{Ecosystem, HttpCache};
+/// use deps_core::{Ecosystem, EcosystemBase, HttpCache};
 /// use deps_core::lockfile::LockFileCache;
 /// use deps_engine::classify::resolved::{LockfileLoad, parse_known_lockfile};
 /// use deps_engine::setup::CargoEcosystem;
@@ -575,8 +551,6 @@ mod tests {
         use deps_core::position::{Position, Range};
         use deps_core::test_util::StubFormatter;
         use deps_core::{Dependency, PackageName};
-        use std::any::Any;
-
         const LOWERCASE: StubFormatter = StubFormatter::new().with_lowercase_names();
 
         struct MockDep {
@@ -604,9 +578,6 @@ mod tests {
             fn source(&self) -> deps_core::parser::DependencySource {
                 deps_core::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct MockParseResult(Vec<MockDep>);
@@ -622,8 +593,13 @@ mod tests {
                 static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/requirements.txt"))
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedParseResult for MockParseResult {
+            type Dep = MockDep;
+
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.0
             }
         }
 
@@ -669,11 +645,15 @@ mod tests {
                 ConcreteVersion::from("4.1.0"),
             )]);
 
+            let document = deps_core::test_util::stub_document_with(
+                parse_result(&[("Django", "==4.0")]),
+                LOWERCASE.for_dependency::<MockDep>(),
+                EcosystemId::Pypi,
+            );
             let in_use = collect_in_use_versions(
-                &parse_result(&[("Django", "==4.0")]),
+                document.as_ref(),
                 &resolved,
                 &ResolvedCandidatesMap::new(),
-                &LOWERCASE,
                 EcosystemId::Pypi,
             );
 

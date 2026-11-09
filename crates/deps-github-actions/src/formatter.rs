@@ -5,17 +5,18 @@ use crate::registry::RepositoryIndexes;
 use deps_core::lsp_helpers::TagIndex;
 use deps_core::lsp_helpers::{
     AheadProof, BoundedVersionReq, BranchEvidence, CandidateTagSource, CommentCheck, CommentSlot,
-    CommitRewrite, CommitSha, DiagnosticMessages, DiagnosticPolicy, GitPinView, NormalizeName,
-    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy,
-    PinResolution, ProbeRef, ProbeStores, RequirementResolution, RequirementStatus, ShaPinLookup,
-    ShaPinTail, SourcePolicy, concrete_pin_version, git_candidate_tag_source, git_commit_rewrite,
-    git_tag_replacement, is_partial_semver_shaped, requirement_contains_template_placeholder,
-    resolve_git_pin, sha_pin_rewrite, tag_has_precedence, tag_pin_is_up_to_date,
+    CommitRewrite, CommitSha, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    GitPinView, NormalizeName, OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering,
+    PartialTagPolicy, PinResolution, ProbeRef, ProbeStores, RequirementResolution,
+    RequirementStatus, ShaPinLookup, ShaPinTail, SourcePolicy, concrete_pin_version,
+    git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, is_partial_semver_shaped,
+    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite,
+    tag_has_precedence, tag_pin_is_up_to_date,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
-    PackageName, lsp_helpers::warn_rejected_value,
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
+    lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
 
@@ -177,9 +178,8 @@ impl GithubActionsFormatter {
 impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
     fn resolve_static_sha_pin(
         &self,
-        dep: &dyn Dependency,
+        gha_dep: &GithubActionsDependency,
     ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
-        let gha_dep = self.own_dependency(dep)?;
         // Shared with `mutable_ref_pin_diagnostics`'s message-branch selection (#1188
         // critic S1/S2): the structural shape gate (`PinStyle::Tag`, `is_plain_scalar`/
         // FR-010, `is_last_on_line`/#633) lives in one ungated place so a diagnostic and
@@ -252,58 +252,9 @@ impl PackageNaming for GithubActionsFormatter {
     }
 }
 
-impl OwnDependency for GithubActionsFormatter {
-    type Dep = GithubActionsDependency;
-}
-
 impl PackageRendering for GithubActionsFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.as_str().to_string()
-    }
-
-    /// "Commit N ahead of latest release" for a commentless SHA pin that probes proved ahead of
-    /// the latest release and on the default branch.
-    fn hover_provenance(
-        &self,
-        dep: &dyn Dependency,
-    ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
-        self.commit_proof(self.own_dependency(dep)?)
-            .map(|proof| proof.hover_provenance())
-    }
-
-    /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
-    /// new SHA for `version`'s tag in the shared [`TagIndex`] and rewrites the pin through
-    /// [`sha_pin_rewrite`]: `{sha}{closers} # {tag}` for a comment-annotated pin (the closing
-    /// quote/`}` are re-emitted, #1732) or a plain, last-on-line scalar, the bare SHA for a
-    /// quoted/flow-style pin without a comment (`version_range` is then exactly the 40 hex,
-    /// so no `#` may be injected, #1724). Otherwise (index miss) returns
-    /// `dep.version_literal().unwrap_or(current)`, byte-identical to the raw declared span,
-    /// so every shared no-op guard (comparing against exactly that text) suppresses the
-    /// action instead of emitting a destructive downgrade-to-tag edit (B1). Branch →
-    /// `current` unchanged, for the same reason.
-    fn format_version_replacing_for(
-        &self,
-        dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        let Some(gha_dep) = self.own_dependency(dep) else {
-            return self.format_version_for_text_edit(version);
-        };
-        match &gha_dep.pin {
-            Some(PinStyle::Tag) => {
-                let index = self.tag_index.get(dep.name());
-                git_tag_replacement(current, version, index.as_deref())
-            }
-            Some(PinStyle::Sha { .. }) => gha_dep
-                .sha_pin_tail()
-                .zip(self.release_commit_for(dep.name(), version.as_str()))
-                .map_or_else(
-                    || dep.version_literal().unwrap_or(current).to_string(),
-                    |(tail, (tag, sha))| sha_pin_rewrite(&tail, &sha, &tag),
-                ),
-            Some(PinStyle::Branch) | None => dep.version_literal().unwrap_or(current).to_string(),
-        }
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -392,6 +343,62 @@ impl RequirementResolution for GithubActionsFormatter {
         requirement_contains_template_placeholder(requirement) || requirement.contains("${{")
     }
 
+    /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
+    /// fetch, not before — see [`RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
+    ///
+    /// [`GithubActionsRegistry`]: crate::registry::GithubActionsRegistry
+    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
+        true
+    }
+}
+
+impl DependencyFormatter for GithubActionsFormatter {
+    type Dep = GithubActionsDependency;
+
+    /// "Commit N ahead of latest release" for a commentless SHA pin that probes proved ahead of
+    /// the latest release and on the default branch.
+    fn hover_provenance(
+        &self,
+        gha_dep: &GithubActionsDependency,
+    ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
+        self.commit_proof(gha_dep)
+            .map(|proof| proof.hover_provenance())
+    }
+
+    /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
+    /// new SHA for `version`'s tag in the shared [`TagIndex`] and rewrites the pin through
+    /// [`sha_pin_rewrite`]: `{sha}{closers} # {tag}` for a comment-annotated pin (the closing
+    /// quote/`}` are re-emitted, #1732) or a plain, last-on-line scalar, the bare SHA for a
+    /// quoted/flow-style pin without a comment (`version_range` is then exactly the 40 hex,
+    /// so no `#` may be injected, #1724). Otherwise (index miss) returns
+    /// `gha_dep.version_literal().unwrap_or(current)`, byte-identical to the raw declared span,
+    /// so every shared no-op guard (comparing against exactly that text) suppresses the
+    /// action instead of emitting a destructive downgrade-to-tag edit (B1). Branch →
+    /// `current` unchanged, for the same reason.
+    fn format_version_replacing_for(
+        &self,
+        gha_dep: &GithubActionsDependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        match &gha_dep.pin {
+            Some(PinStyle::Tag) => {
+                let index = self.tag_index.get(gha_dep.name());
+                git_tag_replacement(current, version, index.as_deref())
+            }
+            Some(PinStyle::Sha { .. }) => gha_dep
+                .sha_pin_tail()
+                .zip(self.release_commit_for(gha_dep.name(), version.as_str()))
+                .map_or_else(
+                    || gha_dep.version_literal().unwrap_or(current).to_string(),
+                    |(tail, (tag, sha))| sha_pin_rewrite(&tail, &sha, &tag),
+                ),
+            Some(PinStyle::Branch) | None => {
+                gha_dep.version_literal().unwrap_or(current).to_string()
+            }
+        }
+    }
+
     /// Prefers a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`, ground truth
     /// from the tags API) over trusting the comment text, when both are available (#907
     /// review S2): the trailing `# vX` comment names *a* tag the pin was written against,
@@ -402,13 +409,10 @@ impl RequirementResolution for GithubActionsFormatter {
     /// comment-annotated pin absent from the populated index, or a tag/branch pin.
     fn classify_requirement_status_for(
         &self,
-        dep: &dyn Dependency,
+        gha_dep: &GithubActionsDependency,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        let Some(gha_dep) = self.own_dependency(dep) else {
-            return self.classify_requirement_status(requirement, latest);
-        };
         let text = || {
             let status = self.classify_requirement_status(requirement, latest);
             let status = self.distrust_unpublished_tag(gha_dep, requirement, latest, status);
@@ -427,10 +431,11 @@ impl RequirementResolution for GithubActionsFormatter {
         }
     }
 
-    fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
-        let Some(gha_dep) = self.own_dependency(dep) else {
-            return CommitRewrite::NotACommitPin;
-        };
+    fn commit_rewrite_for(
+        &self,
+        gha_dep: &GithubActionsDependency,
+        version: &ConcreteVersion,
+    ) -> CommitRewrite {
         let index = self.tag_index.get(&gha_dep.name);
         git_commit_rewrite(Self::pin_view(gha_dep), index.as_deref(), version)
     }
@@ -458,10 +463,7 @@ impl RequirementResolution for GithubActionsFormatter {
     ///
     /// An exact full-semver tag pin (`@v4.8.0`) keeps itself as the primary and gains the other
     /// releases of its major line on the same commit as siblings (#1709).
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
-        let Some(gha_dep) = self.own_dependency(dep) else {
-            return PinResolution::Unresolved;
-        };
+    fn resolved_pin_version(&self, gha_dep: &GithubActionsDependency) -> PinResolution {
         let index = self.tag_index.get(&gha_dep.name);
         resolve_git_pin(
             Self::pin_view(gha_dep),
@@ -470,25 +472,46 @@ impl RequirementResolution for GithubActionsFormatter {
         )
     }
 
-    /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
-    /// fetch, not before — see [`RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
-    ///
-    /// [`GithubActionsRegistry`]: crate::registry::GithubActionsRegistry
-    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
-        true
-    }
-
     /// A SHA pin names its whole commit, so a candidate's siblings span every major; any other
     /// pin keeps the exact-tag same-major rule. Absent index entry: not yet fetched.
-    fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
-        let Some(gha_dep) = self.own_dependency(dep) else {
-            return CandidateTagSource::NotTagBased;
-        };
+    fn candidate_tag_source(&self, gha_dep: &GithubActionsDependency) -> CandidateTagSource {
         let index = self
             .tag_index
             .get(&gha_dep.name)
             .map(|index| Arc::clone(&index));
         git_candidate_tag_source(Self::pin_view(gha_dep), index)
+    }
+
+    /// Awaiting until the repository's tags response confirmed its canonical casing; the
+    /// written name is offered meanwhile as a provisional query name (#1694).
+    fn osv_name_availability(&self, gha_dep: &GithubActionsDependency) -> OsvNameAvailability {
+        if self.osv_package_name(gha_dep).is_some() {
+            OsvNameAvailability::Ready
+        } else {
+            OsvNameAvailability::AwaitingRegistryData {
+                written_fallback: deps_core::osv::OsvPackageName::new_or_skip(
+                    gha_dep.name().as_str(),
+                ),
+            }
+        }
+    }
+
+    /// OSV's `GitHub Actions` names are exact-case, so only the canonical casing confirmed by
+    /// the repository's tags response is queried; `None` (never a guessed casing, which would
+    /// report a false clean) while it is unconfirmed.
+    fn osv_package_name(
+        &self,
+        gha_dep: &GithubActionsDependency,
+    ) -> Option<deps_core::osv::OsvPackageName> {
+        let index = self.tag_index.get(gha_dep.name())?;
+        let canonical = index.canonical_repo_name()?.as_str();
+        if !canonical.eq_ignore_ascii_case(gha_dep.name().as_str()) {
+            tracing::debug!(
+                written = %deps_core::net_policy::redact_declaration_key(gha_dep.name().as_str()),
+                "canonical repository name differs from the written one beyond casing (renamed or transferred)"
+            );
+        }
+        deps_core::osv::OsvPackageName::new_or_skip(canonical)
     }
 }
 
@@ -586,13 +609,13 @@ impl GithubActionsFormatter {
     }
 
     /// What the repository's `TagIndex` says about a full-SHA pin against `latest` — see
-    /// [`RequirementResolution::classify_requirement_status_for`]. `None` when `dep` isn't a
+    /// [`DependencyFormatter::classify_requirement_status_for`]. `None` when `dep` isn't a
     /// full-SHA pin. A cold index leaves the comment's status standing; a `Truncated` index that
     /// lacks the SHA lets it stand only short of up to date ([`ShaPinLookup::Unlisted`]).
     ///
     /// #1648: no longer gates on `requirement_is_oversized` itself — this method is only ever
     /// reached through
-    /// [`RequirementGate::requirement_status_for`](deps_core::lsp_helpers::RequirementGate::requirement_status_for),
+    /// [`DependencyGate::requirement_status_for`](deps_core::lsp_helpers::DependencyGate::requirement_status_for),
     /// which already constructs a [`BoundedVersionReq`] before calling
     /// [`Self::classify_requirement_status_for`], so an oversized requirement never reaches
     /// here at all.
@@ -647,34 +670,7 @@ impl DiagnosticPolicy for GithubActionsFormatter {}
 
 impl SourcePolicy for GithubActionsFormatter {}
 
-impl OsvNaming for GithubActionsFormatter {
-    /// Awaiting until the repository's tags response confirmed its canonical casing; the
-    /// written name is offered meanwhile as a provisional query name (#1694).
-    fn osv_name_availability(&self, dep: &dyn Dependency) -> OsvNameAvailability {
-        if self.osv_package_name(dep).is_some() {
-            OsvNameAvailability::Ready
-        } else {
-            OsvNameAvailability::AwaitingRegistryData {
-                written_fallback: deps_core::osv::OsvPackageName::new_or_skip(dep.name().as_str()),
-            }
-        }
-    }
-
-    /// OSV's `GitHub Actions` names are exact-case, so only the canonical casing confirmed by
-    /// the repository's tags response is queried; `None` (never a guessed casing, which would
-    /// report a false clean) while it is unconfirmed.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<deps_core::osv::OsvPackageName> {
-        let index = self.tag_index.get(dep.name())?;
-        let canonical = index.canonical_repo_name()?.as_str();
-        if !canonical.eq_ignore_ascii_case(dep.name().as_str()) {
-            tracing::debug!(
-                written = %deps_core::net_policy::redact_declaration_key(dep.name().as_str()),
-                "canonical repository name differs from the written one beyond casing (renamed or transferred)"
-            );
-        }
-        deps_core::osv::OsvPackageName::new_or_skip(canonical)
-    }
-}
+impl OsvNaming for GithubActionsFormatter {}
 
 #[cfg(test)]
 mod tests {
@@ -683,7 +679,9 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     use deps_core::NormalizedName;
     use deps_core::lsp_helpers::TagIndex;
-    use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate, ResolvedPin};
+    use deps_core::lsp_helpers::{
+        CommentMismatch, CommitSha, DependencyGate, RequirementGate, ResolvedPin,
+    };
     use deps_core::osv::SiblingCoverage;
     use deps_core::pagination::ListCoverage;
     use deps_core::parser::DependencySource;
@@ -702,7 +700,6 @@ mod tests {
     /// also serves as a live regression test for that revert holding.
     #[test]
     fn test_plan_vulnerability_fix_still_offered_for_real_tag_pin() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -711,8 +708,8 @@ mod tests {
         let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n";
         let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
         let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
-        let deps = result.dependencies();
-        let dep = deps
+        let dep = result
+            .dependencies
             .iter()
             .find(|d| d.name().as_str() == "actions/checkout")
             .expect("actions/checkout parsed");
@@ -733,7 +730,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             version_range,
             "v3",
             &dv,
@@ -1408,10 +1405,6 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
         let d = parsed.dependencies.first().expect("one dependency");
-        let d = d
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .unwrap();
         assert_matches!(d.pin, Some(PinStyle::Sha { comment: None, .. }));
         assert_eq!(status_1720(&fmt, d), RequirementStatus::Outdated);
     }
@@ -1537,10 +1530,6 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parsed = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
         let d = parsed.dependencies.first().expect("one dependency");
-        let d = d
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .unwrap();
         assert_eq!(status_1720(&fmt, d), RequirementStatus::Unresolved);
     }
 
@@ -3241,7 +3230,6 @@ mod tests {
     /// commit and tag (the `deps-cli update --security-only` write path).
     #[test]
     fn test_plan_vulnerability_fix_sha_pin_fix_version_without_v_prefix_round_trips() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -3288,11 +3276,7 @@ mod tests {
         );
         let rewritten = content.replacen(&format!("{old_sha} # v4.1.2"), &planned.edit.new_text, 1);
         let reparsed = crate::parser::parse_workflow_yaml(&rewritten, &uri).unwrap();
-        let reparsed = &reparsed.dependencies()[0];
-        let reparsed = reparsed
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .unwrap();
+        let reparsed = &reparsed.dependencies[0];
         assert_matches!(
             &reparsed.pin,
             Some(PinStyle::Sha { sha, .. }) if sha.as_str() == new_sha
@@ -3357,10 +3341,7 @@ mod tests {
         let content = format!("steps:\n  - {line}\n");
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
-        let d = parsed.dependencies[0]
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .unwrap();
+        let d = &parsed.dependencies[0];
         let range = d.version_range.unwrap();
         let replacement =
             fmt.format_version_replacing_for(d, &ConcreteVersion::new("stable"), "v1.0.0");
@@ -3579,46 +3560,12 @@ mod tests {
         assert_eq!(via_sha_pin_action, via_outdated_sha_update);
     }
 
-    #[test]
-    fn test_format_version_replacing_for_non_gha_dependency_falls_back_to_identity() {
-        struct OtherDep;
-        impl Dependency for OtherDep {
-            fn name(&self) -> &PackageName {
-                static NAME: std::sync::LazyLock<PackageName> =
-                    std::sync::LazyLock::new(|| PackageName::new("other"));
-                &NAME
-            }
-            fn name_range(&self) -> Range {
-                Range::default()
-            }
-            fn version_requirement(&self) -> Option<&VersionReq> {
-                None
-            }
-            fn version_range(&self) -> Option<Range> {
-                None
-            }
-            fn source(&self) -> DependencySource {
-                DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-        let fmt = formatter();
-        let d = OtherDep;
-        assert_eq!(
-            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("1.0.0"), "0.9.0"),
-            "1.0.0"
-        );
-    }
-
     /// #1391 review S1: #1390's own repro text (`v4.<%= py %>`), parsed through the real
     /// `crate::parser::parse_workflow_yaml` path rather than a hand-built `GithubActionsDependency`
     /// — closes the coverage gap the existing `plan_vulnerability_fix` tests above leave (they
     /// only exercise ordinary tag/SHA pins, not the shared generic-template detector).
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -3627,8 +3574,8 @@ mod tests {
         let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.<%= py %>\n";
         let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
         let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
-        let deps = result.dependencies();
-        let dep = deps
+        let dep = result
+            .dependencies
             .iter()
             .find(|d| d.name().as_str() == "actions/checkout")
             .expect("actions/checkout parsed");
@@ -3656,7 +3603,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             version_range,
             current,
             &dv,
@@ -3676,14 +3623,10 @@ mod tests {
     /// GitHub reported, and to `None` (never the written casing) while it is unconfirmed.
     #[test]
     fn test_osv_package_name_uses_canonical_casing_from_tag_index() {
-        use deps_core::ParseResult;
-        use deps_core::lsp_helpers::OsvNaming;
-
         let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: azure/setup-kubectl@v3\n";
         let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
         let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
-        let deps = result.dependencies();
-        let dep = *deps.first().expect("one dependency");
+        let dep = result.dependencies.first().expect("one dependency");
         let name = PackageName::new("azure/setup-kubectl");
         let formatter = formatter();
 
@@ -3726,13 +3669,10 @@ mod tests {
     /// confirmed canonical name makes every spelling of it `Ready`.
     #[test]
     fn test_osv_package_name_same_action_in_two_casings() {
-        use deps_core::ParseResult;
-        use deps_core::lsp_helpers::OsvNaming;
-
         let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: Azure/setup-kubectl@v3\n      - uses: azure/setup-kubectl@v3\n";
         let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
         let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
-        let deps = result.dependencies();
+        let deps = &result.dependencies;
         assert_eq!(deps.len(), 2);
         let canonical = || {
             Arc::new(TagIndex::default().with_canonical_repo_name(
@@ -3753,7 +3693,7 @@ mod tests {
                     .tag_index
                     .insert(PackageName::new(*key), canonical());
             }
-            for dep in &deps {
+            for dep in deps {
                 let expected = if populated.is_empty() {
                     None
                 } else {
@@ -3761,7 +3701,7 @@ mod tests {
                 };
                 assert_eq!(
                     formatter
-                        .osv_package_name(*dep)
+                        .osv_package_name(dep)
                         .as_ref()
                         .map(deps_core::osv::OsvPackageName::as_str),
                     expected,
@@ -3769,7 +3709,7 @@ mod tests {
                     dep.name().as_str()
                 );
                 assert_eq!(
-                    formatter.osv_name_availability(*dep) == OsvNameAvailability::Ready,
+                    formatter.osv_name_availability(dep) == OsvNameAvailability::Ready,
                     expected.is_some()
                 );
             }

@@ -1,7 +1,7 @@
 //! Shared raw-text scanners for fallback (parse-failure) completion.
 //!
 //! When a manifest fails to parse (typically because the user is mid-edit), ecosystems
-//! fall back to a raw-text heuristic instead of [`crate::ecosystem::Ecosystem::generate_completions`]'s
+//! fall back to a raw-text heuristic instead of [`crate::ecosystem::TypedEcosystem::completions`]'s
 //! parsed-AST path: is the cursor inside a dependencies-like section, and if so, what
 //! prefix has the user typed? This module holds the syntax-shape scanners shared by two
 //! or more ecosystems (issue #722) — a manifest-format-specific ecosystem (e.g. Maven's
@@ -9,7 +9,7 @@
 //! these primitives rather than reimplementing them.
 //!
 //! Each ecosystem composes these into its own
-//! [`Ecosystem::fallback_completion_prefix`](crate::ecosystem::Ecosystem::fallback_completion_prefix)
+//! [`EcosystemBase::fallback_completion_prefix`](crate::ecosystem::EcosystemBase::fallback_completion_prefix)
 //! override: a section-boundary check (this module, or an ecosystem-local equivalent)
 //! followed by [`raw_prefix`] and, where the manifest syntax wraps the completable value
 //! (a JSON string, an XML tag/attribute), a syntax-specific strip.
