@@ -1100,6 +1100,7 @@ mod tests {
 
     /// The OSV gate must find the cursor's dependency in the formatted view by declaration, not
     /// by storage: here `dependencies()` and `own_dependencies()` are separate allocations.
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_matches_dependency_across_storage() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
