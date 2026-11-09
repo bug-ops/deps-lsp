@@ -132,8 +132,9 @@ pub use hover::{CMD_DOT_FOOTER, generate_hover};
 #[cfg(feature = "lsp-responses")]
 pub use hover_markdown::{FieldKind, HoverMarkdown, SafeNumber};
 pub use in_use_version::{
-    InUseVersions, concrete_pin_version, has_unqueryable_resolved_pin, is_full_semver_shape,
-    resolve_in_use_version, resolve_in_use_versions,
+    InUseVersions, LockSelectionMemo, concrete_pin_version, has_unqueryable_resolved_pin,
+    is_full_semver_shape, resolve_in_use_version, resolve_in_use_versions,
+    resolve_in_use_versions_memoized,
 };
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;

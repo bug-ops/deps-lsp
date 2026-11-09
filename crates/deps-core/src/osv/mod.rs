@@ -3203,6 +3203,36 @@ mod tests {
         );
     }
 
+    /// The batch request names the primary version and every lock alternative, in that order.
+    #[tokio::test]
+    async fn lock_alternative_scan_queries_the_alternative_version() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .match_request(|req| {
+                req.utf8_lossy_body().is_ok_and(|body| {
+                    let primary = body.find(r#""version":"1.2.8""#);
+                    let alternative = body.find(r#""version":"1.2.5""#);
+                    matches!((primary, alternative), (Some(p), Some(a)) if p < a)
+                })
+            })
+            .with_status(200)
+            .with_body(batch_results(&[NO_VULNS, NO_VULNS]))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("minimist", "1.2.8", &["1.2.5"]),
+        )
+        .await;
+
+        assert_matches!(outcome, ScanOutcome::Clean);
+        batch.assert_async().await;
+    }
+
     async fn mock_failing_single_query(server: &mut mockito::ServerGuard) -> mockito::Mock {
         server
             .mock("POST", "/v1/query")

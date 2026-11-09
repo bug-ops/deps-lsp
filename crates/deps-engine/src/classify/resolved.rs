@@ -60,19 +60,23 @@ pub fn collect_in_use_versions(
     ecosystem: EcosystemId,
 ) -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
     let mut map: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
+    let mut memo = deps_core::lsp_helpers::LockSelectionMemo::default();
     document.for_each_formatted_dependency(&mut |bound| {
         let (dep, formatter) = (bound.dependency(), bound.formatter());
         if !formatter.source_is_public_registry_content(&dep.source()) {
             return;
         }
         let key = PackageKey::new(dep.name(), formatter);
-        if let Some(v) = bound.resolve_in_use_version(
+        if let Some(v) = bound.resolve_in_use_versions_memoized(
             &key,
             resolved_versions,
             Some(resolved_version_candidates),
             ecosystem,
+            &mut memo,
         ) {
-            map.entry(key.normalized().clone()).or_default().push(v);
+            map.entry(key.normalized().clone())
+                .or_default()
+                .push(v.into_primary());
         }
     });
     map

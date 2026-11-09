@@ -2615,8 +2615,6 @@ where
     F: crate::lsp_helpers::DependencyFormatter<Dep = P::Dep>,
 {
     use crate::Dependency;
-    use crate::lsp_helpers::resolve_in_use_versions;
-
     let deps = parse_result.own_dependencies();
 
     // One signature per occurrence: public-registry-content deps (F1b) carry their own
@@ -2626,18 +2624,20 @@ where
     // `resolved_candidates` (#649) lets two occurrences of a renamed/aliased name pinned to
     // different lock-file majors compute distinct `v:{version}` signatures instead of
     // colliding — see `resolve_occurrence_version`.
+    let mut memo = crate::lsp_helpers::LockSelectionMemo::default();
     let signatures: Vec<(String, String)> = deps
         .iter()
         .map(|dep| {
             let key = crate::PackageKey::new(dep.name(), formatter);
             let signature = if formatter.public_content(dep).is_some() {
-                match resolve_in_use_versions(
+                match crate::lsp_helpers::resolve_in_use_versions_memoized(
                     dep,
                     &key,
                     resolved,
                     resolved_candidates,
                     formatter,
                     ecosystem,
+                    &mut memo,
                 ) {
                     Some(v) => {
                         let mut signature = format!("v:{}", v.primary());
@@ -4496,6 +4496,177 @@ mod vulnerability_keys_candidates_tests {
         assert_eq!(
             ranged.lock_alternatives(),
             [ConcreteVersion::new("1.2.5")].as_slice()
+        );
+
+        let target = |in_use: &crate::lsp_helpers::InUseVersions| {
+            ScanTarget::from_native(
+                crate::test_util::vuln_key("minimist"),
+                OsvQueryName::Confirmed(OsvPackageName::new("minimist").unwrap()),
+                in_use.primary().clone(),
+                &StrictSemverFormatter,
+            )
+            .with_lock_alternatives(in_use, &StrictSemverFormatter)
+        };
+        let alternatives = |target: &ScanTarget| {
+            target
+                .lock_alternatives()
+                .iter()
+                .map(|a| a.display_version().as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let exact = crate::lsp_helpers::resolve_in_use_versions(
+            &parse_result.deps[0],
+            &crate::test_util::package_key("minimist"),
+            &resolved,
+            Some(&candidates),
+            &StrictSemverFormatter,
+            EcosystemId::Cargo,
+        )
+        .unwrap();
+        assert_eq!(alternatives(&target(&ranged)), ["1.2.5"]);
+        assert!(alternatives(&target(&exact)).is_empty());
+    }
+
+    /// Counts requirement compilations and per-candidate matches, so a test can bound the work
+    /// of lock selection without timing it.
+    struct CountingFormatter {
+        compiled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        matched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct MatchEverything(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::lsp_helpers::RequirementMatcher for MatchEverything {
+        fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(true)
+        }
+
+        fn strict_prerelease_exclusion(&self) -> bool {
+            false
+        }
+    }
+
+    impl crate::lsp_helpers::PackageNaming for CountingFormatter {}
+    impl crate::lsp_helpers::PackageRendering for CountingFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl crate::lsp_helpers::RequirementResolution for CountingFormatter {
+        fn compile_bounded_requirement(
+            &self,
+            _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
+        ) -> Option<Box<dyn crate::lsp_helpers::RequirementMatcher>> {
+            self.compiled
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Box::new(MatchEverything(std::sync::Arc::clone(
+                &self.matched,
+            ))))
+        }
+    }
+    impl crate::lsp_helpers::DiagnosticMessages for CountingFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for CountingFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for CountingFormatter {}
+    impl crate::lsp_helpers::OsvNaming for CountingFormatter {}
+    impl crate::lsp_helpers::DependencyFormatter for CountingFormatter {
+        type Dep = MockDep;
+    }
+
+    const MANY_ENTRIES: usize = 3000;
+    const MANY_OCCURRENCES: u32 = 400;
+
+    fn many_candidates() -> std::collections::HashMap<NormalizedName, Vec<ConcreteVersion>> {
+        std::collections::HashMap::from([(
+            NormalizedName::for_test("itoa"),
+            (0..MANY_ENTRIES)
+                .map(|n| ConcreteVersion::new(format!("1.0.{n}")))
+                .collect(),
+        )])
+    }
+
+    fn many_resolved() -> std::collections::HashMap<NormalizedName, ConcreteVersion> {
+        std::collections::HashMap::from([(
+            NormalizedName::for_test("itoa"),
+            ConcreteVersion::new(format!("1.0.{}", MANY_ENTRIES - 1)),
+        )])
+    }
+
+    fn counting_formatter() -> CountingFormatter {
+        CountingFormatter {
+            compiled: std::sync::Arc::default(),
+            matched: std::sync::Arc::default(),
+        }
+    }
+
+    /// #1981 (security re-audit): many occurrences of one name against a lock file with
+    /// thousands of entries must cost one requirement compile and one pass over the entries
+    /// per distinct `(name, requirement)`, not per occurrence.
+    #[test]
+    fn vulnerability_keys_select_once_per_distinct_name_and_requirement() {
+        use crate::lsp_helpers::test_support::MockParseResult;
+        use std::sync::atomic::Ordering;
+
+        let occurrence = |line: u32| MockDep {
+            name: PackageName::new("itoa"),
+            version_req: VersionReq::new("*"),
+            version_range: Range::new(Position::new(line, 10), Position::new(line, 20)),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 8)),
+        };
+        let parse_result = MockParseResult {
+            deps: (0..MANY_OCCURRENCES).map(occurrence).collect(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let formatter = counting_formatter();
+
+        let _keys = vulnerability_keys(
+            &parse_result,
+            &many_resolved(),
+            Some(&many_candidates()),
+            &formatter,
+            EcosystemId::Cargo,
+        );
+
+        assert_eq!(formatter.compiled.load(Ordering::Relaxed), 1);
+        assert_eq!(formatter.matched.load(Ordering::Relaxed), MANY_ENTRIES);
+    }
+
+    /// The alternatives kept are the lowest `MAX_LOCK_ALTERNATIVES + 1` distinct versions, so
+    /// the signature and the scan stay bounded however many entries the lock file holds.
+    #[test]
+    fn lock_alternatives_keep_only_the_lowest_cap_plus_one() {
+        let dep = MockDep {
+            name: PackageName::new("itoa"),
+            version_req: VersionReq::new("*"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        let in_use = crate::lsp_helpers::resolve_in_use_versions(
+            &dep,
+            &crate::test_util::package_key("itoa"),
+            &many_resolved(),
+            Some(&many_candidates()),
+            &counting_formatter(),
+            EcosystemId::Cargo,
+        )
+        .unwrap();
+
+        let expected: Vec<String> = (0..=crate::osv::MAX_LOCK_ALTERNATIVES)
+            .map(|n| format!("1.0.{n}"))
+            .collect();
+        let kept: Vec<&str> = in_use
+            .lock_alternatives()
+            .iter()
+            .map(|v| v.as_str())
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(
+            in_use.primary().as_str(),
+            format!("1.0.{}", MANY_ENTRIES - 1)
         );
     }
 

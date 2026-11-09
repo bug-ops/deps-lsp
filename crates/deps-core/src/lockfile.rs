@@ -615,13 +615,52 @@ impl std::fmt::Debug for ResolvedPackages {
 /// non-semver version string is never ordered by two diverging policies depending on which
 /// caller is asking.
 pub(crate) fn compare_lockfile_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    match (semver::Version::parse(a), semver::Version::parse(b)) {
-        (Ok(va), Ok(vb)) => va.cmp(&vb),
-        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-        (Err(_), Err(_)) => a.cmp(b),
+    LockVersionKey::new(a).cmp(&LockVersionKey::new(b))
+}
+
+/// A version string parsed once, ordered exactly like [`compare_lockfile_versions`].
+///
+/// Selecting from a large candidate list compares each entry many times; building the key once
+/// per entry keeps that at one semver parse per entry instead of two per comparison.
+#[derive(Debug)]
+pub(crate) struct LockVersionKey<'a> {
+    parsed: Option<semver::Version>,
+    raw: &'a str,
+}
+
+impl<'a> LockVersionKey<'a> {
+    pub(crate) fn new(raw: &'a str) -> Self {
+        Self {
+            parsed: semver::Version::parse(raw).ok(),
+            raw,
+        }
     }
 }
+
+impl Ord for LockVersionKey<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (&self.parsed, &other.parsed) {
+            (Some(a), Some(b)) => a.cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => self.raw.cmp(other.raw),
+        }
+    }
+}
+
+impl PartialOrd for LockVersionKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for LockVersionKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for LockVersionKey<'_> {}
 
 /// Returns the package with the highest semver version.
 fn best_package<'a>(

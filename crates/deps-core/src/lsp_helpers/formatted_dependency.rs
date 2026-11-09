@@ -14,7 +14,7 @@ use super::{
     PublicContent,
 };
 use crate::edit::{PlannedUpdate, VulnFixSkip};
-use crate::lsp_helpers::InUseVersions;
+use crate::lsp_helpers::{InUseVersions, LockSelectionMemo};
 use crate::osv::{
     CandidateStatusMap, LatestStatusMap, LockResolution, OsvPackageName, StructuralSkipReason,
     VulnKeys,
@@ -87,6 +87,17 @@ pub trait FormattedDependency<'a>: Send + Sync {
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
         resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
         ecosystem: EcosystemId,
+    ) -> Option<InUseVersions>;
+
+    /// Like [`Self::resolve_in_use_versions`], reusing `memo` across the dependencies of one
+    /// pass so repeated `(name, requirement)` lock selections are computed once.
+    fn resolve_in_use_versions_memoized(
+        &self,
+        key: &PackageKey,
+        resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        ecosystem: EcosystemId,
+        memo: &mut LockSelectionMemo,
     ) -> Option<InUseVersions>;
 
     /// See [`crate::lsp_helpers::has_unqueryable_resolved_pin`].
@@ -254,6 +265,25 @@ impl<'a, F: DependencyFormatter> FormattedDependency<'a> for BoundDependency<'a,
             resolved_version_candidates,
             self.formatter,
             ecosystem,
+        )
+    }
+
+    fn resolve_in_use_versions_memoized(
+        &self,
+        key: &PackageKey,
+        resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        ecosystem: EcosystemId,
+        memo: &mut LockSelectionMemo,
+    ) -> Option<InUseVersions> {
+        crate::lsp_helpers::resolve_in_use_versions_memoized(
+            self.dep,
+            key,
+            resolved_versions,
+            resolved_version_candidates,
+            self.formatter,
+            ecosystem,
+            memo,
         )
     }
 

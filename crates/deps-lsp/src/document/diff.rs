@@ -298,12 +298,24 @@ pub(crate) fn resolved_versions_changed(
     ecosystem_id: EcosystemId,
 ) -> Vec<NormalizedName> {
     let mut changed = Vec::new();
+    let mut old_memo = deps_core::lsp_helpers::LockSelectionMemo::default();
+    let mut new_memo = deps_core::lsp_helpers::LockSelectionMemo::default();
     manifest.for_each_formatted_dependency(&mut |bound| {
         let key = deps_core::PackageKey::new(bound.dependency().name(), bound.formatter());
-        let old =
-            bound.resolve_in_use_versions(&key, old_resolved, Some(old_candidates), ecosystem_id);
-        let new =
-            bound.resolve_in_use_versions(&key, new_resolved, Some(new_candidates), ecosystem_id);
+        let old = bound.resolve_in_use_versions_memoized(
+            &key,
+            old_resolved,
+            Some(old_candidates),
+            ecosystem_id,
+            &mut old_memo,
+        );
+        let new = bound.resolve_in_use_versions_memoized(
+            &key,
+            new_resolved,
+            Some(new_candidates),
+            ecosystem_id,
+            &mut new_memo,
+        );
         if old != new {
             changed.push(key.normalized().clone());
         }

@@ -229,7 +229,10 @@ mod tests {
         );
         for lock in [LockPresence::Found, LockPresence::Absent] {
             let coverage = OsvCoverage::from_vulnerabilities(Some(&map), lock, &HashSet::new());
-            assert_eq!(coverage, OsvCoverage::new(0, 1));
+            assert_eq!(
+                coverage,
+                OsvCoverage::default().with_lock_alternatives_unchecked(1)
+            );
             assert_eq!(
                 exit_code(
                     &CheckReport::default(),
