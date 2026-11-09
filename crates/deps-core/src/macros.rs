@@ -714,22 +714,32 @@ macro_rules! impl_get_versions_with_passthrough {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use deps_core::{Dependency, PackageName, VersionReq};
+/// ```
+/// use deps_core::lsp_helpers::ProbeDependency;
 /// use deps_core::parser::DependencySource;
 /// use deps_core::position::Range;
+/// use deps_core::{PackageName, VersionReq};
 ///
-/// struct Fixture(PackageName);
-///
-/// impl Dependency for Fixture {
-///     fn name(&self) -> &PackageName { &self.0 }
-///     fn name_range(&self) -> Range { Range::default() }
-///     fn version_requirement(&self) -> Option<&VersionReq> { None }
-///     fn version_range(&self) -> Option<Range> { None }
-///     fn source(&self) -> DependencySource { DependencySource::Registry }
+/// struct Fixture {
+///     name: PackageName,
+///     name_range: Range,
+///     version: Option<VersionReq>,
+///     version_range: Option<Range>,
+///     source: DependencySource,
 /// }
 ///
+/// deps_core::impl_dependency!(Fixture {
+///     name: name,
+///     name_range: name_range,
+///     version: version,
+///     version_range: version_range,
+///     source: source,
+/// });
+///
 /// deps_core::impl_unprobed_dependency!(Fixture);
+///
+/// fn requires_probe<D: ProbeDependency>() {}
+/// requires_probe::<Fixture>();
 /// ```
 #[cfg(any(test, feature = "test-util"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]

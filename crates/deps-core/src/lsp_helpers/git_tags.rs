@@ -25,6 +25,21 @@ use tower_lsp_server::ls_types::CodeAction;
 /// whether the diagnostic or its quick fix asks (#1781), and that [`Self::sha_comment_check`],
 /// [`Self::pinned_commit`] and [`Self::sha_pin_comment`] describe the same SHA pin. Callers
 /// may assume every method is a pure, non-blocking read of already-fetched state.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::GitTagsPinning;
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+///
+/// // The stub formatter reads every dependency as neither a SHA pin nor a tag pin.
+/// let formatter = StubFormatter::DEFAULT;
+/// let dep = StubDependency::new("actions/checkout");
+/// assert!(formatter.sha_comment_check(&dep).is_none());
+/// assert!(formatter.pinned_commit(&dep).is_none());
+/// assert!(formatter.sha_pin_comment(&dep).is_none());
+/// assert!(formatter.unknown_ref_target(&dep).is_none());
+/// ```
 pub trait GitTagsPinning: DependencyFormatter {
     /// Whether the SHA pin's trailing `# tag` comment agrees with the tag index; `None` when
     /// `dep` is not a SHA pin.
@@ -45,6 +60,19 @@ pub trait GitTagsPinning: DependencyFormatter {
 /// names a different commit than the pinned SHA.
 ///
 /// Silent for a confirmed, absent or unverifiable (cold or truncated index) comment.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::diagnostic::Severity;
+/// use deps_core::lsp_helpers::sha_comment_mismatch_diagnostics;
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+///
+/// let deps = [StubDependency::new("actions/checkout")];
+/// let diagnostics =
+///     sha_comment_mismatch_diagnostics(&deps, &StubFormatter::DEFAULT, Severity::Warning);
+/// assert!(diagnostics.is_empty());
+/// ```
 #[must_use]
 pub fn sha_comment_mismatch_diagnostics<F: GitTagsPinning>(
     deps: &[F::Dep],
@@ -73,6 +101,19 @@ pub fn sha_comment_mismatch_diagnostics<F: GitTagsPinning>(
 /// order.
 ///
 /// Neither is gated on the mutable-ref-pin switch: each fires only for a provable problem.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DiagnosticSeverities;
+/// use deps_core::lsp_helpers::git_tags_diagnostics;
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+///
+/// let deps = [StubDependency::new("actions/checkout")];
+/// let diagnostics =
+///     git_tags_diagnostics(&deps, &StubFormatter::DEFAULT, DiagnosticSeverities::default());
+/// assert!(diagnostics.is_empty());
+/// ```
 #[must_use]
 pub fn git_tags_diagnostics<F: GitTagsPinning>(
     deps: &[F::Dep],
@@ -105,6 +146,24 @@ fn dependency_at<'a, F: GitTagsPinning>(
 ///
 /// Offered exactly where [`sha_comment_mismatch_diagnostics`] reports, since both read the
 /// same [`GitTagsPinning::sha_comment_check`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::git_tags_sha_comment_fix_action;
+/// use deps_core::position::Position;
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+///
+/// let deps = [StubDependency::new("actions/checkout")];
+/// let uri = url::Url::parse("file:///repo/.github/workflows/ci.yml").unwrap();
+/// let action = git_tags_sha_comment_fix_action(
+///     &deps,
+///     &StubFormatter::DEFAULT,
+///     Position::new(0, 0),
+///     &uri,
+/// );
+/// assert!(action.is_none());
+/// ```
 #[cfg(feature = "lsp-responses")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lsp-responses")))]
 #[must_use]
@@ -131,6 +190,24 @@ pub fn git_tags_sha_comment_fix_action<F: GitTagsPinning>(
 ///
 /// Selects the pin through the same [`GitTagsPinning::unknown_ref_target`] the diagnostic
 /// uses, so the two can never pick different indexes.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::git_tags_unknown_ref_fix_action;
+/// use deps_core::position::Position;
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+///
+/// let deps = [StubDependency::new("actions/checkout")];
+/// let uri = url::Url::parse("file:///repo/.github/workflows/ci.yml").unwrap();
+/// let action = git_tags_unknown_ref_fix_action(
+///     &deps,
+///     &StubFormatter::DEFAULT,
+///     Position::new(0, 0),
+///     &uri,
+/// );
+/// assert!(action.is_none());
+/// ```
 #[cfg(feature = "lsp-responses")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lsp-responses")))]
 #[must_use]

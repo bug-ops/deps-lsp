@@ -34,7 +34,7 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(15);
 /// drops it).
 struct Gate {
     started: Arc<Mutex<mpsc::Receiver<()>>>,
-    release: mpsc::Sender<()>,
+    release: Option<mpsc::Sender<()>>,
 }
 
 impl Gate {
@@ -46,8 +46,14 @@ impl Gate {
             .expect("the gated registry request must arrive");
     }
 
-    fn release(self) {
-        drop(self.release);
+    fn release(&mut self) {
+        self.release.take();
+    }
+
+    /// Requests that reached the gated mock after the one [`Self::wait_started`] consumed.
+    fn further_requests(&self) -> usize {
+        let started = self.started.lock().unwrap();
+        std::iter::from_fn(|| started.try_recv().ok()).count()
     }
 }
 
@@ -80,7 +86,7 @@ fn gated_mock(
         mock,
         Gate {
             started: Arc::new(Mutex::new(started_rx)),
-            release: release_tx,
+            release: Some(release_tx),
         },
     )
 }
@@ -195,6 +201,16 @@ impl Fixture {
         .expect("the document load settles");
     }
 
+    async fn wait_for_cached_count(&self, expected: usize) {
+        tokio::time::timeout(SETTLE_DEADLINE, async {
+            while self.cached_count() != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the cached versions reach the expected count");
+    }
+
     fn cached_count(&self) -> usize {
         self.state
             .with_document(&self.uri, |doc| doc.signals.cached_versions.len())
@@ -216,7 +232,7 @@ impl Fixture {
 }
 
 /// RT-001/RT-002: the edit lands while the open task's only request is in flight.
-async fn assert_edit_during_initial_fetch_keeps_registry_data(fixture: Fixture, gate: Gate) {
+async fn assert_edit_during_initial_fetch_keeps_registry_data(fixture: Fixture, mut gate: Gate) {
     let open = fixture.open().await;
     fixture
         .state
@@ -273,8 +289,11 @@ mod npm_cases {
         assert_edit_during_initial_fetch_keeps_registry_data(fixture, gate).await;
     }
 
+    const TWO_DEPENDENCIES: &str =
+        r#"{"dependencies": {"@acme-corp/widget": "^1.0.0", "@acme-corp/gadget": "^1.0.0"}}"#;
+
     /// RT-003: a dependency with a committed outcome is not fetched again when an edit adds
-    /// another one; only the new name is requested.
+    /// another one; only the new name is requested, and a later edit requests nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rt_003_edit_fetches_only_uncommitted_dependencies() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
@@ -298,13 +317,65 @@ mod npm_cases {
         fixture.open().await.await.unwrap();
         assert_eq!(fixture.cached_count(), 1);
 
-        let two =
-            r#"{"dependencies": {"@acme-corp/widget": "^1.0.0", "@acme-corp/gadget": "^1.0.0"}}"#;
-        fixture.change(two.to_owned(), 2).await.await.unwrap();
+        fixture
+            .change(TWO_DEPENDENCIES.to_owned(), 2)
+            .await
+            .await
+            .unwrap();
+        assert_eq!(fixture.cached_count(), 2);
+
+        fixture
+            .change(format!("{TWO_DEPENDENCIES}\n"), 3)
+            .await
+            .await
+            .unwrap();
 
         assert_eq!(fixture.cached_count(), 2);
         widget.assert_async().await;
         gadget.assert_async().await;
+    }
+
+    /// RT-003 (abort): a change task aborted mid-fetch commits nothing; the next edit fetches
+    /// the added dependency once more, caches it, and leaves the committed one alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rt_003_aborted_change_fetch_is_retried_by_the_next_edit() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let mut registry = mockito::Server::new_async().await;
+        let widget = registry
+            .mock("GET", "/@acme-corp/widget")
+            .with_status(200)
+            .with_body(PACKUMENT)
+            .expect(1)
+            .create_async()
+            .await;
+        let (_gadget, mut gate) =
+            gated_mock(&mut registry, "/@acme-corp/gadget", false, PACKUMENT.into());
+        let fixture = npm_fixture(&registry.url(), None);
+
+        fixture.open().await.await.unwrap();
+        assert_eq!(fixture.cached_count(), 1);
+
+        let change = fixture.change(TWO_DEPENDENCIES.to_owned(), 2).await;
+        fixture
+            .state
+            .spawn_background_task(fixture.uri.clone(), change)
+            .await;
+        gate.wait_started().await;
+
+        let retry = fixture.change(format!("{TWO_DEPENDENCIES}\n"), 3).await;
+        fixture
+            .state
+            .spawn_background_task(fixture.uri.clone(), retry)
+            .await;
+        gate.release();
+        fixture.wait_for_cached_count(2).await;
+
+        assert_eq!(
+            gate.further_requests(),
+            1,
+            "gadget fetched more than once again"
+        );
+        widget.assert_async().await;
     }
 
     /// RT-004: a whitespace edit on a fully loaded document performs no registry request and

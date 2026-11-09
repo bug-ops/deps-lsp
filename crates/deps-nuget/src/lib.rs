@@ -1,5 +1,5 @@
 // `NuGetRegistry::unlisted_versions`'s boxed-future coercion in
-// `NuGetEcosystem::generate_hover` nests through several layers of `tokio::join!`/
+// `NuGetEcosystem::decorate_hover` nests through several layers of `tokio::join!`/
 // `MaybeDone` combinators; rustc's default recursion limit is occasionally insufficient to
 // prove the resulting `Send` bound and downgrades a previously-silent trait-solver retry
 // into `recursion_depth_exceeding_limit`, which the fuzz CI job's `-D warnings` nightly

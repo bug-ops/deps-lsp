@@ -130,7 +130,7 @@ impl Hover {
     /// Appends `extra` to [`Self::markdown`], sanitizing it the same way [`Self::new`]
     /// sanitizes its initial value.
     ///
-    /// For an ecosystem's `generate_hover` override that adds a trailing section (e.g. a
+    /// For an ecosystem's `decorate_hover` decoration that adds a trailing section (e.g. a
     /// catalog-source note or an update-footer) after the shared base hover was already
     /// built.
     ///
@@ -151,7 +151,7 @@ impl Hover {
     /// Replaces [`Self::markdown`] with the result of `f`, applied to the current value —
     /// sanitizing the result the same way [`Self::new`] sanitizes its initial value.
     ///
-    /// For an ecosystem's `generate_hover` override that needs to splice or annotate a line
+    /// For an ecosystem's `decorate_hover` decoration that needs to splice or annotate a line
     /// somewhere inside the already-built base hover (not just append at the end, which
     /// [`Self::push_markdown`] covers) — e.g. inserting a resolved-tag note after the
     /// `**Current**` line. Deliberately the only read-modify-write path: there is no bare

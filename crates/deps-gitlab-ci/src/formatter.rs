@@ -360,7 +360,7 @@ impl PackageRendering for GitlabCiFormatter {
     /// `component:` includes only (spec §8.2/NFR-004 carve-out) — a component's name ends
     /// in the component segment, so `https://{name}` is not the project's URL; the real
     /// project link is spliced into the hover body instead (`crate::ecosystem`'s
-    /// `generate_hover` override). A `project:` include's name is exactly
+    /// `decorate_hover` decoration). A `project:` include's name is exactly
     /// `{host}/{project_path}`, so its standard heading link is correct and unsuppressed.
     fn suppress_package_url(&self, source: &DependencySource) -> bool {
         match source {

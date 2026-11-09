@@ -402,7 +402,7 @@ impl TypedEcosystem for NuGetEcosystem {
                         hover.rewrite_markdown(|md| annotate_unlisted_versions(md, &unlisted));
                     })
                 }
-                _ => Box::new(|_| {}),
+                InteractiveFetch::Live(_) | InteractiveFetch::Degraded(_) => Box::new(|_| {}),
             };
             decorator
         })

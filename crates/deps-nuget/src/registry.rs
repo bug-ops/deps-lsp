@@ -1118,7 +1118,7 @@ impl NuGetRegistry {
     /// version silently vanish from completion suggestions too
     /// (`prepare_version_display_items` filters on `removal_status().blocks_resolution()`
     /// unconditionally) — the wrong tradeoff the spec calls out. This method is instead
-    /// called only from [`crate::ecosystem::NuGetEcosystem`]'s `generate_hover` override,
+    /// called only from [`crate::ecosystem::NuGetEcosystem`]'s `decorate_hover` decoration,
     /// so only a hover request ever pays for it.
     ///
     /// Degrades to an empty set (never an error) on any fetch/parse failure, or when the

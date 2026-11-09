@@ -4,8 +4,9 @@ use std::marker::PhantomData;
 
 use super::StubDependency;
 use crate::lsp_helpers::{
-    DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, PinResolution, ProbeDependency, RequirementResolution, SourcePolicy,
+    CommentCheck, CommitSha, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    GitTagsPinning, OsvNaming, PackageNaming, PackageRendering, PinResolution, ProbeDependency,
+    RequirementResolution, ShaPinComment, SourcePolicy, UnknownRefTarget,
 };
 use crate::{ConcreteVersion, PackageName};
 
@@ -285,6 +286,25 @@ impl<D: ProbeDependency + 'static> DependencyFormatter for StubFormatter<D> {
         } else {
             PinResolution::Unresolved
         }
+    }
+}
+
+/// A stub dependency is never a SHA or tag pin: every query answers `None`.
+impl<D: ProbeDependency + 'static> GitTagsPinning for StubFormatter<D> {
+    fn sha_comment_check(&self, _dep: &D) -> Option<CommentCheck> {
+        None
+    }
+
+    fn pinned_commit(&self, _dep: &D) -> Option<CommitSha> {
+        None
+    }
+
+    fn sha_pin_comment<'a>(&self, _dep: &'a D) -> Option<&'a ShaPinComment> {
+        None
+    }
+
+    fn unknown_ref_target<'a>(&self, _dep: &'a D) -> Option<UnknownRefTarget<'a>> {
+        None
     }
 }
 

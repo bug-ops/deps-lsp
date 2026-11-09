@@ -44,14 +44,23 @@ enum LockfilePresence {
 }
 
 impl LockfilePresence {
+    /// Absent only when nothing exists at `path`: a lock that cannot be stat'ed or is not a
+    /// regular file is still there, so the parse path reports the failure and keeps the
+    /// previous in-use versions instead of re-resolving them away.
+    fn of(path: &std::path::Path) -> Self {
+        match deps_core::fs_probe::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Ok(_) | Err(_) => Self::Present,
+        }
+    }
+
     async fn probe(path: &std::path::Path) -> Self {
         let path = path.to_path_buf();
         // A panicked probe is treated as present: the parse path then reports a reload failure
         // and keeps the previous in-use versions instead of wiping them.
-        match tokio::task::spawn_blocking(move || deps_core::fs_probe::is_file(&path)).await {
-            Ok(false) => Self::Absent,
-            Ok(true) | Err(_) => Self::Present,
-        }
+        tokio::task::spawn_blocking(move || Self::of(&path))
+            .await
+            .unwrap_or(Self::Present)
     }
 }
 
@@ -2009,6 +2018,23 @@ fn build_batch_workspace_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lockfile_presence_is_absent_only_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.lock");
+        std::fs::write(&file, "").unwrap();
+        let directory = dir.path().join("package-lock.json");
+        std::fs::create_dir(&directory).unwrap();
+
+        assert_eq!(LockfilePresence::of(&file), LockfilePresence::Present);
+        assert_eq!(LockfilePresence::of(&directory), LockfilePresence::Present);
+        assert_eq!(
+            LockfilePresence::of(&dir.path().join("missing.lock")),
+            LockfilePresence::Absent
+        );
+    }
+
     #[cfg(any(
         feature = "cargo",
         feature = "dart",

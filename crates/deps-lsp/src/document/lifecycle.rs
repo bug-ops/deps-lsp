@@ -1119,9 +1119,12 @@ pub(crate) async fn handle_document_change_guarded(
     // `commit_parsed_document` always installs a fresh `Idle` state, which would otherwise let
     // a document with pending registry data publish "Unknown package" until the debounced
     // task fetches (FR-008, issue #1987). The task recomputes the pending names itself.
-    if let Some(mut doc) = state.documents.get_mut(&uri)
-        && !pending_fetch_names(&doc, ecosystem.formatter(), refetch).is_empty()
-    {
+    let has_pending_fetch = state
+        .with_document(&uri, |doc| {
+            !pending_fetch_names(doc, ecosystem.formatter(), refetch).is_empty()
+        })
+        .unwrap_or(false);
+    if has_pending_fetch && let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.set_loading();
     }
 
