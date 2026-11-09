@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, ecosystem crates**: `TypedEcosystem::{hover, diagnostics, code_actions}` are replaced by `decorate_*` hooks with `HoverDecoration` and the free functions `deps_core::ecosystem::{hover, diagnostics, code_actions}` (#PR)
+- **deps-core**: `DependencyFormatter::Dep` and `TypedParseResult::Dep` must implement the new `ProbeDependency` (#PR)
+- **deps-core**: `ResolvedPackage` gains `EntryPlacement`, `SkipReason` gains `LockAlternativesUnchecked`, and `MatchedTags` gains `MatchOrigin` (#PR)
+- **deps-core**: `dependency_truncation` returns `DependencyTruncation { kept, total }` instead of a tuple, and `FlightHandle::wait` returns `FlightEnd` (#PR)
+- **deps-core**: `EcosystemBase::id` is removed and `id()` on `dyn Ecosystem` derives from `ecosystem_id()` (#PR)
+- **deps-core**: `Registry`, `Version` and `Metadata` expose `as_any` only through the test-gated `RegistryAny`, `VersionAny` and `MetadataAny`; the clippy bans and the CI exemption guard are removed (#PR)
 - **deps-core, ecosystem crates**: `Ecosystem` is split into `EcosystemBase` and `TypedEcosystem`; `Ecosystem` is erased and blanket-only (#1980)
 - **deps-core**: new `ParsedManifest`, `DependencyFormatter` and `FormattedDependency` replace dyn dependency formatting and helpers (#1980)
 - **deps-core**: `as_any` is removed from `Ecosystem`, `ParseResult` and `Dependency`, along with the Own/Narrow traits and `cap_dependencies` (#1980)
@@ -27,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: invalid YAML returns `DepsError::ParseError` instead of an empty result, except a bare `action.yml` (#1956)
 
 ### Added
+- **deps-core, deps-cli**: lock-file entries that satisfy a requirement but are not the in-use version are scanned in OSV and labelled "also locked at", and more than 16 of them report an unchecked note that `--fail-on unchecked` enforces (#PR)
+- **deps-github-actions**: `test-util` feature with `GithubActionsEcosystem::for_test` (#PR)
 - **deps-npm, deps-core**: read in-use versions from `bun.lock` (lockfileVersion 0-3) through the new `parse_jsonc_typed` helper (#1976)
 - **deps-core**: `SwrStore`, `SingleFlight`/`FlightHandle` and the `OwnParseResult`/`OwnDependency` typed boundary; new methods on the unsealed `OwnDependency` need a default body (#1974)
 - **deps-cli**: `--fail-on unchecked` is a strict, additive gate that exits 1 when vulnerability data was not checked for any dependency or scanning is disabled; with `--offline` it exits 2 (#1961)
@@ -38,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: a neutral `ℹ` inlay hint marks a dependency that was never looked up in a registry (#1956)
 
 ### Changed
+- **deps-core, deps-github-actions, deps-gitlab-ci**: the git-tags diagnostics and quick fixes live in the shared `lsp_helpers::git_tags` (#PR)
+- **deps-engine**: the cross-ecosystem `non_public_route` guard is restored through an erased `ProbeDependency` probe (#PR)
+- **deps-npm**: yarn.lock percent-decoding, bun.lock truncation and lock-file parse errors reuse shared helpers (#PR)
+- **deps-core**: lock-file candidate selection is bounded and memoized per name and requirement (#PR)
 - **deps-pypi**: an invalid or blocked uv `default = true` index fails closed as an unverified registry even when valid extra indexes exist (#1976)
 - **deps-go**: a `go.env` found through `PATH` no longer feeds the trusted `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB` and `GOSUMDB` lists and only marks matching modules unverified (#1976)
 - **deps-core, deps-swift**: `EvidenceStore` and `ScmIdentityMemo` share one SWR store with O(log n) eviction, and ecosystem hooks narrow parse results once at the boundary, cutting production `as_any()` calls from 51 to 4 (#1974)
@@ -52,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps**: refresh `Cargo.lock` (#1956)
 
 ### Fixed
+- **deps-lsp**: a `didChange` during the initial registry fetch no longer discards the fetch, so dependencies keep their registry data and OSV outcome (#PR)
+- **deps-lsp**: deleting a lock file refreshes the in-use versions of open manifests (#PR)
+- **deps-core, deps-npm, deps-engine**: a nested or duplicated lock-file entry no longer hides advisories of the in-use dependency in npm, yarn, bun and pnpm projects (#PR)
+- **deps-core, deps-lsp**: the hover update footer is shown only when code actions are offered (#PR)
+- **deps-core**: a panic in a `SingleFlight` leader is logged and reported to waiters as abandoned instead of completion (#PR)
 - **deps-npm**: partial `<=` ranges such as `<=1` and `<=1.x` admit every matching version instead of flagging it outdated (#1976)
 - **deps-deno, deps-npm**: Deno `npm:` specifiers under a non-public `registry=` report the unverified-mirror OSV signal (#1976)
 - **deps-core, deps-composer**: `^0` and `^0.0` requirements are kept unchanged on update when the picked version is in range (#1976)
