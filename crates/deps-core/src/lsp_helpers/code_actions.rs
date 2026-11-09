@@ -489,6 +489,10 @@ fn build_replacement_action(
 /// The hover footer advertises `Cmd+.` through this, so it cannot promise an action
 /// `codeAction` then withholds (#1988). The one gate it cannot apply is the document-content
 /// literal-span check, which a hover has no text for.
+///
+/// The interactive-fetch circuit breaker enforces for hover but only observes for `codeAction`:
+/// with the breaker open, `fetched` is a degraded answer here and the footer is withheld while
+/// `codeAction` may still offer actions. An action without a footer is the safe direction.
 pub(super) fn code_actions_offered<P, F, R>(
     parse_result: &P,
     dep: &P::Dep,
@@ -503,15 +507,15 @@ where
     R: Registry + ?Sized,
 {
     let uri = parse_result.uri();
-    if offered_replacement_name(dep, versions, formatter).is_some() {
-        return true;
-    }
     let (Some(version_range), Some(version_req)) = (dep.version_range(), dep.version_requirement())
     else {
         return false;
     };
     if version_req.as_str().is_empty() {
         return false;
+    }
+    if offered_replacement_name(dep, versions, formatter).is_some() {
+        return true;
     }
     let version_range: Range = version_range.into();
 
@@ -851,15 +855,21 @@ pub(super) struct FetchedVersions {
 }
 
 impl FetchedVersions {
+    /// This answer as a footer must read it, ahead of the `codeAction` it advertises.
+    ///
+    /// A genuine failure fails open only for the request that received it, and records a memo
+    /// that refuses every later lookup as unverified. The `codeAction` the footer points at is
+    /// such a later request, so a failure here promises no fix action.
+    pub(super) const fn seen_by_the_next_request(mut self) -> Self {
+        if self.live.is_none() {
+            self.unverified = true;
+        }
+        self
+    }
+
     /// The live version list, when the registry answered with one.
     pub(super) const fn live(&self) -> Option<&Arc<[Box<dyn Version>]>> {
         self.live.as_ref()
-    }
-
-    /// Whether the lookup ended without the registry having answered either way (a timeout, a
-    /// shed request): the case in which `codeAction` withholds every speculative action.
-    pub(super) const fn is_unverified(&self) -> bool {
-        self.unverified
     }
 
     /// The registry's answer as `codeAction` reads it, from an interactive lookup's outcome.

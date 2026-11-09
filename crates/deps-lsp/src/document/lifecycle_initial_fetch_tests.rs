@@ -269,11 +269,19 @@ mod npm_cases {
     }
 
     pub(super) fn npm_fixture(registry: &str, osv_url: Option<String>) -> Fixture {
+        npm_fixture_for(MANIFEST.to_owned(), registry, osv_url)
+    }
+
+    pub(super) fn npm_fixture_for(
+        manifest: String,
+        registry: &str,
+        osv_url: Option<String>,
+    ) -> Fixture {
         let npmrc = npmrc(registry);
         fixture(FixtureSpec {
             files: &[(".npmrc", npmrc.as_str())],
             manifest_path: "package.json",
-            manifest: MANIFEST.to_owned(),
+            manifest,
             ecosystem: None,
             osv_url,
         })
@@ -564,4 +572,109 @@ async fn rt_002_github_actions_edit_during_initial_fetch_keeps_registry_data() {
         osv_url: None,
     });
     assert_edit_during_initial_fetch_keeps_registry_data(fixture, gate).await;
+}
+
+/// #1988: through the real handlers, the hover footer is present exactly when `codeAction`
+/// returns something, in the states the unit-level table cannot model: a document still
+/// loading, and a package deprecated at its latest version.
+#[cfg(feature = "npm")]
+mod footer_parity {
+    use super::npm_cases::npm_fixture_for;
+    use super::*;
+    use crate::handlers::code_actions::handle_code_actions;
+    use crate::handlers::hover::handle_hover;
+    use tower_lsp_server::ls_types::{
+        CodeActionParams, HoverContents, HoverParams, Position, Range, TextDocumentIdentifier,
+        TextDocumentPositionParams,
+    };
+
+    const FOOTER: &str = "Cmd+.";
+    const PACKUMENT_ALL_DEPRECATED: &str = r#"{"versions": {"1.0.0": {"deprecated": "old"}, "1.1.0": {"deprecated": "use another package"}}, "dist-tags": {"latest": "1.1.0"}}"#;
+    const PACKUMENT_CURRENT: &str =
+        r#"{"versions": {"1.0.0": {}, "1.1.0": {}}, "dist-tags": {"latest": "1.1.0"}}"#;
+    const MANIFEST: &str = r#"{"dependencies": {"@acme-corp/widget": "^1.1.0"}}"#;
+
+    impl Fixture {
+        /// `(footer shown, code actions offered)` for the requirement `^1.1.0`.
+        async fn footer_and_actions(&self) -> (bool, usize) {
+            let column = u32::try_from(self.content.find("^1.1.0").unwrap() + 1).unwrap();
+            let position = Position::new(0, column);
+            let hover = handle_hover(
+                Arc::clone(&self.state),
+                HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: self.uri.clone(),
+                        },
+                        position,
+                    },
+                    work_done_progress_params: Default::default(),
+                },
+                self.client.clone(),
+                Arc::clone(&self.config),
+            )
+            .await
+            .expect("hover");
+            let footer = match hover.contents {
+                HoverContents::Markup(markup) => markup.value.contains(FOOTER),
+                other => panic!("unexpected hover contents {other:?}"),
+            };
+            let actions = handle_code_actions(
+                Arc::clone(&self.state),
+                CodeActionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: self.uri.clone(),
+                    },
+                    range: Range::new(position, position),
+                    context: Default::default(),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                },
+                self.client.clone(),
+                Arc::clone(&self.config),
+            )
+            .await;
+            (footer, actions.len())
+        }
+    }
+
+    async fn registry_serving(packument: &str) -> mockito::ServerGuard {
+        let mut registry = mockito::Server::new_async().await;
+        registry
+            .mock("GET", "/@acme-corp/widget")
+            .with_status(200)
+            .with_body(packument)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        registry
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn footer_matches_code_actions_when_every_version_is_deprecated_at_latest() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let registry = registry_serving(PACKUMENT_ALL_DEPRECATED).await;
+        let osv = mockito::Server::new_async().await;
+        let fixture = npm_fixture_for(MANIFEST.to_owned(), &registry.url(), Some(osv.url()));
+        fixture.open().await.await.unwrap();
+
+        let (footer, actions) = fixture.footer_and_actions().await;
+
+        assert_eq!(footer, actions > 0, "footer={footer} actions={actions}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn footer_matches_code_actions_while_the_document_is_still_loading() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let registry = registry_serving(PACKUMENT_CURRENT).await;
+        let osv = mockito::Server::new_async().await;
+        let fixture = npm_fixture_for(MANIFEST.to_owned(), &registry.url(), Some(osv.url()));
+        let _open = fixture.open().await;
+
+        let (footer, actions) = fixture.footer_and_actions().await;
+
+        // The OSV phase keeps running between the two requests, so an action may appear
+        // after the hover; a footer without an action must never be shown.
+        assert!(!footer || actions > 0, "footer={footer} actions={actions}");
+    }
 }

@@ -129,9 +129,12 @@ where
         FetchContext::Hover,
     );
     let fetched = if resolvable {
-        Some(FetchedVersions::from_interactive(
-            await_interactive_versions(registry, fetch_request.clone(), freshness).await,
-        ))
+        Some(
+            FetchedVersions::from_interactive(
+                await_interactive_versions(registry, fetch_request.clone(), freshness).await,
+            )
+            .seen_by_the_next_request(),
+        )
     } else {
         None
     };
@@ -262,20 +265,23 @@ where
         .version_requirement()
         .is_some_and(|req| requirement_is_placeholder_for(formatter, dep, req.as_str()));
     let offline = versions.network.is_offline();
-    let latest_is_safe = matches!(
-        latest_verdict_result,
-        LatestVerdict::Verified | LatestVerdict::NotApplicable
-    );
     let code_actions = match &fetched {
         Some(fetched)
-            if code_actions_offered(parse_result, dep, versions, fetched, registry, formatter)
-                || cached_latest_stands_in(fetched, cached_latest, latest_is_safe) =>
+            if !requirement_is_placeholder
+                && code_actions_offered(
+                    parse_result,
+                    dep,
+                    versions,
+                    fetched,
+                    registry,
+                    formatter,
+                ) =>
         {
             CodeActions::Offered
         }
         Some(_) | None => CodeActions::None,
     };
-    push_cmd_dot_footer_hover_section(&mut markdown, requirement_is_placeholder, code_actions);
+    push_cmd_dot_footer_hover_section(&mut markdown, code_actions);
 
     push_offline_footer_hover_section(&mut markdown, resolvable, offline);
     push_skip_reason_footer_hover_section(&mut markdown, resolvable, offline, vuln_outcome);
@@ -1032,21 +1038,6 @@ enum CodeActions {
     None,
 }
 
-/// Whether a cached, safe-to-suggest latest stands in for a live version list that never
-/// arrived: `HttpCache` serves warm entries while offline and doc-state survives the
-/// transition via `preserve_cache` (#501), so `codeAction` can still build its updates from the
-/// same data. Never when the lookup was unverified, where `codeAction` offers nothing.
-fn cached_latest_stands_in(
-    fetched: &FetchedVersions,
-    cached_latest: Option<&super::PackageVersions>,
-    latest_is_safe: bool,
-) -> bool {
-    fetched.live().is_none()
-        && !fetched.is_unverified()
-        && cached_latest.is_some()
-        && latest_is_safe
-}
-
 /// Appends the `Cmd+.` code-action footer — advertised exactly when `codeAction` can offer
 /// something for this dependency (#474, #1988).
 ///
@@ -1056,15 +1047,11 @@ fn cached_latest_stands_in(
 /// non-resolvable source (a local composite action, a Docker image ref, a Git or path
 /// dependency) never gets an action and is passed in as [`CodeActions::None`].
 ///
-/// `requirement_is_placeholder` (#1402) suppresses the footer independent of the above: an
-/// unexpanded template placeholder is rejected by the write-path guard every `codeAction` fix
-/// routes through ([`crate::edit::requirement_is_placeholder_for`], #1393).
-fn push_cmd_dot_footer_hover_section(
-    markdown: &mut HoverMarkdown,
-    requirement_is_placeholder: bool,
-    code_actions: CodeActions,
-) {
-    if code_actions == CodeActions::Offered && !requirement_is_placeholder {
+/// An unexpanded template placeholder requirement (#1402) is passed in as [`CodeActions::None`]
+/// too: the write-path guard every `codeAction` fix routes through rejects it
+/// ([`crate::edit::requirement_is_placeholder_for`], #1393).
+fn push_cmd_dot_footer_hover_section(markdown: &mut HoverMarkdown, code_actions: CodeActions) {
+    if code_actions == CodeActions::Offered {
         markdown.push_static(CMD_DOT_FOOTER);
     }
 }
@@ -7857,7 +7844,7 @@ mod tests {
             let content = hover_markdown(
                 &outcomes(LookupMiss::NotFound),
                 &scan(vulnerable()),
-                &NotFoundRegistry,
+                &MockRegistry,
             )
             .await;
             assert!(content.contains("Security advisories"), "{content}");
@@ -7984,12 +7971,14 @@ mod tests {
                     offers_actions: false,
                 },
                 Scenario {
+                    // A failure fails open only for the request that received it; the hover
+                    // is first, so the `codeAction` right after is refused as unverified.
                     name: "failed lookup, fixable advisory",
                     registry: Box::new(ErrorRegistry),
                     vulnerabilities: scan(vulnerable()),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
-                    offers_actions: true,
+                    offers_actions: false,
                 },
                 Scenario {
                     name: "failed lookup, advisory without a fixed version",
@@ -8031,7 +8020,14 @@ mod tests {
             let cached = HashMap::new();
             let resolved = HashMap::new();
             for scenario in scenarios {
+                // One gate per scenario, as in the server: the hover's failure is memoized
+                // before the `codeAction` that follows it.
+                let gate = crate::lsp_helpers::InteractiveFetchGate::new(
+                    std::num::NonZeroUsize::new(4).unwrap(),
+                );
                 let versions = VersionData::new(&cached, &resolved)
+                    .with_ecosystem(crate::EcosystemId::Cargo)
+                    .with_interactive_fetch_gate(&gate)
                     .with_outcomes(&scenario.outcomes)
                     .with_vulnerabilities(&scenario.vulnerabilities);
                 let hover = generate_hover(

@@ -3639,11 +3639,26 @@ mod tests {
                 )
                 .await
                 .expect("hover");
-                assert!(
+                let sha_column = content
+                    .lines()
+                    .nth(line as usize)
+                    .and_then(|text| text.find(|c: char| c.is_ascii_digit()))
+                    .expect("the pin line carries a SHA");
+                let actions = deps_core::ecosystem::code_actions(
+                    &eco,
+                    ParsedView::new(&parse_result),
+                    Position::new(line, sha_column as u32 + 1),
+                    &uri,
+                    versions().with_network(deps_core::NetworkMode::Offline),
+                    &content,
+                )
+                .await;
+                assert_eq!(
                     hover
                         .markdown()
                         .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
-                    "line {line}: {}",
+                    !actions.is_empty(),
+                    "line {line}: footer must match code actions {actions:?}; hover: {}",
                     hover.markdown()
                 );
             }
