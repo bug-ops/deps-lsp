@@ -11,6 +11,7 @@ use crate::fs_probe;
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use url::Url;
 
@@ -386,16 +387,192 @@ pub struct ResolvedPackage {
 /// transitive-only copies of a package under a nested location (#1981).
 ///
 /// Exhaustive on purpose: every `match` must decide how each placement is treated.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryPlacement {
-    /// The entry a root or workspace-member dependency resolves to. The default for every
-    /// lock format that does not distinguish nested copies.
-    #[default]
-    Hoisted,
+    /// The entry a root or workspace-member dependency resolves to, with the owner the lock
+    /// format attributes it to. The default (with [`EntryOwner::Unattributed`]) for every lock
+    /// format that records neither nested copies nor owners.
+    Hoisted {
+        /// Which manifest(s) this entry serves (#1993).
+        owner: EntryOwner,
+    },
     /// A copy installed only for a transitive consumer (`package-lock.json`
     /// `node_modules/<parent>/node_modules/<name>`). Never authoritative for a direct
-    /// dependency while a [`Self::Hoisted`] entry of the same name exists.
+    /// dependency while a [`Self::Hoisted`] entry of the same name exists, and never owned: a
+    /// nested copy cannot serve a manifest.
     Nested,
+}
+
+impl Default for EntryPlacement {
+    fn default() -> Self {
+        Self::Hoisted {
+            owner: EntryOwner::Unattributed,
+        }
+    }
+}
+
+/// Which workspace member(s) a hoisted lock entry serves (#1993).
+///
+/// Exhaustive on purpose: every `match` must decide how each owner kind selects an entry.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EntryOwner {
+    /// The lock format records no owner (flat lists, package-lock workspace-folder entries);
+    /// the entry is a candidate for every manifest.
+    Unattributed,
+    /// The entry sits under one workspace importer (pnpm `importers.<path>`, package-lock
+    /// `<member>/node_modules/<name>`, bun `<workspace>/<name>`, or the root).
+    Importer(ImporterPath),
+    /// The entry resolves exactly these declared requirements (yarn descriptors), compared as
+    /// raw text with a manifest's declared requirement.
+    Descriptors(Box<[crate::VersionReq]>),
+}
+
+impl std::fmt::Debug for EntryOwner {
+    /// Manual: descriptors are raw lock-file declarations, redacted like every other
+    /// declaration key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unattributed => f.write_str("Unattributed"),
+            Self::Importer(path) => f.debug_tuple("Importer").field(path).finish(),
+            Self::Descriptors(descriptors) => f
+                .debug_tuple("Descriptors")
+                .field(
+                    &descriptors
+                        .iter()
+                        .map(|d| crate::redact::redact_declaration_key(d.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+                .finish(),
+        }
+    }
+}
+
+/// Why a string is not a valid [`ImporterPath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ImporterPathError {
+    /// The path is absolute; an importer path is relative to the lock file's directory.
+    #[error("importer path is absolute")]
+    Absolute,
+    /// The path contains a `..` component and could leave the workspace.
+    #[error("importer path contains a `..` component")]
+    ParentComponent,
+    /// The path contains a NUL byte.
+    #[error("importer path contains a NUL byte")]
+    Nul,
+}
+
+/// A workspace member's directory relative to its lock file's directory (#1993).
+///
+/// `/`-separated with no leading, trailing or repeated separators and no `.` components; the
+/// lock file's own directory (the workspace root) is the empty path. Rejecting absolute paths,
+/// `..` and NUL at construction keeps every comparison a plain component comparison.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lockfile::ImporterPath;
+///
+/// let member = ImporterPath::parse("packages/a").unwrap();
+/// assert!(ImporterPath::root().is_ancestor_or_self_of(&member));
+/// assert!(!ImporterPath::parse("packages/ab").unwrap().is_ancestor_or_self_of(&member));
+/// assert_eq!(ImporterPath::parse(".").unwrap(), ImporterPath::root());
+/// assert!(ImporterPath::parse("../escape").is_err());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ImporterPath(String);
+
+impl ImporterPath {
+    /// The workspace root (the lock file's own directory).
+    #[must_use]
+    pub const fn root() -> Self {
+        Self(String::new())
+    }
+
+    /// Parses a `/`-separated relative path, treating `.` and empty components as no-ops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImporterPathError`] for an absolute path, a `..` component or a NUL byte.
+    pub fn parse(path: &str) -> std::result::Result<Self, ImporterPathError> {
+        if path.contains('\0') {
+            return Err(ImporterPathError::Nul);
+        }
+        if path.starts_with('/') {
+            return Err(ImporterPathError::Absolute);
+        }
+        let mut normalized = String::with_capacity(path.len());
+        for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            if component == ".." {
+                return Err(ImporterPathError::ParentComponent);
+            }
+            if !normalized.is_empty() {
+                normalized.push('/');
+            }
+            normalized.push_str(component);
+        }
+        Ok(Self(normalized))
+    }
+
+    /// The directory of `manifest` relative to the directory of `lockfile`, or `None` when the
+    /// manifest is not below the lock file's directory (or a component is not plain UTF-8).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lockfile::ImporterPath;
+    /// use std::path::Path;
+    ///
+    /// let scope = ImporterPath::of_manifest(
+    ///     Path::new("/ws/package-lock.json"),
+    ///     Path::new("/ws/packages/a/package.json"),
+    /// );
+    /// assert_eq!(scope, Some(ImporterPath::parse("packages/a").unwrap()));
+    /// assert_eq!(
+    ///     ImporterPath::of_manifest(Path::new("/ws/a.lock"), Path::new("/elsewhere/package.json")),
+    ///     None
+    /// );
+    /// ```
+    #[must_use]
+    pub fn of_manifest(lockfile: &Path, manifest: &Path) -> Option<Self> {
+        let relative = manifest.parent()?.strip_prefix(lockfile.parent()?).ok()?;
+        let mut segments = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(segment) => segments.push(segment.to_str()?),
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        Self::parse(&segments.join("/")).ok()
+    }
+
+    /// Whether `self` is `other` or one of its parent directories, comparing whole path
+    /// components (`packages/a` is not an ancestor of `packages/ab`).
+    #[must_use]
+    pub fn is_ancestor_or_self_of(&self, other: &Self) -> bool {
+        self.0.is_empty()
+            || other.0 == self.0
+            || other
+                .0
+                .strip_prefix(self.0.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    /// Number of path components; the root is `0`.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        if self.0.is_empty() {
+            0
+        } else {
+            self.0.split('/').count()
+        }
+    }
+
+    /// The normalized `/`-separated path (empty for the root).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for ResolvedPackage {
@@ -452,7 +629,7 @@ impl ResolvedPackage {
             version,
             source,
             dependencies: Vec::new(),
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         }
     }
 
@@ -465,8 +642,8 @@ impl ResolvedPackage {
 
     /// Where this entry sits relative to the project root. See [`EntryPlacement`].
     #[must_use]
-    pub const fn placement(&self) -> EntryPlacement {
-        self.placement
+    pub const fn placement(&self) -> &EntryPlacement {
+        &self.placement
     }
 
     /// Attaches this package's own dependencies. See [`Self::dependencies`].
@@ -645,6 +822,133 @@ fn best_package<'a>(
         .max_by(|a, b| compare_lockfile_versions(&a.version, &b.version))
 }
 
+/// Most declared requirements kept per lock entry and per distinct version.
+///
+/// A crafted header listing thousands of ranges must not make descriptor handling quadratic.
+/// A dropped descriptor only falls back to the highest satisfying entry.
+pub const MAX_ENTRY_DESCRIPTORS: usize = 256;
+
+/// The owner a hoisted entry carries; a nested copy has none.
+const fn owner_of(package: &ResolvedPackage) -> Option<&EntryOwner> {
+    match &package.placement {
+        EntryPlacement::Hoisted { owner } => Some(owner),
+        EntryPlacement::Nested => None,
+    }
+}
+
+/// The importer whose entries `scope` owns: the deepest importer that is an ancestor of, or
+/// equal to, `scope` among the entries' importers.
+fn owning_importer<'a>(
+    packages: &[&'a ResolvedPackage],
+    scope: &ImporterPath,
+) -> Option<&'a ImporterPath> {
+    packages
+        .iter()
+        .filter_map(|package| match owner_of(package) {
+            Some(EntryOwner::Importer(importer)) if importer.is_ancestor_or_self_of(scope) => {
+                Some(importer)
+            }
+            _ => None,
+        })
+        .max_by_key(|importer| importer.depth())
+}
+
+/// One normalized name's collapsed version and, when it has more than one distinct version,
+/// its candidates (see [`ResolvedPackages::split_normalized_for`] for the rules).
+fn split_one_name(
+    mut packages: Vec<&ResolvedPackage>,
+    scope: Option<&ImporterPath>,
+) -> (
+    Option<crate::ConcreteVersion>,
+    Option<crate::lsp_helpers::LockCandidates>,
+) {
+    use crate::lsp_helpers::{LockCandidates, OwnerPreference};
+
+    if packages.iter().any(|package| owner_of(package).is_some()) {
+        packages.retain(|package| owner_of(package).is_some());
+    }
+
+    let owning = scope.and_then(|scope| owning_importer(&packages, scope));
+    let is_owned = |package: &ResolvedPackage| {
+        owning.is_some_and(|owning| {
+            matches!(owner_of(package), Some(EntryOwner::Importer(importer)) if importer == owning)
+        })
+    };
+    let owned: Vec<&ResolvedPackage> = packages
+        .iter()
+        .copied()
+        .filter(|package| is_owned(package))
+        .collect();
+    let best = if owned.is_empty() {
+        best_package(packages.iter().copied())
+    } else {
+        best_package(owned.iter().copied())
+    }
+    .map(|best| crate::ConcreteVersion::from(best.version.clone()));
+
+    struct Distinct<'a> {
+        version: &'a str,
+        owned: bool,
+        descriptors: Vec<crate::VersionReq>,
+        seen_descriptors: HashSet<&'a str>,
+    }
+    let mut distinct: Vec<Distinct<'_>> = Vec::new();
+    for package in &packages {
+        let version = package.version.as_str();
+        let index = distinct
+            .iter()
+            .position(|seen| compare_lockfile_versions(seen.version, version).is_eq())
+            .unwrap_or_else(|| {
+                distinct.push(Distinct {
+                    version,
+                    owned: false,
+                    descriptors: Vec::new(),
+                    seen_descriptors: HashSet::new(),
+                });
+                distinct.len() - 1
+            });
+        let Some(slot) = distinct.get_mut(index) else {
+            continue;
+        };
+        slot.owned |= is_owned(package);
+        if let Some(EntryOwner::Descriptors(declared)) = owner_of(package) {
+            for descriptor in declared.iter() {
+                if slot.descriptors.len() < MAX_ENTRY_DESCRIPTORS {
+                    if slot.seen_descriptors.insert(descriptor.as_str()) {
+                        slot.descriptors.push(descriptor.clone());
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if distinct.len() <= 1 {
+        return (best, None);
+    }
+
+    let preference = if !owned.is_empty() {
+        OwnerPreference::Owned(distinct.iter().map(|d| d.owned).collect())
+    } else if scope.is_some() && distinct.iter().any(|d| !d.descriptors.is_empty()) {
+        OwnerPreference::Descriptors(
+            distinct
+                .iter()
+                .map(|d| d.descriptors.clone().into_boxed_slice())
+                .collect(),
+        )
+    } else {
+        OwnerPreference::Unscoped
+    };
+    let versions = distinct
+        .iter()
+        .map(|d| crate::ConcreteVersion::from(d.version))
+        .collect();
+    (
+        best,
+        Some(LockCandidates::with_preference(versions, preference)),
+    )
+}
+
 impl ResolvedPackages {
     /// Creates a new empty collection.
     pub fn new() -> Self {
@@ -791,11 +1095,72 @@ impl ResolvedPackages {
     /// let (versions, candidates) = resolved.split_normalized(&Lowercase);
     /// let key = Lowercase.normalize_package_name(&PackageName::new("Django"));
     /// assert_eq!(versions.get(&key).map(|v| v.as_str()), Some("4.1.0"));
-    /// assert_eq!(candidates.get(&key).map(Vec::len), Some(2));
+    /// assert_eq!(candidates.get(&key).map(|c| c.len()), Some(2));
     /// ```
     pub fn split_normalized(
         &self,
         naming: &(impl crate::lsp_helpers::PackageNaming + ?Sized),
+    ) -> (
+        crate::lsp_helpers::ResolvedVersionsMap,
+        crate::lsp_helpers::ResolvedCandidatesMap,
+    ) {
+        self.split_with_scope(naming, None)
+    }
+
+    /// [`Self::split_normalized`] for the workspace member at `scope` (#1993).
+    ///
+    /// After the same nested-copy demotion, entries owned by the *deepest importer that is an
+    /// ancestor of, or equal to, `scope`* are the member's own: the collapsed version is the
+    /// best of those when there are any (otherwise the best overall), and each candidates entry
+    /// remembers which versions are owned so a requirement is resolved against them first. A
+    /// lock format that attributes entries to declared requirements (yarn) instead records
+    /// those, and the collapsed version stays the best overall.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageName;
+    /// use deps_core::lockfile::{
+    ///     EntryOwner, EntryPlacement, ImporterPath, ResolvedPackage, ResolvedPackages,
+    ///     ResolvedSource,
+    /// };
+    /// use deps_core::lsp_helpers::{NormalizeName, PackageNaming};
+    ///
+    /// struct Identity;
+    /// impl PackageNaming for Identity {}
+    ///
+    /// let registry = || ResolvedSource::Registry { url: String::new(), checksum: String::new() };
+    /// let owned_by = |version: &str, importer: &str| {
+    ///     ResolvedPackage::new("left-pad".into(), version.into(), registry()).with_placement(
+    ///         EntryPlacement::Hoisted {
+    ///             owner: EntryOwner::Importer(ImporterPath::parse(importer).unwrap()),
+    ///         },
+    ///     )
+    /// };
+    /// let mut resolved = ResolvedPackages::new();
+    /// resolved.insert(owned_by("1.0.0", "packages/a"));
+    /// resolved.insert(owned_by("2.0.0", "packages/b"));
+    ///
+    /// let scope = ImporterPath::parse("packages/a").unwrap();
+    /// let (versions, _) = resolved.split_normalized_for(&Identity, &scope);
+    /// let key = Identity.normalize_package_name(&PackageName::new("left-pad"));
+    /// assert_eq!(versions.get(&key).map(|v| v.as_str()), Some("1.0.0"));
+    /// ```
+    pub fn split_normalized_for(
+        &self,
+        naming: &(impl crate::lsp_helpers::PackageNaming + ?Sized),
+        scope: &ImporterPath,
+    ) -> (
+        crate::lsp_helpers::ResolvedVersionsMap,
+        crate::lsp_helpers::ResolvedCandidatesMap,
+    ) {
+        self.split_with_scope(naming, Some(scope))
+    }
+
+    fn split_with_scope(
+        &self,
+        naming: &(impl crate::lsp_helpers::PackageNaming + ?Sized),
+        scope: Option<&ImporterPath>,
     ) -> (
         crate::lsp_helpers::ResolvedVersionsMap,
         crate::lsp_helpers::ResolvedCandidatesMap,
@@ -813,37 +1178,13 @@ impl ResolvedPackages {
 
         let mut versions = HashMap::with_capacity(union.len());
         let mut candidates = HashMap::new();
-        for (key, mut packages) in union {
-            if packages
-                .iter()
-                .any(|package| package.placement == EntryPlacement::Hoisted)
-            {
-                packages.retain(|package| package.placement == EntryPlacement::Hoisted);
+        for (key, packages) in union {
+            let (best, alternatives) = split_one_name(packages, scope);
+            if let Some(best) = best {
+                versions.insert(key.clone(), best);
             }
-            if let Some(best) = best_package(packages.iter().copied()) {
-                versions.insert(
-                    key.clone(),
-                    crate::ConcreteVersion::from(best.version.clone()),
-                );
-            }
-            let mut distinct: Vec<&str> = Vec::new();
-            for package in &packages {
-                let version = package.version.as_str();
-                if !distinct
-                    .iter()
-                    .any(|seen| compare_lockfile_versions(seen, version).is_eq())
-                {
-                    distinct.push(version);
-                }
-            }
-            if distinct.len() > 1 {
-                candidates.insert(
-                    key,
-                    distinct
-                        .into_iter()
-                        .map(crate::ConcreteVersion::from)
-                        .collect(),
-                );
+            if let Some(alternatives) = alternatives {
+                candidates.insert(key, alternatives);
             }
         }
         (versions, candidates)
@@ -956,7 +1297,7 @@ pub const DEFAULT_MAX_CACHED_LOCKFILES: usize = 256;
 
 /// Cached lock file entry with staleness detection.
 struct CachedLockFile {
-    packages: ResolvedPackages,
+    packages: Arc<ResolvedPackages>,
     modified_at: SystemTime,
     /// When this entry was last parsed *or* served from a cache hit — the recency key
     /// [`LockFileCache::evict_oldest`] evicts by once the cache is at capacity. Refreshed on
@@ -1066,7 +1407,8 @@ impl LockFileCache {
     ///
     /// # Returns
     ///
-    /// Resolved packages on success
+    /// Resolved packages on success, shared with the cache so a hit clones a pointer, not the
+    /// map (#1968)
     ///
     /// # Errors
     ///
@@ -1075,7 +1417,7 @@ impl LockFileCache {
         &self,
         provider: &dyn LockFileProvider,
         lockfile_path: &Path,
-    ) -> Result<ResolvedPackages> {
+    ) -> Result<Arc<ResolvedPackages>> {
         // Extract owned data from the cache entry before awaiting: the DashMap shard
         // `Ref` returned by `entries.get` must not be held across `.await`, or a
         // concurrent access to the same key blocks for the duration (#350, same hazard
@@ -1083,7 +1425,7 @@ impl LockFileCache {
         let cached = self
             .entries
             .get(lockfile_path)
-            .map(|entry| (entry.modified_at, entry.packages.clone()));
+            .map(|entry| (entry.modified_at, Arc::clone(&entry.packages)));
 
         if let Some((cached_modified_at, cached_packages)) = cached
             && let Ok(metadata) = tokio::fs::metadata(lockfile_path).await
@@ -1107,7 +1449,7 @@ impl LockFileCache {
         let metadata = tokio::fs::metadata(lockfile_path).await?;
         let modified_at = metadata.modified()?;
 
-        let packages = provider.parse_lockfile(lockfile_path).await?;
+        let packages = Arc::new(provider.parse_lockfile(lockfile_path).await?);
 
         if !self.entries.contains_key(lockfile_path) && self.entries.len() >= self.capacity {
             self.evict_oldest();
@@ -1115,7 +1457,7 @@ impl LockFileCache {
         self.entries.insert(
             lockfile_path.to_path_buf(),
             CachedLockFile {
-                packages: packages.clone(),
+                packages: Arc::clone(&packages),
                 modified_at,
                 parsed_at: Instant::now(),
             },
@@ -1341,7 +1683,7 @@ mod tests {
                 checksum: "abc123".into(),
             },
             dependencies: vec!["serde_derive".into()],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         };
 
         packages.insert(pkg);
@@ -1375,7 +1717,7 @@ mod tests {
                 checksum: "old".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1386,7 +1728,7 @@ mod tests {
                 checksum: "new".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         // Both versions stored, but len counts unique names
@@ -1408,7 +1750,7 @@ mod tests {
                 checksum: "a".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1419,7 +1761,7 @@ mod tests {
                 checksum: "b".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1430,7 +1772,7 @@ mod tests {
                 checksum: "c".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         assert_eq!(packages.len(), 1);
@@ -1447,7 +1789,7 @@ mod tests {
             version: "abc".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1455,7 +1797,7 @@ mod tests {
             version: "xyz".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         // Falls back to string comparison: "xyz" > "abc"
@@ -1471,7 +1813,7 @@ mod tests {
             version: "not-a-version".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1479,7 +1821,7 @@ mod tests {
             version: "1.0.0".into(),
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         // Parseable semver is preferred over non-parseable
@@ -1517,7 +1859,7 @@ mod tests {
                 checksum: "a".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1528,7 +1870,7 @@ mod tests {
                 checksum: "b".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         let count = packages.iter().count();
@@ -1551,7 +1893,7 @@ mod tests {
                 checksum: "a".into(),
             },
             dependencies: vec![],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         });
 
         let map = packages.into_map();
@@ -1578,7 +1920,7 @@ mod tests {
         cache.entries.insert(
             test_path.clone(),
             CachedLockFile {
-                packages: ResolvedPackages::new(),
+                packages: Arc::default(),
                 modified_at: SystemTime::now(),
                 parsed_at: Instant::now(),
             },
@@ -1966,7 +2308,7 @@ mod tests {
                     version: content.trim().to_string(),
                     source: ResolvedSource::Path { path: ".".into() },
                     dependencies: vec![],
-                    placement: EntryPlacement::Hoisted,
+                    placement: EntryPlacement::default(),
                 });
                 Ok(packages)
             })
@@ -1989,6 +2331,10 @@ mod tests {
         let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
 
         assert_eq!(provider.parse_count(), 1, "second call should hit cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a cache hit must share the parsed map, not clone it"
+        );
         assert_eq!(first.version("test-package"), Some("1.0.0"));
         assert_eq!(second.version("test-package"), Some("1.0.0"));
     }
@@ -2187,7 +2533,7 @@ mod tests {
                     version: content.trim().to_string(),
                     source: ResolvedSource::Path { path: ".".into() },
                     dependencies: vec![],
-                    placement: EntryPlacement::Hoisted,
+                    placement: EntryPlacement::default(),
                 });
                 Ok(packages)
             })
@@ -2265,7 +2611,7 @@ mod tests {
                 rev: "deadbeef".to_string(),
             },
             dependencies: vec![crate::conformance::CREDENTIAL_PROBE_KEY.to_string()],
-            placement: EntryPlacement::Hoisted,
+            placement: EntryPlacement::default(),
         },
     );
 
@@ -2431,6 +2777,7 @@ mod tests {
             Some("4.1.0")
         );
         let union: Vec<&str> = candidates[&normalized("django")]
+            .versions()
             .iter()
             .map(|v| v.as_str())
             .collect();
@@ -2500,5 +2847,206 @@ mod tests {
             Some("2.0.0")
         );
         assert_eq!(candidates[&normalized("bar")].len(), 2);
+    }
+
+    fn importer(path: &str) -> ImporterPath {
+        ImporterPath::parse(path).unwrap()
+    }
+
+    fn owned_by(version: &str, path: &str) -> ResolvedPackage {
+        registry_pkg("left-pad", version).with_placement(EntryPlacement::Hoisted {
+            owner: EntryOwner::Importer(importer(path)),
+        })
+    }
+
+    fn declared(version: &str, descriptors: &[&str]) -> ResolvedPackage {
+        registry_pkg("left-pad", version).with_placement(EntryPlacement::Hoisted {
+            owner: EntryOwner::Descriptors(
+                descriptors
+                    .iter()
+                    .map(|d| crate::VersionReq::new(*d))
+                    .collect(),
+            ),
+        })
+    }
+
+    fn collapsed(packages: &ResolvedPackages, scope: Option<&ImporterPath>) -> Option<String> {
+        let (versions, _) = scope.map_or_else(
+            || packages.split_normalized(&Lowercase),
+            |scope| packages.split_normalized_for(&Lowercase, scope),
+        );
+        versions
+            .get(&normalized("left-pad"))
+            .map(|v| v.as_str().to_string())
+    }
+
+    #[test]
+    fn importer_path_parse_normalizes_and_rejects_escapes() {
+        assert_eq!(importer("."), ImporterPath::root());
+        assert_eq!(importer("./packages//a/").as_str(), "packages/a");
+        assert_eq!(
+            ImporterPath::parse("/abs"),
+            Err(ImporterPathError::Absolute)
+        );
+        assert_eq!(
+            ImporterPath::parse("a/../b"),
+            Err(ImporterPathError::ParentComponent)
+        );
+        assert_eq!(ImporterPath::parse("a\0b"), Err(ImporterPathError::Nul));
+        assert_eq!(importer("packages/a").depth(), 2);
+        assert_eq!(ImporterPath::root().depth(), 0);
+    }
+
+    #[test]
+    fn importer_ancestry_compares_whole_components() {
+        assert!(importer("packages/a").is_ancestor_or_self_of(&importer("packages/a")));
+        assert!(importer("packages").is_ancestor_or_self_of(&importer("packages/a")));
+        assert!(!importer("packages/a").is_ancestor_or_self_of(&importer("packages/ab")));
+        assert!(!importer("packages/a").is_ancestor_or_self_of(&importer("packages")));
+    }
+
+    #[test]
+    fn importer_of_manifest_is_relative_to_the_lockfile_directory() {
+        let lock = Path::new("/ws/package-lock.json");
+        assert_eq!(
+            ImporterPath::of_manifest(lock, Path::new("/ws/package.json")),
+            Some(ImporterPath::root())
+        );
+        assert_eq!(
+            ImporterPath::of_manifest(lock, Path::new("/ws/packages/a/package.json")),
+            Some(importer("packages/a"))
+        );
+        assert_eq!(
+            ImporterPath::of_manifest(lock, Path::new("/other/package.json")),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_split_prefers_the_members_own_entry() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(owned_by("1.0.0", "packages/a"));
+        packages.insert(owned_by("2.0.0", "packages/b"));
+
+        let a = importer("packages/a");
+        let b = importer("packages/b");
+        assert_eq!(collapsed(&packages, Some(&a)).as_deref(), Some("1.0.0"));
+        assert_eq!(collapsed(&packages, Some(&b)).as_deref(), Some("2.0.0"));
+        assert_eq!(
+            collapsed(&packages, None).as_deref(),
+            Some("2.0.0"),
+            "the unscoped split keeps the best overall"
+        );
+    }
+
+    #[test]
+    fn scoped_split_walks_up_to_the_deepest_ancestor_importer() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(owned_by("1.0.0", ""));
+        packages.insert(owned_by("1.5.0", "packages"));
+        packages.insert(owned_by("2.0.0", "packages/b"));
+
+        assert_eq!(
+            collapsed(&packages, Some(&importer("packages/a/src"))).as_deref(),
+            Some("1.5.0")
+        );
+        assert_eq!(
+            collapsed(&packages, Some(&importer("tools"))).as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn scoped_split_falls_back_to_the_best_overall_without_an_owner() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(owned_by("1.0.0", "packages/a"));
+        packages.insert(owned_by("2.0.0", "packages/b"));
+
+        assert_eq!(
+            collapsed(&packages, Some(&importer("packages/c"))).as_deref(),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn scoped_split_ignores_a_nested_copy_even_for_its_owner_scope() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(owned_by("1.0.0", "packages/a"));
+        packages.insert(registry_pkg("left-pad", "9.0.0").with_placement(EntryPlacement::Nested));
+
+        let (versions, candidates) =
+            packages.split_normalized_for(&Lowercase, &importer("packages/a"));
+        assert_eq!(
+            versions.get(&normalized("left-pad")).map(|v| v.as_str()),
+            Some("1.0.0")
+        );
+        assert!(candidates.is_empty(), "the nested copy is demoted first");
+    }
+
+    #[test]
+    fn scoped_split_marks_owned_versions_in_the_candidates() {
+        use crate::lsp_helpers::OwnerPreference;
+
+        let mut packages = ResolvedPackages::new();
+        packages.insert(owned_by("1.0.0", "packages/a"));
+        packages.insert(owned_by("2.0.0", "packages/b"));
+
+        let (_, candidates) = packages.split_normalized_for(&Lowercase, &importer("packages/a"));
+        let entry = &candidates[&normalized("left-pad")];
+        assert_eq!(entry.versions(), ["1.0.0", "2.0.0"]);
+        assert_eq!(
+            entry.preference(),
+            &OwnerPreference::Owned(vec![true, false].into())
+        );
+
+        let (_, unscoped) = packages.split_normalized(&Lowercase);
+        assert_eq!(
+            unscoped[&normalized("left-pad")].preference(),
+            &OwnerPreference::Unscoped
+        );
+    }
+
+    #[test]
+    fn descriptors_per_version_are_deduplicated_and_capped() {
+        use crate::lsp_helpers::OwnerPreference;
+
+        let many: Vec<String> = (0..MAX_ENTRY_DESCRIPTORS * 3)
+            .map(|n| format!("left-pad@>=0.0.{n}"))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut packages = ResolvedPackages::new();
+        packages.insert(declared("1.0.0", &refs));
+        packages.insert(declared("1.0.0", &refs));
+        packages.insert(declared("2.0.0", &["left-pad@^2.0.0"]));
+
+        let (_, candidates) = packages.split_normalized_for(&Lowercase, &importer(""));
+        let OwnerPreference::Descriptors(per_version) =
+            candidates[&normalized("left-pad")].preference()
+        else {
+            panic!("a descriptor-owned name must record descriptors");
+        };
+        let mut lengths: Vec<usize> = per_version.iter().map(|d| d.len()).collect();
+        lengths.sort_unstable();
+        assert_eq!(lengths, [1, MAX_ENTRY_DESCRIPTORS]);
+    }
+
+    #[test]
+    fn descriptor_owned_entries_keep_the_best_overall_and_record_descriptors() {
+        use crate::lsp_helpers::OwnerPreference;
+
+        let mut packages = ResolvedPackages::new();
+        packages.insert(declared("1.0.0", &["left-pad@^1.0.0"]));
+        packages.insert(declared("1.2.0", &["left-pad@^1.0.0", "left-pad@~1.2.0"]));
+
+        let scope = importer("packages/a");
+        assert_eq!(collapsed(&packages, Some(&scope)).as_deref(), Some("1.2.0"));
+        let (_, candidates) = packages.split_normalized_for(&Lowercase, &scope);
+        let OwnerPreference::Descriptors(per_version) =
+            candidates[&normalized("left-pad")].preference()
+        else {
+            panic!("a descriptor-owned name must record descriptors");
+        };
+        assert_eq!(per_version[0].len(), 1);
+        assert_eq!(per_version[1].len(), 2);
     }
 }

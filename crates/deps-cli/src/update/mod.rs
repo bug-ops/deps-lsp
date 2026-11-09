@@ -736,7 +736,6 @@ fn resolve_cooldown_fallback_view(
 /// let plan = plan_updates(
 ///     &analysis,
 ///     content,
-///     &StubFormatter::DEFAULT,
 ///     &reparse,
 ///     &[],
 ///     &IgnoreRules::empty(),
@@ -749,22 +748,16 @@ fn resolve_cooldown_fallback_view(
 /// assert_eq!(plan.items[0].target(), Some(&ConcreteVersion::from("1.2.0")));
 /// ```
 #[must_use]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "spec 076 T004 adds `reparse` (FR-024) to the existing FR-007 planner surface; \
-              grouping into a struct would only move, not reduce, churn (mirrors \
-              resolve_occurrence's own identical rationale)"
-)]
 pub fn plan_updates(
     analysis: &ManifestAnalysis,
     content: &str,
-    formatter: &dyn EcosystemFormatter,
     reparse: &dyn ManifestReparse,
     package_filter: &[String],
     ignore_rules: &IgnoreRules,
     freshness: deps_core::FreshnessSettings,
     now: deps_core::PublishTime,
 ) -> UpdatePlan {
+    let formatter = analysis.parse_result.formatter();
     let latest_candidates = analysis
         .parse_result
         .collect_update_candidates(content, analysis.version_data());
@@ -1709,13 +1702,7 @@ mod tests {
             analysis
         };
 
-        let plan = plan_updates_no_cooldown(
-            &make_analysis(),
-            content,
-            &UNPUBLISHED,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&make_analysis(), content, &[], &IgnoreRules::empty());
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].current.render_text(), "4.2.2");
         assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
@@ -1727,8 +1714,7 @@ mod tests {
             }],
             &UNPUBLISHED,
         );
-        let ignored =
-            plan_updates_no_cooldown(&make_analysis(), content, &UNPUBLISHED, &[], &patch_only);
+        let ignored = plan_updates_no_cooldown(&make_analysis(), content, &[], &patch_only);
         assert_eq!(ignored.items[0].current.render_text(), "4.2.2");
         assert_matches!(
             ignored.items[0].outcome,
@@ -1848,14 +1834,12 @@ mod tests {
     fn plan_updates_no_cooldown(
         analysis: &ManifestAnalysis,
         content: &str,
-        formatter: &dyn EcosystemFormatter,
         package_filter: &[String],
         ignore_rules: &IgnoreRules,
     ) -> UpdatePlan {
         plan_updates(
             analysis,
             content,
-            formatter,
             &never_reparse,
             package_filter,
             ignore_rules,
@@ -1941,7 +1925,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -1990,7 +1973,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -2022,13 +2004,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
@@ -2073,7 +2049,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -2138,13 +2113,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
         let applied: Vec<&str> = plan
             .items
             .iter()
@@ -2196,13 +2165,7 @@ mod tests {
         );
         analysis.latest_status = Some(latest_status);
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(
@@ -2253,13 +2216,7 @@ mod tests {
         );
         analysis.latest_status = Some(latest_status);
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         let item = &plan.items[0];
         let note = item
@@ -2313,7 +2270,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -2380,7 +2336,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -2438,7 +2393,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -2486,13 +2440,7 @@ mod tests {
         // latest yet — the pre-phase-B state, distinct from `None` (checking disabled/offline).
         analysis.latest_status = Some(LatestStatusMap::new());
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(
@@ -2541,7 +2489,6 @@ mod tests {
         let plan = plan_updates_no_cooldown(
             &analysis,
             content,
-            &STUB_FORMATTER,
             &["serde".to_string()],
             &IgnoreRules::empty(),
         );
@@ -2579,8 +2526,7 @@ mod tests {
             &STUB_FORMATTER,
         );
 
-        let plan =
-            plan_updates_no_cooldown(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(
@@ -2618,8 +2564,7 @@ mod tests {
             &STUB_FORMATTER,
         );
 
-        let plan =
-            plan_updates_no_cooldown(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(
@@ -2649,13 +2594,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(
@@ -2685,13 +2624,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates_no_cooldown(
-            &analysis,
-            content,
-            &STUB_FORMATTER,
-            &[],
-            &IgnoreRules::empty(),
-        );
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         assert_eq!(plan.items.len(), 1);
         assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
@@ -3486,7 +3419,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3551,7 +3483,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3595,7 +3526,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3630,7 +3560,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3705,7 +3634,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3767,7 +3695,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3811,7 +3738,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3866,7 +3792,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3926,7 +3851,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -3984,7 +3908,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -4027,7 +3950,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -4094,7 +4016,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &reparse,
             &[],
             &ignore_pkg,
@@ -4139,7 +4060,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &reparse,
             &[],
             &ignore_pkg,
@@ -4194,7 +4114,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &ignore_pkg,
@@ -4265,7 +4184,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &lowercase_formatter,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -4363,7 +4281,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &RealSemverFormatter,
             &reparse,
             &[],
             &IgnoreRules::empty(),
@@ -4443,7 +4360,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -4527,7 +4443,6 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
             &never_reparse,
             &[],
             &IgnoreRules::empty(),
@@ -4574,7 +4489,6 @@ mod tests {
                 ("v7.0.1", &commit),
             ])),
         );
-        let formatter = GithubActionsFormatter::new(std::sync::Arc::clone(&tag_index));
         let mut analysis = test_analysis(vec![], cached("actions/checkout", "v7.0.1"));
         analysis.parse_result = stub_document_with(
             parse_result,
@@ -4584,8 +4498,7 @@ mod tests {
         analysis.uri = uri;
         analysis.ecosystem_id = EcosystemId::GithubActions;
 
-        let plan =
-            plan_updates_no_cooldown(&analysis, content, &formatter, &[], &IgnoreRules::empty());
+        let plan = plan_updates_no_cooldown(&analysis, content, &[], &IgnoreRules::empty());
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
         let Outcome::Applied { edit, target } = &plan.items[0].outcome else {

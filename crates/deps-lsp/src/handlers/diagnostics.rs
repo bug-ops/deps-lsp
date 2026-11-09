@@ -19,7 +19,7 @@ use tower_lsp_server::ls_types::{
 /// Floor under the dependency/concurrency-scaled ceiling (issue #632 critic S1): keeps a
 /// small `fetch_timeout` or a small manifest from producing an unrealistically tight
 /// ceiling.
-pub(crate) const MIN_LOADING_CEILING: Duration = Duration::from_secs(120);
+pub(crate) const MIN_LOADING_CEILING: Duration = Duration::from_mins(2);
 
 /// Ceiling on the dependency/concurrency-scaled result (issue #636 critic S1): without this,
 /// a large manifest combined with a low `max_concurrent_fetches` (both user-configurable, down
@@ -262,13 +262,37 @@ async fn publish_with<F, Fut>(
     F: FnMut(DiagnosticsSnapshot) -> Fut,
     Fut: std::future::Future<Output = Vec<Diagnostic>>,
 {
-    let generated = generate_until_current(state, uri, config, generate).await;
+    publish_via(state, uri, config, generate, |diagnostics| {
+        client.publish_diagnostics(uri.clone(), diagnostics, None)
+    })
+    .await;
     if let Some(notice) = state.take_egress_notice() {
         tracing::warn!("{notice}");
         client
             .show_message(MessageType::WARNING, format!("deps-lsp: {notice}"))
             .await;
     }
+}
+
+/// [`publish_with`] over an injectable `send`, so tests can observe and stall the publish.
+///
+/// The claim and the send run under `uri`'s publish gate, which `did_close` also takes (see
+/// [`clear_diagnostics_on_close`]): a generation that loses the race to a close finds the
+/// document untracked at its claim, and one already past its claim finishes sending before the
+/// close's empty publish goes out (#1938).
+async fn publish_via<F, Fut, S, SFut>(
+    state: &ServerState,
+    uri: &Uri,
+    config: &RwLock<DepsConfig>,
+    generate: F,
+    send: S,
+) where
+    F: FnMut(DiagnosticsSnapshot) -> Fut,
+    Fut: std::future::Future<Output = Vec<Diagnostic>>,
+    S: FnOnce(Vec<Diagnostic>) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let generated = generate_until_current(state, uri, config, generate).await;
     if !generated.current {
         tracing::debug!(
             ?uri,
@@ -289,24 +313,48 @@ async fn publish_with<F, Fut>(
     {
         return;
     }
-    if !state.claim_publish(uri, generated.ticket) {
-        tracing::debug!(?uri, "a later diagnostics generation already published");
-        return;
-    }
-    // The config read guard is still held here so no apply can start before the send is queued.
-    // A client that stops draining must not wedge config applies (and, behind a queued writer,
-    // every other config reader), so the send is bounded.
-    let sent = send_bounded(
-        client.publish_diagnostics(uri.clone(), generated.value, None),
-        PUBLISH_SEND_TIMEOUT,
-    )
-    .await;
-    if !sent {
-        tracing::warn!(
+    let gate = state.lock_publish(uri).await;
+    if state.claim_publish(uri, generated.ticket) {
+        // The config read guard is still held here so no apply can start before the send is
+        // queued. A client that stops draining must not wedge config applies (and, behind a
+        // queued writer, every other config reader), so the send is bounded.
+        if !send_bounded(send(generated.value), PUBLISH_SEND_TIMEOUT).await {
+            tracing::warn!(
+                ?uri,
+                "client did not accept publishDiagnostics in time; dropped it"
+            );
+        }
+    } else {
+        tracing::debug!(
             ?uri,
-            "client did not accept publishDiagnostics in time; dropped it"
+            "a later diagnostics generation already published, or the document was closed"
         );
     }
+    drop(gate);
+    state.prune_publish_gate(uri);
+}
+
+/// Handles `textDocument/didClose` for `uri`: removes the document and, if it was tracked,
+/// sends an empty diagnostics set through `send` so the client drops what was published.
+///
+/// Runs under `uri`'s publish gate, so every diagnostics publish is either sent before the
+/// clearing one or finds the document untracked at its claim (#1938).
+pub(crate) async fn clear_diagnostics_on_close<S, SFut>(state: &ServerState, uri: &Uri, send: S)
+where
+    S: FnOnce(Vec<Diagnostic>) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let gate = state.lock_publish(uri).await;
+    if state.remove_document(uri).is_some()
+        && !send_bounded(send(Vec::new()), PUBLISH_SEND_TIMEOUT).await
+    {
+        tracing::warn!(
+            ?uri,
+            "client did not accept the clearing publishDiagnostics in time; dropped it"
+        );
+    }
+    drop(gate);
+    state.prune_publish_gate(uri);
 }
 
 /// Longest a diagnostics publish may hold the config read guard waiting on the client.
@@ -1343,11 +1391,157 @@ mod tests {
         let in_flight = state.next_publish_ticket();
         state.remove_document(&uri);
         assert!(!state.has_published(&uri));
-        assert!(state.claim_publish(&uri, in_flight));
+        assert!(!state.claim_publish(&uri, in_flight));
         assert!(
             !state.has_published(&uri),
             "a late claim must not re-insert after the document was removed"
         );
+    }
+
+    fn publish_recorder() -> Arc<std::sync::Mutex<Vec<usize>>> {
+        Arc::default()
+    }
+
+    fn one_diagnostic() -> Vec<Diagnostic> {
+        vec![Diagnostic {
+            message: "stale".into(),
+            ..Diagnostic::default()
+        }]
+    }
+
+    /// #1938: a generation stalled before its claim, then overtaken by a close, stays silent.
+    #[tokio::test]
+    async fn generation_stalled_before_claim_cannot_publish_after_close() {
+        let state = Arc::new(ServerState::new());
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        let sent = publish_recorder();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+
+        let publish = tokio::spawn({
+            let (state, config, uri, sent, release, entered) = (
+                Arc::clone(&state),
+                Arc::clone(&config),
+                uri.clone(),
+                Arc::clone(&sent),
+                Arc::clone(&release),
+                Arc::clone(&entered),
+            );
+            async move {
+                let recorder = Arc::clone(&sent);
+                let calls = std::sync::atomic::AtomicU32::new(0);
+                publish_via(
+                    &state,
+                    &uri,
+                    &config,
+                    |_snapshot| {
+                        let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                        let (release, entered) = (Arc::clone(&release), Arc::clone(&entered));
+                        async move {
+                            if first {
+                                entered.notify_one();
+                                release.notified().await;
+                            }
+                            one_diagnostic()
+                        }
+                    },
+                    |diagnostics| async move { recorder.lock().unwrap().push(diagnostics.len()) },
+                )
+                .await;
+            }
+        });
+        entered.notified().await;
+
+        let recorder = Arc::clone(&sent);
+        clear_diagnostics_on_close(&state, &uri, |diagnostics| async move {
+            recorder.lock().unwrap().push(diagnostics.len());
+        })
+        .await;
+        release.notify_one();
+        publish.await.expect("publish task");
+
+        assert_eq!(*sent.lock().unwrap(), vec![0], "only the clearing publish");
+    }
+
+    /// #1938: a generation stalled between its claim and its send finishes before the close's
+    /// clearing publish, so the empty set is the last one the client receives.
+    #[tokio::test]
+    async fn generation_stalled_between_claim_and_send_cannot_outlive_close() {
+        let state = Arc::new(ServerState::new());
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        let sent = publish_recorder();
+        let in_send = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let publish = tokio::spawn({
+            let (state, config, uri, sent) = (
+                Arc::clone(&state),
+                Arc::clone(&config),
+                uri.clone(),
+                Arc::clone(&sent),
+            );
+            let (in_send, release) = (Arc::clone(&in_send), Arc::clone(&release));
+            async move {
+                publish_via(
+                    &state,
+                    &uri,
+                    &config,
+                    |_snapshot| async { one_diagnostic() },
+                    |diagnostics| async move {
+                        in_send.notify_one();
+                        release.notified().await;
+                        sent.lock().unwrap().push(diagnostics.len());
+                    },
+                )
+                .await;
+            }
+        });
+        in_send.notified().await;
+
+        let close = tokio::spawn({
+            let (state, uri, sent) = (Arc::clone(&state), uri.clone(), Arc::clone(&sent));
+            async move {
+                clear_diagnostics_on_close(&state, &uri, |diagnostics| async move {
+                    sent.lock().unwrap().push(diagnostics.len());
+                })
+                .await;
+            }
+        });
+        // The ordering assertion below is the real proof; yielding only lets a gate-ignoring
+        // close run to completion first, so it would be caught as `[0, 1]`.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !close.is_finished(),
+            "close must wait for the in-flight send"
+        );
+
+        release.notify_one();
+        publish.await.expect("publish task");
+        close.await.expect("close task");
+
+        assert_eq!(*sent.lock().unwrap(), vec![1, 0]);
+        assert!(!state.has_published(&uri));
+    }
+
+    #[tokio::test]
+    async fn closing_an_untracked_document_publishes_nothing() {
+        let state = ServerState::new();
+        let uri = epoch_test_uri();
+        let sent = publish_recorder();
+        let recorder = Arc::clone(&sent);
+
+        clear_diagnostics_on_close(&state, &uri, |diagnostics| async move {
+            recorder.lock().unwrap().push(diagnostics.len());
+        })
+        .await;
+
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     /// I1: a client that never drains the send must not hold the config guard forever.

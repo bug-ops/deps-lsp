@@ -186,6 +186,7 @@ mod tests {
         assert!(flights.start_or_join("k", async {}).issued());
     }
 
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn a_panicking_leader_is_logged_inside_the_callers_span() {
         let flights = SingleFlight::default();

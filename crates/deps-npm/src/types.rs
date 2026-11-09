@@ -322,13 +322,14 @@ fn split_selector_segment(
 /// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "express");
-/// assert!(matches!(
+/// # use std::assert_matches;
+/// assert_matches!(
 ///     dep.origin,
 ///     deps_npm::types::NpmDependencyOrigin::Manifest {
 ///         section: NpmDependencySection::Dependencies,
 ///         ..
 ///     }
-/// ));
+/// );
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]

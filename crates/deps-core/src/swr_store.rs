@@ -164,7 +164,7 @@ impl<K: Hash + Eq + Clone, V> Inner<K, V> {
 ///
 /// let store = SwrStore::new(SwrPolicy {
 ///     capacity: NonZeroUsize::new(2).unwrap(),
-///     ttl: Some(Duration::from_secs(60)),
+///     ttl: Some(Duration::from_mins(1)),
 ///     idle: None,
 ///     recency: Recency::ReadsAndWrites,
 /// });
@@ -303,7 +303,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const TTL: Duration = Duration::from_secs(60);
+    const TTL: Duration = Duration::from_mins(1);
 
     fn policy(capacity: usize, recency: Recency) -> SwrPolicy {
         SwrPolicy {
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn with_ttl_and_idle_an_entry_is_stale_before_it_is_idle_and_a_read_resets_idle() {
         let s = SwrStore::new(SwrPolicy {
-            ttl: Some(Duration::from_secs(60)),
+            ttl: Some(Duration::from_mins(1)),
             idle: Some(Duration::from_secs(100)),
             ..policy(4, Recency::ReadsOnly)
         });

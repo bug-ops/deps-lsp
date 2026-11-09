@@ -5,9 +5,11 @@
 //! and OSV targeting all use. The primary is the highest satisfying lock entry; every other
 //! satisfying entry is a lock alternative that the OSV scan covers too.
 //!
-//! yarn, bun and pnpm cannot attribute a lock entry to the manifest that requested it, so a
-//! transitive consumer's copy of the same package is a lock alternative there. package-lock.json
-//! can, and filters nested copies out.
+//! These cases use the owner-blind split (`split_normalized`, the `None`-scope path), where
+//! pnpm and yarn cannot attribute a lock entry to the manifest that requested it and flatten
+//! every importer's entry into primary and alternatives. package-lock.json and bun filter copies
+//! nested under another package out (#1981, #1993). Owner-aware selection per workspace member
+//! is covered in `owner_aware_selection.rs`.
 
 // Test code: workspace-level `clippy::unwrap_used` is meant for library code (#689).
 #![allow(clippy::unwrap_used)]
@@ -220,14 +222,8 @@ const BUN_MINIMIST_ENTRIES: [&str; 3] = [
 ];
 
 #[tokio::test]
-async fn bun_highest_satisfying_entry_is_primary_and_the_rest_are_alternatives() {
-    assert_minimist(
-        "bun.lock",
-        &bun_lock(&BUN_MINIMIST_ENTRIES),
-        "1.2.8",
-        &["1.2.5"],
-    )
-    .await;
+async fn bun_nested_newer_copy_does_not_hide_root_version() {
+    assert_minimist("bun.lock", &bun_lock(&BUN_MINIMIST_ENTRIES), "1.2.5", &[]).await;
 }
 
 #[tokio::test]
@@ -241,16 +237,14 @@ async fn bun_selection_is_independent_of_entry_order() {
     ];
     for order in orders {
         let resolved = resolve(minimist_manifest(), "bun.lock", &bun_lock(&order)).await;
-        assert_eq!(
-            resolved,
-            [selection("minimist", "1.2.8", &["1.2.5"])],
-            "{order:?}"
-        );
+        assert_eq!(resolved, [selection("minimist", "1.2.5", &[])], "{order:?}");
     }
 }
 
+/// Intended (#1993): bun's nested copies are demoted like package-lock's, so a copy installed
+/// only for a transitive consumer is not a lock alternative of the direct dependency.
 #[tokio::test]
-async fn bun_malware_version_stays_primary_beside_a_nested_older_copy() {
+async fn bun_nested_older_copy_is_not_an_alternative_of_the_malware_primary() {
     let lock = r#"{
   "lockfileVersion": 1,
   "workspaces": {"": {"dependencies": {"ua-parser-js": "^0.7.28"}}},
@@ -260,14 +254,15 @@ async fn bun_malware_version_stays_primary_beside_a_nested_older_copy() {
     "foo/ua-parser-js": ["ua-parser-js@0.7.28", "", {}, "sha512-c"]
   }
 }"#;
-    assert_ua_parser("bun.lock", lock).await;
+    let resolved = resolve(ua_parser_manifest(), "bun.lock", lock).await;
+    assert_eq!(resolved, [selection("ua-parser-js", "0.7.29", &[])]);
 }
 
 #[tokio::test]
 async fn bun_workspace_entries_resolve_by_requirement() {
     let lock = r#"{
   "lockfileVersion": 1,
-  "workspaces": {"": {}},
+  "workspaces": {"": {}, "packages/bar": {"name": "bar"}},
   "packages": {
     "chalk": ["chalk@1.0.0", "", {}, "sha512-a"],
     "bar/chalk": ["chalk@2.0.0", "", {}, "sha512-b"]

@@ -366,6 +366,9 @@ serde = "1.0.0"
 /// `window/workDoneProgress/create` requests to a client that explicitly
 /// declined `window.workDoneProgress` support during `initialize` — doing
 /// so unconditionally is an LSP 3.17 spec violation.
+///
+/// The manifest declares only a path dependency, so the open path runs to its diagnostics
+/// publish without any registry traffic (#2002).
 #[cfg(feature = "cargo")]
 #[test]
 fn test_no_progress_create_without_client_capability() {
@@ -380,18 +383,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = "1.0.0"
+local = { path = "../local" }
 "#;
 
     client.did_open(&fixture_uri("Cargo.toml"), "toml", cargo_toml);
 
     // Positive liveness proof: `publishDiagnostics` for this URI is only sent
-    // after the background registry fetch completes (see `lifecycle.rs`), so
-    // waiting for it proves the fetch actually ran to completion rather than
+    // after the background open task completes (see `lifecycle.rs`), so
+    // waiting for it proves the open path actually ran to completion rather than
     // the absence check below being vacuously true (e.g. because `did_open`
     // became a no-op in the harness).
     let _diagnostics = client
-        .wait_for_notification(20, |n| {
+        .wait_for_notification(5, |n| {
             n.method == "textDocument/publishDiagnostics"
                 && n.params["uri"] == fixture_uri("Cargo.toml").as_str()
         })
@@ -403,6 +406,76 @@ serde = "1.0.0"
         client.progress_create_request_count(),
         0,
         "Server must not request a workDoneProgress token when the client didn't advertise support"
+    );
+
+    let _shutdown_response = client.shutdown();
+}
+
+/// A manifest whose only dependency is a path dependency: the open path runs to its
+/// diagnostics publish without any registry traffic.
+#[cfg(feature = "cargo")]
+const OFFLINE_CARGO_TOML: &str = r#"[package]
+name = "test-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+local = { path = "../local" }
+"#;
+
+/// Positive control for `test_no_progress_create_without_client_capability` (#2002): the same
+/// path-only manifest does request a token when the client advertises support, so the absence
+/// check there is not vacuous.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_progress_create_requested_with_client_capability_for_offline_manifest() {
+    let mut client = LspClient::spawn();
+
+    let _init_response = client.initialize_with_progress_support(true);
+    client.clear_notifications();
+
+    client.did_open(&fixture_uri("Cargo.toml"), "toml", OFFLINE_CARGO_TOML);
+    let _diagnostics = client
+        .wait_for_notification(5, |n| {
+            n.method == "textDocument/publishDiagnostics"
+                && n.params["uri"] == fixture_uri("Cargo.toml").as_str()
+        })
+        .expect("Server should publish diagnostics for the opened document");
+
+    assert!(
+        client.progress_create_request_count() >= 1,
+        "Expected a workDoneProgress token request when the client supports progress"
+    );
+
+    let _shutdown_response = client.shutdown();
+}
+
+/// #1938: closing a document with ordinary (non parse-failure) diagnostics clears them.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_close_clears_published_diagnostics_for_a_parsed_manifest() {
+    let mut client = LspClient::spawn();
+    let _init_response = client.initialize();
+    client.clear_notifications();
+
+    let uri = fixture_uri("Cargo.toml");
+    client.did_open(&uri, "toml", OFFLINE_CARGO_TOML);
+    let _opened = client
+        .wait_for_notification(5, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect("open must publish diagnostics");
+
+    client.clear_notifications();
+    client.did_close(&uri);
+    let cleared = client
+        .wait_for_notification(5, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect("close must publish an empty diagnostic set");
+    assert_eq!(
+        cleared.params["diagnostics"].as_array().map(Vec::len),
+        Some(0)
     );
 
     let _shutdown_response = client.shutdown();

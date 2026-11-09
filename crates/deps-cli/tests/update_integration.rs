@@ -482,7 +482,6 @@ fn plan_manifest(fixture: &ManifestFixture<'_>) -> deps_cli::update::UpdatePlan 
     plan_updates(
         &analysis,
         content,
-        formatter,
         &reparse,
         &[fixture.cache_key.to_string()],
         &ignore_rules,

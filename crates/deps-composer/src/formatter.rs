@@ -7,10 +7,11 @@ use deps_core::PackageName;
 use deps_core::StabilityFloor;
 use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar,
-    OsvNaming, PackageNaming, PackageRendering, RequirementGate, RequirementMatcher,
-    RequirementResolution, RewriteTarget, SourcePolicy, compile_requirement_unless,
-    match_v_prefix_style, requirement_contains_template_placeholder,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OperatorGrammar, OsvNaming, PackageNaming, PackageRendering, RequirementGate,
+    RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy, VersionGrammar,
+    grammar_candidates, grammar_matcher, match_v_prefix_style,
+    requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 use deps_core::osv::OsvPackageName;
@@ -72,46 +73,70 @@ fn requirement_is_composer_unresolved(requirement: &str) -> bool {
         || requirement_contains_template_placeholder(requirement)
 }
 
-/// Composer requirement matcher, compiled once per dependency by
-/// [`ComposerFormatter::compile_bounded_requirement`]. Shares `version_satisfies_requirement`'s
-/// hand-rolled comparator, which has no external parser to fail on, so this always
-/// decides (`Some`).
-struct ComposerMatcher {
+/// Composer's version grammar. Shares `version_satisfies_requirement`'s hand-rolled comparator,
+/// which has no external parser to fail on, so every candidate is decidable.
+#[derive(Clone, Copy)]
+struct ComposerGrammar;
+
+impl VersionGrammar for ComposerGrammar {
+    type Version = ConcreteVersion;
+    type Compiled = ComposerRequirement;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<ConcreteVersion> {
+        Some(version.clone())
+    }
+
+    /// `None` for an unresolved requirement, or a `dev-*`/`*-dev` branch or `@dev` flag, see
+    /// [`ComposerFormatter::compile_bounded_requirement`].
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<ComposerRequirement> {
+        let text = requirement.as_str().trim();
+        if requirement_is_composer_unresolved(text)
+            || text.starts_with("dev-")
+            || text.ends_with("-dev")
+            || text.contains("@dev")
+        {
+            return None;
+        }
+        Some(ComposerRequirement::new(text.to_owned()))
+    }
+
+    fn satisfies(&self, compiled: &ComposerRequirement, version: &ConcreteVersion) -> bool {
+        walk_requirement(&AdmitLeaf, version.as_str(), &compiled.requirement)
+    }
+
+    /// Composer's requirement grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
+    fn strict_prerelease_exclusion(&self, _: &ComposerRequirement) -> bool {
+        false
+    }
+
+    fn explicitly_excludes(
+        &self,
+        compiled: &ComposerRequirement,
+        version: &ConcreteVersion,
+    ) -> bool {
+        let version = version.as_str();
+        walk_requirement(&ExcludeLeaf, version, &compiled.requirement)
+            || compiled.or_gap_branches.as_deref().is_some_and(|branches| {
+                !walk_requirement(&AdmitLeaf, version, &compiled.requirement)
+                    && or_gap_excludes_version(branches, version)
+            })
+    }
+}
+
+/// A requirement compiled by `ComposerGrammar`: its text and the bounds of its `||` branches,
+/// derived once for the OR-gap check.
+struct ComposerRequirement {
     requirement: String,
     or_gap_branches: Option<Vec<VersionRange<String>>>,
 }
 
-impl ComposerMatcher {
+impl ComposerRequirement {
     fn new(requirement: String) -> Self {
         let or_gap_branches = or_gap_branches(&requirement);
         Self {
             requirement,
             or_gap_branches,
         }
-    }
-}
-
-impl RequirementMatcher for ComposerMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        Some(walk_requirement(
-            &AdmitLeaf,
-            version.as_str(),
-            &self.requirement,
-        ))
-    }
-
-    /// Composer's requirement grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
-        false
-    }
-
-    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
-        let version = version.as_str();
-        walk_requirement(&ExcludeLeaf, version, &self.requirement)
-            || self.or_gap_branches.as_deref().is_some_and(|branches| {
-                !walk_requirement(&AdmitLeaf, version, &self.requirement)
-                    && or_gap_excludes_version(branches, version)
-            })
     }
 }
 
@@ -319,7 +344,7 @@ fn hyphen_range_edges(normalized: &str) -> Option<HyphenRangeMatch<'_>> {
 /// Shared OR (`||`/`|`)/AND (whitespace or comma)-splitting tree-walker for Composer's
 /// requirement grammar, including its `v`-prefix and `@stability`-flag stripping — the
 /// traversal `ComposerFormatter::version_satisfies_requirement` and
-/// `ComposerMatcher::explicitly_excludes` both need identically (PR #1589 had to fix the same
+/// `ComposerRequirement::explicitly_excludes` both need identically (PR #1589 had to fix the same
 /// `normalize_operator_spacing` spacing bug in both functions because they did not share this
 /// walker; #1591 extracted it). #1603: a comma is Composer's other AND separator
 /// (`">=1.0,<2.0"` == `">=1.0 <2.0"`) and must be split identically to whitespace, or a
@@ -407,7 +432,7 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
 /// A single non-combinator requirement clause's evaluation, plumbed into [`walk_requirement`].
 /// The OR/AND splitting and `v`-prefix/stability-flag normalization are identical for both
 /// `ComposerFormatter::version_satisfies_requirement`'s "does this admit `version`" question
-/// ([`AdmitLeaf`]) and `ComposerMatcher::explicitly_excludes`'s "does this explicitly ban `version`"
+/// ([`AdmitLeaf`]) and `ComposerRequirement::explicitly_excludes`'s "does this explicitly ban `version`"
 /// question ([`ExcludeLeaf`]) — only what a leaf decides, and how an AND-group folds its
 /// clauses' results, differ.
 ///
@@ -773,7 +798,7 @@ fn intersect_clause_bounds<'a>(
 
 /// Precompiles the per-branch bounds [`or_gap_excludes_version`] needs for OR-alternation gap
 /// detection (#1601, same class as Maven's #1590 disjoint-range gap), once per requirement —
-/// mirroring `deps-npm`'s `NodeSemverMatcher`, which compiles its OR branches at construction.
+/// mirroring `deps-npm`'s `NodeSemverGrammar`, which compiles its OR branches at construction.
 ///
 /// Returns `None` when the requirement has no `||`/`|` alternation, is a wildcard, or has a blank
 /// branch (a malformed shape that fails closed). A branch whose bound [`branch_bound`] cannot
@@ -1051,10 +1076,10 @@ impl RequirementResolution for ComposerFormatter {
         walk_requirement(&AdmitLeaf, version.as_str(), requirement.as_str())
     }
 
-    /// Compiles `requirement` into a `ComposerMatcher` using the same
+    /// Compiles `requirement` into a `ComposerRequirement` using the same
     /// `version_satisfies_requirement` comparator — Composer requirements have no separate
-    /// "loose" vs. "precise" form to distinguish. Uses [`compile_requirement_unless`] (see
-    /// that function and [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared
+    /// "loose" vs. "precise" form to distinguish. Matches through
+    /// `ComposerGrammar` (see [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared
     /// "undecidable" contract).
     ///
     /// The undecidable predicate rejects a `dev-*`/`*-dev` branch requirement (e.g.
@@ -1068,16 +1093,11 @@ impl RequirementResolution for ComposerFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        compile_requirement_unless(
-            requirement.as_str().trim(),
-            |r| {
-                requirement_is_composer_unresolved(r)
-                    || r.starts_with("dev-")
-                    || r.ends_with("-dev")
-                    || r.contains("@dev")
-            },
-            ComposerMatcher::new,
-        )
+        grammar_matcher(ComposerGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(ComposerGrammar, candidates))
     }
 
     /// #1373: `self.version` or an inline alias (see `requirement_is_composer_unresolved`)
@@ -1419,6 +1439,75 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use crate::types::{ComposerDependency, ComposerSection};
+
+    const REQUIREMENTS: &[&str] = &[
+        "^1.2",
+        "^1.2.3",
+        "~1.2",
+        "~1.2.3",
+        ">=1.0",
+        ">1.0",
+        "<2.0",
+        "<=1.5",
+        "1.2.3",
+        "=1.2.3",
+        "1.*",
+        "1.2.*",
+        "*",
+        "",
+        "v1.2.3",
+        ">=1.0,<2.0",
+        ">=1.0 <2.0",
+        ">=1.0,!=1.5.0,<2.0",
+        "^1.0 || ^2.0",
+        "<1.5 || >1.5",
+        ">=1.0 <1.5 || >1.5 <2.0",
+        "1.2 - 1.9",
+        "!=1.5.0",
+        "@dev",
+        "dev-master",
+        "1.0.x-dev",
+        "1.0.*@dev",
+        "2.0@dev",
+        "1.2@stable",
+        "self.version",
+        "dev-main as 1.0.0",
+        "${PSR_LOG}",
+        "{{ version }}",
+        "  ^1.0  ",
+        "^1.0-beta",
+        "garbage",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.9.0",
+        "1.0.0",
+        "1.0.0-beta",
+        "1.2.0",
+        "1.2.3",
+        "1.2.4",
+        "1.5.0",
+        "1.5.1",
+        "1.9.9",
+        "2.0.0",
+        "2.0.0-RC1",
+        "3.0.0",
+        "v1.2.3",
+        "dev-master",
+        "garbage",
+        "",
+        "1.2",
+        "1.2.3.4",
+        "1.0.0-patch1",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &ComposerFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
     use deps_core::NormalizedName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
@@ -1428,8 +1517,10 @@ mod tests {
     use tower_lsp_server::ls_types::Position;
 
     fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
-        ComposerMatcher::new(requirement.to_string())
-            .explicitly_excludes(&ConcreteVersion::new(version))
+        ComposerGrammar.explicitly_excludes(
+            &ComposerRequirement::new(requirement.to_string()),
+            &ConcreteVersion::new(version),
+        )
     }
 
     #[test]
@@ -1911,7 +2002,7 @@ mod tests {
     }
 
     /// #1603 impl-critic follow-up: the cooldown-fallback safety net
-    /// (`ComposerMatcher::explicitly_excludes`) shares `walk_requirement`'s comma split, so a
+    /// (`ComposerRequirement::explicitly_excludes`) shares `walk_requirement`'s comma split, so a
     /// `!=` clause placed after a comma is now reachable by `ExcludeLeaf` too.
     #[test]
     fn test_composer_explicitly_excludes_reaches_comma_separated_exclusion() {
@@ -1995,7 +2086,7 @@ mod tests {
     /// *entirely* of caret/tilde branches has no recognized bound anywhere, so
     /// `or_gap_branches` yields no branches to compare and never fires — this is
     /// always safe (no false exclusion), just a known gap in detection coverage, unlike npm's
-    /// `NodeSemverMatcher`, whose probe-based approach handles this same shape (see that
+    /// `NodeSemverGrammar`, whose probe-based approach handles this same shape (see that
     /// module's own `^1.0.0 || ^3.0.0` regression test).
     #[test]
     fn test_composer_explicitly_excludes_or_gap_all_caret_branches_undetected() {
@@ -2016,7 +2107,7 @@ mod tests {
 
     /// impl-critic S2: a candidate actually admitted by an unrecognized (caret) branch must
     /// never simultaneously be reported as explicitly excluded by a gap between the OTHER,
-    /// recognized branches — `ComposerMatcher::explicitly_excludes`'s real-matcher coverage check
+    /// recognized branches — `ComposerRequirement::explicitly_excludes`'s real-matcher coverage check
     /// must see every branch, not just the ones with a derivable bound.
     #[test]
     fn test_composer_explicitly_excludes_or_gap_no_contradiction_with_opaque_branch() {

@@ -263,12 +263,14 @@ async fn test_get_cached_trusted_origin_stops_cross_origin_redirect() {
 /// recur across tests, and the stopped-hop warning is deduplicated per origin pair for the whole
 /// process, so a test asserting that warning would otherwise see it swallowed whenever an
 /// earlier test stopped a hop on the same pooled port.
+#[cfg(feature = "test-util")]
 async fn unpooled_server() -> mockito::Server {
     mockito::Server::new_with_opts_async(mockito::ServerOpts::default()).await
 }
 
 // #1856 M5: a hop the trusted-origin policy stops is logged once per origin pair, with the
 // origins only (no userinfo, path or query of the redirect target).
+#[cfg(feature = "test-util")]
 #[tokio::test]
 async fn test_trusted_origin_stopped_cross_origin_hop_warns_once_with_redacted_origins() {
     let mut trusted_server = unpooled_server().await;
@@ -323,6 +325,7 @@ async fn test_trusted_origin_stopped_cross_origin_hop_warns_once_with_redacted_o
 
 // #1856 M5: a hop that stays on the origin but leaves the trusted path prefix is not a
 // "left the origin" event, and the message must not claim it is.
+#[cfg(feature = "test-util")]
 #[tokio::test]
 async fn test_trusted_origin_same_origin_path_escape_warns_as_path_escape() {
     let mut server = unpooled_server().await;

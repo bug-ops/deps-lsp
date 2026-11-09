@@ -244,7 +244,7 @@ pub struct GitlabCiRegistry {
     routes: Arc<DashMap<String, GitlabRoute>>,
     /// Per-host (not process-wide, spec §9.3) gate: one self-hosted instance rate-limiting
     /// must not disable lookups against `gitlab.com` or any other host.
-    rate_limits: Arc<DashMap<String, Arc<RateLimitGate>>>,
+    rate_limits: Arc<DashMap<GitlabHost, Arc<RateLimitGate>>>,
     tag_index: Arc<ProjectIndexes>,
     tag_refreshes: RefreshSender,
     /// Branch and commit evidence gathered by background probes, and the latest release each
@@ -396,7 +396,7 @@ impl GitlabCiRegistry {
                     Arc::new(ProbeAllowance::new(
                         self.client.probe_credential(host),
                         self.client.quota_meter(host),
-                        self.rate_limit_gate(host.origin()),
+                        self.rate_limit_gate(host),
                     ))
                 })
                 .value(),
@@ -490,13 +490,13 @@ impl GitlabCiRegistry {
         self.routes.get(index).map(|route| route.clone())
     }
 
-    fn rate_limit_gate(&self, origin: &str) -> Arc<RateLimitGate> {
-        if let Some(existing) = self.rate_limits.get(origin) {
+    fn rate_limit_gate(&self, host: &GitlabHost) -> Arc<RateLimitGate> {
+        if let Some(existing) = self.rate_limits.get(host) {
             return Arc::clone(&existing);
         }
         Arc::clone(
             self.rate_limits
-                .entry(origin.to_string())
+                .entry(host.clone())
                 .or_insert_with(|| Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)))
                 .value(),
         )
@@ -505,7 +505,7 @@ impl GitlabCiRegistry {
     /// Maps a raw fetch error to its `DepsError` classification (spec §9.3 — GitLab's status
     /// semantics differ from GitHub's, so this is not a verbatim copy of
     /// `GithubActionsRegistry::map_tags_error`'s arms) and, for a `429` or an untokened
-    /// `401`/`403`, trips `origin`'s rate-limit gate so every other dependency on the same
+    /// `401`/`403`, trips `host`'s rate-limit gate so every other dependency on the same
     /// host short-circuits locally instead of also firing (and losing) its own doomed
     /// request.
     ///
@@ -515,7 +515,7 @@ impl GitlabCiRegistry {
     /// other client-side request defect (an unroutable/malformed project path). Classified as
     /// [`DepsError::PackageNotFound`], the same graceful, actionable outcome a `404` already
     /// gets, rather than an opaque transport error that aborts the whole version list.
-    fn map_error(&self, origin: &str, name: &str, e: DepsError) -> DepsError {
+    fn map_error(&self, host: &GitlabHost, name: &str, e: DepsError) -> DepsError {
         match &e {
             // #1295 critic S1 second-order effect: `deps_core::cache`'s header-evidence check
             // (`X-RateLimit-Remaining: 0` / `Retry-After` on a 403/429) is registry-neutral and
@@ -531,7 +531,7 @@ impl GitlabCiRegistry {
                 verified: RateLimitEvidence::Confirmed,
                 ..
             } => {
-                self.rate_limit_gate(origin).trip_verified();
+                self.rate_limit_gate(host).trip_verified();
                 gitlab_rate_limit_error(RateLimitEvidence::Confirmed)
             }
             // A bare, unconfirmed 429 — `trip()`, not `trip_verified()` — is always
@@ -543,7 +543,7 @@ impl GitlabCiRegistry {
             // gate's state (e.g. `Self::fetch_route`'s short-circuit), not the call site
             // doing the tripping.
             DepsError::HttpStatus { status: 429, .. } => {
-                self.rate_limit_gate(origin).trip();
+                self.rate_limit_gate(host).trip();
                 gitlab_rate_limit_error(RateLimitEvidence::Inferred)
             }
             // A *tokened* 401/403 is scoped to this one project (private/insufficient-scope),
@@ -553,8 +553,8 @@ impl GitlabCiRegistry {
             // 429 arm above.
             DepsError::HttpStatus {
                 status: 401 | 403, ..
-            } if !self.client.sends_token_to(origin) => {
-                self.rate_limit_gate(origin).trip();
+            } if !self.client.sends_token_to(host.origin()) => {
+                self.rate_limit_gate(host).trip();
                 gitlab_rate_limit_error(RateLimitEvidence::Inferred)
             }
             DepsError::HttpStatus {
@@ -572,7 +572,7 @@ impl GitlabCiRegistry {
         name: &PackageName,
         route: &GitlabRoute,
     ) -> Result<Vec<GitlabCiVersion>> {
-        let gate = self.rate_limit_gate(route.host().origin());
+        let gate = self.rate_limit_gate(route.host());
         if gate.is_tripped() {
             // Replays the gate's own recorded `verified` state (#1295 critic N3, mirroring
             // `deps_github_actions::registry::GithubActionsRegistry::rate_limited_error`'s S3
@@ -601,7 +601,7 @@ impl GitlabCiRegistry {
                     |data| parse_tags_page(data),
                 )
                 .await
-                .map_err(|e| self.map_error(route.host().origin(), name.as_str(), e))?;
+                .map_err(|e| self.map_error(route.host(), name.as_str(), e))?;
                 // C1 (validation finding): index straight from the raw, unfiltered `tags`
                 // response, not `tags_to_versions`' semver-filtered output — see
                 // `populate_tag_index_entries`'s doc.
@@ -631,7 +631,7 @@ impl GitlabCiRegistry {
                     |data| parse_releases_page(data),
                 )
                 .await
-                .map_err(|e| self.map_error(route.host().origin(), name.as_str(), e))?;
+                .map_err(|e| self.map_error(route.host(), name.as_str(), e))?;
                 // `releases_to_versions` never drops an entry on shape grounds (unlike
                 // `tags_to_versions`), so this is not affected by C1 — kept symmetric with
                 // the Tags arm anyway, and keyed by `EndpointKind::Releases` (S2 fix).
@@ -1463,7 +1463,7 @@ mod tests {
     fn test_map_error_404_is_package_not_found() {
         let registry = GitlabCiRegistry::new(test_client());
         let err = registry.map_error(
-            "https://gitlab.com",
+            &GitlabHost::for_test("https://gitlab.com"),
             "org/proj",
             DepsError::HttpStatus {
                 url: "https://gitlab.com/x".into(),
@@ -1481,7 +1481,7 @@ mod tests {
     fn test_map_error_400_is_package_not_found() {
         let registry = GitlabCiRegistry::new(test_client());
         let err = registry.map_error(
-            "https://gitlab.com",
+            &GitlabHost::for_test("https://gitlab.com"),
             "org/proj",
             DepsError::HttpStatus {
                 url: "https://gitlab.com/x".into(),
@@ -1507,7 +1507,7 @@ mod tests {
         };
 
         match registry.map_error(
-            "https://gitlab.corp",
+            &GitlabHost::for_test("https://gitlab.corp"),
             "org/proj",
             unauthorized("https://gitlab.corp"),
         ) {
@@ -1519,7 +1519,7 @@ mod tests {
         }
         assert_matches!(
             registry.map_error(
-                "https://gitlab.com",
+                &GitlabHost::for_test("https://gitlab.com"),
                 "org/proj",
                 unauthorized("https://gitlab.com")
             ),
@@ -1531,7 +1531,7 @@ mod tests {
     fn test_map_error_429_trips_rate_limit_gate() {
         let registry = GitlabCiRegistry::new(test_client());
         let err = registry.map_error(
-            "https://gitlab.com",
+            &GitlabHost::for_test("https://gitlab.com"),
             "org/proj",
             DepsError::HttpStatus {
                 url: "https://gitlab.com/x".into(),
@@ -1545,7 +1545,11 @@ mod tests {
                 ..
             }
         );
-        assert!(registry.rate_limit_gate("https://gitlab.com").is_tripped());
+        assert!(
+            registry
+                .rate_limit_gate(&GitlabHost::for_test("https://gitlab.com"))
+                .is_tripped()
+        );
     }
 
     /// #1295 critic N2: a confirmed rate limit (from `deps_core::cache`'s registry-neutral
@@ -1555,7 +1559,7 @@ mod tests {
     fn test_map_error_confirmed_rate_limit_keeps_gitlab_token_remedy() {
         let registry = GitlabCiRegistry::new(test_client());
         let err = registry.map_error(
-            "https://gitlab.com",
+            &GitlabHost::for_test("https://gitlab.com"),
             "org/proj",
             DepsError::rate_limited(
                 "registry rate limit exceeded (confirmed by the response)",
@@ -1571,7 +1575,11 @@ mod tests {
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
-        assert!(registry.rate_limit_gate("https://gitlab.com").is_tripped());
+        assert!(
+            registry
+                .rate_limit_gate(&GitlabHost::for_test("https://gitlab.com"))
+                .is_tripped()
+        );
     }
 
     /// #1295 critic N3: once the gate is tripped by a *confirmed* rate limit, a later call
@@ -1581,11 +1589,15 @@ mod tests {
     async fn test_fetch_route_replays_verified_state_on_short_circuit() {
         let registry = GitlabCiRegistry::new(test_client());
         registry.map_error(
-            "https://gitlab.com",
+            &GitlabHost::for_test("https://gitlab.com"),
             "org/proj",
             DepsError::rate_limited("confirmed", RateLimitEvidence::Confirmed),
         );
-        assert!(registry.rate_limit_gate("https://gitlab.com").is_tripped());
+        assert!(
+            registry
+                .rate_limit_gate(&GitlabHost::for_test("https://gitlab.com"))
+                .is_tripped()
+        );
 
         let name = PackageName::new("gitlab.com/org/proj");
         let r = route("https://gitlab.com", EndpointKind::Tags);

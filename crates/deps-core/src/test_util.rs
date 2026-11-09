@@ -38,10 +38,13 @@
 //! for a test whose production call swallows the underlying error to an empty/missing
 //! result rather than surfacing a `Result` directly.
 
+mod requirement_matching;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub mod scaling;
 mod stalled_registry;
 mod stub_formatter;
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+pub use requirement_matching::{assert_candidate_set_consistent, assert_matchers_equivalent};
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub use stalled_registry::{
     SilentListener, StalledCoalescingRegistry, waiters_open_the_breaker_while,
@@ -1561,15 +1564,16 @@ where
     ))
 }
 
-/// Implements [`TypedEcosystem`](crate::TypedEcosystem) for a test double that only needs to
-/// exist, not to parse.
+/// Implements [`TypedEcosystem`](crate::TypedEcosystem) for a test double over
+/// [`StubParseResult`] and a [`StubFormatter`].
 ///
-/// The double reads [`StubParseResult`] through a [`StubFormatter`], and its `parse` is
-/// `unimplemented!()`. Implement [`EcosystemBase`](crate::EcosystemBase) for the type
-/// separately; a double that needs a real `parse` or hook writes its own `TypedEcosystem` impl.
+/// Its `parse` returns a [`StubParseResult`] of the requested URI with no dependencies. The
+/// optional braced items (hook overrides) go into the same impl block. Implement
+/// [`EcosystemBase`](crate::EcosystemBase) for the type separately; a double that needs a real
+/// `parse` writes its own `TypedEcosystem` impl.
 #[macro_export]
 macro_rules! impl_stub_typed_ecosystem {
-    ($ty:ty) => {
+    ($ty:ty $(, { $($item:item)* })?) => {
         impl $crate::TypedEcosystem for $ty {
             type Parsed = $crate::test_util::StubParseResult;
             type Formatter = $crate::test_util::StubFormatter;
@@ -1581,10 +1585,12 @@ macro_rules! impl_stub_typed_ecosystem {
             fn parse<'a>(
                 &'a self,
                 _content: &'a str,
-                _uri: &'a ::url::Url,
+                uri: &'a ::url::Url,
             ) -> $crate::ecosystem::BoxFuture<'a, $crate::error::Result<Self::Parsed>> {
-                Box::pin(async move { unimplemented!() })
+                Box::pin(async move { Ok($crate::test_util::StubParseResult::new(uri.clone(), 0)) })
             }
+
+            $($($item)*)?
         }
     };
 }

@@ -21,6 +21,8 @@
 //! (`deps-deno`, which already depends on `jsonc-parser` directly) walks the AST for positions;
 //! every other caller goes through [`parse_jsonc_typed`].
 
+mod de;
+
 use jsonc_parser::ast::{Object, ObjectProp, ObjectPropName, Value};
 use jsonc_parser::errors::ParseErrorKind;
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
@@ -62,6 +64,28 @@ fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::R
             | Value::NumberLit(_)
             | Value::BooleanLit(_)
             | Value::NullKeyword(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Rejects the first number literal that is not valid JSON (e.g. hex), anywhere in `root`.
+///
+/// [`de::AstDeserializer`] never visits subtrees the target ignores, so this keeps their
+/// numbers validated exactly as when the whole tree was converted. Allocation-free apart from
+/// the explicit stack.
+fn check_ast_numbers(root: &Value<'_>) -> std::result::Result<(), String> {
+    let mut stack = vec![root];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Object(obj) => stack.extend(obj.properties.iter().map(|prop| &prop.value)),
+            Value::Array(arr) => stack.extend(arr.elements.iter()),
+            Value::NumberLit(lit) => {
+                if lit.value.parse::<serde_json::Number>().is_err() {
+                    return Err(format!("invalid JSON number `{}`", lit.value));
+                }
+            }
+            Value::StringLit(_) | Value::BooleanLit(_) | Value::NullKeyword(_) => {}
         }
     }
     Ok(())
@@ -117,9 +141,10 @@ pub fn parse_jsonc_ast_checked<'a>(
     Ok(ast.value)
 }
 
-/// Converts a depth-bounded AST into a `serde_json::Value`. Recursion is bounded by
-/// [`MAX_JSON_NESTING_DEPTH`], enforced by [`parse_jsonc_ast_checked`] before this runs.
-/// Duplicate object keys resolve to the last occurrence, like [`find_last_prop`].
+/// Test oracle for [`parse_jsonc_typed`]: converts a depth-bounded AST into a
+/// `serde_json::Value`. Duplicate object keys resolve to the last occurrence, like
+/// [`find_last_prop`].
+#[cfg(test)]
 fn ast_to_json(value: &Value<'_>, file_type: &'static str) -> Result<serde_json::Value> {
     Ok(match value {
         Value::Object(obj) => {
@@ -152,6 +177,11 @@ fn ast_to_json(value: &Value<'_>, file_type: &'static str) -> Result<serde_json:
 /// Deserializes JSONC `content` (comments and trailing commas allowed) into `T`, after the
 /// same [`MAX_JSON_NESTING_DEPTH`] gate as [`parse_jsonc_ast_checked`].
 ///
+/// `T` is deserialized straight from the AST, so subtrees it ignores are never materialized.
+/// Semantics match `serde_json::from_value`: the last duplicate key wins and numbers must be
+/// valid JSON, including inside subtrees `T` ignores. Integer map keys are parsed from their
+/// string form, and enums must be unit variants spelled as strings.
+///
 /// `Ok(None)` means the document holds no value (empty, whitespace-only or comment-only), so a
 /// caller can treat it as an empty file.
 ///
@@ -180,8 +210,8 @@ pub fn parse_jsonc_typed<T: serde::de::DeserializeOwned>(
     let Some(root) = parse_jsonc_ast_checked(content, file_type)? else {
         return Ok(None);
     };
-    let json = ast_to_json(&root, file_type)?;
-    serde_json::from_value(json)
+    check_ast_numbers(&root).map_err(|message| DepsError::parse_error(file_type, &message))?;
+    T::deserialize(de::AstDeserializer(&root))
         .map(Some)
         .map_err(|e| DepsError::parse_error(file_type, &e))
 }
@@ -459,6 +489,172 @@ mod tests {
             err.parse_failure_kind(),
             Some(ParseFailureKind::NestingTooDeep)
         );
+    }
+
+    fn oracle(content: &str) -> Result<Option<serde_json::Value>> {
+        let Some(root) = parse_jsonc_ast_checked(content, "t")? else {
+            return Ok(None);
+        };
+        ast_to_json(&root, "t").map(Some)
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_matches_value_tree_oracle() {
+        let corpus = [
+            r#"{"a": 1, "a": 2, "b": {"c": [1, 2.5, -3, 1e3, true, null, "xé\n"]}}"#,
+            "{\"k\": 1, // c\n \"k\": {\"k\": [ {\"z\": 1, \"z\": 2}, ], }, /* d */ }",
+            "[18446744073709551615, -9223372036854775808, 0.1, 1E-2]",
+            r#""scalar""#,
+            "null",
+            r#"{"": "", "a": 1, "a": 2}"#,
+            r#"{"vendor\/pkg": ["a@1.0.0", "", {}, "sha512-x"]}"#,
+        ];
+        for content in corpus {
+            let expected = oracle(content).unwrap();
+            let actual = parse_jsonc_typed::<serde_json::Value>(content, "t").unwrap();
+            assert_eq!(actual, expected, "{content}");
+        }
+        for bad in ["[0x10]", "[1,, 2]", "{", "[.5]"] {
+            assert_eq!(
+                parse_jsonc_typed::<serde_json::Value>(bad, "t").is_err(),
+                oracle(bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Asserts `parse_jsonc_typed::<T>` and `from_value::<T>` over the oracle tree agree on
+    /// success vs failure and, on success, on the value.
+    fn assert_typed_matches_oracle<T>(content: &str)
+    where
+        T: serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let expected = oracle(content).map(|tree| tree.map(serde_json::from_value::<T>));
+        let actual = parse_jsonc_typed::<T>(content, "t");
+        match (expected, actual) {
+            (Ok(Some(Ok(expected))), Ok(Some(actual))) => assert_eq!(actual, expected, "{content}"),
+            (Ok(Some(Err(_))) | Err(_), Err(_)) | (Ok(None), Ok(None)) => {}
+            (expected, actual) => panic!(
+                "{} {content}: oracle {expected:?}, actual {actual:?}",
+                std::any::type_name::<T>()
+            ),
+        }
+    }
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct Newtype(u32);
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct Pair(u8, String);
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct Partial {
+        keep: Vec<u32>,
+        #[serde(default)]
+        opt: Option<String>,
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_typed_targets_match_value_tree_oracle() {
+        use std::collections::BTreeMap;
+
+        let inputs = [
+            "{}",
+            r#"{"a": 1, "b": 4294967295, "c": 4294967296, "d": -1, "e": 1.5, "f": 2.0}"#,
+            r#"{"1": "x", "2": "y", "-3": "z", "k": "w", "1": "dup"}"#,
+            r#"{"1": "x", "2": "y", "1": "dup"}"#,
+            r#"{"-3": "z", "127": "m", "128": "n"}"#,
+            r#"{"1": 2, "-3": 4, "300": 1}"#,
+            r#"{"1": 2, "-3": 4}"#,
+            r#"{"true": 1, "1.5": 2, "": 3}"#,
+            "[0, 255, 256, -1, 1.0, 18446744073709551615, -9223372036854775808]",
+            r#"[1, "a"]"#,
+            r#"[1, "a", 3]"#,
+            "[1]",
+            "[]",
+            "true",
+            "false",
+            "null",
+            "1",
+            "-1",
+            "1.5",
+            "4294967296",
+            "18446744073709551615",
+            "-9223372036854775808",
+            "9223372036854775808",
+            r#""text""#,
+            r#"{"keep": [1, 2], "opt": null, "skip": {"deep": [[[{"x": 1}]]], "n": 0.5}}"#,
+            r#"{"keep": [1], "opt": "o", "keep": [2, 3], "skip": [1, {"a": null}]}"#,
+            r#"{"keep": "no"}"#,
+            r#"{"opt": "missing keep"}"#,
+            "[0x10]",
+            "[1,, 2]",
+            "{",
+            "",
+            "// only a comment",
+        ];
+        for input in inputs {
+            assert_typed_matches_oracle::<HashMap<String, u32>>(input);
+            assert_typed_matches_oracle::<BTreeMap<u32, String>>(input);
+            assert_typed_matches_oracle::<BTreeMap<i8, u8>>(input);
+            assert_typed_matches_oracle::<Vec<u8>>(input);
+            assert_typed_matches_oracle::<Vec<i64>>(input);
+            assert_typed_matches_oracle::<Vec<u64>>(input);
+            assert_typed_matches_oracle::<Vec<f64>>(input);
+            assert_typed_matches_oracle::<(u8, String)>(input);
+            assert_typed_matches_oracle::<Pair>(input);
+            assert_typed_matches_oracle::<Newtype>(input);
+            assert_typed_matches_oracle::<bool>(input);
+            assert_typed_matches_oracle::<u32>(input);
+            assert_typed_matches_oracle::<i64>(input);
+            assert_typed_matches_oracle::<u64>(input);
+            assert_typed_matches_oracle::<f64>(input);
+            assert_typed_matches_oracle::<String>(input);
+            assert_typed_matches_oracle::<Option<u32>>(input);
+            assert_typed_matches_oracle::<Option<Vec<u8>>>(input);
+            assert_typed_matches_oracle::<Partial>(input);
+            assert_typed_matches_oracle::<()>(input);
+            assert_typed_matches_oracle::<serde::de::IgnoredAny>(input);
+        }
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_float_to_integer_is_an_error() {
+        assert!(parse_jsonc_typed::<u32>("1.5", "t").is_err());
+        assert!(parse_jsonc_typed::<u32>("2.0", "t").is_err());
+        assert!(parse_jsonc_typed::<u8>("256", "t").is_err());
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_duplicate_key_in_derived_struct() {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            a: u32,
+        }
+        let doc: Doc = parse_jsonc_typed(r#"{"a": 1, "a": 2}"#, "t")
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.a, 2);
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_option_and_unit_enum() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        enum Kind {
+            Alpha,
+        }
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            kind: Kind,
+            maybe: Option<u32>,
+            absent: Option<u32>,
+        }
+        let doc: Doc = parse_jsonc_typed(r#"{"kind": "Alpha", "maybe": null}"#, "t")
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.kind, Kind::Alpha);
+        assert_eq!((doc.maybe, doc.absent), (None, None));
+        assert!(parse_jsonc_typed::<Doc>(r#"{"kind": 1}"#, "t").is_err());
     }
 
     #[test]

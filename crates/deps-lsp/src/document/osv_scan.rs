@@ -111,7 +111,6 @@ impl OsvScanPlan {
 /// the single input both [`run_osv_scan_phase_a`] and the rescan predicate derive from.
 fn scan_inputs(
     doc: &super::state::DocumentState,
-    ecosystem: &dyn Ecosystem,
 ) -> Option<(
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::VulnerabilityMap,
@@ -121,7 +120,6 @@ fn scan_inputs(
         manifest,
         &doc.signals.resolved_versions,
         &doc.signals.resolved_version_candidates,
-        ecosystem.ecosystem_id(),
     ))
 }
 
@@ -164,7 +162,7 @@ pub(crate) async fn run_osv_scan_phase_a(
 
     let (content_snapshot, resolved_generation, targets, mut vulnerabilities) = {
         let doc = state.get_document(&uri)?;
-        let (targets, skipped) = scan_inputs(&doc, ecosystem.as_ref())?;
+        let (targets, skipped) = scan_inputs(&doc)?;
         (
             doc.content.clone(),
             doc.signals.resolved_versions_generation,
@@ -249,11 +247,8 @@ pub(crate) async fn rescan_after_resolved_version_change(
 /// Whether the [`OsvScanPlan`] rebuilt from `doc`'s current state differs from the one its last
 /// committed scan ran with — also true when no scan ever committed, which is how a change task
 /// notices an OSV outcome lost to an aborted predecessor (issue #1987).
-pub(crate) fn osv_scan_plan_is_stale(
-    doc: &super::state::DocumentState,
-    ecosystem: &dyn Ecosystem,
-) -> bool {
-    scan_inputs(doc, ecosystem).is_some_and(|(targets, skipped)| {
+pub(crate) fn osv_scan_plan_is_stale(doc: &super::state::DocumentState) -> bool {
+    scan_inputs(doc).is_some_and(|(targets, skipped)| {
         OsvScanPlan::new(&targets, &skipped) != doc.signals.osv_scan_plan
     })
 }
@@ -312,7 +307,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
 
     let plan_changed = state
         .get_document(uri)
-        .is_some_and(|doc| osv_scan_plan_is_stale(&doc, ecosystem.as_ref()));
+        .is_some_and(|doc| osv_scan_plan_is_stale(&doc));
     if !plan_changed {
         return RescanOutcome::Unchanged;
     }
@@ -426,7 +421,6 @@ pub(crate) async fn run_license_prefetch(
             manifest,
             &doc.signals.resolved_versions,
             &doc.signals.resolved_version_candidates,
-            ecosystem.ecosystem_id(),
         );
         (
             doc.content.clone(),
@@ -557,7 +551,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             Some(&doc.signals.resolved_version_candidates),
         );
         let candidate_tags =
-            deps_engine::classify::osv::candidate_tag_sources(manifest, &vuln_keys, ecosystem_id);
+            deps_engine::classify::osv::candidate_tag_sources(manifest, &vuln_keys);
         let (targets, latest_status) = deps_engine::classify::osv::build_latest_check_targets(
             manifest,
             &doc.signals.cached_versions,

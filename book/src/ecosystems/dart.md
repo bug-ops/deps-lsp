@@ -20,6 +20,10 @@ dependencies:
 pub_semver requires all three version components, so `^0` and `^0.0` are not valid pub
 constraints; an update writes the full version (`^0.3.2`).
 
+Unlike Cargo, npm and Composer, a Dart update always writes the full version (`^0.13` becomes
+`^1.6.0`): pub_semver rejects a partial caret such as `^1.6` or `^2`, so keeping the declared
+precision would produce an invalid constraint.
+
 Hovering a package's version constraint shows the latest pub.dev release and whether the
 constraint is satisfied; an outdated dependency gets an inlay hint and a diagnostic with an
 "Update to latest version" code action. `dependencies`, `dev_dependencies`, and

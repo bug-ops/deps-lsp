@@ -7,10 +7,10 @@ use deps_core::EcosystemId;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, BuildMetadataPolicy, DependencyFormatter, DiagnosticMessages,
+    BoundedVersionReq, BuildMetadataPolicy, CandidateSet, DependencyFormatter, DiagnosticMessages,
     DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering, RequirementMatcher,
-    RequirementResolution, RewriteTarget, SourcePolicy, bare_meaning,
-    format_version_replacing_by_shape,
+    RequirementResolution, RewriteTarget, SourcePolicy, VersionGrammar, bare_meaning,
+    format_version_replacing_by_shape, grammar_candidates, grammar_matcher,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -25,21 +25,38 @@ fn is_valid_dart_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// pub.dev constraint matcher, compiled once per dependency by
-/// [`DartFormatter::compile_bounded_requirement`]. Holds the requirement already run through
-/// [`normalize_operator_spacing`] so per-candidate matching never re-normalizes or
-/// allocates. `version_matches_normalized_constraint` is a hand-rolled comparator with no
-/// external parser to fail on, so this always decides (`Some`).
-struct PubDevMatcher(String);
+/// Dart's version grammar: pub.dev constraints. The compiled requirement is already run through
+/// [`normalize_operator_spacing`] so per-candidate matching never re-normalizes or allocates.
+/// `version_matches_normalized_constraint` is a hand-rolled comparator with no external parser to
+/// fail on, so every candidate is decidable.
+#[derive(Clone, Copy)]
+struct PubDevGrammar;
 
-impl RequirementMatcher for PubDevMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        Some(version_matches_normalized_constraint(version, &self.0))
+impl VersionGrammar for PubDevGrammar {
+    type Version = ConcreteVersion;
+    type Compiled = String;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<ConcreteVersion> {
+        Some(version.clone())
+    }
+
+    /// `None` for an unresolved requirement (see
+    /// [`DartFormatter::bounded_requirement_is_unresolved`]): the hand-rolled comparator would
+    /// otherwise read a `${VAR}`-shaped constraint as satisfied by no candidate and misreport it
+    /// unsatisfiable.
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<String> {
+        if DartFormatter.bounded_requirement_is_unresolved(requirement) {
+            return None;
+        }
+        Some(normalize_operator_spacing(requirement.as_str().trim()).into_owned())
+    }
+
+    fn satisfies(&self, compiled: &String, version: &ConcreteVersion) -> bool {
+        version_matches_normalized_constraint(version.as_str(), compiled)
     }
 
     /// pub.dev's constraint grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &String) -> bool {
         false
     }
 }
@@ -129,13 +146,13 @@ impl RequirementResolution for DartFormatter {
         version_matches_constraint(version.as_str(), requirement.as_str())
     }
 
-    /// Compiles `requirement` into a `PubDevMatcher` using the same comparator as
+    /// Compiles `requirement` into a `PubDevGrammar` requirement using the same comparator as
     /// `version_satisfies_requirement` — Dart constraints have no separate "loose" vs.
     /// "precise" form to distinguish. Spaced-operator normalization runs once here, not
     /// per candidate version.
     ///
     /// #1374 hardening: an unresolved placeholder (see
-    /// [`Self::bounded_requirement_is_unresolved`]) returns `None` up front — `PubDevMatcher`'s
+    /// [`Self::bounded_requirement_is_unresolved`]) returns `None` up front — `PubDevGrammar`'s
     /// hand-rolled comparator otherwise always decides (`Some`), which would read a
     /// `${VAR}`-shaped constraint as satisfied by no candidate and misreport it
     /// unsatisfiable (`requirement_is_unresolved` already short-circuits that diagnostic
@@ -145,11 +162,11 @@ impl RequirementResolution for DartFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        if self.bounded_requirement_is_unresolved(requirement) {
-            return None;
-        }
-        let normalized = normalize_operator_spacing(requirement.as_str().trim()).into_owned();
-        Some(Box::new(PubDevMatcher(normalized)))
+        grammar_matcher(PubDevGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(PubDevGrammar, candidates))
     }
 
     // #1370/#1374/#1379/#1391: `pubspec.yaml`'s own version-constraint grammar has no
@@ -173,6 +190,57 @@ mod tests {
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
+
+    const REQUIREMENTS: &[&str] = &[
+        "^1.2.3",
+        "^0.13.0",
+        "1.2.3",
+        ">=1.2.0",
+        ">=1.2.0 <2.0.0",
+        ">= 1.2.0 < 2.0.0",
+        "<2.0.0",
+        ">1.0.0",
+        "<=1.5.0",
+        "any",
+        "*",
+        "",
+        "  ^1.0.0  ",
+        "^1.2.3+4",
+        "1.2.3+4",
+        ">=1.0.0-dev <2.0.0",
+        "${VERSION}",
+        "{{ version }}",
+        "$(Version)",
+        "not a constraint",
+        "^1.0.0 <1.5.0",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.13.0",
+        "1.0.0",
+        "1.0.0-dev",
+        "1.2.0",
+        "1.2.3",
+        "1.2.3+4",
+        "1.2.4",
+        "1.5.0",
+        "1.9.9",
+        "2.0.0",
+        "2.0.0-beta",
+        "3.0.0",
+        "v1.2.3",
+        "garbage",
+        "",
+        "1.2",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &DartFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
 
     /// #1687: `+N` build revisions are distinct releases in pub.
     #[test]

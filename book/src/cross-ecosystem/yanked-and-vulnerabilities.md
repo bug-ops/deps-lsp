@@ -33,9 +33,11 @@ distinguishable from a graded finding via its severity field.
 ## Lock alternatives (issue #1981)
 
 When a lock file holds several entries that satisfy one dependency's requirement, `deps-lsp` and
-`deps-cli` cannot tell which one the package manager installed for it. The highest satisfying entry
-drives "Current", yanked and update status. The OSV scan queries it and every other satisfying
-entry (up to 16, lowest versions first), so an advisory that affects only the newer copy or only an
+`deps-cli` cannot always tell which one the package manager installed for it. Where the lock file
+records which workspace member or declared requirement an entry serves (npm-family lock files), the
+entry owned by the manifest drives "Current", yanked and update status; otherwise the highest
+satisfying entry does. The OSV scan queries it and every other satisfying
+entry (up to 16, the ones nearest the in-use version when more exist), so an advisory that affects only the newer copy or only an
 older one is never hidden:
 
 - An advisory matched only by another locked copy is listed with `also locked at <versions>`.

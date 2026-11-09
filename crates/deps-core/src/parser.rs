@@ -1129,10 +1129,11 @@ impl From<CheckedJsonError> for DepsError {
 /// assert_eq!(value["a"], 1);
 ///
 /// let deeply_nested = format!("{}1{}", "[".repeat(100), "]".repeat(100));
-/// assert!(matches!(
+/// # use std::assert_matches;
+/// assert_matches!(
 ///     parse_json_checked::<serde_json::Value>(deeply_nested.as_bytes()),
 ///     Err(deps_core::parser::CheckedJsonError::NestingTooDeep { .. })
-/// ));
+/// );
 /// ```
 pub fn parse_json_checked<T: serde::de::DeserializeOwned>(
     bytes: &[u8],

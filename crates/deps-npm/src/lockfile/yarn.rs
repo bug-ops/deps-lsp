@@ -6,8 +6,12 @@
 
 use std::collections::HashSet;
 
+use deps_core::VersionReq;
 use deps_core::error::Result;
-use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
+use deps_core::lockfile::{
+    EntryOwner, EntryPlacement, MAX_ENTRY_DESCRIPTORS, ResolvedPackage, ResolvedPackages,
+    ResolvedSource,
+};
 use deps_core::yaml_scalar_string;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -76,6 +80,29 @@ fn real_name(specifier: &str) -> Option<(&str, &str)> {
     // `npm:^1.0.0` (no inner `@`) is the plain registry form, not an alias.
     let aliased = range.strip_prefix("npm:").and_then(split_specifier);
     Some(aliased.unwrap_or((name, range)))
+}
+
+/// Placement that records the declared requirements a registry entry resolves (#1993), so a
+/// manifest's own requirement text can be matched against them. Yarn lists no importers, so
+/// the declarations are the only owner signal. Other sources stay unattributed.
+fn descriptor_placement<'a>(
+    source: &ResolvedSource,
+    ranges: impl IntoIterator<Item = &'a str>,
+) -> EntryPlacement {
+    if !source.is_registry() {
+        return EntryPlacement::default();
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let descriptors = ranges
+        .into_iter()
+        .map(|range| range.strip_prefix("npm:").unwrap_or(range))
+        .filter(|range| seen.insert(range))
+        .take(MAX_ENTRY_DESCRIPTORS)
+        .map(VersionReq::new)
+        .collect();
+    EntryPlacement::Hoisted {
+        owner: EntryOwner::Descriptors(descriptors),
+    }
 }
 
 fn unquote(value: &str) -> &str {
@@ -173,23 +200,36 @@ fn finish_v1_entry(entry: &V1Entry<'_>, packages: &mut ResolvedPackages) {
         return;
     };
 
+    let mut ranges_by_name: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for specifier in entry.header.split(',') {
-        if seen.len() >= MAX_V1_NAMES_PER_HEADER {
-            tracing::debug!("yarn.lock entry header lists too many packages; ignoring the rest");
-            break;
-        }
         let Some((name, range)) = real_name(unquote(specifier)) else {
             continue;
         };
-        if !seen.insert(name) || skip_non_semver(name, version) {
+        if seen.insert(name) {
+            if seen.len() > MAX_V1_NAMES_PER_HEADER {
+                tracing::debug!(
+                    "yarn.lock entry header lists too many packages; ignoring the rest"
+                );
+                break;
+            }
+            ranges_by_name.push((name, vec![range]));
+        } else if let Some((_, ranges)) = ranges_by_name.iter_mut().find(|(n, _)| *n == name) {
+            ranges.push(range);
+        }
+    }
+
+    for (name, ranges) in ranges_by_name {
+        if skip_non_semver(name, version) {
             continue;
         }
-        packages.insert(ResolvedPackage::new(
-            name.to_string(),
-            version.to_string(),
-            v1_source(range, entry.resolved.unwrap_or_default()),
-        ));
+        let first_range = ranges.first().copied().unwrap_or_default();
+        let source = v1_source(first_range, entry.resolved.unwrap_or_default());
+        let placement = descriptor_placement(&source, ranges);
+        packages.insert(
+            ResolvedPackage::new(name.to_string(), version.to_string(), source)
+                .with_placement(placement),
+        );
     }
 }
 
@@ -381,7 +421,13 @@ fn berry_package(key: &str, entry: &Yaml) -> Option<ResolvedPackage> {
     if skip_non_semver(&name, &version) {
         return None;
     }
-    Some(ResolvedPackage::new(name, version, source))
+    let ranges = key
+        .split(',')
+        .filter_map(|descriptor| real_name(unquote(descriptor)))
+        .filter(|(descriptor_name, _)| *descriptor_name == name)
+        .map(|(_, range)| range);
+    let placement = descriptor_placement(&source, ranges);
+    Some(ResolvedPackage::new(name, version, source).with_placement(placement))
 }
 
 #[cfg(test)]
@@ -418,6 +464,71 @@ request@^2.88.2:
         assert_eq!(packages.all("@babel/code-frame").unwrap().len(), 1);
         assert_eq!(packages.version("request"), Some("2.88.2"));
         assert!(packages.get("request").unwrap().source.is_registry());
+    }
+
+    fn descriptors_of(packages: &ResolvedPackages, name: &str) -> Vec<Vec<String>> {
+        packages
+            .all(name)
+            .unwrap_or_default()
+            .iter()
+            .map(|package| match package.placement() {
+                EntryPlacement::Hoisted {
+                    owner: EntryOwner::Descriptors(declared),
+                } => declared.iter().map(|d| d.as_str().to_string()).collect(),
+                other => panic!("expected descriptors, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v1_header_specifiers_become_the_entrys_descriptors() {
+        let packages = parse(
+            "\"a@^1.0.0\", a@~1.0.2, \"my-a@npm:a@^1.0.1\":\n  version \"1.0.5\"\n  resolved \"https://registry.yarnpkg.com/a/-/a-1.0.5.tgz\"\n",
+        );
+        assert_eq!(
+            descriptors_of(&packages, "a"),
+            [["^1.0.0", "~1.0.2", "^1.0.1"]]
+        );
+    }
+
+    #[test]
+    fn descriptors_are_deduplicated_and_capped_per_entry() {
+        let header = (0..MAX_ENTRY_DESCRIPTORS * 4)
+            .flat_map(|n| [format!("\"a@>=0.0.{n}\""), format!("\"a@>=0.0.{n}\"")])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let v1 = parse(&format!("{header}:\n  version \"1.0.5\"\n"));
+        let kept = descriptors_of(&v1, "a");
+        assert_eq!(kept.len(), 1);
+        let first = kept.first().unwrap();
+        assert_eq!(first.len(), MAX_ENTRY_DESCRIPTORS);
+        assert_eq!(
+            first.iter().collect::<HashSet<_>>().len(),
+            MAX_ENTRY_DESCRIPTORS,
+            "duplicates must not consume the cap"
+        );
+
+        let berry = parse(
+            "__metadata:\n  version: 8\n\n\"a@npm:^1.0.0, a@npm:^1.0.0, a@npm:~1.0.2\":\n  version: 1.0.5\n  resolution: \"a@npm:1.0.5\"\n",
+        );
+        assert_eq!(descriptors_of(&berry, "a"), [["^1.0.0", "~1.0.2"]]);
+    }
+
+    #[test]
+    fn berry_key_descriptors_drop_the_default_npm_protocol() {
+        let packages = parse(
+            "__metadata:\n  version: 8\n\n\"a@npm:^1.0.0, a@npm:~1.0.2\":\n  version: 1.0.5\n  resolution: \"a@npm:1.0.5\"\n",
+        );
+        assert_eq!(descriptors_of(&packages, "a"), [["^1.0.0", "~1.0.2"]]);
+    }
+
+    #[test]
+    fn non_registry_yarn_entries_carry_no_descriptors() {
+        let packages = parse("\"loc@file:../loc\":\n  version \"1.0.0\"\n");
+        assert_eq!(
+            packages.get("loc").unwrap().placement(),
+            &EntryPlacement::default()
+        );
     }
 
     #[test]

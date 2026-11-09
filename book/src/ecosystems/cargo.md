@@ -32,8 +32,10 @@ dependencies, and a `package = "..."` rename (aliasing the TOML key to a differe
 lookup name) are all recognized and routed correctly — a renamed dependency's diagnostics and
 completions key off the real crate name, not the local alias.
 
-Update edits keep a partial tilde requirement's precision: `~0.7` with a latest of 0.10.3 becomes
-`~0.10`, not `~0.10.3`. A security-fix or cooldown-fallback target writes the full version.
+Update edits keep a partial requirement's precision: `~0.7` with a latest of 0.10.3 becomes
+`~0.10`, a bare `0.7` becomes `0.10`, and `^0.4` with a latest of 1.0.19 becomes `1.0` (a
+redundant `^` is dropped), not the full version. A prerelease pick, an all-zero requirement
+(`0`, `^0.0`) and a security-fix or cooldown-fallback target write the full version.
 
 ## Custom/Private Registries
 

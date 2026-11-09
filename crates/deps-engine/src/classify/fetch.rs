@@ -214,8 +214,6 @@ pub struct FetchPreparation {
 /// let parsed = stub_document(stub_parse_result(2));
 /// let prep = prepare_fetch(
 ///     parsed.as_ref(),
-///     &SimpleFormatter,
-///     EcosystemId::Cargo,
 ///     &HashMap::new(),
 ///     &HashMap::new(),
 /// );
@@ -225,18 +223,16 @@ pub struct FetchPreparation {
 /// ```
 pub fn prepare_fetch(
     document: &dyn deps_core::ParsedManifest,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
-    ecosystem: deps_core::EcosystemId,
     resolved_versions: &ResolvedVersionsMap,
     resolved_version_candidates: &ResolvedCandidatesMap,
 ) -> FetchPreparation {
-    let (sources_map, collided_names) = dedup_dependencies_by_source(document, formatter);
+    let (sources_map, collided_names) =
+        dedup_dependencies_by_source(document, document.formatter());
     let dep_sources: DepSources = sources_map.into_values().collect();
     let in_use = crate::classify::resolved::collect_in_use_versions(
         document,
         resolved_versions,
         resolved_version_candidates,
-        ecosystem,
     );
     FetchPreparation {
         dep_sources,
@@ -3658,20 +3654,12 @@ mod tests {
 }"#;
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let parse_result = crate::setup::parse_composer_json(json, &uri).unwrap();
-            let formatter = deps_composer::ComposerFormatter;
-
             let document = deps_core::test_util::stub_document_with(
                 parse_result,
                 deps_composer::ComposerFormatter,
                 deps_core::EcosystemId::Composer,
             );
-            let prep = prepare_fetch(
-                document.as_ref(),
-                &formatter,
-                deps_core::EcosystemId::Composer,
-                &HashMap::new(),
-                &HashMap::new(),
-            );
+            let prep = prepare_fetch(document.as_ref(), &HashMap::new(), &HashMap::new());
 
             assert_eq!(
                 prep.selection_context.minimum_stability(),
@@ -3686,20 +3674,12 @@ mod tests {
             let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let parse_result = crate::setup::parse_composer_json(json, &uri).unwrap();
-            let formatter = deps_composer::ComposerFormatter;
-
             let document = deps_core::test_util::stub_document_with(
                 parse_result,
                 deps_composer::ComposerFormatter,
                 deps_core::EcosystemId::Composer,
             );
-            let prep = prepare_fetch(
-                document.as_ref(),
-                &formatter,
-                deps_core::EcosystemId::Composer,
-                &HashMap::new(),
-                &HashMap::new(),
-            );
+            let prep = prepare_fetch(document.as_ref(), &HashMap::new(), &HashMap::new());
 
             assert_eq!(prep.selection_context.minimum_stability(), None);
         }
@@ -5858,13 +5838,7 @@ mod tests {
                 LOWERCASE_FORMATTER.for_dependency::<MockDep>(),
                 deps_core::EcosystemId::Cargo,
             );
-            let prep = prepare_fetch(
-                document.as_ref(),
-                &LOWERCASE_FORMATTER,
-                deps_core::EcosystemId::Cargo,
-                &HashMap::new(),
-                &HashMap::new(),
-            );
+            let prep = prepare_fetch(document.as_ref(), &HashMap::new(), &HashMap::new());
             let registry = Arc::new(RecordingRegistry {
                 requested: Mutex::new(Vec::new()),
             });

@@ -2,13 +2,14 @@
 
 use crate::types::{NuGetDependency, NuGetFeedRoute};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
-    requirement_contains_template_placeholder,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    RequirementRewriteShape, RewriteTarget, SourcePolicy, VersionGrammar, bare_meaning,
+    classify_requirement_rewrite_shape, fit_segments, format_version_replacing_by_shape,
+    grammar_candidates, grammar_matcher, requirement_contains_template_placeholder,
 };
 use deps_core::osv::NonPublicRoute;
-use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -26,33 +27,89 @@ fn is_valid_nuget_id(name: &str) -> bool {
         .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
-/// NuGet interval/floating-pattern matcher, compiled once per dependency by
-/// [`NuGetFormatter::compile_bounded_requirement`] — the range or floating pattern is parsed once
-/// here rather than being re-parsed for every candidate version scanned. Always decidable
-/// (`Some`) — matching a candidate against an already-parsed range/pattern has no separate
-/// "candidate failed to parse" signal, only "range/pattern failed to parse" (already ruled
-/// out by `compile_bounded_requirement` before this is constructed).
-enum NuGetMatcher {
+/// A NuGet requirement compiled by `NuGetGrammar`: an interval or a floating pattern.
+enum NuGetRequirement {
     Range(crate::version::VersionRange),
     Float(crate::version::FloatPattern),
 }
 
-impl RequirementMatcher for NuGetMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        Some(match self {
-            Self::Range(range) => crate::version::range_contains(version, range),
-            Self::Float(pattern) => {
-                let parsed = crate::version::ParsedVersion::parse(version);
-                crate::version::float_matches(version, &parsed, pattern)
-            }
+/// A candidate version with its parsed form, so the parse happens once per candidate rather than
+/// once per requirement.
+struct NuGetCandidate {
+    text: ConcreteVersion,
+    parsed: crate::version::ParsedVersion,
+}
+
+/// NuGet's version grammar: interval notation and floating patterns. The range or pattern is
+/// parsed once per requirement and the candidate once per list. Every candidate is decidable:
+/// matching an already-parsed candidate has no "candidate failed to parse" signal, only "range or
+/// pattern failed to parse", which [`Self::compile`] rules out.
+#[derive(Clone, Copy)]
+struct NuGetGrammar;
+
+impl VersionGrammar for NuGetGrammar {
+    type Version = NuGetCandidate;
+    type Compiled = NuGetRequirement;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<NuGetCandidate> {
+        Some(NuGetCandidate {
+            text: version.clone(),
+            parsed: crate::version::ParsedVersion::parse(version.as_str()),
         })
     }
 
+    /// `None` for an unresolved requirement (see
+    /// [`NuGetFormatter::compile_bounded_requirement`]) or a range or floating pattern that does
+    /// not parse.
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<NuGetRequirement> {
+        if NuGetFormatter.bounded_requirement_is_unresolved(requirement) {
+            return None;
+        }
+        let requirement = requirement.as_str();
+        if requirement.contains('*') {
+            crate::version::parse_float(requirement).map(NuGetRequirement::Float)
+        } else {
+            crate::version::parse_range(requirement).map(NuGetRequirement::Range)
+        }
+    }
+
+    fn satisfies(&self, compiled: &NuGetRequirement, version: &NuGetCandidate) -> bool {
+        match compiled {
+            NuGetRequirement::Range(range) => {
+                crate::version::range_contains_parsed(&version.parsed, range)
+            }
+            NuGetRequirement::Float(pattern) => {
+                crate::version::float_matches(version.text.as_str(), &version.parsed, pattern)
+            }
+        }
+    }
+
     /// NuGet's range/float grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &NuGetRequirement) -> bool {
         false
     }
+}
+
+/// Rewrites a stable numeric floating pattern (`3.*`) to the picked stable `version` at the
+/// declared precision (`5.*`), or `None` for any other requirement shape or a prerelease pick.
+fn rewrite_numeric_float(version: &ConcreteVersion, current: &str) -> Option<String> {
+    let crate::version::FloatPattern::NumericPrefix {
+        prefix,
+        include_prerelease: false,
+    } = crate::version::parse_float(current)?
+    else {
+        return None;
+    };
+    let core = version.as_str();
+    let numeric =
+        |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
+    if !prefix.split('.').all(numeric) || core.contains(['-', '+']) {
+        return None;
+    }
+    Some(format!(
+        "{}.*",
+        fit_segments(core, prefix.split('.').count())
+    ))
 }
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for NuGet.
@@ -119,7 +176,14 @@ impl PackageRendering for NuGetFormatter {
     /// its upper bound, widening what the requirement accepts instead of updating it.
     ///
     /// [bm]: deps_core::lsp_helpers::BareMeaning::Floor
+    ///
+    /// A stable numeric floating pattern (`3.*`, `1.1.*`) is the one exception: it keeps its
+    /// wildcard and its declared segment count (`5.*`, `1.2.*`), which admits the picked version
+    /// without dropping the float (#1939). A bounded interval is still left unchanged.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if let Some(floating) = rewrite_numeric_float(version, current) {
+            return floating;
+        }
         format_version_replacing_by_shape(
             version,
             current,
@@ -242,7 +306,7 @@ impl RequirementResolution for NuGetFormatter {
             || crate::parser::is_msbuild_reference(requirement)
     }
 
-    /// Uses [`compile_requirement_unless`] (see that function and
+    /// Matches through `NuGetGrammar` (see
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a syntactically malformed range or floating pattern
@@ -261,38 +325,15 @@ impl RequirementResolution for NuGetFormatter {
     /// with (see `parser::test_unresolved_msbuild_property_degrades_to_none`), so this guard is
     /// defense-in-depth, consistent with the parser's own treatment of the same input as "no
     /// requirement" rather than a real constraint.
-    // `compile_requirement_unless`'s contract only invokes the build closure when the
-    // undecidable predicate returned `false`, i.e. parsing already succeeded.
-    #[allow(clippy::expect_used)]
     fn compile_bounded_requirement(
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        if self.bounded_requirement_is_unresolved(requirement) {
-            return None;
-        }
-        let requirement = requirement.as_str();
-        if requirement.contains('*') {
-            compile_requirement_unless(
-                requirement,
-                |r| crate::version::parse_float(r).is_none(),
-                |r| {
-                    NuGetMatcher::Float(
-                        crate::version::parse_float(&r).expect("validated by undecidable guard"),
-                    )
-                },
-            )
-        } else {
-            compile_requirement_unless(
-                requirement,
-                |r| crate::version::parse_range(r).is_none(),
-                |r| {
-                    NuGetMatcher::Range(
-                        crate::version::parse_range(&r).expect("validated by undecidable guard"),
-                    )
-                },
-            )
-        }
+        grammar_matcher(NuGetGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(NuGetGrammar, candidates))
     }
 
     /// Overridden for the same reason as [`Self::is_bounded_requirement_up_to_date`]: a bare or
@@ -320,7 +361,20 @@ impl RequirementResolution for NuGetFormatter {
     }
 }
 
-impl DiagnosticMessages for NuGetFormatter {}
+impl DiagnosticMessages for NuGetFormatter {
+    /// A bounded interval is never rewritten by an update edit (#1602), so its notice says the
+    /// bounds need a manual edit instead of promising a quick fix (#1939).
+    fn newer_version_notice(&self, requirement: Option<&VersionReq>) -> &'static str {
+        let is_interval = requirement.is_some_and(|req| {
+            classify_requirement_rewrite_shape(req.as_str()) == RequirementRewriteShape::Compound
+        });
+        if is_interval {
+            "Newer version outside the declared range (edit the bounds manually)"
+        } else {
+            "Newer version available"
+        }
+    }
+}
 
 impl DiagnosticPolicy for NuGetFormatter {}
 
@@ -363,6 +417,68 @@ mod tests {
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
+    const REQUIREMENTS: &[&str] = &[
+        "1.0",
+        "1.0.0",
+        "[1.0]",
+        "[1.0,)",
+        "(1.0,)",
+        "(,2.0]",
+        "(,2.0)",
+        "[1.0,2.0)",
+        "(1.0,2.0]",
+        "[1.0,2.0]",
+        "3.*",
+        "3.1.*",
+        "*",
+        "*-*",
+        "1.0-*",
+        "1.0.0-beta*",
+        "1.*-*",
+        "",
+        "[1.0",
+        "garbage",
+        "[2.0,1.0]",
+        "$(Version)",
+        "[$(Min),$(Max))",
+        "%(Version)",
+        "@(Items)",
+        "[1.0, 2.0)",
+        "1.0.0.0",
+        "1.0.0+build",
+        "1.0.*-beta*",
+        "{{ version }}",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.9.0",
+        "1.0.0",
+        "1.0.0-beta",
+        "1.0.0-beta.2",
+        "1.0.0.0",
+        "1.0.0+build",
+        "1.0.1",
+        "1.5.0",
+        "2.0.0",
+        "2.0.0-rc.1",
+        "3.0.0",
+        "3.1.4",
+        "3.1.4-alpha",
+        "4.0.0",
+        "garbage",
+        "",
+        "1.2",
+        "1.0.0.1",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &NuGetFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
+
     #[test]
     fn test_format_version() {
         let f = NuGetFormatter;
@@ -383,15 +499,44 @@ mod tests {
         );
     }
 
-    /// #1602: a floating pattern (`1.1.*`) must never collapse to a bare version either — same
-    /// widening hazard as a bounded range.
+    /// #1602: a floating pattern (`1.1.*`) must never collapse to a bare version — same
+    /// widening hazard as a bounded range. #1939: it keeps its wildcard and precision instead.
     #[test]
-    fn test_format_version_replacing_floating_pattern_refused() {
+    fn test_format_version_replacing_floating_pattern_keeps_wildcard() {
         let f = NuGetFormatter;
+        for (current, picked, expected) in [
+            ("1.1.*", "1.2.0", "1.2.*"),
+            ("3.*", "5.0.0", "5.*"),
+            ("3.*", "5.0.0-rc.1", "3.*"),
+            ("3.*-*", "5.0.0", "3.*-*"),
+            ("x.*", "5.0.0", "x.*"),
+        ] {
+            assert_eq!(
+                f.format_version_replacing(&ConcreteVersion::new(picked), current),
+                expected,
+                "{current}"
+            );
+        }
+    }
+
+    /// #1939: an interval has no update edit, so its notice does not promise a fix.
+    #[test]
+    fn test_newer_version_notice_interval_makes_no_fix_promise() {
+        let f = NuGetFormatter;
+        let interval = VersionReq::new("[2.0.0,3.0.0)");
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "1.1.*"),
-            "1.1.*"
+            f.newer_version_notice(Some(&interval)),
+            "Newer version outside the declared range (edit the bounds manually)"
         );
+        for plain in ["3.*", "12.0.1", "[1.0.0]"] {
+            let req = VersionReq::new(plain);
+            assert_eq!(
+                f.newer_version_notice(Some(&req)),
+                "Newer version available",
+                "{plain}"
+            );
+        }
+        assert_eq!(f.newer_version_notice(None), "Newer version available");
     }
 
     /// #1602 impl-critic S2: a prerelease-label float (`1.2.0-rc.*`,
@@ -437,7 +582,8 @@ mod tests {
             deps_core::EcosystemId::NuGet,
             &[
                 "[12.0.1,13.0.0)",
-                "1.1.*",
+                // "1.1.*" is shape-preserved (-> "1.2.*"), not refused (#1939); see
+                // test_format_version_replacing_floating_pattern_keeps_wildcard.
                 "(1.0,2.0]",
                 // #1602 impl-critic S2: the wildcard lives in the prerelease part, not the core.
                 "1.2.0-rc.*",

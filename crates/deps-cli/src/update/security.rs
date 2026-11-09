@@ -123,7 +123,6 @@ pub async fn plan_security_updates(
         analysis.parse_result.as_ref(),
         &analysis.resolved_versions,
         &analysis.resolved_version_candidates,
-        ecosystem_id,
     );
     let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
 
@@ -142,7 +141,6 @@ pub async fn plan_security_updates(
     let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
         analysis.parse_result.as_ref(),
         &vuln_key_by_range,
-        ecosystem_id,
     );
 
     let fix_target_registry = deps_engine::classify::osv::fix_target_registry(
@@ -184,6 +182,7 @@ pub async fn plan_security_updates(
     }
 
     let mut items = Vec::new();
+    let mut memo = deps_core::lsp_helpers::LockSelectionMemo::default();
     analysis
         .parse_result
         .for_each_formatted_dependency(&mut |bound| {
@@ -194,8 +193,9 @@ pub async fn plan_security_updates(
             else {
                 return;
             };
+            let current = security_current(bound, &key, analysis, ecosystem_id, &mut memo);
             if !is_requested(package_filter, key.normalized(), formatter) {
-                items.push(skipped_not_requested(bound, &key, ecosystem_id, analysis));
+                items.push(skipped_not_requested(bound, current));
                 return;
             }
 
@@ -214,7 +214,7 @@ pub async fn plan_security_updates(
                 latest,
                 &key,
                 analysis,
-                ecosystem_id,
+                current,
                 ignore_rules,
             ));
         });
@@ -238,7 +238,7 @@ fn classify_vulnerable_dependency(
     latest: Option<&deps_core::osv::UpgradeStatus>,
     key: &PackageKey,
     analysis: &ManifestAnalysis,
-    ecosystem_id: deps_core::EcosystemId,
+    current: CurrentVersion,
     ignore_rules: &IgnoreRules,
 ) -> PlannedUpdateItem {
     // M8: the resolved in-use version, not the declared requirement text, is what
@@ -262,7 +262,6 @@ fn classify_vulnerable_dependency(
     // constraint rules out doing casually anyway).
     let dep = bound.dependency();
     let formatter = bound.formatter();
-    let current = security_current(bound, key, analysis, ecosystem_id);
     let ignore_rule_overridden = ignore_override(ignore_rules, key.normalized());
 
     // FR-011: the two-signal, load-bearing `Unfixable` rule — `fetch_and_classify_package`
@@ -522,14 +521,17 @@ fn security_current(
     key: &PackageKey,
     analysis: &ManifestAnalysis,
     ecosystem_id: deps_core::EcosystemId,
+    memo: &mut deps_core::lsp_helpers::LockSelectionMemo,
 ) -> CurrentVersion {
     bound
-        .resolve_in_use_version(
+        .resolve_in_use_versions_memoized(
             key,
             &analysis.resolved_versions,
             Some(&analysis.resolved_version_candidates),
             ecosystem_id,
+            memo,
         )
+        .map(deps_core::lsp_helpers::InUseVersions::into_primary)
         .map(CurrentVersion::Resolved)
         .or_else(|| {
             bound
@@ -552,11 +554,8 @@ fn ignore_override(
 
 fn skipped_not_requested(
     bound: &dyn FormattedDependency<'_>,
-    key: &PackageKey,
-    ecosystem_id: deps_core::EcosystemId,
-    analysis: &ManifestAnalysis,
+    current: CurrentVersion,
 ) -> PlannedUpdateItem {
-    let current = security_current(bound, key, analysis, ecosystem_id);
     PlannedUpdateItem::new(
         bound.dependency().name().as_str().to_string(),
         current,
@@ -705,13 +704,20 @@ mod tests {
         let document = stub_document_with(parse, formatter, ecosystem_id);
         let mut item = None;
         document.for_each_formatted_dependency(&mut |bound| {
+            let current = security_current(
+                bound,
+                key,
+                analysis,
+                ecosystem_id,
+                &mut deps_core::lsp_helpers::LockSelectionMemo::default(),
+            );
             item = Some(classify_vulnerable_dependency(
                 bound,
                 dv,
                 latest,
                 key,
                 analysis,
-                ecosystem_id,
+                current,
                 ignore_rules,
             ));
         });
@@ -730,13 +736,20 @@ mod tests {
         let key = deps_core::test_util::package_key(package);
         let mut item = None;
         document.for_each_formatted_dependency(&mut |bound| {
+            let current = security_current(
+                bound,
+                &key,
+                analysis,
+                ecosystem_id,
+                &mut deps_core::lsp_helpers::LockSelectionMemo::default(),
+            );
             item = Some(classify_vulnerable_dependency(
                 bound,
                 dv,
                 None,
                 &key,
                 analysis,
-                ecosystem_id,
+                current,
                 &IgnoreRules::empty(),
             ));
         });
@@ -2096,14 +2109,10 @@ mod tests {
             document.as_ref(),
             &HashMap::new(),
             &HashMap::new(),
-            EcosystemId::GithubActions,
         );
         let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
-        let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
-            document.as_ref(),
-            &vuln_keys,
-            EcosystemId::GithubActions,
-        );
+        let candidate_tags =
+            deps_engine::classify::osv::candidate_tag_sources(document.as_ref(), &vuln_keys);
         let (resolved, _live) = deps_engine::classify::osv::collect_fix_target_resolutions(
             &vulnerabilities,
             &[key],

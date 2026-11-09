@@ -261,6 +261,7 @@ async fn assert_edit_during_initial_fetch_keeps_registry_data(fixture: Fixture, 
 #[cfg(feature = "npm")]
 mod npm_cases {
     use super::*;
+    use std::assert_matches;
 
     const MANIFEST: &str = r#"{"dependencies": {"@acme-corp/widget": "^1.0.0"}}"#;
     const PACKUMENT: &str =
@@ -388,9 +389,35 @@ mod npm_cases {
         widget.assert_async().await;
     }
 
+    /// Catch-all OSV mock that fails `assert_async` on any request: the fixture's `.npmrc`
+    /// registry is a private route, so the scan must record a skip instead of querying OSV.
+    async fn no_osv_requests(osv: &mut mockito::ServerGuard) -> mockito::Mock {
+        osv.mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await
+    }
+
+    /// Positive half of the `expect(0)` OSV check: the scan ran and chose to skip every
+    /// dependency as a private (scope-registry) route, so an unqueried OSV mock is not just an unrun scan.
+    fn assert_every_osv_outcome_is_a_private_route_skip(fixture: &Fixture) {
+        let outcomes = fixture
+            .state
+            .with_document(&fixture.uri, |doc| doc.signals.vulnerabilities.clone())
+            .unwrap();
+        assert!(!outcomes.is_empty(), "the OSV scan recorded no outcome");
+        for (key, outcome) in &outcomes {
+            assert_matches!(
+                outcome,
+                deps_core::osv::ScanOutcome::Skipped(deps_core::osv::SkipReason::NonRegistrySource),
+                "{key:?}"
+            );
+        }
+    }
+
     /// RT-004: a whitespace edit on a fully loaded document performs no registry request and
     /// leaves the OSV scan plan current. The `.npmrc` registry is a non-public route, so the OSV
-    /// scan records a skip for the dependency instead of querying osv.dev.
+    /// scan records a `NonRegistrySource` skip for the dependency instead of querying osv.dev.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rt_004_whitespace_edit_on_loaded_document_requests_nothing() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
@@ -402,7 +429,8 @@ mod npm_cases {
             .expect(1)
             .create_async()
             .await;
-        let osv = mockito::Server::new_async().await;
+        let mut osv = mockito::Server::new_async().await;
+        let osv_requests = no_osv_requests(&mut osv).await;
         let fixture = npm_fixture(&registry.url(), Some(osv.url()));
 
         fixture.open().await.await.unwrap();
@@ -413,16 +441,11 @@ mod npm_cases {
             .unwrap();
 
         widget.assert_async().await;
-        let ecosystem = fixture
-            .state
-            .ecosystem_registry
-            .get(deps_core::EcosystemId::Npm)
-            .unwrap();
+        osv_requests.assert_async().await;
+        assert_every_osv_outcome_is_a_private_route_skip(&fixture);
         let stale = fixture
             .state
-            .with_document(&fixture.uri, |doc| {
-                osv_scan_plan_is_stale(doc, ecosystem.as_ref())
-            })
+            .with_document(&fixture.uri, osv_scan_plan_is_stale)
             .unwrap();
         assert!(
             !stale,
@@ -443,7 +466,8 @@ mod npm_cases {
             .expect(1)
             .create_async()
             .await;
-        let osv = mockito::Server::new_async().await;
+        let mut osv = mockito::Server::new_async().await;
+        let osv_requests = no_osv_requests(&mut osv).await;
         let fixture = npm_fixture(&registry.url(), Some(osv.url()));
 
         fixture.open().await.await.unwrap();
@@ -470,6 +494,8 @@ mod npm_cases {
             .unwrap();
 
         widget.assert_async().await;
+        osv_requests.assert_async().await;
+        assert_every_osv_outcome_is_a_private_route_skip(&fixture);
         let restored = fixture
             .state
             .with_document(&fixture.uri, |doc| !doc.signals.vulnerabilities.is_empty())

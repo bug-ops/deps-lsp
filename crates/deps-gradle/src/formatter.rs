@@ -2,10 +2,10 @@
 
 use crate::types::GradleDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
-    requirement_contains_template_placeholder,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    RewriteTarget, SourcePolicy, VersionGrammar, bare_meaning, format_version_replacing_by_shape,
+    grammar_candidates, grammar_matcher, requirement_contains_template_placeholder,
 };
 use deps_core::{
     ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, is_safe_maven_coordinate_segment,
@@ -111,7 +111,7 @@ fn gradle_version_matches(version: &str, requirement: &str) -> bool {
 /// `requirement_is_unresolved` before calling `compile_bounded_requirement`, so the unresolved and
 /// `latest.*` short-circuits are unreachable from that caller in practice; they stay so this
 /// matcher is correct if used standalone.
-enum GradleMatcher {
+enum GradleRequirement {
     /// Unresolved `$var`/`${var}`, `latest`/`latest.*`, or a `-SNAPSHOT` pin.
     AlwaysSatisfied,
     /// A dynamic `1.0.+` prefix — the text before the trailing `+`.
@@ -122,22 +122,69 @@ enum GradleMatcher {
     Exact(String),
 }
 
-impl RequirementMatcher for GradleMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+/// Gradle's version grammar: bracket intervals, dynamic `1.0.+` prefixes and exact versions.
+/// Every candidate is decidable: matching has no "candidate failed to parse" signal, only "range
+/// failed to parse", which [`Self::compile`] rules out.
+#[derive(Clone, Copy)]
+struct GradleGrammar;
+
+impl VersionGrammar for GradleGrammar {
+    type Version = ConcreteVersion;
+    type Compiled = GradleRequirement;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<ConcreteVersion> {
+        Some(version.clone())
+    }
+
+    /// `None` for a malformed range (leading `[`/`(`/`]` but `parse_range` fails), checked
+    /// first, before any other branch: without it a malformed bracket range that also ends in
+    /// `+` (e.g. `"[1.0,2.0]+"`) would be misclassified as a dynamic prefix, which decides
+    /// `false` for every real candidate, instead of correctly suppressing the check.
+    ///
+    /// The `!!` strictly-version marker is stripped once here, so every branch operates on the
+    /// strictlyVersion spelling and `Exact` never compares against a target that still includes
+    /// `!!`.
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<GradleRequirement> {
+        let requirement = strip_strict_marker(requirement.as_str());
+        let is_bracketed = requirement.starts_with(['[', '(', ']']);
+        let range = if is_bracketed {
+            Some(crate::range::parse_range(requirement)?)
+        } else {
+            None
+        };
+        if is_placeholder(requirement)
+            || requirement == "latest"
+            || requirement.starts_with("latest.")
+            || is_snapshot(requirement)
+        {
+            return Some(GradleRequirement::AlwaysSatisfied);
+        }
+        if let Some(prefix) = requirement.strip_suffix('+') {
+            return Some(GradleRequirement::DynamicPrefix(prefix.to_string()));
+        }
+        // `]` is a leading delimiter in its own right (Gradle's reversed-bracket exclusive
+        // notation, `]1.2,1.5]`), not just a trailing one.
+        Some(match range {
+            Some(range) => GradleRequirement::Range(range),
+            None => GradleRequirement::Exact(requirement.to_owned()),
+        })
+    }
+
+    fn satisfies(&self, compiled: &GradleRequirement, version: &ConcreteVersion) -> bool {
         let version = version.as_str();
-        Some(match self {
-            Self::AlwaysSatisfied => true,
-            Self::DynamicPrefix(prefix) => {
+        match compiled {
+            GradleRequirement::AlwaysSatisfied => true,
+            GradleRequirement::DynamicPrefix(prefix) => {
                 version == prefix.trim_end_matches('.') || version.starts_with(prefix.as_str())
             }
-            Self::Range(range) => deps_maven::interval::contains(version, range),
-            Self::Exact(target) => version == target,
-        })
+            GradleRequirement::Range(range) => deps_maven::interval::contains(version, range),
+            GradleRequirement::Exact(target) => version == target,
+        }
     }
 
     /// Gradle's bracket-interval/dynamic range model is not strict SemVer 2.0.0 (#299) — must
     /// not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &GradleRequirement) -> bool {
         false
     }
 }
@@ -275,13 +322,13 @@ impl RequirementResolution for GradleFormatter {
         is_placeholder(requirement.as_str())
     }
 
-    /// Uses [`compile_requirement_unless`] (see that function and
+    /// Matches through `GradleGrammar` (see
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
-    /// The undecidable predicate rejects a malformed range (leading `[`/`(`/`]` but
+    /// The grammar rejects a malformed range (leading `[`/`(`/`]` but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any
     /// other branch: without this guard ahead of the `AlwaysSatisfied`/dynamic-prefix
-    /// short-circuits below, a malformed bracket range that also happens to end in `+`
+    /// short-circuits, a malformed bracket range that also happens to end in `+`
     /// (e.g. `"[1.0,2.0]+"`) would be misclassified as a dynamic prefix — which decides
     /// `Some(false)` for every real candidate — instead of correctly suppressing the check.
     ///
@@ -291,37 +338,11 @@ impl RequirementResolution for GradleFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        // Stripped once here so every branch below operates on the strictlyVersion spelling —
-        // unlike `gradle_version_matches`, this matcher is pre-parsed once, so the stripped
-        // spelling must be what's stored in `GradleMatcher` (e.g. `Exact` must not compare
-        // against a target that still includes "!!").
-        let requirement = strip_strict_marker(requirement.as_str());
-        compile_requirement_unless(
-            requirement,
-            |r| r.starts_with(['[', '(', ']']) && crate::range::parse_range(r).is_none(),
-            |r| {
-                if is_placeholder(&r) || r == "latest" || r.starts_with("latest.") {
-                    return GradleMatcher::AlwaysSatisfied;
-                }
-                if is_snapshot(&r) {
-                    return GradleMatcher::AlwaysSatisfied;
-                }
-                if let Some(prefix) = r.strip_suffix('+') {
-                    return GradleMatcher::DynamicPrefix(prefix.to_string());
-                }
-                // `]` is included alongside `[`/`(` because Gradle's reversed-bracket
-                // exclusive notation (`]1.2,1.5]`) is a leading delimiter in its own
-                // right, not just a trailing one. The undecidable guard above already
-                // ensures `parse_range` succeeds here.
-                if r.starts_with(['[', '(', ']'])
-                    && let Some(range) = crate::range::parse_range(&r)
-                {
-                    return GradleMatcher::Range(range);
-                }
-                GradleMatcher::Exact(r)
-            },
-        )
+        grammar_matcher(GradleGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(GradleGrammar, candidates))
     }
 }
 
@@ -343,6 +364,66 @@ mod tests {
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::{RequirementGate, RequirementStatus};
+
+    const REQUIREMENTS: &[&str] = &[
+        "1.0",
+        "1.0.0",
+        "1.0.+",
+        "1.+",
+        "+",
+        "latest",
+        "latest.release",
+        "latest.integration",
+        "1.0-SNAPSHOT",
+        "[1.0]",
+        "[1.0,)",
+        "(1.0,)",
+        "(,2.0]",
+        "[1.0,2.0)",
+        "]1.0,2.0[",
+        "]1.2,1.5]",
+        "[1.0,2.0]+",
+        "[1.0,2.0",
+        "[2.0,1.0]",
+        "1.0!!",
+        "[1.0,2.0)!!1.5",
+        "  1.0  ",
+        "$ver",
+        "${ver}",
+        "",
+        "{{ v }}",
+        "%V%",
+        "@V@",
+        "garbage",
+        "1.0.0-rc1",
+        "1.+.0",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.9",
+        "1.0",
+        "1.0.0",
+        "1.0.5",
+        "1.0-SNAPSHOT",
+        "1.1",
+        "1.5",
+        "1.9",
+        "2.0",
+        "2.0.1",
+        "3.0",
+        "1.0.0-rc1",
+        "garbage",
+        "",
+        "1.",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &GradleFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
 
     /// A minimal [`deps_core::Dependency`] for probing
     /// [`deps_core::edit::replacement_text`] directly — its identity is irrelevant to the
@@ -980,7 +1061,7 @@ mod tests {
 
     /// #1353/#1391 S1: `[1.0,$hi` and `[$lo,` are classified placeholders (`is_placeholder`
     /// matches `$`), but both are *also* malformed ranges — `compile_bounded_requirement`'s
-    /// malformed-range guard returns `None` for them (not `GradleMatcher::AlwaysSatisfied`),
+    /// malformed-range guard returns `None` for them (not `GradleRequirement::AlwaysSatisfied`),
     /// making the default `bounded_requirement_already_resolves_to` inert.
     /// `RequirementResolution::bounded_requirement_is_placeholder`'s direct `is_placeholder` check —
     /// consulted by `deps_core::edit::replacement_text` before ever calling

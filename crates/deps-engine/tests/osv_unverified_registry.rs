@@ -36,12 +36,8 @@ where
     F: DependencyFormatter<Dep = P::Dep> + 'static,
 {
     let document = stub_document_with(parse_result, formatter, ecosystem);
-    let (targets, skipped) = build_scan_targets(
-        document.as_ref(),
-        &HashMap::new(),
-        &HashMap::new(),
-        ecosystem,
-    );
+    let (targets, skipped) =
+        build_scan_targets(document.as_ref(), &HashMap::new(), &HashMap::new());
     let mut verdicts = HashMap::new();
     document.for_each_formatted_dependency(&mut |bound| {
         let dep = bound.dependency();

@@ -308,7 +308,7 @@ struct BranchKey {
 ///     fn normalized_spelling(&self, name: &PackageName) -> String { name.as_str().to_lowercase() }
 /// }
 ///
-/// let store = BranchEvidenceStore::new(Duration::from_secs(3600));
+/// let store = BranchEvidenceStore::new(Duration::from_hours(1));
 /// let repo = Lowercase.normalize_package_name(&PackageName::new("Actions/Checkout"));
 /// let git_ref = ProbeRef::parse("v40").unwrap();
 /// assert!(store.get(&repo, &git_ref).is_none());
@@ -525,7 +525,7 @@ impl DefaultBranchMembership {
 ///     NormalizeName, TagName,
 /// };
 ///
-/// let store = CommitEvidenceStore::new(Duration::from_secs(3600));
+/// let store = CommitEvidenceStore::new(Duration::from_hours(1));
 /// let repo = LowercaseNaming.normalize_package_name(&PackageName::new("o/r"));
 /// let release = CommitSha::parse(&"a".repeat(40)).unwrap();
 /// let pin = CommitSha::parse(&"b".repeat(40)).unwrap();
@@ -617,7 +617,7 @@ impl AheadProof {
     ///     LowercaseNaming, NormalizeName, RequirementStatus, TagName,
     /// };
     ///
-    /// let store = CommitEvidenceStore::new(Duration::from_secs(3600));
+    /// let store = CommitEvidenceStore::new(Duration::from_hours(1));
     /// let repo = LowercaseNaming.normalize_package_name(&PackageName::new("o/r"));
     /// let release = CommitSha::parse(&"a".repeat(40)).unwrap();
     /// let pin = CommitSha::parse(&"b".repeat(40)).unwrap();
@@ -710,7 +710,7 @@ struct MembershipKey {
 ///     fn normalized_spelling(&self, name: &PackageName) -> String { name.as_str().to_lowercase() }
 /// }
 ///
-/// let store = CommitEvidenceStore::new(Duration::from_secs(3600));
+/// let store = CommitEvidenceStore::new(Duration::from_hours(1));
 /// let repo = Lowercase.normalize_package_name(&PackageName::new("o/r"));
 /// let release = CommitSha::parse(&"a".repeat(40)).unwrap();
 /// let pin = CommitSha::parse(&"b".repeat(40)).unwrap();

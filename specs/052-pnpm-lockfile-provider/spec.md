@@ -159,7 +159,7 @@ THEN behavior is byte-for-byte identical to before this feature (same
 | FR-004 | WHEN reading the `importers` map THE SYSTEM SHALL iterate every importer key (not just `"."`) and, for each, read `dependencies`, `devDependencies`, and `optionalDependencies` sub-maps, extracting each entry's `version` field, stripping any parenthesized peer-dependency suffix (e.g. `1.2.3(react@18.2.0)` → `1.2.3`) to obtain a plain semver string | must |
 | FR-005 | WHEN an importer dependency's `version` field starts with `link:` (a workspace-local sibling package, not a registry package) THE SYSTEM SHALL skip that entry — it contributes no `ResolvedPackage` | must |
 | FR-006 | WHEN the lock file's top-level `lockfileVersion` is present and its major version component (parsed as the portion before `.`) is below `6` THE SYSTEM SHALL treat the file as unparseable and return `DepsError::ParseError` with a message naming the unsupported version, rather than silently misparsing an incompatible shape | must |
-| FR-007 | WHEN a dependency name appears with different resolved versions across multiple importers (monorepo, differing workspace-member pins) THE SYSTEM SHALL record every distinct version as a candidate for that name in the returned `ResolvedPackages`, using its existing multi-version-per-name support (`ResolvedPackages::insert`/`get_version`) — no importer-to-manifest correlation is performed; the existing semver-range-based `get_version` selection (already used for `package-lock.json`'s multi-version node_modules entries) picks the right candidate per occurrence | must |
+| FR-007 | WHEN a dependency name appears with different resolved versions across multiple importers (monorepo, differing workspace-member pins) THE SYSTEM SHALL record every distinct version as a candidate for that name in the returned `ResolvedPackages`, using its existing multi-version-per-name support (`ResolvedPackages::insert`/`get_version`) — each entry also records the importer it was listed under, and the requesting manifest's own importer (nearest ancestor importer when the manifest is not itself an importer) selects its entry before the semver-range-based selection falls back to the highest satisfying candidate (amended by #1993) | must |
 | FR-008 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the LSP file watcher (`crates/deps-npm/src/ecosystem.rs`) THE SYSTEM SHALL include `"pnpm-lock.yaml"` alongside `"package-lock.json"` so edits to either file trigger a re-resolve | must |
 | FR-009 | WHEN a located `pnpm-lock.yaml` is looked up through the LSP's lock file cache THE SYSTEM SHALL rely on `LockFileCache::get_or_parse`'s existing mtime-comparison caching (no `LockFileProvider` override needed) exactly as `package-lock.json` already does | should |
 
@@ -192,7 +192,7 @@ No new public types. Reuses `deps_core::lockfile::{ResolvedPackage, ResolvedPack
 | `lockfileVersion` below `'6.0'` | `DepsError::ParseError` naming the unsupported version (FR-006) — deliberately refuses to guess at an incompatible shape rather than silently returning wrong/empty data |
 | Dependency version with peer suffix, e.g. `"5.0.0(typescript@5.3.0)"` | Suffix stripped; resolves to `5.0.0` (FR-004) |
 | Dependency version `"link:../shared-lib"` (workspace-local sibling) | Skipped entirely (FR-005) — not reported as an unresolvable or missing version, simply absent from `ResolvedPackages`, matching how a workspace-local package is not a registry lookup target elsewhere in the ecosystem |
-| Same package name resolved to different versions in different importers | Both recorded as candidates; per-occurrence resolution already handled by existing `get_version` semver matching (FR-007) |
+| Same package name resolved to different versions in different importers | Both recorded as candidates, each owned by its importer; the requesting manifest's importer entry is preferred, with the highest satisfying candidate as fallback (FR-007, #1993) |
 | `pnpm-lock.yaml` larger than the 32 MiB cap | `read_lockfile_content` returns `None`/error per its existing capped-read contract — same behavior as an oversized `package-lock.json` today |
 | Symlink or non-regular file at the `pnpm-lock.yaml` path | Rejected by `read_lockfile_content`'s existing stat pre-filter, same as any other lock file |
 
@@ -226,7 +226,7 @@ No new public types. Reuses `deps_core::lockfile::{ResolvedPackage, ResolvedPack
 
 None outstanding. Both design decisions issue #709 left open were resolved during spec drafting:
 - Precedence when both lock files coexist: `package-lock.json` first (FR-001/FR-002).
-- Monorepo `importers` handling: aggregate all importers into one `ResolvedPackages`, relying on existing multi-version-per-name semver matching (FR-007), consistent with how `package-lock.json`'s own multi-version entries are already handled.
+- Monorepo `importers` handling: aggregate all importers into one `ResolvedPackages`, recording each entry's importer so the requesting manifest resolves its own entry first (FR-007, amended by #1993), consistent with how `package-lock.json`'s `<member>/node_modules` entries are attributed.
 
 ## 10. See Also
 

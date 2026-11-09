@@ -40,6 +40,7 @@ mod in_use_version;
 #[cfg(feature = "lsp-responses")]
 mod inlay_hints;
 mod interactive_fetch;
+mod mutable_ref_pin;
 mod probe_pass;
 mod sha_comment;
 mod suppression;
@@ -50,6 +51,7 @@ pub(crate) mod test_support;
 pub(crate) mod test_support_lsp;
 mod unknown_ref;
 mod version_data;
+mod version_grammar;
 
 /// Generic replacement for this module's former `TextEdit`-only `dedup_overlapping_edits`
 /// (#1329) — re-exported here so every existing `lsp_helpers::dedup_overlapping_edits(edits,
@@ -72,13 +74,13 @@ pub use diagnostics::{
     BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities,
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, MAX_DIAGNOSTIC_VALUE_CHARS, MAX_REQUIREMENT_LEN,
     SiblingMatchNote, TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, advisory_text, compile_requirement_unless,
-    fetch_gossip_findings_batch, fetch_typosquat_signals, force_refresh_gossip_findings,
-    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
-    requirement_is_unsatisfiable, requirement_len_exceeds_cap,
-    sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
-    truncate_for_diagnostic,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, advisory_text, fetch_gossip_findings_batch,
+    fetch_typosquat_signals, force_refresh_gossip_findings, generate_diagnostics_from_cache,
+    redact_name_for_diagnostic, redact_requirement_for_diagnostic, requirement_is_unsatisfiable,
+    requirement_len_exceeds_cap, sanitize_advisory_text_for_diagnostic,
+    sanitize_and_truncate_for_diagnostic, truncate_for_diagnostic,
 };
+pub use mutable_ref_pin::{FixAvailability, GitlabInclude, MutableRefPin, PinSubject};
 // `pub` (#1578): `edit.rs`/`in_use_version.rs` share this in-crate, and it is also reused by
 // callers outside `deps-core` that need this same size gate before compiling a requirement
 // (mirroring `requirement_len_exceeds_cap`'s own `pub` rationale) rather than duplicating the
@@ -97,7 +99,7 @@ pub use formatter::{
     DiagnosticPolicy, EcosystemFormatter, LowercaseNaming, NormalizeName, OperatorGrammar,
     OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, ProbeDependency,
     PublicContent, RequirementGate, RequirementResolution, RequirementRewriteShape, RewriteTarget,
-    SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
+    SourcePolicy, bare_meaning, classify_requirement_rewrite_shape, fit_segments,
     format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
@@ -111,16 +113,17 @@ pub use git_probe::{
     ProbePhase, ProbeRef, ProbeReport,
 };
 pub use git_ref::{
-    CommitRewrite, CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy,
-    PinResolution, ResolvedPin, ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagName,
-    TagPosition, UnpublishedRef, byte_span_to_range, extends_tag, is_full_sha, is_null_tag,
-    is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset,
-    match_v_prefix_style, short_sha, tag_has_precedence, tag_pin_is_up_to_date,
+    CommitRewrite, CommitSha, CoreSchemaType, MAX_FALLBACK_SCAN_BYTES, MarkedScalar,
+    PartialTagPolicy, PinResolution, ResolvedPin, ShaPinLookup, SiblingScope, SiblingTags,
+    TagIndex, TagName, TagPosition, UnpublishedRef, byte_span_to_range, extends_tag,
+    is_core_schema_tag, is_full_sha, is_null_tag, is_partial_semver_shaped, is_plain_null,
+    is_tag_shaped, locate_value_span, marker_byte_offset, match_v_prefix_style, short_sha,
+    tag_has_precedence, tag_pin_is_up_to_date,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{
     ResolvedShaPin, ShaPinning, build_sha_pin_action, sha_pin_text_edit, splice_hover_line,
-    splice_resolved_line,
+    splice_resolved_line, splice_sha_pin_hover_lines,
 };
 pub use git_tags::{GitTagsPinning, git_tags_diagnostics, sha_comment_mismatch_diagnostics};
 #[cfg(feature = "lsp-responses")]
@@ -166,8 +169,13 @@ pub use unknown_ref::{
     UNKNOWN_REF_DIAGNOSTIC_CODE, UnknownRefTarget, dependency_at_position, unknown_ref_diagnostic,
     unknown_ref_diagnostic_for, unknown_ref_diagnostics,
 };
+pub(crate) use version_data::OwnerPreference;
 pub use version_data::{
-    CachedVersionsMap, ResolvedCandidatesMap, ResolvedVersionsMap, VersionData,
+    CachedVersionsMap, LockCandidates, ResolvedCandidatesMap, ResolvedVersionsMap, VersionData,
+};
+use version_grammar::matcher_of;
+pub use version_grammar::{
+    CandidateSet, SemverGrammar, VersionGrammar, grammar_candidates, grammar_matcher,
 };
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -2927,7 +2935,7 @@ pub trait RequirementMatcher: Send + Sync {
     /// default pre-release exclusion" enrichment (#299) is gated on this, read from the
     /// already-compiled matcher instance rather than from a separate per-formatter flag
     /// (#1478) — so a formatter that reuses an existing matcher implementation (e.g.
-    /// `deps-npm`'s shared `compile_node_semver_range`, also used by `deps-deno`) inherits the
+    /// `deps-npm`'s shared `NodeSemverGrammar`, also used by `deps-deno`) inherits the
     /// correct answer for free; only a formatter introducing a genuinely new matcher type
     /// needs to decide this at all, and only in the one place that type is defined.
     ///
@@ -2937,7 +2945,7 @@ pub trait RequirementMatcher: Send + Sync {
     /// unconsidered. Return `true` only for a matcher whose underlying comparator itself
     /// implements this exclusion ([`compile_semver_requirement`]'s shared `semver::VersionReq`
     /// wrapper, used by `deps-cargo` and `deps-swift`; `deps-npm`'s shared
-    /// `compile_node_semver_range`/`node_semver::Range` wrapper, used by `deps-npm` and
+    /// `NodeSemverGrammar`/`node_semver::Range` wrapper, used by `deps-npm` and
     /// `deps-deno`). Maven/NuGet/Composer/Gradle/PyPI/Go/Bundler/Dart's own matchers use
     /// non-strict, ecosystem-specific range models where this premise does not hold — they must
     /// return `false`.
@@ -3010,8 +3018,9 @@ pub trait RequirementMatcher: Send + Sync {
 }
 
 /// Parses `version` as [`semver::Version`] and tests it against `req`, `None` on parse failure.
-/// Shared by [`SemverReqMatcher::matches`] and the test-only `NonStrictSemverMatcher` in
-/// `diagnostics.rs` (identical logic, differing only in `strict_prerelease_exclusion()`).
+/// Used by the test-only `NonStrictSemverMatcher` in `diagnostics.rs`, which mirrors
+/// [`SemverGrammar`]'s matching and differs only in `strict_prerelease_exclusion()`.
+#[cfg(test)]
 pub(crate) fn semver_req_matches(
     req: &semver::VersionReq,
     version: &ConcreteVersion,
@@ -3023,39 +3032,18 @@ pub(crate) fn semver_req_matches(
         .map(|v| req.matches(&v))
 }
 
-/// Precise [`semver::VersionReq`] matcher, constructed only through [`compile_semver_requirement`].
-/// Named to avoid shadowing the public `crate::version_matcher::SemverMatcher`.
-struct SemverReqMatcher(semver::VersionReq);
-
-impl RequirementMatcher for SemverReqMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        semver_req_matches(&self.0, version)
-    }
-
-    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins to
-    /// the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
-    /// Declared once, here, on the matcher type itself: any formatter that reuses
-    /// [`compile_semver_requirement`] (`deps-cargo`'s `CargoFormatter`, `deps-swift`'s
-    /// `SwiftFormatter`) inherits this answer for free, with no separate per-formatter flag to
-    /// keep in sync (#1478, #1495).
-    fn strict_prerelease_exclusion(&self) -> bool {
-        true
-    }
-}
-
 /// Compiles `requirement` as a plain [`semver::VersionReq`], the range grammar Cargo's registry
 /// and Swift Package Manager's `from:`/closed-range/`upToNextMajor` translations both use for
 /// matching.
 ///
-/// The single source of truth for `deps-cargo`'s `CargoFormatter::compile_bounded_requirement` and
-/// `deps-swift`'s `SwiftFormatter::compile_bounded_requirement` (#1495) — mirroring how #1478 unified
-/// the analogous `node_semver::Range` case into `deps_npm::compile_node_semver_range`.
+/// For callers that compile a plain `semver::VersionReq` without a [`BoundedVersionReq`]; it
+/// matches through [`SemverGrammar`], the grammar `deps-cargo`'s and `deps-swift`'s formatters
+/// wrap with their own placeholder guards (#1495).
 ///
-/// Unlike that npm/JSR case, this function has no built-in unresolved-placeholder guard: Cargo
-/// and Swift's [`formatter::RequirementResolution::bounded_requirement_is_unresolved`] overrides
-/// diverge (Swift additionally rejects its own native `\(...)` string-interpolation syntax), so
-/// each formatter must run its own `self.bounded_requirement_is_unresolved(requirement)` guard before
-/// calling this function, rather than the guard being hardcoded here.
+/// This function has no built-in unresolved-placeholder guard: Cargo and Swift's
+/// [`formatter::RequirementResolution::bounded_requirement_is_unresolved`] overrides diverge
+/// (Swift additionally rejects its own native `\(...)` string-interpolation syntax), so a
+/// formatter must run its own guard first.
 ///
 /// # Examples
 ///
@@ -3075,7 +3063,7 @@ pub fn compile_semver_requirement(requirement: &VersionReq) -> Option<Box<dyn Re
         .as_str()
         .parse::<semver::VersionReq>()
         .ok()
-        .map(|req| Box::new(SemverReqMatcher(req)) as Box<dyn RequirementMatcher>)
+        .map(|compiled| matcher_of(SemverGrammar, compiled))
 }
 
 #[cfg(test)]
@@ -6231,7 +6219,7 @@ mod tests {
             }
             // Fix-cycle (#1571 critic S1): the intensional signal a real `!=` matcher
             // (PyPI/Composer/Bundler) provides — mirrors this stub's own `excluded` field
-            // directly, the same way `Pep440Matcher`/`ComposerMatcher`/`RubygemsMatcher` read
+            // directly, the same way `Pep440Grammar`/`ComposerGrammar`/`RubygemsGrammar` read
             // their own parsed `!=` term instead of inferring it from `available`.
             fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
                 version.as_str() == self.excluded

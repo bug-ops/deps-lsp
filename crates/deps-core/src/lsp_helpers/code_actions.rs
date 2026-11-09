@@ -20,7 +20,7 @@ use super::{
 
 /// Whether REFACTOR "Update to X" items may offer pre-release versions (#1885).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrereleasePolicy {
+pub(super) enum PrereleasePolicy {
     /// Only the registry's own pick may be a pre-release; every other item must be stable.
     StableOnly,
     /// The dependency is already on a pre-release line, so pre-release items stay offered.
@@ -42,7 +42,7 @@ impl PrereleasePolicy {
     ///    flags, Maven/NuGet intervals, PEP 440 spellings).
     ///
     /// Upper bounds (`<2.0.0-0`) never opt in: they exist to exclude pre-releases.
-    fn for_dependency(
+    pub(super) fn for_dependency(
         prereleases: &HashSet<&str>,
         pick: Option<&ConcreteVersion>,
         in_use: Option<&ConcreteVersion>,
@@ -1033,6 +1033,9 @@ where
     {
         display_items.retain(|item| item.is_latest || !prereleases.contains(item.version.as_str()));
     }
+    // A prerelease channel (nightly, canary) sorts above the stable pick by version number, but
+    // the first action must never edit the manifest to it (#1940).
+    display_items.sort_by_key(|item| !item.is_latest);
 
     let mut targets = Vec::new();
     for item in display_items {
@@ -3335,6 +3338,30 @@ mod tests {
                 .any(|t| t.contains("beta1") || t.contains("rc1")),
             "{titles:?}"
         );
+    }
+
+    /// #1940: a requirement already on a prerelease keeps prerelease offers, but the stable
+    /// latest is listed before the newer nightly builds.
+    #[tokio::test]
+    async fn test_refactor_prerelease_requirement_lists_stable_latest_first() {
+        let titles = refactor_titles_for(
+            "1.4.0-rc1",
+            vec![
+                ("2.0.0-dev.3", false),
+                ("2.0.0-dev.2", false),
+                ("1.5.0", false),
+                ("1.4.0-rc1", false),
+            ],
+            None,
+            &MOCK_FORMATTER,
+        )
+        .await;
+        assert_eq!(
+            titles.first().map(String::as_str),
+            Some("1.5.0 (latest)"),
+            "{titles:?}"
+        );
+        assert!(titles.contains(&"2.0.0-dev.3".to_owned()), "{titles:?}");
     }
 
     #[tokio::test]

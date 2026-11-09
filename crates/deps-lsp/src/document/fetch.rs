@@ -10,7 +10,7 @@
 use super::diff::{DeclaredRequirements, drop_cache_for_forced_refetch};
 use super::resolved::RefetchPolicy;
 use super::state::ServerState;
-use crate::progress::RegistryProgress;
+use crate::progress::{RegistryProgress, start_registry_progress};
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::NormalizedName;
@@ -120,19 +120,8 @@ pub(crate) async fn fetch_registry_versions_for_change(
         doc.set_loading();
     }
 
-    let (progress, progress_sender) = if state.supports_progress() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            RegistryProgress::start(client.clone(), uri.as_str(), deps_to_fetch.len()),
-        )
-        .await
-        {
-            Ok(Ok((p, s))) => (Some(p), Some(s)),
-            _ => (None, None),
-        }
-    } else {
-        (None, None)
-    };
+    let (progress, progress_sender) =
+        start_registry_progress(state, client, uri, deps_to_fetch.len()).await;
 
     // Build the in-use-version map (§4.6), the manifest's own `SelectionContext` (#1433),
     // and the added/changed dependencies' resolved sources (spec FR-001/FR-011) from the
@@ -146,13 +135,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
     ) = match state.get_document(uri) {
         Some(doc) => match doc.manifest() {
             Some(pr) => {
-                let mut prep = prepare_fetch(
-                    pr,
-                    ecosystem.formatter(),
-                    ecosystem.ecosystem_id(),
-                    resolved_versions,
-                    resolved_version_candidates,
-                );
+                let mut prep = prepare_fetch(pr, resolved_versions, resolved_version_candidates);
                 // This call only fetches the added/version-changed subset the caller's diff
                 // determined, unlike `prepare_fetch`'s default full-manifest set.
                 retain_requested(&mut prep.dep_sources, &deps_to_fetch);
@@ -650,12 +633,8 @@ dependencies = ["requests>=2.0.0"]
                 .into_iter()
                 .map(|d| PackageKey::new(d.name(), formatter))
                 .collect();
-            let in_use = collect_in_use_versions(
-                parse_result.as_ref(),
-                &resolved_versions,
-                &HashMap::new(),
-                EcosystemId::Pypi,
-            );
+            let in_use =
+                collect_in_use_versions(parse_result.as_ref(), &resolved_versions, &HashMap::new());
             // Sanity check on the fix this guard exists for: the pep440
             // `==` comparator must already be stripped here.
             assert_eq!(

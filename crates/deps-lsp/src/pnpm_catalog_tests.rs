@@ -543,7 +543,8 @@ mod seeded {
             candidates
                 .iter()
                 .map(|v| deps_core::ConcreteVersion::new(*v))
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .into(),
         )]);
         backend
             .state()

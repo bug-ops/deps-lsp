@@ -29,8 +29,8 @@ use local_match::{LocalVersion, Verdict, match_affected};
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
-    Advisory, CandidateStatusMap, CandidateStatuses, Capped, CoverageGap,
-    DependencyVulnerabilities, EmptyOsvPackageName, FixRecommendation, InvalidOsvId,
+    Advisory, AdvisoryCount, AlternativeCoverage, CandidateStatusMap, CandidateStatuses, Capped,
+    CoverageGap, DependencyVulnerabilities, EmptyOsvPackageName, FixRecommendation, InvalidOsvId,
     LatestStatusMap, LockPresence, LockResolution, MatchOrigin, MatchedTags, NonPublicRoute,
     OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget,
     ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus,
@@ -109,7 +109,8 @@ pub const MAX_ADVISORY_RECORDS: usize = 50;
 /// Bound on lock-file alternatives scanned per dependency occurrence (#1981).
 ///
 /// Each alternative is an extra OSV query. More satisfying lock entries than this is vanishingly
-/// rare; beyond the cap the lowest are scanned and a clean answer degrades to
+/// rare; beyond the cap the entries nearest the primary version are scanned and a clean answer
+/// degrades to
 /// [`SkipReason::LockAlternativesUnchecked`] rather than being reported as authoritative.
 pub const MAX_LOCK_ALTERNATIVES: usize = 16;
 
@@ -3091,6 +3092,19 @@ mod tests {
             .with_lock_alternatives(&in_use, &crate::test_util::StubFormatter::DEFAULT)
     }
 
+    fn truncated_lock_target(name: &str, version: &str, alternatives: &[&str]) -> ScanTarget {
+        let in_use = crate::lsp_helpers::InUseVersions::for_test_with_alternative_coverage(
+            ConcreteVersion::new(version),
+            alternatives
+                .iter()
+                .map(|v| ConcreteVersion::new(*v))
+                .collect(),
+            AlternativeCoverage::Truncated,
+        );
+        target(name, version)
+            .with_lock_alternatives(&in_use, &crate::test_util::StubFormatter::DEFAULT)
+    }
+
     fn batch_results(results: &[&str]) -> String {
         format!(r#"{{"results":[{}]}}"#, results.join(","))
     }
@@ -3128,6 +3142,53 @@ mod tests {
             );
         }
         mocks
+    }
+
+    /// Like [`mock_lock_scan`], but the batch mock only answers a request naming exactly the
+    /// `queried` versions in order, and must be hit once, so a failing or partial body is
+    /// matched against the request that produced it.
+    async fn mock_lock_scan_for(
+        server: &mut mockito::ServerGuard,
+        queried: &[&str],
+        results: &[&str],
+        records: &[&str],
+    ) -> (mockito::Mock, Vec<mockito::Mock>) {
+        let expected: Vec<String> = queried
+            .iter()
+            .map(|v| format!(r#""version":"{v}""#))
+            .collect();
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .match_request(move |req| {
+                req.utf8_lossy_body().is_ok_and(|body| {
+                    let mut rest: &str = &body;
+                    expected.iter().all(|needle| {
+                        rest.split_once(needle.as_str()).is_some_and(|(_, tail)| {
+                            rest = tail;
+                            true
+                        })
+                    }) && body.matches(r#""version":"#).count() == expected.len()
+                })
+            })
+            .with_status(200)
+            .with_body(batch_results(results))
+            .expect(1)
+            .create_async()
+            .await;
+        let mut record_mocks = Vec::new();
+        for id in records {
+            record_mocks.push(
+                server
+                    .mock("GET", format!("/v1/vulns/{id}").as_str())
+                    .with_status(200)
+                    .with_body(format!(
+                        r#"{{"id":"{id}","modified":"2023-01-01T00:00:00Z"}}"#
+                    ))
+                    .create_async()
+                    .await,
+            );
+        }
+        (batch, record_mocks)
     }
 
     async fn scan_one(
@@ -3237,6 +3298,7 @@ mod tests {
         server
             .mock("POST", "/v1/query")
             .with_status(500)
+            .expect(1)
             .create_async()
             .await
     }
@@ -3244,8 +3306,14 @@ mod tests {
     #[tokio::test]
     async fn clean_primary_with_a_failed_lock_alternative_is_query_failed() {
         let (mut server, client) = mock_client().await;
-        let _mocks = mock_lock_scan(&mut server, &[NO_VULNS, TRUNCATED], &[]).await;
-        let _single = mock_failing_single_query(&mut server).await;
+        let (batch, _records) = mock_lock_scan_for(
+            &mut server,
+            &["1.2.8", "1.2.5"],
+            &[NO_VULNS, TRUNCATED],
+            &[],
+        )
+        .await;
+        let single = mock_failing_single_query(&mut server).await;
 
         let outcome = scan_one(
             &client,
@@ -3255,14 +3323,21 @@ mod tests {
         .await;
 
         assert_matches!(outcome, ScanOutcome::Skipped(SkipReason::QueryFailed));
+        batch.assert_async().await;
+        single.assert_async().await;
     }
 
     #[tokio::test]
     async fn vulnerable_primary_with_a_failed_lock_alternative_stays_vulnerable_but_incomplete() {
         let (mut server, client) = mock_client().await;
-        let _mocks =
-            mock_lock_scan(&mut server, &[&vulns("ADV-NEW"), TRUNCATED], &["ADV-NEW"]).await;
-        let _single = mock_failing_single_query(&mut server).await;
+        let (batch, _records) = mock_lock_scan_for(
+            &mut server,
+            &["1.2.8", "1.2.5"],
+            &[&vulns("ADV-NEW"), TRUNCATED],
+            &["ADV-NEW"],
+        )
+        .await;
+        let single = mock_failing_single_query(&mut server).await;
 
         let outcome = scan_one(
             &client,
@@ -3276,6 +3351,13 @@ mod tests {
             unreachable!("asserted Vulnerable above")
         };
         assert!(!dv.advisories.is_complete());
+        assert_eq!(
+            dv.advisories.overflow(),
+            Some(AdvisoryCount::AtLeast(0)),
+            "a failed alternative makes the count a lower bound, never an exact +1"
+        );
+        batch.assert_async().await;
+        single.assert_async().await;
     }
 
     #[tokio::test]
@@ -3298,7 +3380,7 @@ mod tests {
     }
 
     fn overflowing_alternatives() -> Vec<String> {
-        (0..=MAX_LOCK_ALTERNATIVES)
+        (0..MAX_LOCK_ALTERNATIVES)
             .map(|n| format!("1.0.{n}"))
             .collect()
     }
@@ -3314,7 +3396,7 @@ mod tests {
         let outcome = scan_one(
             &client,
             EcosystemId::Npm,
-            lock_target("minimist", "2.0.0", &alternatives),
+            truncated_lock_target("minimist", "2.0.0", &alternatives),
         )
         .await;
 
@@ -3337,7 +3419,7 @@ mod tests {
         let outcome = scan_one(
             &client,
             EcosystemId::Npm,
-            lock_target("minimist", "2.0.0", &alternatives),
+            truncated_lock_target("minimist", "2.0.0", &alternatives),
         )
         .await;
 

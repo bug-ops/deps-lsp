@@ -87,7 +87,9 @@ pub enum DiagnosticKind {
     Yanked,
     /// One OSV advisory affecting the resolved version.
     Advisory(OsvId),
-    /// The trailing "+N more advisories" summary line.
+    /// The trailing "+N more advisories" summary line, worded "+N or more" when an unchecked lock
+    /// entry makes the count a lower bound. Never suppressed itself: a `deprecated` suppression
+    /// instead removes the hidden advisories from the count before it is rendered.
     AdvisoryOverflow,
     /// The requirement matches no published version.
     Unsatisfiable,

@@ -284,10 +284,10 @@ impl ManifestAnalysis {
     #[must_use]
     pub fn has_unverified_latest_check(
         &self,
-        formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
         package_filter: &[String],
         ignore_rules: &crate::update::ignore::IgnoreRules,
     ) -> bool {
+        let formatter = self.parse_result.formatter();
         let vuln_keys = self.parse_result.vulnerability_keys(
             &self.resolved_versions,
             Some(&self.resolved_version_candidates),
@@ -435,8 +435,6 @@ pub async fn analyze_manifest(
 
     let prep = prepare_fetch(
         parse_result.as_ref(),
-        formatter,
-        ecosystem_id,
         &resolved_versions,
         &resolved_version_candidates,
     );
@@ -560,7 +558,6 @@ pub async fn analyze_manifest(
                 parse_result.as_ref(),
                 &resolved_versions,
                 &resolved_version_candidates,
-                ecosystem_id,
             );
             let mut vulns = skipped;
             if !targets.is_empty() {
@@ -615,9 +612,9 @@ pub async fn analyze_manifest(
         parse_result.vulnerability_keys(&resolved_versions, Some(&resolved_version_candidates))
     });
 
-    let candidate_tags = vuln_keys.as_ref().map(|keys| {
-        deps_engine::classify::osv::candidate_tag_sources(parse_result.as_ref(), keys, ecosystem_id)
-    });
+    let candidate_tags = vuln_keys
+        .as_ref()
+        .map(|keys| deps_engine::classify::osv::candidate_tag_sources(parse_result.as_ref(), keys));
 
     let latest_check = async {
         let (true, Some(vuln_keys), Some(candidate_tags)) = (
@@ -848,11 +845,7 @@ mod has_unverified_latest_check_tests {
     #[test]
     fn true_for_outdated_unverified_dependency_in_scope() {
         let analysis = analysis_with_one_outdated_unverified_dep();
-        assert!(analysis.has_unverified_latest_check(
-            &StubFormatter::DEFAULT,
-            &[],
-            &IgnoreRules::empty(),
-        ));
+        assert!(analysis.has_unverified_latest_check(&[], &IgnoreRules::empty(),));
     }
 
     /// Issue #1517 critique S4: a `--package` filter that does not name the unverified
@@ -862,7 +855,6 @@ mod has_unverified_latest_check_tests {
     fn false_when_package_filter_excludes_the_dependency() {
         let analysis = analysis_with_one_outdated_unverified_dep();
         assert!(!analysis.has_unverified_latest_check(
-            &StubFormatter::DEFAULT,
             &["some-other-package".to_string()],
             &IgnoreRules::empty(),
         ));
@@ -872,11 +864,9 @@ mod has_unverified_latest_check_tests {
     #[test]
     fn true_when_package_filter_names_the_dependency() {
         let analysis = analysis_with_one_outdated_unverified_dep();
-        assert!(analysis.has_unverified_latest_check(
-            &StubFormatter::DEFAULT,
-            &["serde".to_string()],
-            &IgnoreRules::empty(),
-        ));
+        assert!(
+            analysis.has_unverified_latest_check(&["serde".to_string()], &IgnoreRules::empty(),)
+        );
     }
 
     /// Issue #1517 critique S4: an `[update].ignore` rule naming the dependency must exclude
@@ -893,6 +883,6 @@ mod has_unverified_latest_check_tests {
             }],
             &StubFormatter::DEFAULT,
         );
-        assert!(!analysis.has_unverified_latest_check(&StubFormatter::DEFAULT, &[], &rules));
+        assert!(!analysis.has_unverified_latest_check(&[], &rules));
     }
 }

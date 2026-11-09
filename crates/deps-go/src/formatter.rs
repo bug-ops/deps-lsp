@@ -1,7 +1,7 @@
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    compile_requirement_unless,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    SourcePolicy, VersionGrammar, grammar_candidates, grammar_matcher,
 };
 use deps_core::osv::NonPublicRoute;
 use deps_core::parser::DependencySource;
@@ -32,21 +32,40 @@ fn go_version_matches(version: &str, requirement: &str) -> bool {
     false
 }
 
-/// Exact/pseudo-version matcher, compiled once per dependency by
-/// [`GoFormatter::compile_bounded_requirement`]. Always decidable (`Some`) — Go module version
-/// strings need no external parser, just [`go_version_matches`]'s string comparison — so
-/// this never skips a candidate the way ecosystems with a real version parser can.
-struct ExactMatcher(String);
+/// Go's version grammar: exact/pseudo-version comparison. Every candidate is decidable — Go
+/// module version strings need no external parser, just [`go_version_matches`]'s string
+/// comparison — so this never skips a candidate the way ecosystems with a real version parser
+/// can.
+#[derive(Clone, Copy)]
+struct GoGrammar;
 
-impl RequirementMatcher for ExactMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        Some(go_version_matches(version, &self.0))
+impl VersionGrammar for GoGrammar {
+    type Version = ConcreteVersion;
+    type Compiled = String;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<ConcreteVersion> {
+        Some(version.clone())
+    }
+
+    /// `None` for a pseudo-version or an unresolved external-templating placeholder, see
+    /// [`GoFormatter::compile_bounded_requirement`].
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<String> {
+        let text = requirement.as_str();
+        if crate::version::is_pseudo_version(text)
+            || GoFormatter.bounded_requirement_is_placeholder(requirement)
+        {
+            return None;
+        }
+        Some(text.to_owned())
+    }
+
+    fn satisfies(&self, compiled: &String, version: &ConcreteVersion) -> bool {
+        go_version_matches(version.as_str(), compiled)
     }
 
     /// Go modules pin an exact version string; there is no range grammar with SemVer 2.0.0
     /// pre-release exclusion semantics to opt into (#299).
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &String) -> bool {
         false
     }
 }
@@ -115,10 +134,10 @@ impl RequirementResolution for GoFormatter {
     // nor `requirement_is_placeholder` needs an override here — both defaults already
     // delegate to the same shared detector.
 
-    /// Compiles `requirement` into an `ExactMatcher` using the same exact/pseudo-version
+    /// Compiles `requirement` into a `GoGrammar` requirement using the same exact/pseudo-version
     /// comparison `version_satisfies_requirement` uses — Go's requirement syntax has no
-    /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`. Uses
-    /// [`compile_requirement_unless`] (see that function and
+    /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`. Matches
+    /// through `GoGrammar` (see
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate is `crate::version::is_pseudo_version` — or an unresolved
@@ -133,14 +152,11 @@ impl RequirementResolution for GoFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        compile_requirement_unless(
-            requirement.as_str(),
-            |req| {
-                crate::version::is_pseudo_version(req)
-                    || self.bounded_requirement_is_placeholder(requirement)
-            },
-            ExactMatcher,
-        )
+        grammar_matcher(GoGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(GoGrammar, candidates))
     }
 }
 
@@ -238,6 +254,46 @@ mod tests {
     use super::*;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
+
+    const REQUIREMENTS: &[&str] = &[
+        "v1.2.3",
+        "v1.2",
+        "v0.0.0",
+        "v2.0.0",
+        "v2.0.0+incompatible",
+        "v1.2.3-rc.1",
+        "1.2.3",
+        "",
+        "v0.0.0-20191109021931-daa7c04131f5",
+        "v1.2.4-0.20191109021931-daa7c04131f5",
+        "v1.2.30",
+        "{{ version }}",
+        "$(Version)",
+        "latest",
+        "v1.2.3+incompatible",
+    ];
+    const VERSIONS: &[&str] = &[
+        "v1.2.3",
+        "v1.2.30",
+        "v1.2.3-rc.1",
+        "v1.2.3+incompatible",
+        "v1.2.4",
+        "v0.0.0",
+        "v0.0.0-20191109021931-daa7c04131f5",
+        "v2.0.0",
+        "v2.0.0+incompatible",
+        "v2.0.0.1",
+        "1.2.3",
+        "garbage",
+        "",
+        "v1.2",
+        "v1.2.3.4",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(&GoFormatter, REQUIREMENTS, VERSIONS);
+    }
     use deps_core::position::{Position, Range};
 
     fn go_dep(directive: GoDirective, version: &str) -> GoDependency {

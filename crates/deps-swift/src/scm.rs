@@ -65,7 +65,7 @@ impl CanonicalScmUrl {
     /// The reparse key of this repository: the only way Swift mints a
     /// [`deps_core::ParseInputKey`].
     pub(crate) fn to_parse_input(&self) -> deps_core::ParseInputKey {
-        deps_core::ParseInputKey::new(self.0.as_str())
+        deps_core::ParseInputKey::minted_by(deps_core::EcosystemId::Swift, self.0.as_str())
     }
 }
 

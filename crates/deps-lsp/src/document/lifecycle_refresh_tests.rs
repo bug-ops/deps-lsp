@@ -49,22 +49,39 @@ async fn labels(backend: &Backend, uri: &Uri) -> Vec<String> {
         .collect()
 }
 
-/// Opens a locked npm manifest whose scoped registry answers `status`, then answers the
-/// server's client requests and returns the labels served at the first
-/// `workspace/inlayHint/refresh` that shows a `⚠` marker, or the last labels seen on timeout.
-async fn labels_served_at_refresh(registry_url: &str) -> Vec<String> {
+/// A manifest plus the files its registry routing needs, written into one temp directory.
+struct Scenario<'a> {
+    files: Vec<(&'a str, &'a str)>,
+    manifest_name: &'a str,
+    manifest: &'a str,
+    language_id: &'a str,
+}
+
+fn npm_scenario(npmrc: &str) -> Scenario<'_> {
+    Scenario {
+        files: vec![(".npmrc", npmrc), ("package-lock.json", LOCKFILE)],
+        manifest_name: "package.json",
+        manifest: MANIFEST,
+        language_id: "json",
+    }
+}
+
+/// Opens `scenario`, then answers the server's client requests and returns the labels served
+/// at the *first* `workspace/inlayHint/refresh`, or the last labels seen on timeout. Taking the
+/// first refresh pins the ordering: the fetch outcome must be recorded before the refresh is
+/// requested, so a refresh that raced ahead of it cannot be masked by a later one.
+async fn labels_served_at_refresh(scenario: &Scenario<'_>) -> Vec<String> {
     use tower::Service as _;
     use tower_lsp_server::LanguageServer as _;
     let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(".npmrc"),
-        format!("@acme-corp:registry={registry_url}\n"),
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("package-lock.json"), LOCKFILE).unwrap();
-    let manifest = dir.path().join("package.json");
-    std::fs::write(&manifest, MANIFEST).unwrap();
+    for (name, content) in &scenario.files {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let manifest = dir.path().join(scenario.manifest_name);
+    std::fs::write(&manifest, scenario.manifest).unwrap();
     let uri = Uri::from_file_path(&manifest).unwrap();
 
     let (mut service, mut socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -105,9 +122,9 @@ async fn labels_served_at_refresh(registry_url: &str) -> Vec<String> {
         .did_open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
-                language_id: "json".to_string(),
+                language_id: scenario.language_id.to_string(),
                 version: 1,
-                text: MANIFEST.to_string(),
+                text: scenario.manifest.to_string(),
             },
         })
         .await;
@@ -126,9 +143,7 @@ async fn labels_served_at_refresh(registry_url: &str) -> Vec<String> {
             continue;
         }
         last = labels(backend, &uri).await;
-        if last.iter().any(|label| label.starts_with('⚠')) {
-            break;
-        }
+        break;
     }
     last
 }
@@ -143,7 +158,11 @@ async fn test_registry_http_failure_is_visible_at_inlay_refresh() {
         .create_async()
         .await;
     assert_eq!(
-        labels_served_at_refresh(&registry.url()).await,
+        labels_served_at_refresh(&npm_scenario(&format!(
+            "@acme-corp:registry={}\n",
+            registry.url()
+        )))
+        .await,
         vec!["⚠ 1.0.0"]
     );
 }
@@ -151,7 +170,37 @@ async fn test_registry_http_failure_is_visible_at_inlay_refresh() {
 #[tokio::test]
 async fn test_registry_transport_failure_is_visible_at_inlay_refresh() {
     assert_eq!(
-        labels_served_at_refresh("http://127.0.0.1:9").await,
+        labels_served_at_refresh(&npm_scenario("@acme-corp:registry=http://127.0.0.1:9\n")).await,
         vec!["⚠ 1.0.0"]
     );
+}
+
+/// A Cargo alternate registry records the 404 as a lookup miss (unlike npm's `.npmrc` route),
+/// rendered as the neutral `ℹ` marker.
+#[tokio::test]
+async fn test_registry_lookup_miss_is_visible_at_inlay_refresh() {
+    let mut index = mockito::Server::new_async().await;
+    let _mock = index
+        .mock("GET", "/mo/ck/mockdep")
+        .with_status(404)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let cargo_config = format!("[registries.corp]\nindex = \"sparse+{}/\"\n", index.url());
+    let manifest = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                    mockdep = { version = \"1.0\", registry = \"corp\" }\n";
+    let lockfile = format!(
+        "version = 3\n\n[[package]]\nname = \"mockdep\"\nversion = \"1.0.0\"\nsource = \"sparse+{}/\"\n",
+        index.url()
+    );
+    let scenario = Scenario {
+        files: vec![
+            (".cargo/config.toml", cargo_config.as_str()),
+            ("Cargo.lock", lockfile.as_str()),
+        ],
+        manifest_name: "Cargo.toml",
+        manifest,
+        language_id: "toml",
+    };
+    assert_eq!(labels_served_at_refresh(&scenario).await, vec!["ℹ 1.0.0"]);
 }

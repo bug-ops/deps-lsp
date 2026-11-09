@@ -417,6 +417,7 @@ mod tests {
     use deps_core::DependencyOutcomes;
     use deps_core::Deprecation;
     use deps_core::EcosystemId;
+    use deps_core::LockCandidates;
     use deps_core::PackageName;
     use deps_core::PackageVersions;
     use deps_core::RemovalStatus;
@@ -574,7 +575,7 @@ serde_old = { package = "serde", version = "0.9" }
                     .insert(NormalizedName::for_test("serde"), "1.0.219".into());
                 doc.signals.resolved_version_candidates.insert(
                     NormalizedName::for_test("serde"),
-                    vec!["0.9.15".into(), "1.0.219".into()],
+                    LockCandidates::from(vec!["0.9.15".into(), "1.0.219".into()]),
                 );
             }
 
@@ -603,10 +604,10 @@ serde_old = { package = "serde", version = "0.9" }
                     .signals
                     .resolved_version_candidates
                     .get(&NormalizedName::for_test("serde")),
-                Some(&vec![
+                Some(&LockCandidates::from(vec![
                     ConcreteVersion::from("0.9.15"),
                     ConcreteVersion::from("1.0.219")
-                ]),
+                ])),
                 "resolved_version_candidates must survive preserve_cache alongside resolved_versions"
             );
         }
@@ -1007,7 +1008,7 @@ serde_old = { package = "serde", version = "0.9" }
                     .insert(NormalizedName::for_test("serde"), "1.0.219".into());
                 doc.signals.resolved_version_candidates.insert(
                     NormalizedName::for_test("serde"),
-                    vec!["0.9.15".into(), "1.0.219".into()],
+                    LockCandidates::from(vec!["0.9.15".into(), "1.0.219".into()]),
                 );
             }
 
@@ -2236,7 +2237,7 @@ time = "0.1"
                 ConcreteVersion::from("0.1.44"),
             ))
             .collect();
-            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates = ResolvedCandidatesMap::new();
 
             let changed = reload_resolved_versions(
                 &uri,
@@ -2310,7 +2311,7 @@ time = "0.1"
                 ConcreteVersion::from("1.3.0"),
             ))
             .collect();
-            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates = ResolvedCandidatesMap::new();
 
             let changed = reload_resolved_versions(
                 &uri,
@@ -2416,7 +2417,7 @@ time = "0.1"
                 version_req: None,
             };
             let manifest = document(vec![time, serde], IDENTITY_FORMATTER, EcosystemId::Cargo);
-            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates = ResolvedCandidatesMap::new();
 
             // `time` newly resolved (no lock file entry before `cargo generate-lockfile`).
             let old: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
@@ -2524,7 +2525,7 @@ time = "0.1"
                 version_req: None,
             };
             let manifest = document(vec![time], IDENTITY_FORMATTER, EcosystemId::Cargo);
-            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates = ResolvedCandidatesMap::new();
 
             let old: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
                 NormalizedName::for_test("time"),
@@ -2560,7 +2561,7 @@ time = "0.1"
                 version_req: None,
             };
             let manifest = document(vec![django], LOWERCASE_FORMATTER, EcosystemId::Pypi);
-            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates = ResolvedCandidatesMap::new();
 
             // The lock file resolves under the normalized key, never the raw manifest
             // spelling — a raw `old.get(dep.name())`/`new.get(dep.name())` lookup would
@@ -2610,21 +2611,21 @@ time = "0.1"
             ))
             .collect();
 
-            let old_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = std::iter::once((
+            let old_candidates: ResolvedCandidatesMap = std::iter::once((
                 NormalizedName::for_test("time"),
-                vec![
+                LockCandidates::from(vec![
                     ConcreteVersion::from("0.1.43"),
                     ConcreteVersion::from("0.3.36"),
-                ],
+                ]),
             ))
             .collect();
             // `cargo update -p time@0.1.43` moves only the direct dependency's own entry.
-            let new_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = std::iter::once((
+            let new_candidates: ResolvedCandidatesMap = std::iter::once((
                 NormalizedName::for_test("time"),
-                vec![
+                LockCandidates::from(vec![
                     ConcreteVersion::from("0.1.45"),
                     ConcreteVersion::from("0.3.36"),
-                ],
+                ]),
             ))
             .collect();
 
@@ -2659,10 +2660,14 @@ time = "0.1"
                 ConcreteVersion::from("2.0.0"),
             ))
             .collect();
-            let candidates = |versions: &[&str]| -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
+            let candidates = |versions: &[&str]| -> ResolvedCandidatesMap {
                 std::iter::once((
                     NormalizedName::for_test("minimist"),
-                    versions.iter().map(|v| ConcreteVersion::from(*v)).collect(),
+                    versions
+                        .iter()
+                        .map(|v| ConcreteVersion::from(*v))
+                        .collect::<Vec<_>>()
+                        .into(),
                 ))
                 .collect()
             };

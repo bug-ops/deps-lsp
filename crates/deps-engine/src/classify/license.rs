@@ -21,7 +21,6 @@
 
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
-use deps_core::EcosystemId;
 use deps_core::NormalizedName;
 use deps_core::PackageKey;
 use deps_core::PackageName;
@@ -217,7 +216,6 @@ impl TierThreeLicenseFetch {
 ///     document.as_ref(),
 ///     &resolved_versions,
 ///     &HashMap::new(),
-///     EcosystemId::Dart,
 /// );
 ///
 /// assert_eq!(targets.len(), 1);
@@ -228,21 +226,26 @@ pub fn tier3_license_targets(
     document: &dyn deps_core::ParsedManifest,
     resolved_versions: &deps_core::ResolvedVersionsMap,
     resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
-    ecosystem_id: EcosystemId,
 ) -> Vec<Tier3Target> {
+    let ecosystem_id = document.ecosystem_id();
     let mut seen = std::collections::HashSet::new();
     let mut targets = Vec::new();
+    let mut memo = deps_core::lsp_helpers::LockSelectionMemo::default();
     document.for_each_formatted_dependency(&mut |bound| {
         let Some(content) = bound.public_content() else {
             return;
         };
         let key = PackageKey::new(bound.dependency().name(), bound.formatter());
-        let Some(version) = bound.resolve_in_use_version(
-            &key,
-            resolved_versions,
-            Some(resolved_version_candidates),
-            ecosystem_id,
-        ) else {
+        let Some(version) = bound
+            .resolve_in_use_versions_memoized(
+                &key,
+                resolved_versions,
+                Some(resolved_version_candidates),
+                ecosystem_id,
+                &mut memo,
+            )
+            .map(deps_core::lsp_helpers::InUseVersions::into_primary)
+        else {
             return;
         };
         let target = Tier3Target::new(key, version).requesting(content.name.into_owned());
@@ -328,12 +331,7 @@ pub async fn prefetch_tier3_licenses(
         return TierThreeLicenseFetch::default();
     }
 
-    let targets = tier3_license_targets(
-        document,
-        resolved_versions,
-        resolved_version_candidates,
-        ecosystem.ecosystem_id(),
-    );
+    let targets = tier3_license_targets(document, resolved_versions, resolved_version_candidates);
 
     fetch_tier3_licenses(ecosystem, targets, fetch_timeout, concurrency).await
 }
@@ -455,6 +453,7 @@ pub async fn fetch_tier3_licenses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::EcosystemId;
     use deps_core::NormalizedName;
     use deps_core::PackageName;
     use deps_core::test_util::package_key;
@@ -561,7 +560,6 @@ mod tests {
             .as_ref(),
             &resolved,
             &HashMap::new(),
-            EcosystemId::Dart,
         );
 
         assert_eq!(declared_targets(&targets), [("collection", "1.18.0")]);
@@ -597,7 +595,6 @@ mod tests {
             .as_ref(),
             &resolved,
             &HashMap::new(),
-            EcosystemId::Dart,
         );
 
         assert!(targets.is_empty());
@@ -618,7 +615,6 @@ mod tests {
             .as_ref(),
             &HashMap::new(),
             &HashMap::new(),
-            EcosystemId::Dart,
         );
 
         assert!(targets.is_empty());
@@ -645,7 +641,6 @@ mod tests {
             .as_ref(),
             &resolved,
             &HashMap::new(),
-            EcosystemId::Dart,
         );
 
         assert_eq!(targets.len(), 2);
@@ -674,7 +669,6 @@ mod tests {
             .as_ref(),
             &resolved,
             &HashMap::new(),
-            EcosystemId::Gradle,
         );
 
         assert_eq!(declared_targets(&targets), [("okhttp", "4.12.0")]);
@@ -701,7 +695,6 @@ mod tests {
             .as_ref(),
             &HashMap::new(),
             &HashMap::new(),
-            EcosystemId::Gradle,
         );
 
         assert_eq!(declared_targets(&targets), [("okhttp", "4.12.0")]);
@@ -731,7 +724,6 @@ mod tests {
             .as_ref(),
             &resolved,
             &HashMap::new(),
-            EcosystemId::Dart,
         );
 
         assert_eq!(declared_targets(&targets), [("Collection", "1.18.0")]);

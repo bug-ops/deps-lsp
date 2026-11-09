@@ -9,8 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::types::{
-    Advisory, Capped, DependencyVulnerabilities, MatchOrigin, MatchedTags, OsvId, OsvVersion,
-    ScanOutcome, ScanTarget, SiblingMatches, SkipReason, VulnKey, VulnerabilityMap,
+    Advisory, AlternativeCoverage, Capped, DependencyVulnerabilities, MatchOrigin, MatchedTags,
+    OsvId, OsvVersion, ScanOutcome, ScanTarget, SiblingMatches, SkipReason, VulnKey,
+    VulnerabilityMap,
 };
 use super::{LockPresence, MAX_ADVISORY_RECORDS, MAX_LOCK_ALTERNATIVES};
 use crate::ConcreteVersion;
@@ -20,7 +21,7 @@ pub(super) struct Fan {
     key: VulnKey,
     version: OsvVersion,
     alternatives: Vec<(VulnKey, ConcreteVersion)>,
-    overflowed: bool,
+    coverage: AlternativeCoverage,
 }
 
 /// Returns `targets` followed by one sub-target per scanned lock alternative, plus the
@@ -54,7 +55,7 @@ pub(super) fn expand(targets: &[ScanTarget]) -> (Vec<ScanTarget>, Vec<Fan>) {
             key: target.key.clone(),
             version: target.version.clone(),
             alternatives,
-            overflowed: target.lock_alternatives().len() > MAX_LOCK_ALTERNATIVES,
+            coverage: target.alternative_coverage(),
         });
     }
     (expanded, fans)
@@ -79,7 +80,7 @@ pub(super) fn merge(outcomes: &mut VulnerabilityMap, fans: Vec<Fan>) {
             .unwrap_or(ScanOutcome::Skipped(SkipReason::QueryFailed));
         outcomes.insert(
             fan.key,
-            merge_outcomes(primary, &fan.version, alternatives, fan.overflowed),
+            merge_outcomes(primary, &fan.version, alternatives, fan.coverage),
         );
     }
 }
@@ -90,7 +91,7 @@ pub(super) fn merge(outcomes: &mut VulnerabilityMap, fans: Vec<Fan>) {
 /// 1. Any `Vulnerable` sub-outcome wins: the result is the deduplicated union of advisories,
 ///    and an advisory only an alternative matched carries [`MatchOrigin::LockEntry`] tags. The
 ///    list is marked incomplete when any other sub-outcome was skipped or alternatives
-///    overflowed.
+///    were truncated.
 /// 2. Otherwise a skipped primary keeps its own reason.
 /// 3. Otherwise the first skipped alternative's reason stands when it is a coverage gap, else
 ///    [`SkipReason::LockAlternativesUnchecked`], so a structural reason cannot make the
@@ -101,8 +102,9 @@ fn merge_outcomes(
     primary: ScanOutcome,
     primary_version: &OsvVersion,
     alternatives: Vec<(ConcreteVersion, ScanOutcome)>,
-    overflowed: bool,
+    coverage: AlternativeCoverage,
 ) -> ScanOutcome {
+    let overflowed = coverage == AlternativeCoverage::Truncated;
     let mut primary_vulnerable = None;
     let mut primary_skip = None;
     match primary {
@@ -183,8 +185,7 @@ fn union_advisories(
         }
     }
 
-    // One unknown advisory stands in for whatever a skipped sub-scan could not report.
-    let total = advisories.len() + unfetched + usize::from(incomplete);
+    let total = advisories.len() + unfetched;
     advisories.truncate(MAX_ADVISORY_RECORDS);
 
     let mut matches = SiblingMatches::new(primary_version.clone());
@@ -195,7 +196,13 @@ fn union_advisories(
             matches.insert(advisory.id().clone(), tags);
         }
     }
-    let merged = DependencyVulnerabilities::new(Capped::new(advisories, total));
+    let counted = Capped::new(advisories, total);
+    let counted = if incomplete {
+        counted.with_total_as_lower_bound()
+    } else {
+        counted
+    };
+    let merged = DependencyVulnerabilities::new(counted);
     if matches.is_empty() {
         merged
     } else {
@@ -238,7 +245,16 @@ mod tests {
             .into_iter()
             .map(|(v, outcome)| (ConcreteVersion::new(v), outcome))
             .collect();
-        merge_outcomes(primary, &OsvVersion::new("1.2.8"), alternatives, overflowed)
+        merge_outcomes(
+            primary,
+            &OsvVersion::new("1.2.8"),
+            alternatives,
+            if overflowed {
+                AlternativeCoverage::Truncated
+            } else {
+                AlternativeCoverage::Complete
+            },
+        )
     }
 
     fn dv(outcome: &ScanOutcome) -> &DependencyVulnerabilities {
@@ -337,6 +353,28 @@ mod tests {
     }
 
     #[test]
+    fn failed_alternative_keeps_the_known_total_and_reports_a_lower_bound() {
+        let outcome = merged(
+            vulnerable(&["GHSA-aaaa-bbbb-cccc"]),
+            vec![("1.2.5", ScanOutcome::Skipped(SkipReason::QueryFailed))],
+            false,
+        );
+
+        let advisories = &dv(&outcome).advisories;
+        assert_eq!(advisories.total(), 1);
+        assert_eq!(
+            advisories.overflow(),
+            Some(crate::osv::AdvisoryCount::AtLeast(0))
+        );
+    }
+
+    #[test]
+    fn fully_scanned_alternatives_report_an_exact_count() {
+        let outcome = merged(vulnerable(&["GHSA-aaaa-bbbb-cccc"]), vec![], false);
+        assert_eq!(dv(&outcome).advisories.overflow(), None);
+    }
+
+    #[test]
     fn clean_primary_with_a_failed_alternative_is_query_failed() {
         let outcome = merged(
             ScanOutcome::Clean,
@@ -403,13 +441,14 @@ mod tests {
         assert!(!dv(&outcome).advisories.is_complete());
     }
 
-    fn target_with_alternatives(count: usize) -> ScanTarget {
+    fn target_with_alternatives(count: usize, coverage: AlternativeCoverage) -> ScanTarget {
         let versions: Vec<ConcreteVersion> = (0..count)
             .map(|n| ConcreteVersion::new(format!("1.0.{n}")))
             .collect();
-        let in_use = crate::lsp_helpers::InUseVersions::for_test_with_lock_alternatives(
+        let in_use = crate::lsp_helpers::InUseVersions::for_test_with_alternative_coverage(
             ConcreteVersion::new("2.0.0"),
             versions,
+            coverage,
         );
         ScanTarget::from_native(
             crate::test_util::vuln_key("pkg"),
@@ -421,8 +460,9 @@ mod tests {
     }
 
     #[test]
-    fn expand_caps_alternatives_and_merge_removes_synthetic_keys() {
-        let target = target_with_alternatives(MAX_LOCK_ALTERNATIVES + 3);
+    fn expand_scans_every_listed_alternative_and_truncation_turns_clean_into_unchecked() {
+        let target =
+            target_with_alternatives(MAX_LOCK_ALTERNATIVES, AlternativeCoverage::Truncated);
         let (expanded, fans) = expand(std::slice::from_ref(&target));
 
         assert_eq!(expanded.len(), 1 + MAX_LOCK_ALTERNATIVES);
@@ -445,7 +485,7 @@ mod tests {
 
     #[test]
     fn expand_fans_out_only_the_first_target_of_a_duplicate_key() {
-        let target = target_with_alternatives(2);
+        let target = target_with_alternatives(2, AlternativeCoverage::Complete);
         let (expanded, fans) = expand(&[target.clone(), target]);
 
         assert_eq!(expanded.len(), 2 + 2);

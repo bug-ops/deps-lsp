@@ -29,8 +29,8 @@
 
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
-    EntryPlacement, LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest, read_and_parse_lockfile,
+    EntryOwner, EntryPlacement, ImporterPath, LockFileProvider, ResolvedPackage, ResolvedPackages,
+    ResolvedSource, locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
 use deps_core::yaml_scalar_string;
 use serde::Deserialize;
@@ -331,7 +331,7 @@ fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> 
             continue;
         };
 
-        let source = parse_npm_source(&entry);
+        let source = package_lock_source(&key, &entry, version);
         let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
 
         packages.insert(
@@ -361,16 +361,9 @@ const MIN_PNPM_LOCKFILE_MAJOR_VERSION: u32 = 6;
 /// Parses a `pnpm-lock.yaml` at `lockfile_path` into resolved packages, aggregating every
 /// workspace importer (spec 052 FR-004/FR-007).
 ///
-/// **Known limitation**: importers are aggregated flatly into one shared version pool per
-/// package name, with no correlation back to the specific `package.json` being queried (spec
-/// 052's deliberate scoping — Out of Scope forbids importer-to-manifest correlation). When two
-/// importers have *overlapping* semver ranges that pnpm resolved to *different* concrete
-/// versions, a caller resolving one importer's dependency can be handed the version resolved
-/// for a different importer instead of its own — a false-negative risk for OSV vulnerability
-/// matching, not merely an imprecision. The same applies to any `package.json` under the
-/// workspace root that isn't itself a registered importer, since it inherits whichever
-/// importer's version the ancestor lock-file search happens to attach to. See
-/// `docs/ECOSYSTEM_GUIDE.md`'s pnpm section for the user-facing note.
+/// Each entry records the importer it was listed under ([`EntryOwner::Importer`]), so a caller
+/// resolving one `package.json` selects its own importer's version (nearest ancestor importer
+/// when the manifest is not itself an importer) instead of another importer's (#1993).
 async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
     tracing::debug!("Parsing pnpm-lock.yaml: {}", lockfile_path.display());
 
@@ -436,7 +429,11 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
         return Ok(packages);
     };
 
-    for (_importer_path, importer) in importers {
+    for (importer_path, importer) in importers {
+        let owner = importer_path
+            .as_str()
+            .and_then(|path| ImporterPath::parse(path).ok())
+            .map_or(EntryOwner::Unattributed, EntryOwner::Importer);
         for section in ["dependencies", "devDependencies", "optionalDependencies"] {
             let Yaml::Hash(deps) = &importer[section] else {
                 continue;
@@ -473,14 +470,19 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
                     continue;
                 }
 
-                packages.insert(ResolvedPackage::new(
-                    name.to_string(),
-                    version.to_string(),
-                    ResolvedSource::Registry {
-                        url: String::new(),
-                        checksum: String::new(),
-                    },
-                ));
+                packages.insert(
+                    ResolvedPackage::new(
+                        name.to_string(),
+                        version.to_string(),
+                        ResolvedSource::Registry {
+                            url: String::new(),
+                            checksum: String::new(),
+                        },
+                    )
+                    .with_placement(EntryPlacement::Hoisted {
+                        owner: owner.clone(),
+                    }),
+                );
             }
         }
     }
@@ -530,12 +532,22 @@ fn strip_peer_suffix(version: &str) -> &str {
 /// nested under another package (a transitive consumer's), while the root `node_modules/<n>`
 /// and a workspace member's `<member>/node_modules/<n>` are what direct dependencies resolve
 /// to (#1981).
+///
+/// A hoisted `node_modules/<n>` belongs to the root importer and `<member>/node_modules/<n>` to
+/// the member before the first `/node_modules/`; a workspace-folder key (`packages/a`) has no
+/// owner (#1993).
 fn package_lock_placement(key: &str) -> EntryPlacement {
     if key.matches("node_modules/").nth(1).is_some() {
-        EntryPlacement::Nested
-    } else {
-        EntryPlacement::Hoisted
+        return EntryPlacement::Nested;
     }
+    let owner = match key.split_once("/node_modules/") {
+        Some((member, _)) => {
+            ImporterPath::parse(member).map_or(EntryOwner::Unattributed, EntryOwner::Importer)
+        }
+        None if key.starts_with("node_modules/") => EntryOwner::Importer(ImporterPath::root()),
+        None => EntryOwner::Unattributed,
+    };
+    EntryPlacement::Hoisted { owner }
 }
 
 /// Extracts package name from lockfile key.
@@ -547,6 +559,29 @@ fn package_lock_placement(key: &str) -> EntryPlacement {
 /// - `"node_modules/express/node_modules/debug"` → `"debug"`
 fn extract_package_name(key: &str) -> &str {
     key.rsplit("node_modules/").next().unwrap_or(key)
+}
+
+/// Classifies a `package-lock.json` entry, treating an installed package whose `resolved` URL
+/// was omitted (`omit-lockfile-registry-resolved`) as a registry package (#1941).
+///
+/// Only keys with a `node_modules/` segment qualify: a workspace folder entry such as
+/// `packages/a` also lacks `resolved` but is genuinely local (#1891).
+fn package_lock_source(key: &str, entry: &PackageEntry, version: &str) -> ResolvedSource {
+    let source = parse_npm_source(entry);
+    let installed_under_node_modules =
+        key.starts_with("node_modules/") || key.contains("/node_modules/");
+    if matches!(source, ResolvedSource::Path { .. })
+        && entry.link != Some(true)
+        && entry.resolved.is_none()
+        && installed_under_node_modules
+        && node_semver::Version::parse(version).is_ok()
+    {
+        return ResolvedSource::Registry {
+            url: String::new(),
+            checksum: String::new(),
+        };
+    }
+    source
 }
 
 /// Parses npm source information into ResolvedSource.
@@ -632,16 +667,18 @@ fn parse_git_source(url: &str) -> ResolvedSource {
 mod tests {
     #[test]
     fn package_lock_placement_flags_only_keys_nested_under_another_package() {
-        for key in [
-            "node_modules/minimist",
-            "node_modules/@babel/core",
-            "packages/bar/node_modules/minimist",
+        let hoisted = |owner: EntryOwner| EntryPlacement::Hoisted { owner };
+        let importer = |path: &str| EntryOwner::Importer(ImporterPath::parse(path).unwrap());
+        for (key, owner) in [
+            ("node_modules/minimist", importer("")),
+            ("node_modules/@babel/core", importer("")),
+            (
+                "packages/bar/node_modules/minimist",
+                importer("packages/bar"),
+            ),
+            ("packages/bar", EntryOwner::Unattributed),
         ] {
-            assert_eq!(
-                package_lock_placement(key),
-                EntryPlacement::Hoisted,
-                "{key}"
-            );
+            assert_eq!(package_lock_placement(key), hoisted(owner), "{key}");
         }
         for key in [
             "node_modules/foo/node_modules/minimist",
@@ -653,6 +690,77 @@ mod tests {
 
     use super::*;
     use std::assert_matches;
+
+    /// #1993: each pnpm entry is owned by the importer it was listed under, `.` being the root.
+    #[test]
+    fn pnpm_entries_are_owned_by_their_importer() {
+        let lock = "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: ^1.0.0\n        version: 1.0.0\n  packages/ui:\n    dependencies:\n      a:\n        specifier: ^1.0.0\n        version: 1.1.0\n";
+        let packages = parse_pnpm_lock_yaml(lock).unwrap();
+        let mut owners: Vec<(String, EntryOwner)> = packages
+            .all("a")
+            .unwrap()
+            .iter()
+            .map(|p| match p.placement() {
+                EntryPlacement::Hoisted { owner } => (p.version.clone(), owner.clone()),
+                EntryPlacement::Nested => panic!("pnpm entries are never nested"),
+            })
+            .collect();
+        owners.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            owners,
+            [
+                (
+                    "1.0.0".to_string(),
+                    EntryOwner::Importer(ImporterPath::root())
+                ),
+                (
+                    "1.1.0".to_string(),
+                    EntryOwner::Importer(ImporterPath::parse("packages/ui").unwrap())
+                ),
+            ]
+        );
+    }
+
+    fn local_only(content: &str) -> Vec<String> {
+        let packages = parse_package_lock_json_content(content.to_string()).unwrap();
+        let local = packages.local_only_names(&deps_core::test_util::StubFormatter::new());
+        local.iter().map(|name| name.as_str().to_string()).collect()
+    }
+
+    /// #1941: an installed entry without `resolved` is registry-served, but a workspace folder
+    /// entry (no `link`) stays local-only (#1891).
+    #[test]
+    fn package_lock_without_resolved_is_registry_only_under_node_modules() {
+        let local = local_only(
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "root"},
+    "packages/a": {"name": "a", "version": "1.0.0"},
+    "node_modules/zzz": {"version": "1.0.0"}
+  }
+}"#,
+        );
+        assert!(local.contains(&"a".to_string()), "{local:?}");
+        assert!(!local.contains(&"zzz".to_string()), "{local:?}");
+    }
+
+    /// #1941: a `link` entry stays local-only even without a workspace folder entry.
+    #[test]
+    fn package_lock_link_entry_stays_local_only() {
+        let local = local_only(
+            r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"name": "root"},
+    "node_modules/a": {"resolved": "packages/a", "link": true, "version": "1.0.0"},
+    "node_modules/zzz": {"version": "1.0.0"}
+  }
+}"#,
+        );
+        assert!(local.contains(&"a".to_string()), "{local:?}");
+        assert!(!local.contains(&"zzz".to_string()), "{local:?}");
+    }
 
     /// #1240: a duplicate mapping key whose name is credential-shaped must not leak the
     /// credential into the parse error's `Display` text, which reaches `tracing::warn!`.

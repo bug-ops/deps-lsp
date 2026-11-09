@@ -10,9 +10,10 @@
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::DenoDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    up_to_date_via_compiled_matcher, warn_rejected_value,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    SourcePolicy, grammar_candidates, grammar_matcher, up_to_date_via_compiled_matcher,
+    warn_rejected_value,
 };
 use deps_core::osv::{NonPublicRoute, OsvPackageName};
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -114,10 +115,10 @@ impl PackageRendering for DenoFormatter {
 }
 
 impl RequirementResolution for DenoFormatter {
-    /// Delegates to [`deps_npm::compile_node_semver_range`] — the single shared
-    /// `node_semver::Range` matcher `deps-npm`'s own formatter also uses (#1478) — correct for
+    /// Matches through [`deps_npm::NodeSemverGrammar`] — the single shared
+    /// `node_semver::Range` grammar `deps-npm`'s own formatter also uses (#1478) — correct for
     /// JSR too, since JSR mandates semver. The unresolved-placeholder guard (#1377) lives
-    /// inside that function itself; see its doc for why that's safe without an extra
+    /// inside that grammar itself; see its doc for why that's safe without an extra
     /// `self.requirement_is_unresolved` check here. The returned matcher's
     /// `RequirementMatcher::strict_prerelease_exclusion` also carries over unchanged, so the
     /// unsatisfiable-requirement diagnostic's pre-release hint applies to both `npm:` and
@@ -126,8 +127,11 @@ impl RequirementResolution for DenoFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        deps_npm::compile_node_semver_range(requirement)
+        grammar_matcher(deps_npm::NodeSemverGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(deps_npm::NodeSemverGrammar, candidates))
     }
 
     /// Same compiled-matcher verdict as `deps-npm` (#1656), for both `npm:` and `jsr:`.
@@ -250,6 +254,53 @@ impl DependencyFormatter for DenoFormatter {
 
 #[cfg(test)]
 mod tests {
+
+    const REQUIREMENTS: &[&str] = &[
+        "^1.2.3",
+        "~1.2",
+        "1.x",
+        "*",
+        "",
+        "1.2.3 - 2.3.4",
+        ">=1.0.0 <1.5.0 || >1.5.0 <2.0.0",
+        "1.2.3",
+        "~*",
+        "{{ version }}",
+        "^1.0.0-beta.1",
+        "||",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.5.0",
+        "1.0.0-beta.1",
+        "1.0.0",
+        "1.2.3",
+        "1.5.0",
+        "1.8.0",
+        "2.0.0",
+        "2.0.0-rc.1",
+        "garbage",
+        "",
+    ];
+
+    /// The same grammar as `deps-npm`: its matcher is the oracle for Deno's.
+    #[test]
+    fn grammar_matcher_is_equivalent_to_deps_npm() {
+        deps_core::test_util::assert_matchers_equivalent(
+            &DenoFormatter,
+            &|requirement| deps_npm::NpmFormatter.compile_bounded_requirement(requirement),
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &DenoFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
     use super::*;
     use deps_core::lsp_helpers::RequirementGate;
 
@@ -464,7 +515,7 @@ mod tests {
     }
 
     /// #1646 impl-critic M4: `deps-deno` inherits `deps-npm`'s precise `~1.x.3` resolution
-    /// entirely through `compile_node_semver_range`, but had no test asserting it positively
+    /// entirely through `NodeSemverGrammar`, but had no test asserting it positively
     /// resolves here (only that the *unresolvable* shapes don't panic, above).
     #[test]
     fn test_compile_requirement_tilde_wildcard_patch_resolves_precisely() {
@@ -650,7 +701,7 @@ mod tests {
     }
 
     /// #1601 impl-critic M4: Deno's `compile_bounded_requirement` delegates entirely to
-    /// `deps_npm::compile_node_semver_range`, so it must inherit `NodeSemverMatcher`'s
+    /// `deps_npm::NodeSemverGrammar`, so it must inherit `NodeSemverGrammar`'s
     /// OR-alternation-gap detection unchanged — not previously covered by a direct test here,
     /// unlike npm's own `formatter.rs`/`ecosystem.rs` suites.
     #[test]

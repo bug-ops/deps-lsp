@@ -144,19 +144,26 @@ shown as in use is the **highest** satisfying entry, and every other satisfying 
 for advisories as well. An advisory that affects only another locked copy is reported as `also
 locked at <version>`; see [Lock alternatives](../cross-ecosystem/yanked-and-vulnerabilities.md#lock-alternatives-issue-1981).
 
-The formats differ in how much they can attribute:
+Each lock format attributes its entries to a workspace member as far as it records them, and the
+entry belonging to the `package.json` you are looking at is preferred:
 
 - **`package-lock.json`** knows where each copy lives. A copy nested under another package
   (`node_modules/foo/node_modules/minimist`) belongs to that package and is not a candidate for your
-  dependency. The root `node_modules/<name>` entry and a workspace member's own
-  `<member>/node_modules/<name>` entry are both candidates.
-- **`yarn.lock`, `bun.lock` and `pnpm-lock.yaml`** record entries without an owner (pnpm only per
-  importer, which `deps-lsp` flattens). A transitive consumer's copy of the same package therefore
-  also satisfies the requirement and is reported as `also locked at`, where `package-lock.json`
-  would have filtered it out.
+  dependency. The root `node_modules/<name>` entry belongs to the root, and
+  `<member>/node_modules/<name>` to that workspace member; a member's own entry wins over another
+  member's. A workspace folder entry (`packages/a`) has no owner.
+- **`pnpm-lock.yaml`** lists the resolved version per importer, so a member's own importer entry is
+  used; a `package.json` that is not a registered importer falls back to the nearest ancestor
+  importer, then to the highest satisfying entry.
+- **`bun.lock`** installs a member's own copy under `<workspace name>/<name>` and hoisted copies
+  under the bare name (the root). A copy under any other prefix is nested under another package and
+  is demoted exactly like `package-lock.json`'s: it is no longer reported as `also locked at` while a
+  hoisted entry of the same name exists.
+- **`yarn.lock`** (v1 and Berry) records which declared requirement each entry resolves, so the entry
+  that lists your requirement text verbatim (`^1.2.0`, compared as written) is used.
 
-So the same project can show an extra `also locked at` finding under Yarn, Bun or pnpm that npm
-does not show. Selecting the entry by owner is tracked as a follow-up.
+When the preferred entry does not satisfy the requirement, the highest satisfying entry is used
+instead, and every other satisfying entry stays an `also locked at` alternative.
 
 ## Non-Registry Dependency Sources
 
@@ -251,17 +258,8 @@ never per-key-merges the two sections.
   validated against pnpm's own schema further.
 - The binary `bun.lockb` is not read for in-use/resolved-version detection; only the text
   `bun.lock` is (see [Lock Files](#lock-files)).
-- `pnpm-lock.yaml`'s `importers` map is aggregated flatly across every
-  workspace member into one shared version pool per package name, without
-  correlating an importer entry back to the specific `package.json` being
-  queried (spec 052's deliberate scoping). When two importers have
-  *overlapping* semver ranges that pnpm resolved to *different* concrete
-  versions, hover/OSV scanning for one importer's `package.json` can show the
-  version resolved for a different importer instead of its own — a
-  false-negative risk for vulnerability scanning, not just an imprecision.
-  The same applies to any `package.json` under the workspace root that isn't
-  itself a registered importer: it inherits whichever importer's version the
-  ancestor lock file search happens to attach to.
+- A `package.json` that is not a registered pnpm importer inherits its nearest ancestor importer's
+  entries (the same walk-up `node_modules` resolution uses), not an arbitrary importer's.
 
 ## Editing `pnpm-workspace.yaml` Catalog Entries
 

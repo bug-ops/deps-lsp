@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core**: `ResolvedCandidatesMap` holds `LockCandidates`, `EntryPlacement` is no longer `Copy` and carries an `EntryOwner`, and `ImporterPath` is added (#PR)
+- **deps-core, deps-engine, deps-lsp**: `parse_known_lockfile` and `split_resolved_packages` take an importer scope (#PR)
+- **deps-core, deps-cli**: `Capped` gains a lower bound, and `InUseVersions` and `ScanTarget` gain `alternative_coverage`; lock alternatives are the nearest to the primary (#PR)
+- **deps-core**: `ParseInputKey` is owner-tagged, `ParsedManifest` gains `ecosystem_id` and `formatter`, and the matching parameters are dropped from `build_scan_targets`, `collect_in_use_versions`, `plan_updates` and related entry points (#PR)
+- **deps-core, deps-lsp**: `ParsedManifest` and `FormattedDependency` are sealed and `impl_stub_typed_ecosystem!` replaces the deps-lsp stub macro (#PR)
+- **deps-core, deps-npm**: `parse_jsonc_typed` deserializes straight from the AST; `compile_node_semver_range` becomes `NodeSemverGrammar` and `SemverReqMatcher` is removed (#PR)
+- **deps-core, deps-github-actions, deps-gitlab-ci**: `MutableRefPin` replaces the per-ecosystem pin diagnostics, and `GitlabInclude` marks the GitLab-only floating states (#PR)
+- **deps-lsp**: `didClose` publishes empty diagnostics for every tracked manifest under a per-URI publish gate (#PR)
 - **deps-core, ecosystem crates**: `TypedEcosystem::{hover, diagnostics, code_actions}` are replaced by `decorate_*` hooks with `HoverDecoration` and the free functions `deps_core::ecosystem::{hover, diagnostics, code_actions}` (#2006)
 - **deps-core**: `DependencyFormatter::Dep` and `TypedParseResult::Dep` must implement the new `ProbeDependency` (#2006)
 - **deps-core**: `ResolvedPackage` gains `EntryPlacement`, `SkipReason` gains `LockAlternativesUnchecked`, and `MatchedTags` gains `MatchOrigin` (#2006)
@@ -33,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: invalid YAML returns `DepsError::ParseError` instead of an empty result, except a bare `action.yml` (#1956)
 
 ### Added
+- **deps-npm, deps-core**: lock selection prefers the entry owned by the manifest's own importer for package-lock, pnpm, bun and yarn v1/Berry (#PR)
+- **deps-core, deps-cli**: lower-bound advisory counts, a lock-alternative inlay warning, and a stderr warning when lock alternatives exceed the cap and stay unchecked (#PR)
+- **deps-lsp**: sticky full-refetch escalation across debounced edits, a shared registry-progress starter, and a registry-progress abort marker (#PR)
+- **deps-cargo**: update edits keep the declared partial-version precision; Dart keeps full versions because pub_semver rejects partial carets (#PR)
+- **deps-nuget**: floating-version updates keep the wildcard shape, and interval constraints get an explicit manual-edit notice (#PR)
+- **deps-core**: `VersionGrammar` and `CandidateSet` parse each lock candidate once, implemented by all 12 requirement formatters (#PR)
+- **deps-core, deps-lsp**: `LockCandidates`, `AlternativeCoverage`, `GitlabInclude` and `CoreSchemaType` typed boundaries (#PR)
 - **deps-core, deps-cli**: lock-file entries that satisfy a requirement but are not the in-use version are scanned in OSV and labelled "also locked at", and more than 16 of them report an unchecked note that `--fail-on unchecked` enforces (#2006)
 - **deps-github-actions**: `test-util` feature with `GithubActionsEcosystem::for_test` (#2006)
 - **deps-npm, deps-core**: read in-use versions from `bun.lock` (lockfileVersion 0-3) through the new `parse_jsonc_typed` helper (#1976)
@@ -46,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: a neutral `ℹ` inlay hint marks a dependency that was never looked up in a registry (#1956)
 
 ### Changed
+- **deps-core**: the lock cache shares `Arc<ResolvedPackages>` and the selection memo caches the candidate set per name (#PR)
+- **deps-npm**: `package-lock.json` entries without `resolved` count as registry entries only under `node_modules/`, and `bun.lock` is parsed with visitors (peak RSS 551 to 259 MiB) (#PR)
+- **deps-core**: hover recent versions and update actions rank stable releases above prerelease builds (#PR)
+- **deps-gitlab-ci, deps-github-actions**: mutable-ref pin diagnostics share one builder and the GitLab rate-limit map is keyed by the typed host (#PR)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: the git-tags diagnostics and quick fixes live in the shared `lsp_helpers::git_tags` (#2006)
 - **deps-engine**: the cross-ecosystem `non_public_route` guard is restored through an erased `ProbeDependency` probe (#2006)
 - **deps-npm**: yarn.lock percent-decoding, bun.lock truncation and lock-file parse errors reuse shared helpers (#2006)
@@ -64,6 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps**: refresh `Cargo.lock` (#1956)
 
 ### Fixed
+- **deps-lsp**: a closed document no longer receives late diagnostics, and a forced full refetch survives a `didChange` inside the debounce window (#PR)
+- **deps-core, deps-npm**: yarn descriptors and bun owners are deduplicated, closing a quadratic CPU cost on hostile lock files (#PR)
+- **deps-core**: overflow advisory counts exclude hidden unmaintained advisories and no longer pad after a failed sub-scan (#PR)
+- **deps-cli, deps-pypi**: user-facing messages no longer leak Rust item paths or the `uv-tail` label (#PR)
+- **workspace**: reduced-feature test targets compile, OSV and offline tests are hermetic, and `Duration::from_hours`/`from_mins` and `assert_matches!` replace older spellings (#PR)
 - **deps-lsp**: a `didChange` during the initial registry fetch no longer discards the fetch, so dependencies keep their registry data and OSV outcome (#2006)
 - **deps-lsp**: deleting a lock file refreshes the in-use versions of open manifests (#2006)
 - **deps-core, deps-npm, deps-engine**: a nested or duplicated lock-file entry no longer hides advisories of the in-use dependency in npm, yarn, bun and pnpm projects (#2006)

@@ -35,6 +35,11 @@ NuGet versions follow
 compared case-insensitively — no maintained Rust crate implements this scheme, so `deps-nuget`
 hand-rolls its own comparator (the same pattern `deps-maven` uses for Maven's own scheme).
 
+An update keeps a stable floating version's wildcard and precision: `3.*` with a latest of
+5.0.0 becomes `5.*` and `1.1.*` becomes `1.2.*`. A bounded interval such as `[2.0.0,3.0.0)` has
+no update edit, so its diagnostic reads `Newer version outside the declared range (edit the
+bounds manually)` instead of promising a quick fix.
+
 ## Private/Custom Feeds
 
 A NuGet dependency whose applicable feed is overridden via a repository's

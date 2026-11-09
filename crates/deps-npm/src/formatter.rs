@@ -1,10 +1,10 @@
 use crate::types::{NpmDependency, NpmDependencyOrigin, NpmDependencySection, NpmRegistryEntry};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
     MAX_REQUIREMENT_LEN, OsvNaming, PackageNaming, PackageRendering, RequirementMatcher,
-    RequirementResolution, RewriteTarget, SourcePolicy, bare_meaning,
-    format_version_replacing_by_shape, requirement_len_exceeds_cap,
-    up_to_date_via_compiled_matcher,
+    RequirementResolution, RewriteTarget, SourcePolicy, VersionGrammar, bare_meaning,
+    format_version_replacing_by_shape, grammar_candidates, grammar_matcher,
+    requirement_len_exceeds_cap, up_to_date_via_compiled_matcher,
 };
 use deps_core::osv::{LockResolution, NonPublicRoute};
 use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
@@ -401,44 +401,6 @@ pub fn parse_range_safe(requirement: &str) -> Result<node_semver::Range, RangePa
     }
 }
 
-/// Precise npm semver range matcher, compiled once per dependency by
-/// [`compile_node_semver_range`]. `branches` is `range` split on its top-level `||` and
-/// individually re-parsed — needed only for [`explicitly_excludes`](Self::explicitly_excludes)'s
-/// OR-alternation-gap check (#1601), since `node_semver::Range`'s own internal bound sets are
-/// private and can't be walked from outside the crate.
-struct NodeSemverMatcher {
-    range: node_semver::Range,
-    branches: Vec<node_semver::Range>,
-}
-
-impl RequirementMatcher for NodeSemverMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        node_semver::Version::parse(version)
-            .ok()
-            .map(|v| self.range.satisfies(&v))
-    }
-
-    /// `node_semver::Range::satisfies` excludes pre-releases unless `requirement` itself pins
-    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics
-    /// (#299). Declared once, here, on the matcher type itself: any formatter that reuses
-    /// [`compile_node_semver_range`] (`deps-npm`'s own `NpmFormatter`, and `deps-deno`'s
-    /// `DenoFormatter` for both `npm:` and `jsr:` specifiers) inherits this answer for free,
-    /// with no separate per-formatter flag to keep in sync (#1478).
-    fn strict_prerelease_exclusion(&self) -> bool {
-        true
-    }
-
-    /// #1601 (same class as Maven's #1590 disjoint-range gap and Composer's `||`-gap): a
-    /// version not satisfied by any `||`-branch can still sit strictly between two of them,
-    /// with nothing admitted in the gap — the cooldown-fallback safety net
-    /// (`fallback_edit_excludes_newer`) has no other way to tell that apart from a fallback
-    /// that legitimately exceeds every branch's ceiling.
-    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
-        node_semver_or_gap_excludes(&self.branches, version.as_str())
-    }
-}
-
 /// Whether `version` is explicitly excluded by an OR-alternation gap in npm's `||`-joined
 /// range grammar (#1601). `node_semver::Range`'s own bound values are private, so each
 /// branch's admitted span is probed via its public `allows_any` rather than read as literal
@@ -455,13 +417,13 @@ impl RequirementMatcher for NodeSemverMatcher {
 /// with the branch itself — not recomputed inside both the `admits_at_or_above` and
 /// `admits_at_or_below` closures (code-review perf finding), since `union_gap_excludes` calls
 /// each closure once per branch on every invocation.
-fn node_semver_or_gap_excludes(branches: &[node_semver::Range], version: &str) -> bool {
+fn node_semver_or_gap_excludes(
+    branches: &[node_semver::Range],
+    candidate: &node_semver::Version,
+) -> bool {
     if branches.len() < 2 {
         return false;
     }
-    let Ok(candidate) = node_semver::Version::parse(version) else {
-        return false;
-    };
     let Ok(at_or_above) = parse_range_safe(&format!(">={candidate}")) else {
         return false;
     };
@@ -475,56 +437,100 @@ fn node_semver_or_gap_excludes(branches: &[node_semver::Range], version: &str) -
         .collect();
     deps_core::interval::union_gap_excludes(
         &members,
-        |(branch, _satisfiable)| branch.satisfies(&candidate),
+        |(branch, _satisfiable)| branch.satisfies(candidate),
         |(branch, satisfiable)| !satisfiable || branch.allows_any(&at_or_above),
         |(branch, satisfiable)| !satisfiable || branch.allows_any(&at_or_below),
     )
 }
 
-/// Compiles `requirement` as a `node_semver::Range`, the grammar npm's registry and JSR both
-/// use for matching.
+/// A requirement compiled by [`NodeSemverGrammar`].
 ///
-/// The single source of truth for `deps-npm`'s own [`NpmFormatter::compile_bounded_requirement`] and
-/// `deps-deno`'s `DenoFormatter::compile_bounded_requirement` (#1478).
+/// `branches` is the requirement split on its top-level `||` and individually re-parsed, needed
+/// only for the OR-alternation-gap check of
+/// [`RequirementMatcher::explicitly_excludes`] (#1601), since `node_semver::Range`'s own bound
+/// sets are private.
+#[derive(Debug)]
+pub struct NodeSemverRange {
+    range: node_semver::Range,
+    branches: Vec<node_semver::Range>,
+}
+
+/// The `node_semver::Range` grammar npm's registry and JSR both use for matching.
 ///
-/// Guards against an unresolved placeholder itself (#1374/#1377): a requirement for which
-/// `deps_core::lsp_helpers::requirement_contains_template_placeholder` says `true` never
-/// reaches `node_semver::Range::parse`, which might otherwise parse a placeholder-shaped
-/// string loosely into an incorrect concrete range instead of failing closed. This internal
-/// guard only ever runs that one shared detector — it is *not* equivalent to
-/// [`RequirementResolution::bounded_requirement_is_unresolved`] in general, only for a formatter
-/// whose own override of that method delegates entirely to the shared default (true today of
-/// both `NpmFormatter` and `DenoFormatter`, per each one's own doc comment). A formatter that
-/// overrides `requirement_is_unresolved`/`requirement_is_placeholder` with additional native
-/// placeholder syntax of its own must still call its own `self.requirement_is_unresolved(...)`
-/// before reaching this function — that native syntax is invisible to this guard.
+/// The single source of truth for `deps-npm`'s own [`NpmFormatter`] and `deps-deno`'s
+/// `DenoFormatter` (#1478).
+///
+/// Compiling guards against an unresolved placeholder itself (#1374/#1377): a requirement for
+/// which `deps_core::lsp_helpers::requirement_contains_template_placeholder` says `true` never
+/// reaches `node_semver::Range::parse`, which might otherwise parse a placeholder-shaped string
+/// loosely into an incorrect concrete range instead of failing closed. This internal guard only
+/// ever runs that one shared detector, so a formatter that overrides
+/// `RequirementResolution::bounded_requirement_is_unresolved` with native placeholder syntax of
+/// its own must still check it before compiling.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::RequirementMatcher;
+/// use deps_core::lsp_helpers::{BoundedVersionReq, grammar_matcher};
 /// use deps_core::{ConcreteVersion, VersionReq};
-/// use deps_npm::compile_node_semver_range;
+/// use deps_npm::NodeSemverGrammar;
 ///
-/// let matcher = compile_node_semver_range(&VersionReq::new("^1.0.0")).unwrap();
+/// let requirement = VersionReq::new("^1.0.0");
+/// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+/// let matcher = grammar_matcher(NodeSemverGrammar, bounded).unwrap();
 /// assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
 /// assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
 /// assert!(matcher.strict_prerelease_exclusion());
 ///
 /// // An unresolved template placeholder never reaches `node_semver::Range::parse`.
-/// assert!(compile_node_semver_range(&VersionReq::new("{{ version }}")).is_none());
+/// let placeholder = VersionReq::new("{{ version }}");
+/// let bounded = BoundedVersionReq::new(&placeholder).unwrap();
+/// assert!(grammar_matcher(NodeSemverGrammar, bounded).is_none());
 /// ```
-pub fn compile_node_semver_range(requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-    if deps_core::lsp_helpers::requirement_contains_template_placeholder(requirement.as_str()) {
-        return None;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeSemverGrammar;
+
+impl VersionGrammar for NodeSemverGrammar {
+    type Version = node_semver::Version;
+    type Compiled = NodeSemverRange;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<node_semver::Version> {
+        node_semver::Version::parse(version.as_str()).ok()
     }
-    let range = parse_range_safe(requirement.as_str()).ok()?;
-    let branches = requirement
-        .as_str()
-        .split("||")
-        .filter_map(|branch| parse_range_safe(branch.trim()).ok())
-        .collect();
-    Some(Box::new(NodeSemverMatcher { range, branches }) as Box<dyn RequirementMatcher>)
+
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<NodeSemverRange> {
+        let requirement = requirement.as_str();
+        if deps_core::lsp_helpers::requirement_contains_template_placeholder(requirement) {
+            return None;
+        }
+        let range = parse_range_safe(requirement).ok()?;
+        let branches = requirement
+            .split("||")
+            .filter_map(|branch| parse_range_safe(branch.trim()).ok())
+            .collect();
+        Some(NodeSemverRange { range, branches })
+    }
+
+    fn satisfies(&self, compiled: &NodeSemverRange, version: &node_semver::Version) -> bool {
+        compiled.range.satisfies(version)
+    }
+
+    /// `node_semver::Range::satisfies` excludes pre-releases unless the requirement itself pins
+    /// the same `X.Y.Z` tuple with a pre-release tag: strict SemVer 2.0.0 semantics (#299).
+    fn strict_prerelease_exclusion(&self, _: &NodeSemverRange) -> bool {
+        true
+    }
+
+    /// #1601 (same class as Maven's #1590 disjoint-range gap and Composer's `||`-gap): a version
+    /// not satisfied by any `||`-branch can still sit strictly between two of them, with nothing
+    /// admitted in the gap.
+    fn explicitly_excludes(
+        &self,
+        compiled: &NodeSemverRange,
+        version: &node_semver::Version,
+    ) -> bool {
+        node_semver_or_gap_excludes(&compiled.branches, version)
+    }
 }
 
 /// Maximum name length npm's registry accepts.
@@ -727,17 +733,20 @@ impl PackageRendering for NpmFormatter {
 }
 
 impl RequirementResolution for NpmFormatter {
-    /// Delegates to [`compile_node_semver_range`] — precise npm semver range semantics,
-    /// unlike the default `version_satisfies_requirement` heuristic this method deliberately
-    /// does not reuse (see that method's docs). The unresolved-placeholder guard
-    /// (#1374/#1377) now lives inside `compile_node_semver_range` itself; see its doc for why
-    /// that's safe without an extra `self.requirement_is_unresolved` check here.
+    /// Precise npm semver range semantics through [`NodeSemverGrammar`], unlike the default
+    /// `version_satisfies_requirement` heuristic this method deliberately does not reuse (see
+    /// that method's docs). The unresolved-placeholder guard (#1374/#1377) lives inside the
+    /// grammar itself; see its doc for why that's safe without an extra
+    /// `self.requirement_is_unresolved` check here.
     fn compile_bounded_requirement(
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        compile_node_semver_range(requirement)
+        grammar_matcher(NodeSemverGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(NodeSemverGrammar, candidates))
     }
 
     /// Answers through the compiled npm matcher (#1656): the shared default's heuristic
@@ -849,6 +858,64 @@ mod tests {
     use deps_core::NormalizeName;
     use deps_core::lsp_helpers::RequirementGate;
     use std::assert_matches;
+
+    const REQUIREMENTS: &[&str] = &[
+        "^1.2.3",
+        "~1.2",
+        "~1.2.3",
+        "1.x",
+        "1.2.x",
+        "*",
+        "",
+        "latest",
+        "1.2.3 - 2.3.4",
+        ">=1.0.0 <2.0.0",
+        "<1.5.0 || >=2.0.0",
+        ">=1.0.0 <1.5.0 || >1.5.0 <2.0.0",
+        "1.2.3",
+        "=1.2.3",
+        "~*",
+        "{{ version }}",
+        "^1.0.0-beta.1",
+        ">1.0.0 <1.0.0",
+        "||",
+        "1.2.3 ||",
+        ">=1.0.0-alpha <1.0.0",
+        "workspace:*",
+        "npm:foo@1",
+        "^1.2.3 || ^2.0.0 || ^3.0.0",
+        "<=1.2.3 || >=1.2.4 <1.2.5",
+        "$(Version)",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.5.0",
+        "1.0.0-alpha",
+        "1.0.0-beta.1",
+        "1.0.0",
+        "1.2.0",
+        "1.2.3",
+        "1.2.3+build",
+        "1.2.4",
+        "1.5.0",
+        "1.8.0",
+        "2.0.0",
+        "2.0.0-rc.1",
+        "2.5.0",
+        "3.0.0",
+        "v1.2.3",
+        "garbage",
+        "",
+        "1.2",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &NpmFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
 
     /// #1687: only pub treats `+build` as significant; SemVer ecosystems keep ignoring it.
     #[test]
@@ -1142,7 +1209,7 @@ mod tests {
     /// #1478: the matcher itself carries `strict_prerelease_exclusion`, not a separate
     /// per-formatter flag — proves `deps-npm`'s own compiled matcher opts in; `deps-deno`'s
     /// equivalent behavior is covered by its own end-to-end diagnostic test, since it reuses
-    /// this exact matcher via `compile_node_semver_range`.
+    /// this exact matcher via `NodeSemverGrammar`.
     #[test]
     fn test_compile_requirement_matcher_opts_into_strict_prerelease_exclusion() {
         let formatter = NpmFormatter;
@@ -1552,7 +1619,9 @@ mod tests {
     }
 
     fn explicitly_excludes(requirement: &str, version: &str) -> bool {
-        let matcher = compile_node_semver_range(&VersionReq::new(requirement)).unwrap();
+        let requirement = VersionReq::new(requirement);
+        let bounded = BoundedVersionReq::new(&requirement).unwrap();
+        let matcher = grammar_matcher(NodeSemverGrammar, bounded).unwrap();
         matcher.explicitly_excludes(&ConcreteVersion::new(version))
     }
 

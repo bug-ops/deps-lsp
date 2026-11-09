@@ -173,6 +173,15 @@ impl EcosystemRegistry {
 
     /// Get ecosystem by ID
     ///
+    /// A parsed document keeps the instance that parsed it, so this registry's instance agrees
+    /// with it only while nothing re-registers an ecosystem (registration happens once at
+    /// startup and there is no remove API). The server relies on that when it reads
+    /// [`EcosystemBase::license_source`] and
+    /// `EcosystemBase::pin_all_to_sha_noun` from here; a
+    /// formatter must be read from the document via
+    /// [`ParsedManifest::formatter`](crate::ParsedManifest::formatter) instead. A future
+    /// re-registration path must re-parse open documents.
+    ///
     /// # Arguments
     ///
     /// * `id` - Ecosystem identifier

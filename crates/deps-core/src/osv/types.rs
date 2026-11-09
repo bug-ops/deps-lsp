@@ -523,6 +523,10 @@ pub struct ScanTarget {
     /// them affects the dependency (#1981). Set only via [`Self::with_lock_alternatives`].
     #[raw]
     lock_alternatives: Vec<ScanVersion>,
+    /// Whether [`Self::lock_alternatives`] lists every other satisfying lock entry. Set only via
+    /// [`Self::with_lock_alternatives`].
+    #[raw]
+    alternative_coverage: AlternativeCoverage,
 }
 
 /// Whether a scan target's sibling release tags were read from a complete tag list.
@@ -549,6 +553,27 @@ pub enum SiblingCoverage {
     /// The repository's tag list has not been fetched yet (cold cache) or its fetch failed, so
     /// no sibling data exists. Reported again as soon as a later fetch populates the index.
     NotYetIndexed,
+}
+
+/// Whether a dependency's lock alternatives list holds every other satisfying lock entry or only
+/// the [`crate::osv::MAX_LOCK_ALTERNATIVES`] nearest to the primary (#1997).
+///
+/// Exhaustive so each consumer decides what truncation means; a truncated list makes a clean
+/// OSV answer non-authoritative.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::AlternativeCoverage;
+///
+/// assert_ne!(AlternativeCoverage::Complete, AlternativeCoverage::Truncated);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AlternativeCoverage {
+    /// Every other satisfying lock entry is listed.
+    Complete,
+    /// More satisfying entries exist than are listed.
+    Truncated,
 }
 
 impl From<ListCoverage> for SiblingCoverage {
@@ -623,6 +648,7 @@ impl ScanTarget {
             siblings: Vec::new(),
             sibling_coverage: SiblingCoverage::Complete,
             lock_alternatives: Vec::new(),
+            alternative_coverage: AlternativeCoverage::Complete,
         }
     }
 
@@ -630,15 +656,17 @@ impl ScanTarget {
     /// requirement, deriving each wire version via `naming.osv_version`.
     ///
     /// The lock file cannot say which satisfying entry the package manager installed for this
-    /// dependency, so [`crate::osv::OsvClient`] scans each of them (up to
-    /// [`crate::osv::MAX_LOCK_ALTERNATIVES`]) alongside the target's own version. The target's
-    /// own `version` and `display_version` are never touched.
+    /// dependency, so [`crate::osv::OsvClient`] scans each of them (at most
+    /// [`crate::osv::MAX_LOCK_ALTERNATIVES`], the nearest to the primary) alongside the target's
+    /// own version, and records whether the list was truncated. The target's own `version` and
+    /// `display_version` are never touched.
     #[must_use]
     pub fn with_lock_alternatives(
         mut self,
         versions: &crate::lsp_helpers::InUseVersions,
         naming: &dyn crate::lsp_helpers::OsvNaming,
     ) -> Self {
+        self.alternative_coverage = versions.alternative_coverage();
         self.lock_alternatives = versions
             .lock_alternatives()
             .iter()
@@ -654,6 +682,12 @@ impl ScanTarget {
     #[must_use]
     pub fn lock_alternatives(&self) -> &[ScanVersion] {
         &self.lock_alternatives
+    }
+
+    /// Whether [`Self::lock_alternatives`] lists every other satisfying lock entry.
+    #[must_use]
+    pub const fn alternative_coverage(&self) -> AlternativeCoverage {
+        self.alternative_coverage
     }
 
     /// Attaches the sibling release tags of `versions`, deriving each wire version via
@@ -751,6 +785,7 @@ mod scan_target_debug_redaction_tests {
             siblings: Vec::new(),
             sibling_coverage: crate::osv::SiblingCoverage::Complete,
             lock_alternatives: Vec::new(),
+            alternative_coverage: crate::osv::AlternativeCoverage::Complete,
         },
     );
 }
@@ -1004,14 +1039,97 @@ impl Advisory {
 pub struct Capped<T> {
     items: Vec<T>,
     total: usize,
+    bound: TotalBound,
+}
+
+/// Whether a [`Capped::total`] is the source's real count or only a floor of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TotalBound {
+    Exact,
+    AtLeast,
+}
+
+/// The "+N more" count of items a render layer hides, which is only a lower bound when part of
+/// the source could not be counted (#1996).
+///
+/// Exhaustive so every renderer decides how to word each case. Its [`std::fmt::Display`] is the
+/// single source of the summary wording.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::AdvisoryCount;
+///
+/// assert_eq!(AdvisoryCount::Exact(3).to_string(), "+3 more advisories");
+/// assert_eq!(
+///     AdvisoryCount::AtLeast(0).to_string(),
+///     "+0 or more advisories; some lock entries were not checked"
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryCount {
+    /// Exactly this many advisories are hidden.
+    Exact(usize),
+    /// At least this many are hidden; a lock entry's advisories could not be counted.
+    AtLeast(usize),
+}
+
+impl std::fmt::Display for AdvisoryCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(n) => write!(f, "+{n} more advisories"),
+            Self::AtLeast(n) => write!(
+                f,
+                "+{n} or more advisories; some lock entries were not checked"
+            ),
+        }
+    }
 }
 
 impl<T> Capped<T> {
     /// Pairs an already-truncated `items` list with the `total` the source
-    /// reported, which may exceed `items.len()`.
+    /// reported, which may exceed `items.len()`. A `total` below `items.len()` is raised to it,
+    /// since the source cannot have reported fewer items than it returned.
     #[must_use]
     pub fn new(items: Vec<T>, total: usize) -> Self {
-        Self { items, total }
+        let total = total.max(items.len());
+        Self {
+            items,
+            total,
+            bound: TotalBound::Exact,
+        }
+    }
+
+    /// Marks [`Self::total`] as a floor: part of the source could not be counted, so the real
+    /// count may be higher. A lower-bound list is never [`Self::is_complete`].
+    #[must_use]
+    pub fn with_total_as_lower_bound(mut self) -> Self {
+        self.bound = TotalBound::AtLeast;
+        self
+    }
+
+    /// The summary a renderer shows for the dropped items, `None` when nothing is hidden and
+    /// the count is exact. A lower-bound list always reports, even with zero known dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{AdvisoryCount, Capped};
+    ///
+    /// assert_eq!(Capped::new(vec![1], 1).overflow(), None);
+    /// assert_eq!(Capped::new(vec![1], 4).overflow(), Some(AdvisoryCount::Exact(3)));
+    /// assert_eq!(
+    ///     Capped::new(vec![1], 1).with_total_as_lower_bound().overflow(),
+    ///     Some(AdvisoryCount::AtLeast(0))
+    /// );
+    /// ```
+    #[must_use]
+    pub fn overflow(&self) -> Option<AdvisoryCount> {
+        let remaining = self.remaining();
+        match self.bound {
+            TotalBound::Exact => (remaining > 0).then_some(AdvisoryCount::Exact(remaining)),
+            TotalBound::AtLeast => Some(AdvisoryCount::AtLeast(remaining)),
+        }
     }
 
     /// The items actually retained — **not necessarily all [`Self::total`] of them**.
@@ -1029,7 +1147,7 @@ impl<T> Capped<T> {
     /// Whether [`Self::items`] holds everything the source reported.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.items.len() >= self.total
+        self.bound == TotalBound::Exact && self.items.len() >= self.total
     }
 
     /// How many items were dropped — the render layer's "+N more" count.
@@ -1042,6 +1160,14 @@ impl<T> Capped<T> {
 #[cfg(test)]
 mod capped_tests {
     use super::Capped;
+
+    #[test]
+    fn new_raises_a_total_below_the_item_count() {
+        let capped = Capped::new(vec!["A1", "A2", "A3"], 1);
+        assert_eq!(capped.total(), 3);
+        assert_eq!(capped.remaining(), 0);
+        assert!(capped.is_complete());
+    }
 
     #[test]
     fn new_exposes_items_and_total_as_given() {
@@ -1457,6 +1583,27 @@ impl DependencyVulnerabilities {
             .is_some_and(|m| m.fix_is_not_an_upgrade(advisory))
     }
 
+    /// A copy without the [`VulnSeverity::Informational`] (unmaintained) advisories a
+    /// `deprecated` suppression hides, with the total reduced by the ones removed so the
+    /// "+N more" count agrees with the list (#1960). Informational advisories that were never
+    /// fetched cannot be told apart, so they stay in the total.
+    #[must_use]
+    pub(crate) fn without_informational(&self) -> Self {
+        let (kept, dropped): (Vec<_>, Vec<_>) = self
+            .advisories
+            .items()
+            .iter()
+            .cloned()
+            .partition(|a| a.severity != VulnSeverity::Informational);
+        let mut advisories =
+            Capped::new(kept, self.advisories.total().saturating_sub(dropped.len()));
+        advisories.bound = self.advisories.bound;
+        Self {
+            advisories,
+            ..self.clone()
+        }
+    }
+
     /// Attaches the independent verification of the recommended fix target. See
     /// [`Self::fix_target_status`].
     #[must_use]
@@ -1516,7 +1663,11 @@ impl DependencyVulnerabilities {
                 .then_with(|| a.id.cmp(&b.id))
         });
         items.truncate(super::ADVISORY_DISPLAY_CAP);
-        Capped::new(items, self.advisories.total())
+        Capped {
+            items,
+            total: self.advisories.total(),
+            bound: self.advisories.bound,
+        }
     }
 }
 
@@ -2606,7 +2757,7 @@ pub fn vuln_key_for(
 pub fn vulnerability_keys<P, F>(
     parse_result: &P,
     resolved: &HashMap<crate::NormalizedName, crate::ConcreteVersion>,
-    resolved_candidates: Option<&HashMap<crate::NormalizedName, Vec<crate::ConcreteVersion>>>,
+    resolved_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
     formatter: &F,
     ecosystem: crate::EcosystemId,
 ) -> VulnKeys
@@ -2648,6 +2799,10 @@ where
                         for alternative in v.lock_alternatives() {
                             signature.push_str(" +");
                             signature.push_str(alternative.as_str());
+                        }
+                        match v.alternative_coverage() {
+                            AlternativeCoverage::Complete => {}
+                            AlternativeCoverage::Truncated => signature.push_str(" alt-truncated"),
                         }
                         // Only an incomplete list is marked, so ecosystems without tag indexes
                         // keep their keys.
@@ -4253,10 +4408,10 @@ mod vulnerability_keys_candidates_tests {
         let mut candidates = std::collections::HashMap::new();
         candidates.insert(
             NormalizedName::for_test("serde"),
-            vec![
+            crate::lsp_helpers::LockCandidates::from(vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
-            ],
+            ]),
         );
 
         let keys = vulnerability_keys(
@@ -4468,7 +4623,7 @@ mod vulnerability_keys_candidates_tests {
             std::collections::HashMap::from([(name.clone(), ConcreteVersion::new("1.2.8"))]);
         let candidates = std::collections::HashMap::from([(
             name,
-            vec![ConcreteVersion::new("1.2.5"), ConcreteVersion::new("1.2.8")],
+            vec![ConcreteVersion::new("1.2.5"), ConcreteVersion::new("1.2.8")].into(),
         )]);
 
         let keys = vulnerability_keys(
@@ -4579,12 +4734,13 @@ mod vulnerability_keys_candidates_tests {
     const MANY_ENTRIES: usize = 3000;
     const MANY_OCCURRENCES: u32 = 400;
 
-    fn many_candidates() -> std::collections::HashMap<NormalizedName, Vec<ConcreteVersion>> {
+    fn many_candidates() -> crate::lsp_helpers::ResolvedCandidatesMap {
         std::collections::HashMap::from([(
             NormalizedName::for_test("itoa"),
             (0..MANY_ENTRIES)
                 .map(|n| ConcreteVersion::new(format!("1.0.{n}")))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         )])
     }
 
@@ -4634,10 +4790,11 @@ mod vulnerability_keys_candidates_tests {
         assert_eq!(formatter.matched.load(Ordering::Relaxed), MANY_ENTRIES);
     }
 
-    /// The alternatives kept are the lowest `MAX_LOCK_ALTERNATIVES + 1` distinct versions, so
-    /// the signature and the scan stay bounded however many entries the lock file holds.
+    /// The alternatives kept are the `MAX_LOCK_ALTERNATIVES` distinct versions nearest the
+    /// primary, ascending, so the signature and the scan stay bounded however many entries the
+    /// lock file holds, and the truncation is part of the signature.
     #[test]
-    fn lock_alternatives_keep_only_the_lowest_cap_plus_one() {
+    fn lock_alternatives_keep_only_the_cap_nearest_the_primary() {
         let dep = MockDep {
             name: PackageName::new("itoa"),
             version_req: VersionReq::new("*"),
@@ -4655,9 +4812,14 @@ mod vulnerability_keys_candidates_tests {
         )
         .unwrap();
 
-        let expected: Vec<String> = (0..=crate::osv::MAX_LOCK_ALTERNATIVES)
+        let expected: Vec<String> = (MANY_ENTRIES - 1 - crate::osv::MAX_LOCK_ALTERNATIVES
+            ..MANY_ENTRIES - 1)
             .map(|n| format!("1.0.{n}"))
             .collect();
+        assert_eq!(
+            in_use.alternative_coverage(),
+            AlternativeCoverage::Truncated
+        );
         let kept: Vec<&str> = in_use
             .lock_alternatives()
             .iter()

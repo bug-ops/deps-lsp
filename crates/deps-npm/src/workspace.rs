@@ -21,7 +21,8 @@
 //! anchored *scalar* as an entry value is supported.
 
 use deps_core::lsp_helpers::{
-    LineOffsetTable, MarkedScalar, byte_span_to_range, is_plain_null, marker_byte_offset,
+    CoreSchemaType, LineOffsetTable, MarkedScalar, byte_span_to_range, is_core_schema_tag,
+    is_plain_null, marker_byte_offset,
 };
 use deps_core::position::Range;
 use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
@@ -510,11 +511,6 @@ enum Classified {
     },
 }
 
-fn is_str_tag(tag: &Tag) -> bool {
-    (tag.handle == "tag:yaml.org,2002:" && tag.suffix == "str")
-        || (tag.handle.is_empty() && tag.suffix == "tag:yaml.org,2002:str")
-}
-
 /// Classifies a scalar in value position the way the previous `YamlLoader`-based parser did:
 /// a plain scalar that resolves to a boolean is not a version string (issue #721 keeps
 /// numeric-looking ones), a quoted one always is. The raw event text is kept (not the
@@ -536,7 +532,7 @@ fn classify_text(
         };
     }
     let usable = match tag {
-        Some(tag) => is_str_tag(tag),
+        Some(tag) => is_core_schema_tag(tag, CoreSchemaType::Str),
         None if style == TScalarStyle::Plain => matches!(
             Yaml::from_str(&text),
             Yaml::String(_) | Yaml::Real(_) | Yaml::Integer(_)
