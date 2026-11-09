@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `ResolvedCandidatesMap` holds `LockCandidates`, `EntryPlacement` is no longer `Copy` and carries an `EntryOwner`, and `ImporterPath` is added (#2007)
 - **deps-core, deps-engine, deps-lsp**: `parse_known_lockfile` and `split_resolved_packages` take an importer scope (#2007)
 - **deps-core, deps-cli**: `Capped` gains a lower bound, and `InUseVersions` and `ScanTarget` gain `alternative_coverage`; lock alternatives are the nearest to the primary (#2007)
-- **deps-core**: `ParseInputKey` is owner-tagged, `ParsedManifest` gains `ecosystem_id` and `formatter`, and the matching parameters are dropped from `build_scan_targets`, `collect_in_use_versions`, `plan_updates` and related entry points (#2007)
+- **deps-core**: `ParseInputKey` is owner-tagged, `ParsedManifest` gains `ecosystem_id` and `formatter`, and the matching parameters are dropped from `build_scan_targets`, `collect_in_use_versions`, `plan_updates`, `ManifestAnalysis::has_unverified_latest_check` and related entry points; `LockSelectionMemo` is no longer `UnwindSafe` (#2007)
 - **deps-core, deps-lsp**: `ParsedManifest` and `FormattedDependency` are sealed and `impl_stub_typed_ecosystem!` replaces the deps-lsp stub macro (#2007)
 - **deps-core, deps-npm**: `parse_jsonc_typed` deserializes straight from the AST; `compile_node_semver_range` becomes `NodeSemverGrammar` and `SemverReqMatcher` is removed (#2007)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: `MutableRefPin` replaces the per-ecosystem pin diagnostics, and `GitlabInclude` marks the GitLab-only floating states (#2007)

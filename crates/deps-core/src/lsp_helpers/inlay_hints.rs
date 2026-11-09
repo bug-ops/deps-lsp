@@ -573,6 +573,7 @@ mod tests {
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
+    use std::assert_matches;
 
     /// #1161 M1 (critic follow-up): a dependency whose `version_range()` is `Some` but which
     /// has no `version_requirement()` — Maven's `<version></version>`, whose zero-width
@@ -1137,21 +1138,23 @@ mod tests {
             1,
         )));
         assert_eq!(primary.len(), 1);
-        assert!(
-            matches!(&primary[0].label, InlayHintLabel::String(t) if t.starts_with("⚠ ")),
+        assert_matches!(
+            &primary[0].label,
+            InlayHintLabel::String(t) if t.starts_with("⚠ "),
             "got: {:?}",
             primary[0].label
         );
-        assert!(matches!(
+        assert_matches!(
             &primary[0].tooltip,
             Some(InlayHintTooltip::String(t)) if t.contains("GHSA-aaaa-bbbb-cccc")
-        ));
+        );
 
         let lower_bound = hints_for(DependencyVulnerabilities::new(
             Capped::new(vec![advisory.clone()], 1).with_total_as_lower_bound(),
         ));
-        assert!(
-            matches!(&lower_bound[0].label, InlayHintLabel::String(t) if t.starts_with("⚠ ")),
+        assert_matches!(
+            &lower_bound[0].label,
+            InlayHintLabel::String(t) if t.starts_with("⚠ "),
             "an incomplete union must not keep the check mark: {:?}",
             lower_bound[0].label
         );
@@ -1163,7 +1166,7 @@ mod tests {
             &config,
             &formatter,
         );
-        assert!(matches!(&clean[0].label, InlayHintLabel::String(t) if t.starts_with('✅')));
+        assert_matches!(&clean[0].label, InlayHintLabel::String(t) if t.starts_with('✅'));
         assert!(clean[0].tooltip.is_none());
 
         let alternative_only = hints_for(
@@ -1177,8 +1180,9 @@ mod tests {
                 ),
         );
         assert_eq!(alternative_only.len(), 1);
-        assert!(
-            matches!(&alternative_only[0].label, InlayHintLabel::String(t) if t.starts_with("⚠ ")),
+        assert_matches!(
+            &alternative_only[0].label,
+            InlayHintLabel::String(t) if t.starts_with("⚠ "),
             "got: {:?}",
             alternative_only[0].label
         );
@@ -1401,7 +1405,7 @@ mod tests {
         );
 
         assert_eq!(hints.len(), 1);
-        std::assert_matches!(&hints[0].label, InlayHintLabel::String(text) if text.starts_with("✅"));
+        assert_matches!(&hints[0].label, InlayHintLabel::String(text) if text.starts_with("✅"));
     }
 
     #[test]

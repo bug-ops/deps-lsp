@@ -21,9 +21,9 @@ use deps_core::{
     EcosystemBase, HttpCache, ParsedView, Registry, Result, TypedEcosystem,
     diagnostic::{Diagnostic, DiagnosticKind, Severity},
     lsp_helpers::{
-        CommentCheck, CommitSha, FixAvailability, GitTagsPinning, GitlabInclude,
-        MAX_DIAGNOSTIC_VALUE_CHARS, MutableRefPin, PinSubject, ShaPinComment, UnknownRefTarget,
-        git_tags_diagnostics, sanitize_and_truncate_for_diagnostic,
+        CommentCheck, CommitSha, FixAvailability, GitTagsPinning, GitlabInclude, MutableRefPin,
+        PinSubject, ShaPinComment, UnknownRefTarget, git_tags_diagnostics,
+        sanitize_and_truncate_for_diagnostic,
     },
 };
 use std::sync::{Arc, RwLock};
@@ -853,6 +853,7 @@ mod tests {
     use crate::types::EndpointKind;
     use crate::{MUTABLE_REF_PIN_DIAGNOSTIC_CODE, UNRESOLVED_HOST_DIAGNOSTIC_CODE};
     use dashmap::DashMap;
+    use deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS;
 
     #[test]
     fn test_ecosystem_exposes_tag_index_refreshes() {
