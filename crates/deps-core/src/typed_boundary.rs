@@ -154,7 +154,7 @@ impl<P: TypedParseResult> ParseResult for ParsedView<'_, P> {
         self.erased.rejected_registries()
     }
 
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+    fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
         self.erased.dependency_truncation()
     }
 }

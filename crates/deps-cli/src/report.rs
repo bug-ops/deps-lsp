@@ -893,9 +893,9 @@ pub async fn check_manifest(
     let mut osv_coverage =
         OsvCoverage::from_vulnerabilities(analysis.vulnerabilities.as_ref(), lock, &unlocked);
     if analysis.vulnerabilities.is_some()
-        && let Some((kept, total)) = analysis.parse_result.dependency_truncation()
+        && let Some(truncation) = analysis.parse_result.dependency_truncation()
     {
-        osv_coverage.add_truncated(total.saturating_sub(kept));
+        osv_coverage.add_truncated(truncation.omitted());
     }
     let findings = diagnostics
         .into_iter()

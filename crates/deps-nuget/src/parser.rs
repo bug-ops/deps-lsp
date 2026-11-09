@@ -71,7 +71,7 @@ pub struct NuGetParseResult {
     pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 }
 
 deps_core::impl_parse_result!(

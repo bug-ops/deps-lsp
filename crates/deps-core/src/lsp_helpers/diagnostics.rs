@@ -1379,7 +1379,8 @@ struct YankedOnlyPrior {
 /// Reads: `parse_result.dependency_truncation()`.
 /// Emits: at most one [`Severity::Information`].
 fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
-    if let Some((kept, total)) = parse_result.dependency_truncation() {
+    if let Some(crate::DependencyTruncation { kept, total }) = parse_result.dependency_truncation()
+    {
         diagnostics.push(
             Diagnostic::new(
                 DiagnosticKind::Notice,

@@ -27,7 +27,7 @@ pub struct BundlerParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 }
 
 impl std::fmt::Debug for BundlerParseResult {
@@ -3637,10 +3637,10 @@ gem "x", source: "https://h/group: [:test]""#;
         assert!(!result.dependencies.iter().any(|d| d.name == "over"));
         assert_eq!(
             result.dependency_truncation,
-            Some((
-                deps_core::MAX_DEPENDENCIES_PER_DOCUMENT,
-                deps_core::MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(deps_core::DependencyTruncation {
+                kept: deps_core::MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: deps_core::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
     }
 

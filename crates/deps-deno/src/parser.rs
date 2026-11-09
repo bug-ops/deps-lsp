@@ -115,7 +115,7 @@ pub struct DenoParseResult {
     pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
     /// Every `.npmrc`-resolved alternate registry index an `npm:`-scheme import classified
     /// against (#1227) — the `deno.json` counterpart of
     /// `deps_npm::parser::NpmParseResult::resolved_registries`. Consumed by

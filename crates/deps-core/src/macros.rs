@@ -486,7 +486,7 @@ macro_rules! __impl_parse_result_workspace_root {
 macro_rules! __impl_parse_result_dependency_truncation {
     () => {};
     ($field:ident) => {
-        fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        fn dependency_truncation(&self) -> Option<$crate::DependencyTruncation> {
             self.$field
         }
     };
@@ -527,7 +527,7 @@ macro_rules! __impl_parse_result_rejected_registries {
 /// * `dependencies` - Field name for dependencies vec (`Vec<DepType>`)
 /// * `uri` - Field name for document URI (`Url`)
 /// * `workspace_root` - Optional: field name for workspace root (`Option<PathBuf>`)
-/// * `dependency_truncation` - Optional: field name for the `Option<(usize, usize)>`
+/// * `dependency_truncation` - Optional: field name for the `Option<DependencyTruncation>`
 ///   [`ecosystem::ParseResult::dependency_truncation`](crate::ecosystem::ParseResult::dependency_truncation)
 ///   override (#796) — omit when the parser has no [`crate::DependencyBudget`] wired in yet
 ///   (the trait default `None` applies).
@@ -553,7 +553,7 @@ macro_rules! __impl_parse_result_rejected_registries {
 /// pub struct MyParseResult {
 ///     pub dependencies: Vec<MyDependency>,
 ///     pub uri: Url,
-///     pub dependency_truncation: Option<(usize, usize)>,
+///     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 /// }
 ///
 /// impl_parse_result!(MyParseResult, MyDependency {
@@ -874,7 +874,7 @@ mod tests {
         dependencies: Vec<TestDependency>,
         uri: url::Url,
         workspace_root: Option<std::path::PathBuf>,
-        dependency_truncation: Option<(usize, usize)>,
+        dependency_truncation: Option<crate::DependencyTruncation>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
         rejected_registries: Vec<crate::ecosystem::RejectedRegistryOccurrence>,
     }
@@ -883,7 +883,7 @@ mod tests {
     struct TestParseResultTruncationAndBlockedRegistries {
         dependencies: Vec<TestDependency>,
         uri: url::Url,
-        dependency_truncation: Option<(usize, usize)>,
+        dependency_truncation: Option<crate::DependencyTruncation>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
     }
 
@@ -1210,7 +1210,7 @@ mod tests {
             }],
             uri: crate::test_util::test_uri("/test"),
             workspace_root: Some(std::path::PathBuf::from("/workspace")),
-            dependency_truncation: Some((5, 10)),
+            dependency_truncation: Some(crate::DependencyTruncation { kept: 5, total: 10 }),
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
                 block: crate::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
@@ -1231,7 +1231,10 @@ mod tests {
             result.workspace_root(),
             Some(std::path::Path::new("/workspace"))
         );
-        assert_eq!(result.dependency_truncation(), Some((5, 10)));
+        assert_eq!(
+            result.dependency_truncation(),
+            Some(crate::DependencyTruncation { kept: 5, total: 10 })
+        );
         assert_eq!(result.blocked_registries().len(), 1);
         assert_eq!(result.own_dependencies().len(), 1);
     }
@@ -1245,7 +1248,7 @@ mod tests {
         let result = TestParseResultTruncationAndBlockedRegistries {
             dependencies: vec![],
             uri: crate::test_util::test_uri("/test"),
-            dependency_truncation: Some((3, 7)),
+            dependency_truncation: Some(crate::DependencyTruncation { kept: 3, total: 7 }),
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
                 block: crate::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
@@ -1255,7 +1258,10 @@ mod tests {
         };
 
         assert!(result.workspace_root().is_none());
-        assert_eq!(result.dependency_truncation(), Some((3, 7)));
+        assert_eq!(
+            result.dependency_truncation(),
+            Some(crate::DependencyTruncation { kept: 3, total: 7 })
+        );
         assert_eq!(result.blocked_registries().len(), 1);
         assert!(result.own_dependencies().is_empty());
     }

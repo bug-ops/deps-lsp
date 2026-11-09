@@ -436,7 +436,7 @@ pub struct ParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
 }
 
 deps_core::impl_parse_result!(

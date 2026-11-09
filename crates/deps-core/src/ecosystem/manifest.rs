@@ -219,9 +219,12 @@ impl<E: TypedEcosystem> ParseResult for EcosystemManifest<E> {
         self.parsed.rejected_registries()
     }
 
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+    fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
         if self.total > MAX_DEPENDENCIES_PER_DOCUMENT {
-            Some((MAX_DEPENDENCIES_PER_DOCUMENT, self.total))
+            Some(crate::DependencyTruncation {
+                kept: MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: self.total,
+            })
         } else {
             self.parsed.dependency_truncation()
         }
@@ -456,8 +459,8 @@ mod tests {
             }]
         }
 
-        fn dependency_truncation(&self) -> Option<(usize, usize)> {
-            Some((7, 9))
+        fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
+            Some(crate::DependencyTruncation { kept: 7, total: 9 })
         }
     }
 
@@ -500,10 +503,13 @@ mod tests {
         assert_eq!(manifest.dependencies().len(), 3);
         assert_eq!(
             manifest.dependency_truncation(),
-            Some((7, 9)),
+            Some(crate::DependencyTruncation { kept: 7, total: 9 }),
             "an uncapped document reports the parser's own truncation"
         );
-        assert_eq!(manifest.view().dependency_truncation(), Some((7, 9)));
+        assert_eq!(
+            manifest.view().dependency_truncation(),
+            Some(crate::DependencyTruncation { kept: 7, total: 9 })
+        );
     }
 
     #[test]
@@ -517,10 +523,10 @@ mod tests {
         );
         assert_eq!(
             manifest.dependency_truncation(),
-            Some((
-                MAX_DEPENDENCIES_PER_DOCUMENT,
-                MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(crate::DependencyTruncation {
+                kept: MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
         assert_forwards_inner(&manifest, &manifest.parsed);
     }
@@ -549,7 +555,7 @@ mod tests {
         assert_eq!(manifest.dependencies().len(), MAX_DEPENDENCIES_PER_DOCUMENT);
         assert_eq!(
             manifest.dependency_truncation(),
-            Some((7, 9)),
+            Some(crate::DependencyTruncation { kept: 7, total: 9 }),
             "at the ceiling the parser's own truncation is reported, not a cap"
         );
 

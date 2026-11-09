@@ -31,7 +31,7 @@ pub struct SwiftParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
     /// SE-0292 registries the manifest's `id:` dependencies resolved to (deduplicated), for
     /// [`crate::SwiftRegistry::register_alternate`].
     pub resolved_registries: Vec<ResolvedSwiftRegistry>,

@@ -49,7 +49,7 @@ pub struct NpmParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
     /// `Some(range of the `catalogs.default` key)` when a parsed `pnpm-workspace.yaml` defines
     /// the default catalog twice (a top-level `catalog:` and `catalogs.default:`), which pnpm
     /// rejects for the whole workspace (spec 078 FR-030). Always `None` for a `package.json`.

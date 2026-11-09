@@ -1320,10 +1320,10 @@ mod tests {
         );
         assert_eq!(
             result.dependency_truncation,
-            Some((
-                deps_core::MAX_DEPENDENCIES_PER_DOCUMENT,
-                deps_core::MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(deps_core::DependencyTruncation {
+                kept: deps_core::MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: deps_core::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
     }
 

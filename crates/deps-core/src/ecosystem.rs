@@ -627,7 +627,7 @@ pub trait ParseResult: Send + Sync {
         Vec::new()
     }
 
-    /// Dependency-count ceiling info (#796): `Some((kept, total))` once this document's
+    /// Dependency-count ceiling info (#796): a [`crate::DependencyTruncation`] once this document's
     /// dependency count was truncated to [`crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT`]
     /// by [`parse_manifest_blocking`], `None` otherwise.
     ///
@@ -635,7 +635,7 @@ pub trait ParseResult: Send + Sync {
     /// [`ParsedManifest`] [`parse_manifest_blocking`] returns reports a truncation, so this
     /// needs no per-ecosystem implementation. Read by
     /// `deps_core::lsp_helpers::diagnostics`' truncation notice.
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+    fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
         None
     }
 }
@@ -2199,10 +2199,10 @@ mod tests {
         );
         assert_eq!(
             parsed.dependency_truncation(),
-            Some((
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(crate::DependencyTruncation {
+                kept: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
     }
 
@@ -2267,10 +2267,10 @@ mod tests {
         );
         assert_eq!(
             parsed.dependency_truncation(),
-            Some((
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
-                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1
-            ))
+            Some(crate::DependencyTruncation {
+                kept: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+                total: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+            })
         );
     }
 

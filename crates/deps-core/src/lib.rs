@@ -250,7 +250,7 @@ pub use cache::{
     BodyLimit, CacheMode, CachedResponse, CredentialHeader, HttpCache, NetworkMode, RequestAuth,
     RequestHeader, RevalidationFailure,
 };
-pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
+pub use dependency_cap::{DependencyBudget, DependencyTruncation, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{
     DepsDevClient, FetchCompleteness, GossipCooldown, GossipFindings, GossipLowUsage,
     GossipRiskLevel, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal, TyposquatSignal,

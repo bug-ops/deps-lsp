@@ -409,7 +409,7 @@ pub struct GitlabCiParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
-    pub dependency_truncation: Option<(usize, usize)>,
+    pub dependency_truncation: Option<deps_core::DependencyTruncation>,
     /// Dependencies whose host resolved to [`HostRef::PolicyBlocked`] (issue #967), one entry
     /// per affected dependency. Surfaced by
     /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
