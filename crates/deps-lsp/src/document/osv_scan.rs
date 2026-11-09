@@ -240,6 +240,18 @@ pub(crate) async fn rescan_after_resolved_version_change(
     .await;
 }
 
+/// Whether the [`OsvScanPlan`] rebuilt from `doc`'s current state differs from the one its last
+/// committed scan ran with — also true when no scan ever committed, which is how a change task
+/// notices an OSV outcome lost to an aborted predecessor (issue #1987).
+pub(crate) fn osv_scan_plan_is_stale(
+    doc: &super::state::DocumentState,
+    ecosystem: &dyn Ecosystem,
+) -> bool {
+    scan_inputs(doc, ecosystem).is_some_and(|(targets, skipped)| {
+        OsvScanPlan::new(&targets, &skipped) != doc.signals.osv_scan_plan
+    })
+}
+
 /// Whether [`rescan_osv_if_tag_index_now_warm`] ran the OSV pipeline and committed a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RescanOutcome {
@@ -292,11 +304,9 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         return RescanOutcome::Unchanged;
     }
 
-    let plan_changed = state.get_document(uri).is_some_and(|doc| {
-        scan_inputs(&doc, ecosystem.as_ref()).is_some_and(|(targets, skipped)| {
-            OsvScanPlan::new(&targets, &skipped) != doc.signals.osv_scan_plan
-        })
-    });
+    let plan_changed = state
+        .get_document(uri)
+        .is_some_and(|doc| osv_scan_plan_is_stale(&doc, ecosystem.as_ref()));
     if !plan_changed {
         return RescanOutcome::Unchanged;
     }
@@ -1246,6 +1256,7 @@ mod tests {
             version_req: VersionReq,
         }
 
+        deps_core::impl_unprobed_dependency!(FakeTier3Dep);
         impl Dependency for FakeTier3Dep {
             fn name(&self) -> &PackageName {
                 &self.name

@@ -3652,6 +3652,7 @@ mod tests {
             version_range: Option<Range>,
         }
 
+        crate::impl_unprobed_dependency!(CaDep);
         impl Dependency for CaDep {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -3706,6 +3707,7 @@ mod tests {
             version_literal: Option<String>,
         }
 
+        crate::impl_unprobed_dependency!(CaLiteralDep);
         impl Dependency for CaLiteralDep {
             fn name(&self) -> &PackageName {
                 &self.name

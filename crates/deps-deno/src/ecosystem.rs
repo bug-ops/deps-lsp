@@ -540,15 +540,15 @@ mod tests {
         );
         let resolved_versions = HashMap::new();
 
-        let diagnostics = ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(&cached_versions, &resolved_versions),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await;
 
         let npm_message = diagnostics
             .iter()

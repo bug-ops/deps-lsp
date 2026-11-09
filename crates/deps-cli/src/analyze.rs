@@ -753,6 +753,7 @@ mod has_unverified_latest_check_tests {
         version_req: VersionReq,
         version_range: Range,
     }
+    deps_core::impl_unprobed_dependency!(MockDep);
     impl Dependency for MockDep {
         fn name(&self) -> &PackageName {
             &self.name

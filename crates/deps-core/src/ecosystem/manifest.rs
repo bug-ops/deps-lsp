@@ -73,7 +73,7 @@ pub trait ParsedManifest: ParseResult {
         config: &'a EcosystemConfig,
     ) -> BoxFuture<'a, Vec<InlayHint>>;
 
-    /// Hover for a position, see [`TypedEcosystem::hover`].
+    /// Hover for a position, see [`super::hover`].
     #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
@@ -82,7 +82,7 @@ pub trait ParsedManifest: ParseResult {
         freshness: crate::freshness::FreshnessSettings,
     ) -> BoxFuture<'a, Option<Hover>>;
 
-    /// Code actions for a position, see [`TypedEcosystem::code_actions`].
+    /// Code actions for a position, see [`super::code_actions`].
     #[cfg(feature = "lsp-responses")]
     fn generate_code_actions<'a>(
         &'a self,
@@ -92,7 +92,7 @@ pub trait ParsedManifest: ParseResult {
         content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>>;
 
-    /// Diagnostics for the document, see [`TypedEcosystem::diagnostics`].
+    /// Diagnostics for the document, see [`super::diagnostics`].
     fn generate_diagnostics<'a>(
         &'a self,
         versions: VersionData<'a>,
@@ -258,8 +258,13 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
         versions: VersionData<'a>,
         freshness: crate::freshness::FreshnessSettings,
     ) -> BoxFuture<'a, Option<Hover>> {
-        self.ecosystem
-            .hover(self.view(), position, versions, freshness)
+        Box::pin(super::hover(
+            &*self.ecosystem,
+            self.view(),
+            position,
+            versions,
+            freshness,
+        ))
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -270,8 +275,14 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
         versions: VersionData<'a>,
         content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
-        self.ecosystem
-            .code_actions(self.view(), position, uri, versions, content)
+        Box::pin(super::code_actions(
+            &*self.ecosystem,
+            self.view(),
+            position,
+            uri,
+            versions,
+            content,
+        ))
     }
 
     fn generate_diagnostics<'a>(
@@ -281,8 +292,14 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
         freshness: crate::freshness::FreshnessSettings,
         severities: crate::lsp_helpers::DiagnosticSeverities,
     ) -> BoxFuture<'a, Vec<Diagnostic>> {
-        self.ecosystem
-            .diagnostics(self.view(), versions, uri, freshness, severities)
+        Box::pin(super::diagnostics(
+            &*self.ecosystem,
+            self.view(),
+            versions,
+            uri,
+            freshness,
+            severities,
+        ))
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -658,16 +675,14 @@ mod tests {
             ))
         }
 
-        fn diagnostics<'a>(
+        fn decorate_diagnostics<'a>(
             &'a self,
             parsed: ParsedView<'a, Self::Parsed>,
-            _versions: VersionData<'a>,
-            _uri: &'a url::Url,
-            _freshness: crate::freshness::FreshnessSettings,
             _severities: crate::lsp_helpers::DiagnosticSeverities,
-        ) -> BoxFuture<'a, Vec<Diagnostic>> {
+            _out: &'a mut Vec<Diagnostic>,
+        ) -> BoxFuture<'a, ()> {
             self.record("diagnostics", parsed);
-            Box::pin(std::future::ready(Vec::new()))
+            Box::pin(std::future::ready(()))
         }
 
         #[cfg(feature = "lsp-responses")]
@@ -683,28 +698,29 @@ mod tests {
         }
 
         #[cfg(feature = "lsp-responses")]
-        fn hover<'a>(
+        fn decorate_hover<'a>(
             &'a self,
             parsed: ParsedView<'a, Self::Parsed>,
-            _position: Position,
+            _hovered: &'a crate::test_util::StubDependency,
             _versions: VersionData<'a>,
-            _freshness: crate::freshness::FreshnessSettings,
-        ) -> BoxFuture<'a, Option<Hover>> {
+        ) -> BoxFuture<'a, crate::ecosystem::HoverDecorator<'a>> {
             self.record("hover", parsed);
-            Box::pin(std::future::ready(None))
+            Box::pin(std::future::ready(
+                Box::new(|_: &mut Hover| {}) as crate::ecosystem::HoverDecorator<'a>
+            ))
         }
 
         #[cfg(feature = "lsp-responses")]
-        fn code_actions<'a>(
+        fn decorate_code_actions<'a>(
             &'a self,
             parsed: ParsedView<'a, Self::Parsed>,
             _position: Position,
             _uri: &'a url::Url,
             _versions: VersionData<'a>,
-            _content: &'a str,
-        ) -> BoxFuture<'a, Vec<CodeAction>> {
+            _out: &'a mut Vec<CodeAction>,
+        ) -> BoxFuture<'a, ()> {
             self.record("code_actions", parsed);
-            Box::pin(std::future::ready(Vec::new()))
+            Box::pin(std::future::ready(()))
         }
 
         #[cfg(feature = "lsp-responses")]

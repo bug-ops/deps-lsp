@@ -377,10 +377,12 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// version requirement (FR-001/FR-002), among a name's multiple retained lock-file entries.
 ///
 /// Filters `candidates` down to those [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]
-/// accepts, then returns the highest-semver entry among that satisfying subset — falling back
+/// accepts, then returns the **lowest**-semver entry among that satisfying subset — falling back
 /// to [`crate::lockfile`]'s lexicographic tiebreak for non-parseable versions
 /// ([`crate::lockfile::compare_lockfile_versions`]), the same ordering a single-candidate
-/// collapse already uses, so this never diverges from it. Returns `None` when nothing
+/// collapse already uses, so this never diverges from it. Lowest, not highest (#1981): the
+/// candidates map cannot say which entry the package manager installed for this dependency,
+/// so the choice fails toward reporting an advisory instead of hiding one. Returns `None` when nothing
 /// satisfies the requirement (FR-003) — the caller must not then substitute an arbitrary
 /// non-matching entry.
 /// Prefers [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s precise, ecosystem-native
@@ -414,7 +416,7 @@ fn best_candidate_for_requirement<'a>(
     candidates
         .iter()
         .filter(|v| version_matches_requirement(formatter, v, requirement))
-        .max_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()))
+        .min_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()))
 }
 
 /// Resolves one dependency occurrence's lock-file version, disambiguating by its own
@@ -493,6 +495,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     version_req: Option<VersionReq>,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -690,6 +693,7 @@ impl InUseVersions {
 ///     version_req: Option<VersionReq>,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -1841,7 +1845,7 @@ mod tests {
     #[test]
     fn best_candidate_for_requirement_non_semver_uses_lexicographic_tiebreak() {
         // Testing gap 2 fix: both candidates must satisfy the requirement and both must fail
-        // semver parsing, so `max_by` falls all the way to `compare_lockfile_versions`'s
+        // semver parsing, so `min_by` falls all the way to `compare_lockfile_versions`'s
         // `(Err, Err) => a.cmp(b)` branch — a single-match case never calls the comparator.
         // Requirement `"1"` is a partial-version bare requirement; both `"1-rc1"`/`"1-rc2"`
         // satisfy it via the `starts_with` fallback branch.
@@ -1856,7 +1860,7 @@ mod tests {
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
         );
 
-        assert_eq!(result, Some(&ConcreteVersion::from("1-rc2")));
+        assert_eq!(result, Some(&ConcreteVersion::from("1-rc1")));
     }
 
     /// C1 fix regression guard: `best_candidate_for_requirement` must prefer
@@ -1884,12 +1888,12 @@ mod tests {
         assert_eq!(result, Some(&ConcreteVersion::from("2.9.4")));
     }
 
-    /// FR-002: when more than one lock-file entry satisfies an occurrence's requirement,
-    /// the tiebreak must pick the highest-semver *among the satisfying subset*, not the
-    /// highest overall — `2.0.0` here is the highest candidate but does not satisfy `^1.0`,
-    /// so it must never be picked.
+    /// FR-002 / #1981: when more than one lock-file entry satisfies an occurrence's
+    /// requirement, the tiebreak picks the lowest-semver *among the satisfying subset* —
+    /// `2.0.0` does not satisfy `^1.0` and must never be picked, and `1.0.5` must lose to
+    /// `1.0.1` so the fallback fails toward reporting an advisory.
     #[test]
-    fn best_candidate_for_requirement_picks_highest_of_satisfying_subset() {
+    fn best_candidate_for_requirement_picks_lowest_of_satisfying_subset() {
         use crate::VersionReq;
 
         let candidates = vec![
@@ -1901,7 +1905,7 @@ mod tests {
         let result =
             best_candidate_for_requirement(&candidates, &VersionReq::new("^1.0"), &CaretFormatter);
 
-        assert_eq!(result, Some(&ConcreteVersion::from("1.0.5")));
+        assert_eq!(result, Some(&ConcreteVersion::from("1.0.1")));
     }
 
     /// #1472 defense-in-depth: an oversized requirement must short-circuit to `None` before
@@ -1958,7 +1962,7 @@ mod tests {
             EcosystemId::Cargo,
         );
 
-        assert_eq!(result, Some(ConcreteVersion::from("1.0.5")));
+        assert_eq!(result, Some(ConcreteVersion::from("1.0.1")));
     }
 
     // --- in_use_version end-to-end: #664's exact repro (no lock file, bare full version) ---

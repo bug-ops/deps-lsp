@@ -31,6 +31,7 @@ mod git_probe;
 #[cfg(test)]
 mod git_probe_lineage_tests;
 mod git_ref;
+mod git_tags;
 #[cfg(feature = "lsp-responses")]
 mod hover;
 #[cfg(feature = "lsp-responses")]
@@ -94,11 +95,11 @@ pub use formatted_dependency::{BoundDependency, FormattedDependency};
 pub use formatter::{
     BareMeaning, BuildMetadataPolicy, DependencyFormatter, DependencyGate, DiagnosticMessages,
     DiagnosticPolicy, EcosystemFormatter, LowercaseNaming, NormalizeName, OperatorGrammar,
-    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, PublicContent,
-    RequirementGate, RequirementResolution, RequirementRewriteShape, RewriteTarget, SourcePolicy,
-    bare_meaning, classify_requirement_rewrite_shape, format_version_replacing_by_shape,
-    requirement_is_compound, up_to_date_for_comparators_via_compiled_matcher,
-    up_to_date_via_compiled_matcher,
+    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, ProbeDependency,
+    PublicContent, RequirementGate, RequirementResolution, RequirementRewriteShape, RewriteTarget,
+    SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
+    format_version_replacing_by_shape, requirement_is_compound,
+    up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_pin::{
     GitPinView, git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, resolve_git_pin,
@@ -121,6 +122,11 @@ pub use git_ref::{
     ResolvedShaPin, ShaPinning, build_sha_pin_action, sha_pin_text_edit, splice_hover_line,
     splice_resolved_line,
 };
+pub use git_tags::{GitTagsPinning, git_tags_diagnostics, sha_comment_mismatch_diagnostics};
+#[cfg(feature = "lsp-responses")]
+pub use git_tags::{git_tags_sha_comment_fix_action, git_tags_unknown_ref_fix_action};
+#[cfg(feature = "lsp-responses")]
+pub(crate) use hover::find_hovered_dependency;
 #[cfg(feature = "lsp-responses")]
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
 #[cfg(feature = "lsp-responses")]
@@ -1811,6 +1817,7 @@ pub enum LatestVerdict {
 ///     name_range: Range,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -2041,6 +2048,7 @@ pub fn resolve_candidate_status<'a>(
 ///     name_range: Range,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -5744,6 +5752,7 @@ mod tests {
         source: DependencySource,
     }
 
+    crate::impl_unprobed_dependency!(DepWithSource);
     impl Dependency for DepWithSource {
         fn name(&self) -> &PackageName {
             &self.name

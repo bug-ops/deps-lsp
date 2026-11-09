@@ -8,7 +8,9 @@ pub mod typed;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use manifest::EcosystemManifest;
 pub use manifest::ParsedManifest;
-pub use typed::TypedEcosystem;
+#[cfg(feature = "lsp-responses")]
+pub use typed::{HoverDecoration, HoverDecorator, code_actions, hover};
+pub use typed::{TypedEcosystem, diagnostics};
 
 use crate::{
     Registry,
@@ -1706,6 +1708,25 @@ pub trait Ecosystem: EcosystemBase + typed::BlanketOnly {
         content: &str,
         uri: &url::Url,
     ) -> Option<Box<dyn ParsedManifest>>;
+
+    /// How this ecosystem's own formatter routes a dependency named `name` that resolves from
+    /// `source` (see [`DependencyFormatter::non_public_route`]).
+    ///
+    /// The conformance probe behind `deps-engine/tests/osv_non_public_routes.rs` (#1977): it
+    /// builds a real dependency of this ecosystem through [`ProbeDependency`], so a
+    /// cross-ecosystem test can iterate every registered ecosystem without a synthetic
+    /// dependency. Only available with the `test-util` feature, never reachable from a
+    /// production build.
+    ///
+    /// [`DependencyFormatter::non_public_route`]: crate::lsp_helpers::DependencyFormatter::non_public_route
+    /// [`ProbeDependency`]: crate::lsp_helpers::ProbeDependency
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    fn probe_non_public_route(
+        &self,
+        name: crate::PackageName,
+        source: crate::parser::DependencySource,
+    ) -> crate::osv::NonPublicRoute;
 }
 
 #[cfg(test)]
@@ -1976,6 +1997,7 @@ mod tests {
             version: Range,
             features: Range,
         }
+        crate::impl_unprobed_dependency!(OriginMockDep);
         impl Dependency for OriginMockDep {
             fn name(&self) -> &crate::PackageName {
                 static NAME: std::sync::LazyLock<crate::PackageName> =

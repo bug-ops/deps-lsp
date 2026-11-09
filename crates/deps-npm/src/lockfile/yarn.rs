@@ -4,15 +4,14 @@
 //! classification, and dependency graphs are out of scope. The input is untrusted repository
 //! content, so both parsers are single-pass and linear in the input size.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 
-use deps_core::error::{DepsError, Result};
+use deps_core::error::Result;
 use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
 use deps_core::yaml_scalar_string;
 use yaml_rust2::{Yaml, YamlLoader};
 
-use super::split_specifier;
+use super::{lockfile_parse_error, split_specifier};
 
 const FILE_TYPE: &str = "yarn.lock";
 
@@ -48,7 +47,7 @@ impl YarnFormat {
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::ParseError`] for malformed Berry YAML, an unsupported Berry
+/// Returns [`deps_core::error::DepsError::ParseError`] for malformed Berry YAML, an unsupported Berry
 /// `__metadata.version`, an unsupported v1 header version, or content exceeding the shared
 /// YAML bounds.
 pub(super) fn parse_yarn_lock(content: &str) -> Result<ResolvedPackages> {
@@ -57,10 +56,6 @@ pub(super) fn parse_yarn_lock(content: &str) -> Result<ResolvedPackages> {
         YarnFormat::V1 => parse_v1(content),
         YarnFormat::Berry => parse_berry(content),
     }
-}
-
-fn parse_error(message: &str) -> DepsError {
-    DepsError::parse_error(FILE_TYPE, &message)
 }
 
 fn skip_non_semver(name: &str, version: &str) -> bool {
@@ -163,10 +158,13 @@ fn check_v1_header_version(comment: &str) -> Result<()> {
     if version == "1" {
         return Ok(());
     }
-    Err(parse_error(&format!(
-        "unsupported yarn lockfile version '{}'",
-        deps_core::redact::redact_declaration_key(version)
-    )))
+    Err(lockfile_parse_error(
+        FILE_TYPE,
+        &format!(
+            "unsupported yarn lockfile version '{}'",
+            deps_core::redact::redact_declaration_key(version)
+        ),
+    ))
 }
 
 fn finish_v1_entry(entry: &V1Entry<'_>, packages: &mut ResolvedPackages) {
@@ -255,34 +253,6 @@ impl<'a> BerryRef<'a> {
     }
 }
 
-fn percent_decode(input: &str) -> Cow<'_, str> {
-    if !input.contains('%') {
-        return Cow::Borrowed(input);
-    }
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        let decoded = (b == b'%')
-            .then(|| bytes.get(i + 1..i + 3))
-            .flatten()
-            .and_then(|hex| {
-                let &[hi, lo] = hex else { return None };
-                let hi = char::from(hi).to_digit(16)?;
-                let lo = char::from(lo).to_digit(16)?;
-                u8::try_from(hi * 16 + lo).ok()
-            });
-        if let Some(byte) = decoded {
-            out.push(byte);
-            i += 3;
-        } else {
-            out.push(b);
-            i += 1;
-        }
-    }
-    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
-}
-
 /// Name and reference of the package a Berry `resolution` ultimately points at, unwrapping a
 /// single `patch:` layer (FR-008). A nested patch is not unwrapped further, which bounds the
 /// work to one extra pass regardless of input shape.
@@ -292,28 +262,38 @@ fn resolve_berry_reference(resolution: &str) -> Option<(String, String)> {
         return Some((name.to_string(), reference.to_string()));
     };
     let inner = inner.split_once('#').map_or(inner, |(head, _)| head);
-    let decoded = percent_decode(inner);
+    let decoded =
+        String::from_utf8_lossy(&urlencoding::decode_binary(inner.as_bytes())).into_owned();
     let (inner_name, inner_reference) = split_specifier(&decoded)?;
     Some((inner_name.to_string(), inner_reference.to_string()))
 }
 
 fn check_berry_metadata(doc: &Yaml) -> Result<()> {
     let Some(raw) = yaml_scalar_string(&doc["__metadata"]["version"]) else {
-        return Err(parse_error("missing or non-scalar __metadata.version"));
+        return Err(lockfile_parse_error(
+            FILE_TYPE,
+            "missing or non-scalar __metadata.version",
+        ));
     };
     let version: u32 = raw.parse().map_err(|_| {
-        parse_error(&format!(
-            "unparseable __metadata.version '{}'",
-            deps_core::redact::redact_declaration_key(&raw)
-        ))
+        lockfile_parse_error(
+            FILE_TYPE,
+            &format!(
+                "unparseable __metadata.version '{}'",
+                deps_core::redact::redact_declaration_key(&raw)
+            ),
+        )
     })?;
     if (MIN_BERRY_METADATA_VERSION..=MAX_BERRY_METADATA_VERSION).contains(&version) {
         Ok(())
     } else {
-        Err(parse_error(&format!(
-            "unsupported __metadata.version '{version}' (supported \
+        Err(lockfile_parse_error(
+            FILE_TYPE,
+            &format!(
+                "unsupported __metadata.version '{version}' (supported \
              {MIN_BERRY_METADATA_VERSION}..={MAX_BERRY_METADATA_VERSION})"
-        )))
+            ),
+        ))
     }
 }
 
@@ -321,10 +301,13 @@ fn parse_berry(content: &str) -> Result<ResolvedPackages> {
     deps_core::check_yaml_bounds(content, FILE_TYPE)?;
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| {
-        parse_error(&format!(
-            "invalid YAML: {}",
-            deps_core::net_policy::redact_parse_error_for_log(&e.to_string())
-        ))
+        lockfile_parse_error(
+            FILE_TYPE,
+            &format!(
+                "invalid YAML: {}",
+                deps_core::net_policy::redact_parse_error_for_log(&e.to_string())
+            ),
+        )
     })?;
     let Some(doc) = docs.first() else {
         return Ok(ResolvedPackages::new());
@@ -404,6 +387,7 @@ fn berry_package(key: &str, entry: &Yaml) -> Option<ResolvedPackage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::error::DepsError;
     use std::assert_matches;
 
     fn parse(content: &str) -> ResolvedPackages {
@@ -671,9 +655,12 @@ __metadata:
     }
 
     #[test]
-    fn percent_decode_handles_invalid_sequences() {
-        assert_eq!(percent_decode("a%3Ab"), "a:b");
-        assert_eq!(percent_decode("a%zzb%"), "a%zzb%");
+    fn percent_decoding_handles_invalid_sequences() {
+        let decode = |input: &str| {
+            String::from_utf8_lossy(&urlencoding::decode_binary(input.as_bytes())).into_owned()
+        };
+        assert_eq!(decode("a%3Ab"), "a:b");
+        assert_eq!(decode("a%zzb%"), "a%zzb%");
     }
 
     #[test]

@@ -429,6 +429,29 @@ deps_core::impl_parse_result!(
     }
 );
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for GitlabCiDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        let project_path = name.as_str().to_owned();
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            source,
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Project,
+            host: HostRef::Unresolved(String::new()),
+            pin: None,
+            comment_slot: CommentSlot::Unavailable,
+            project_path,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

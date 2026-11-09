@@ -668,6 +668,7 @@ fn resolve_cooldown_fallback_view(
 /// use std::collections::{HashMap, HashSet};
 ///
 /// struct MockDep { name: PackageName, version_req: VersionReq, version_range: Range }
+/// # deps_core::impl_unprobed_dependency!(MockDep);
 /// impl Dependency for MockDep {
 ///     fn name(&self) -> &PackageName { &self.name }
 ///     fn name_range(&self) -> Range { Range::default() }
@@ -1743,6 +1744,7 @@ mod tests {
         version_req: deps_core::VersionReq,
         version_range: Range,
     }
+    deps_core::impl_unprobed_dependency!(TestDep);
     impl Dependency for TestDep {
         fn name(&self) -> &PackageName {
             &self.name

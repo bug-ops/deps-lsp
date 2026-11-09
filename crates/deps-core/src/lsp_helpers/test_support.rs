@@ -159,6 +159,8 @@ impl ParseResult for MockMixedParseResult {
     }
 }
 
+crate::impl_unprobed_dependency!(Box<dyn Dependency>);
+
 impl TypedParseResult for MockMixedParseResult {
     type Dep = Box<dyn Dependency>;
     fn own_dependencies(&self) -> &[Box<dyn Dependency>] {
@@ -211,6 +213,7 @@ pub(crate) struct MockDep {
     pub(crate) name_range: crate::position::Range,
 }
 
+crate::impl_unprobed_dependency!(MockDep);
 impl Dependency for MockDep {
     fn name(&self) -> &PackageName {
         &self.name
@@ -322,6 +325,7 @@ pub(crate) struct MockMarkedDep {
     pub(crate) markers: Option<String>,
 }
 
+crate::impl_unprobed_dependency!(MockMarkedDep);
 impl Dependency for MockMarkedDep {
     fn name(&self) -> &PackageName {
         &self.name
@@ -392,6 +396,7 @@ pub(crate) struct NonRegistryDep(
     pub(crate) crate::parser::DependencySource,
 );
 
+crate::impl_unprobed_dependency!(NonRegistryDep);
 impl Dependency for NonRegistryDep {
     fn name(&self) -> &PackageName {
         self.0.name()
@@ -429,7 +434,9 @@ impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
     }
 }
 
-impl<D: Dependency + 'static> TypedParseResult for SingleDepParseResult<D> {
+impl<D: crate::lsp_helpers::ProbeDependency + 'static> TypedParseResult
+    for SingleDepParseResult<D>
+{
     type Dep = D;
     fn own_dependencies(&self) -> &[D] {
         std::slice::from_ref(&self.dep)

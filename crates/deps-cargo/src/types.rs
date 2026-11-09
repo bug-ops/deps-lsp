@@ -363,6 +363,25 @@ impl deps_core::Metadata for CrateInfo {
     }
 }
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for CargoDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            features: Vec::new(),
+            features_range: None,
+            source,
+            section: CargoDependencySection::Dependencies,
+            package: None,
+            custom_registry_origin: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

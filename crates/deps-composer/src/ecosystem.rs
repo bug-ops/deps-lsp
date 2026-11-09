@@ -852,15 +852,15 @@ mod tests {
                 let dep = &parse_result.dependencies[0];
                 let position = dep.version_range.unwrap().start.into();
 
-                let hover = ecosystem
-                    .hover(
-                        ParsedView::new(&parse_result),
-                        position,
-                        VersionData::new(&HashMap::new(), &HashMap::new()),
-                        deps_core::FreshnessSettings::default(),
-                    )
-                    .await
-                    .expect("hover must fire on the version token");
+                let hover = deps_core::ecosystem::hover(
+                    &ecosystem,
+                    ParsedView::new(&parse_result),
+                    position,
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover must fire on the version token");
 
                 assert!(
                     hover.markdown().contains("4.0.0-alpha1"),
@@ -925,15 +925,15 @@ mod tests {
                 let dep = &parse_result.dependencies[0];
                 let position = dep.version_range.unwrap().start.into();
 
-                let actions = ecosystem
-                    .code_actions(
-                        ParsedView::new(&parse_result),
-                        position,
-                        &uri,
-                        VersionData::new(&HashMap::new(), &HashMap::new()),
-                        MANIFEST,
-                    )
-                    .await;
+                let actions = deps_core::ecosystem::code_actions(
+                    &ecosystem,
+                    ParsedView::new(&parse_result),
+                    position,
+                    &uri,
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    MANIFEST,
+                )
+                .await;
 
                 // Exact match, not `.contains` (impl-critic M1): the manifest's own requirement
                 // ("3.28.0") is unprefixed, so this also end-to-end-proves #1435's fix through
@@ -957,7 +957,7 @@ mod tests {
             }
 
             /// #1444 end-to-end: a real `composer.json` with an unrecognized `minimum-stability`
-            /// value produces a WARNING diagnostic through the full `TypedEcosystem::diagnostics`
+            /// value produces a WARNING diagnostic through the full `deps_core::ecosystem::diagnostics`
             /// path — parse -> `ParseResult::invalid_minimum_stability` ->
             /// `invalid_minimum_stability_notice`. No mock registry needed:
             /// `generate_diagnostics_from_cache` never performs network I/O.
@@ -974,15 +974,15 @@ mod tests {
                 let uri = deps_core::test_util::test_uri("/test/composer.json");
                 let parse_result = ecosystem.parse(manifest, &uri).await.unwrap();
 
-                let diagnostics = ecosystem
-                    .diagnostics(
-                        ParsedView::new(&parse_result),
-                        VersionData::new(&HashMap::new(), &HashMap::new()),
-                        &uri,
-                        deps_core::FreshnessSettings::default(),
-                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                    )
-                    .await;
+                let diagnostics = deps_core::ecosystem::diagnostics(
+                    &ecosystem,
+                    ParsedView::new(&parse_result),
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
 
                 let notice = diagnostics
                     .iter()

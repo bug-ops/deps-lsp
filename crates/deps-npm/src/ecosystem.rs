@@ -7,7 +7,7 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
-use deps_core::hover::Hover;
+use deps_core::ecosystem::HoverDecorator;
 use deps_core::{
     ConfigReach, EcosystemBase, ParsedView, Registry, Result, TypedEcosystem, WatchedConfig,
     WatchedConfigEffect,
@@ -16,7 +16,7 @@ use deps_core::{
 };
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 use crate::config::NpmParseContext;
@@ -243,103 +243,62 @@ impl TypedEcosystem for NpmEcosystem {
         VERSION_OPERATOR_CHARS
     }
 
-    /// Appends a `**Catalog**` line (spec 046) to the shared default's hover output for a
-    /// `catalog:`/`catalog:<name>`-referencing dependency — the base hover already renders
-    /// everything else identically to a literal-range dependency (FR-004), since a resolved
-    /// catalog entry rewrites `version_req` in place before hover ever runs.
+    /// Appends a `**Catalog**` line (spec 046) for a `catalog:`/`catalog:<name>`-referencing
+    /// dependency — the shared hover already renders everything else identically to a
+    /// literal-range dependency (FR-004), since a resolved catalog entry rewrites `version_req`
+    /// in place before hover ever runs.
     #[cfg(feature = "lsp-responses")]
-    fn hover<'a>(
+    fn decorate_hover<'a>(
         &'a self,
         parsed: ParsedView<'a, Self::Parsed>,
-        position: Position,
-        versions: deps_core::VersionData<'a>,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Option<Hover>> {
+        hovered: &'a NpmDependency,
+        _versions: deps_core::VersionData<'a>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, HoverDecorator<'a>> {
         Box::pin(async move {
-            let mut hover = deps_core::lsp_generate_hover(
-                &parsed,
-                position,
-                versions,
-                self.registry.as_ref(),
-                self.own_formatter(),
-                freshness,
-                deps_core::PublishTime::now(),
-            )
-            .await?;
-
-            let hovered = parsed.dependencies_slice().iter().find(|dep| {
-                deps_core::position_in_range(position.into(), dep.name_range)
-                    || dep
-                        .version_range
-                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
-            });
-
-            if let Some(catalog_line) = hovered.and_then(catalog_hover_line) {
-                hover.push_markdown(&catalog_line);
-            }
-            if let Some(override_line) = hovered.and_then(override_hover_line) {
-                hover.push_markdown(&override_line);
-            }
-            if let (Some(dep), Some(members)) = (
-                hovered.filter(|dep| {
-                    matches!(
-                        dep.origin,
-                        crate::types::NpmDependencyOrigin::CatalogEntry { .. }
-                    )
-                }),
+            let usage_line = match (
+                matches!(
+                    hovered.origin,
+                    crate::types::NpmDependencyOrigin::CatalogEntry { .. }
+                ),
                 parsed.typed().workspace_members.as_ref(),
             ) {
-                let usage = self
+                (true, Some(members)) => self
                     .catalog_usage
                     .usage(members, CATALOG_USAGE_WAIT_BUDGET)
-                    .await;
-                if let Some(line) = usage
+                    .await
                     .as_deref()
-                    .and_then(|index| catalog_usage_line(dep, index))
-                {
+                    .and_then(|index| catalog_usage_line(hovered, index)),
+                _ => None,
+            };
+            let lines = [
+                catalog_hover_line(hovered),
+                override_hover_line(hovered),
+                usage_line,
+            ];
+            let decorator: HoverDecorator<'a> = Box::new(move |hover| {
+                for line in lines.into_iter().flatten() {
                     hover.push_markdown(&line);
                 }
-            }
-
-            Some(hover)
+            });
+            decorator
         })
     }
 
     /// Appends one diagnostic per unresolved `catalog:`-referencing dependency (spec 046
-    /// FR-005/FR-006) to the shared default's output — additive, since the base pass never
-    /// evaluates a catalog dependency's outdated/unsatisfiable/yanked status once
-    /// `version_req` is `None` (the module's totality invariant closes that off structurally).
-    ///
-    /// Delegates to `deps_core::lsp_helpers::generate_diagnostics_from_cache` directly, same
-    /// as the shared default — the typosquat-suspect diagnostic (issue #1437) needs no
-    /// special handling here: it is evaluated inside that shared function itself, from
-    /// `versions.typosquat_prefetch` (a background pre-fetch merged in by
-    /// `deps-lsp::handlers::diagnostics`, the same way `versions.license_prefetch` already
-    /// is), so this override picks it up automatically with no `.await` on this path.
-    fn diagnostics<'a>(
+    /// FR-005/FR-006) — additive, since the shared pass never evaluates a catalog dependency's
+    /// outdated/unsatisfiable/yanked status once `version_req` is `None` (the module's totality
+    /// invariant closes that off structurally).
+    fn decorate_diagnostics<'a>(
         &'a self,
         parsed: ParsedView<'a, Self::Parsed>,
-        versions: deps_core::VersionData<'a>,
-        uri: &'a Url,
-        freshness: deps_core::FreshnessSettings,
         severities: DiagnosticSeverities,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
-        Box::pin(async move {
-            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                &parsed,
-                versions,
-                self.own_formatter(),
-                uri,
-                freshness,
-                severities,
-                deps_core::PublishTime::now(),
-            );
-            let dependencies = parsed.dependencies_slice();
-            annotate_catalog_references(dependencies, &mut diagnostics);
-            diagnostics.extend(catalog_diagnostics(dependencies, severities.unknown));
-            diagnostics.extend(duplicate_default_catalog_diagnostic(parsed.typed()));
-            diagnostics
-        })
+        out: &'a mut Vec<Diagnostic>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ()> {
+        let dependencies = parsed.dependencies_slice();
+        annotate_catalog_references(dependencies, out);
+        out.extend(catalog_diagnostics(dependencies, severities.unknown));
+        out.extend(duplicate_default_catalog_diagnostic(parsed.typed()));
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -457,6 +416,7 @@ mod tests {
     use super::*;
     use deps_core::VersionData;
     use std::collections::HashMap;
+    use tower_lsp_server::ls_types::Position;
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
@@ -703,15 +663,15 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let diagnostics = ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(&cached_versions, &resolved_versions),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert!(diagnostics.is_empty());
     }
@@ -808,15 +768,15 @@ mod tests {
             .with_ecosystem(deps_core::EcosystemId::Npm)
             .with_typosquat_prefetch(&typosquat_outcome.signals);
 
-        let diagnostics = ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                versions,
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            versions,
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert!(
             diagnostics
@@ -854,15 +814,15 @@ mod tests {
             deps_core::lsp_helpers::PackageVersions::latest_only("1.3.0"),
         );
         let resolved_versions = HashMap::new();
-        let diagnostics = ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(&cached_versions, &resolved_versions),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message().contains("left-pad"));
@@ -1423,14 +1383,14 @@ mod tests {
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             assert!(hover.is_none());
         }
@@ -1453,15 +1413,15 @@ mod tests {
             };
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
+            .await;
 
             assert!(actions.is_empty());
         }
@@ -1500,15 +1460,15 @@ mod tests {
 
             // Inside the version literal's text on its line.
             let position = Position::new(2, 20);
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
+            .await;
 
             assert!(
                 actions.is_empty(),
@@ -1837,15 +1797,15 @@ mod tests {
             let position = Position::new(0, 20); // inside "react"'s name
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover must fire for a catalog-resolved dependency");
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover must fire for a catalog-resolved dependency");
 
             let content = hover.markdown();
             assert!(content.contains("**Requirement**"), "{content}");
@@ -1920,6 +1880,7 @@ mod pnpm_workspace_tests {
     use std::assert_matches;
     use std::collections::HashMap;
     use std::path::Path;
+    use tower_lsp_server::ls_types::Position;
 
     fn ecosystem() -> NpmEcosystem {
         NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()))
@@ -1940,15 +1901,15 @@ mod pnpm_workspace_tests {
     ) -> Vec<Diagnostic> {
         let parse_result = ecosystem.parse(content, uri).await.unwrap();
         let resolved = HashMap::new();
-        ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(cached, &resolved),
-                uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await
+        deps_core::ecosystem::diagnostics(
+            ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(cached, &resolved),
+            uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await
     }
 
     fn workspace_uri(dir: &Path) -> Url {
@@ -1964,17 +1925,17 @@ mod pnpm_workspace_tests {
         let parse_result = ecosystem.parse(content, uri).await.unwrap();
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        ecosystem
-            .hover(
-                ParsedView::new(&parse_result),
-                position,
-                VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover on a catalog entry")
-            .markdown()
-            .to_string()
+        deps_core::ecosystem::hover(
+            ecosystem,
+            ParsedView::new(&parse_result),
+            position,
+            VersionData::new(&cached, &resolved),
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover on a catalog entry")
+        .markdown()
+        .to_string()
     }
 
     #[tokio::test]
@@ -2146,15 +2107,15 @@ mod pnpm_workspace_tests {
             let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let cached = latest("react", "19.3.0");
             let resolved = HashMap::new();
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    Position::new(1, 12),
-                    &uri,
-                    VersionData::new(&cached, &resolved),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                Position::new(1, 12),
+                &uri,
+                VersionData::new(&cached, &resolved),
+                content,
+            )
+            .await;
             let edits: Vec<_> = actions
                 .iter()
                 .filter_map(|a| a.edit.as_ref())
@@ -2186,15 +2147,15 @@ mod pnpm_workspace_tests {
                     .map(deps_core::VersionReq::as_str),
                 Some("^19.3.0")
             );
-            let again = ecosystem
-                .code_actions(
-                    ParsedView::new(&reparsed),
-                    Position::new(1, 12),
-                    &uri,
-                    VersionData::new(&cached, &resolved),
-                    expected,
-                )
-                .await;
+            let again = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&reparsed),
+                Position::new(1, 12),
+                &uri,
+                VersionData::new(&cached, &resolved),
+                expected,
+            )
+            .await;
             assert!(
                 again
                     .iter()
@@ -2245,15 +2206,15 @@ mod pnpm_workspace_tests {
 
         let parse_result = ecosystem.parse(content, &uri).await.unwrap();
         let resolved = HashMap::new();
-        let actions = ecosystem
-            .code_actions(
-                ParsedView::new(&parse_result),
-                Position::new(1, 10),
-                &uri,
-                VersionData::new(&cached, &resolved),
-                content,
-            )
-            .await;
+        let actions = deps_core::ecosystem::code_actions(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            Position::new(1, 10),
+            &uri,
+            VersionData::new(&cached, &resolved),
+            content,
+        )
+        .await;
         assert!(actions.is_empty(), "{actions:?}");
     }
 
@@ -2279,15 +2240,15 @@ mod pnpm_workspace_tests {
 
         let parse_result = ecosystem.parse(content, &uri).await.unwrap();
         let resolved = HashMap::new();
-        let actions = ecosystem
-            .code_actions(
-                ParsedView::new(&parse_result),
-                Position::new(1, 11),
-                &uri,
-                VersionData::new(&cached, &resolved),
-                content,
-            )
-            .await;
+        let actions = deps_core::ecosystem::code_actions(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            Position::new(1, 11),
+            &uri,
+            VersionData::new(&cached, &resolved),
+            content,
+        )
+        .await;
         assert!(
             actions
                 .iter()
@@ -2307,15 +2268,15 @@ mod pnpm_workspace_tests {
         let parse_result = ecosystem.parse(content, &uri).await.unwrap();
         let cached = latest("preact", "10.0.0");
         let resolved = HashMap::new();
-        let actions = ecosystem
-            .code_actions(
-                ParsedView::new(&parse_result),
-                Position::new(2, 11),
-                &uri,
-                VersionData::new(&cached, &resolved),
-                content,
-            )
-            .await;
+        let actions = deps_core::ecosystem::code_actions(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            Position::new(2, 11),
+            &uri,
+            VersionData::new(&cached, &resolved),
+            content,
+        )
+        .await;
         assert!(actions.is_empty(), "alias must offer no edit: {actions:?}");
     }
 

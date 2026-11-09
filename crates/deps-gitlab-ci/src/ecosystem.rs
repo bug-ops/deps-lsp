@@ -8,6 +8,8 @@ use deps_core::ParseResult;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
+use deps_core::ecosystem::HoverDecorator;
+#[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
@@ -21,9 +23,8 @@ use deps_core::{
     EcosystemBase, HttpCache, ParsedView, Registry, Result, TypedEcosystem,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{
-        CommentCheck, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
-        sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
-        unknown_ref_diagnostics,
+        CommentCheck, CommitSha, GitTagsPinning, MAX_DIAGNOSTIC_VALUE_CHARS, ShaPinComment,
+        UnknownRefTarget, git_tags_diagnostics, sanitize_and_truncate_for_diagnostic,
     },
 };
 use std::sync::{Arc, RwLock};
@@ -47,10 +48,11 @@ use std::collections::HashMap;
 #[cfg(feature = "lsp-responses")]
 mod lsp;
 #[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::{git_tags_sha_comment_fix_action, git_tags_unknown_ref_fix_action};
+#[cfg(feature = "lsp-responses")]
 use lsp::{
-    VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action, build_sha_comment_fix_action,
-    build_sha_pin_action, build_unknown_ref_fix_action, collect_pin_all_to_sha_edits,
-    splice_project_line,
+    VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action, build_sha_pin_action,
+    collect_pin_all_to_sha_edits, splice_project_line,
 };
 
 /// Maximum character count of an interpolated raw host expression before truncation —
@@ -187,6 +189,88 @@ impl GitlabCiEcosystem {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
+impl GitlabCiEcosystem {
+    fn splice_hover_lines(
+        &self,
+        gl_dep: &GitlabCiDependency,
+        component_resolved: Option<(String, deps_core::lsp_helpers::CommitSha)>,
+        hover: &mut Hover,
+    ) {
+        if gl_dep.kind == IncludeKind::Component
+            && let HostRef::Literal(host) = &gl_dep.host
+            && is_valid_gitlab_coordinate(&gl_dep.project_path)
+        {
+            let url = format!("https://{}/{}", host.host(), gl_dep.project_path);
+            hover.rewrite_markdown(|md| splice_project_line(md, &url));
+        }
+
+        if let Some(sha) = gl_dep.pinned_sha()
+            && let Some(resolved_tag) =
+                self.formatter
+                    .resolved_tag_for_sha(gl_dep.kind.endpoint(), &gl_dep.name, sha)
+        {
+            hover.rewrite_markdown(|md| {
+                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
+            });
+        }
+
+        if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gl_dep)
+            && let Some(comment) = gl_dep.sha_comment()
+            && let Some(sha) = gl_dep.pinned_sha()
+        {
+            let line = sha_comment_mismatch_hover_line(sha, &comment.tag, &mismatch);
+            hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
+        }
+
+        if let Some((version, sha)) = component_resolved {
+            hover.rewrite_markdown(|md| {
+                deps_core::lsp_helpers::splice_resolved_line(md, &version, &sha)
+            });
+        }
+    }
+
+    /// The version and commit a `component:` include pinned to `Latest`/`Partial` resolves to
+    /// against the project's published releases, when the lookup answers live.
+    async fn resolve_component_hover_pin(
+        &self,
+        gl_dep: &GitlabCiDependency,
+        parsed: ParsedView<'_, GitlabCiParseResult>,
+        versions: deps_core::VersionData<'_>,
+    ) -> Option<(String, deps_core::lsp_helpers::CommitSha)> {
+        if gl_dep.kind != IncludeKind::Component {
+            return None;
+        }
+        let pin @ (PinStyle::Latest | PinStyle::Partial) = gl_dep.pin.as_ref()? else {
+            return None;
+        };
+        let route = self.registry.route(&gl_dep.source)?;
+        let raw = gl_dep
+            .version_req
+            .as_ref()
+            .map(deps_core::VersionReq::as_str)?;
+        let outcome = await_interactive_fetch(
+            self.registry.as_ref(),
+            self.registry
+                .resolve_component_pin(&gl_dep.name, &route, pin, raw),
+            InteractiveFetchRequest::for_dependency(
+                versions,
+                parsed.uri(),
+                gl_dep,
+                &self.formatter,
+                FetchContext::Hover,
+            ),
+            AuxiliaryLookup::PinResolution,
+        )
+        .await;
+        let InteractiveFetch::Live(Some(resolved)) = outcome else {
+            return None;
+        };
+        let sha = resolved.sha?;
+        Some((resolved.version.as_str().to_string(), sha))
+    }
+}
+
 impl deps_core::ecosystem::private::Sealed for GitlabCiEcosystem {}
 
 impl EcosystemBase for GitlabCiEcosystem {
@@ -243,6 +327,12 @@ impl EcosystemBase for GitlabCiEcosystem {
 impl TypedEcosystem for GitlabCiEcosystem {
     type Parsed = GitlabCiParseResult;
     type Formatter = GitlabCiFormatter;
+
+    /// The component-pin lookup honors the failure memo the shared hover's own list fetch
+    /// records, so a dead releases endpoint is asked once, not twice.
+    #[cfg(feature = "lsp-responses")]
+    const HOVER_DECORATION: deps_core::ecosystem::HoverDecoration =
+        deps_core::ecosystem::HoverDecoration::AfterHover;
 
     fn own_formatter(&self) -> &GitlabCiFormatter {
         &self.formatter
@@ -373,219 +463,112 @@ impl TypedEcosystem for GitlabCiEcosystem {
     }
 
     /// Appends the FR-012 informational unresolved-host diagnostic and the mutable-ref-pin
-    /// diagnostic (issue #634) to the shared default's output — both additive, independent
-    /// signals from the outdated-version diagnostic the shared default already computes.
+    /// diagnostic (issue #634), both additive, independent signals from the outdated-version
+    /// diagnostic the shared generator computes.
     ///
     /// The mutable-ref-pin diagnostic is gated on `severities.mutable_ref_pin_enabled`,
     /// mirroring `deps_github_actions`'s identical gate: `severities.mutable_ref_pin` alone
     /// cannot silence it, since `DiagnosticSeverity` has no suppression value.
-    fn diagnostics<'a>(
+    fn decorate_diagnostics<'a>(
         &'a self,
         parsed: ParsedView<'a, GitlabCiParseResult>,
-        versions: deps_core::VersionData<'a>,
-        uri: &'a Url,
-        freshness: deps_core::FreshnessSettings,
         severities: deps_core::lsp_helpers::DiagnosticSeverities,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
-        Box::pin(async move {
-            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                &parsed,
-                versions,
-                self.own_formatter(),
-                uri,
-                freshness,
-                severities,
-                deps_core::PublishTime::now(),
-            );
-            let dependencies = parsed.dependencies_slice();
-            diagnostics.extend(unresolved_host_diagnostics(dependencies));
-            diagnostics.extend(sha_comment_mismatch_diagnostics(
+        out: &'a mut Vec<Diagnostic>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ()> {
+        let dependencies = parsed.dependencies_slice();
+        out.extend(unresolved_host_diagnostics(dependencies));
+        out.extend(git_tags_diagnostics(
+            dependencies,
+            &self.formatter,
+            severities,
+        ));
+        if severities.mutable_ref_pin_enabled {
+            out.extend(mutable_ref_pin_diagnostics(
                 dependencies,
-                severities.sha_comment_mismatch,
+                severities.mutable_ref_pin,
                 &self.formatter,
             ));
-            diagnostics.extend(unknown_ref_diagnostics(
-                dependencies,
-                severities.unknown_ref,
-                |gl_dep| unknown_ref_target(&self.formatter, gl_dep),
-            ));
-            if severities.mutable_ref_pin_enabled {
-                diagnostics.extend(mutable_ref_pin_diagnostics(
-                    dependencies,
-                    severities.mutable_ref_pin,
-                    &self.formatter,
-                ));
-            }
-            diagnostics
-        })
+        }
+        Box::pin(std::future::ready(()))
     }
 
-    /// Appends the "Pin to commit SHA" quickfix (issue #634) to the shared default's
-    /// output when the position's dependency is a `PinStyle::Tag` include with a
-    /// resolvable `TagIndex` entry, mirroring
-    /// `deps_github_actions::ecosystem::GithubActionsEcosystem::code_actions`.
+    /// Appends the "Pin to commit SHA" quickfix (issue #634) when the position's dependency is
+    /// a `PinStyle::Tag` include with a resolvable `TagIndex` entry, mirroring
+    /// `deps_github_actions::ecosystem::GithubActionsEcosystem::decorate_code_actions`.
     ///
     /// Also offers the same quickfix for a `component:` include pinned via
     /// `PinStyle::Latest`/`PinStyle::Partial` (validation follow-up C2/S2): unlike `Tag`,
     /// neither names a concrete version by itself, so `build_dynamic_component_pin_action`
     /// resolves it against the project's published releases through the same FR-007
-    /// priority ladder `generate_hover`'s `**Resolved**` splice already drives.
+    /// priority ladder the hover's `**Resolved**` splice already drives.
     #[cfg(feature = "lsp-responses")]
-    fn code_actions<'a>(
+    fn decorate_code_actions<'a>(
         &'a self,
         parsed: ParsedView<'a, GitlabCiParseResult>,
         position: Position,
         uri: &'a Url,
         versions: deps_core::VersionData<'a>,
-        content: &'a str,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CodeAction>> {
+        out: &'a mut Vec<CodeAction>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ()> {
         Box::pin(async move {
-            let registry = self.registry();
-            let mut actions = deps_core::lsp_helpers::generate_code_actions(
-                &parsed,
-                position,
-                uri,
-                versions,
-                content,
-                registry.as_ref(),
-                self.own_formatter(),
-            )
-            .await;
-            actions.extend(build_sha_pin_action(
+            out.extend(build_sha_pin_action(
                 &parsed,
                 position,
                 uri,
                 &self.formatter,
             ));
             let dependencies = parsed.dependencies_slice();
-            actions.extend(build_sha_comment_fix_action(
+            out.extend(git_tags_sha_comment_fix_action(
                 dependencies,
-                position,
-                uri,
                 &self.formatter,
-            ));
-            actions.extend(build_unknown_ref_fix_action(
-                &parsed,
-                position,
+                position.into(),
                 uri,
-                &self.formatter,
             ));
-            if let Some(action) = build_dynamic_component_pin_action(
+            out.extend(git_tags_unknown_ref_fix_action(
                 dependencies,
-                position,
-                uri,
                 &self.formatter,
-                self.registry.as_ref(),
-                versions,
-            )
-            .await
-            {
-                actions.push(action);
-            }
-            actions
+                position.into(),
+                uri,
+            ));
+            out.extend(
+                build_dynamic_component_pin_action(
+                    dependencies,
+                    position,
+                    uri,
+                    &self.formatter,
+                    self.registry.as_ref(),
+                    versions,
+                )
+                .await,
+            );
         })
     }
 
     /// Splices a `**Resolved**` line for a SHA pin (via the shared tag index) and, for a
     /// `component:` include only, a `**Project**` link line — the one NFR-004 hover
     /// divergence this ecosystem has (spec §8.1/§8.2).
+    ///
+    /// The tag index is read when the decorator is applied, after the shared hover warmed it.
     #[cfg(feature = "lsp-responses")]
-    fn hover<'a>(
+    fn decorate_hover<'a>(
         &'a self,
         parsed: ParsedView<'a, GitlabCiParseResult>,
-        position: Position,
+        hovered: &'a GitlabCiDependency,
         versions: deps_core::VersionData<'a>,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Option<Hover>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, HoverDecorator<'a>> {
         Box::pin(async move {
-            let registry = self.registry.clone();
-            let base_hover = deps_core::lsp_generate_hover(
-                &parsed,
-                position,
-                versions,
-                registry.as_ref(),
-                self.own_formatter(),
-                freshness,
-                deps_core::PublishTime::now(),
-            )
-            .await;
-            let mut hover = base_hover?;
-
-            let Some(gl_dep) = parsed.dependencies_slice().iter().find(|d| {
-                deps_core::position_in_range(position.into(), d.name_range)
-                    || d.version_range
-                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
-            }) else {
-                return Some(hover);
-            };
-
-            if gl_dep.kind == IncludeKind::Component
-                && let HostRef::Literal(host) = &gl_dep.host
-                && is_valid_gitlab_coordinate(&gl_dep.project_path)
-            {
-                let url = format!("https://{}/{}", host.host(), gl_dep.project_path);
-                hover.rewrite_markdown(|md| splice_project_line(md, &url));
-            }
-
-            if let Some(sha) = gl_dep.pinned_sha()
-                && let Some(resolved_tag) =
-                    self.formatter
-                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), &gl_dep.name, sha)
-            {
-                hover.rewrite_markdown(|md| {
-                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
-                });
-            }
-
-            if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gl_dep)
-                && let Some(comment) = gl_dep.sha_comment()
-                && let Some(sha) = gl_dep.pinned_sha()
-            {
-                let line = sha_comment_mismatch_hover_line(sha, &comment.tag, &mismatch);
-                hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
-            }
-
             // FR-007 (H1, #466 review): a `component:` `Latest`/`Partial` pin names no
-            // concrete version by itself — unlike `Sha` (resolved above via the tag index,
-            // no extra fetch needed) or `Tag`/`Branch` (whose text either is or isn't the
-            // version). Resolving it needs the priority ladder run against the project's
-            // published releases.
-            let dep_source = gl_dep.source.clone();
-            if gl_dep.kind == IncludeKind::Component
-                && let Some(pin @ (PinStyle::Latest | PinStyle::Partial)) = &gl_dep.pin
-                && let Some(route) = registry.route(&dep_source)
-                && let Some(raw) = gl_dep
-                    .version_req
-                    .as_ref()
-                    .map(deps_core::VersionReq::as_str)
-            {
-                let outcome = await_interactive_fetch(
-                    registry.as_ref(),
-                    registry.resolve_component_pin(&gl_dep.name, &route, pin, raw),
-                    InteractiveFetchRequest::for_dependency(
-                        versions,
-                        parsed.uri(),
-                        gl_dep,
-                        &self.formatter,
-                        FetchContext::Hover,
-                    ),
-                    AuxiliaryLookup::PinResolution,
-                )
+            // concrete version by itself — unlike `Sha` (resolved via the tag index, no extra
+            // fetch needed) or `Tag`/`Branch` (whose text either is or isn't the version).
+            // Resolving it needs the priority ladder run against the project's published
+            // releases.
+            let component_resolved = self
+                .resolve_component_hover_pin(hovered, parsed, versions)
                 .await;
-                if let InteractiveFetch::Live(Some(resolved)) = outcome
-                    && let Some(sha) = &resolved.sha
-                {
-                    hover.rewrite_markdown(|md| {
-                        deps_core::lsp_helpers::splice_resolved_line(
-                            md,
-                            resolved.version.as_str(),
-                            sha,
-                        )
-                    });
-                }
-            }
-
-            Some(hover)
+            let decorator: HoverDecorator<'a> = Box::new(move |hover| {
+                self.splice_hover_lines(hovered, component_resolved, hover);
+            });
+            decorator
         })
     }
 
@@ -788,32 +771,22 @@ fn position_in_sha_comment(
             .is_some_and(|range| deps_core::lsp_helpers::position_past_sha(range, position))
 }
 
-/// One SHA-comment-mismatch diagnostic per SHA pin whose trailing `# tag` comment provably
-/// names a different commit than the pinned SHA; silent for a confirmed, absent or
-/// unverifiable (cold or truncated index) comment.
-fn sha_comment_mismatch_diagnostics(
-    dependencies: &[GitlabCiDependency],
-    severity: Severity,
-    formatter: &GitlabCiFormatter,
-) -> Vec<Diagnostic> {
-    dependencies
-        .iter()
-        .filter_map(|gl_dep| {
-            let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
-                return None;
-            };
-            let comment = gl_dep.sha_comment()?;
-            let sha = gl_dep.pinned_sha()?;
-            Some(sha_comment_mismatch_diagnostic(
-                gl_dep.version_range?,
-                &gl_dep.name,
-                sha,
-                &comment.tag,
-                &mismatch,
-                severity,
-            ))
-        })
-        .collect()
+impl GitTagsPinning for GitlabCiFormatter {
+    fn sha_comment_check(&self, dep: &GitlabCiDependency) -> Option<CommentCheck> {
+        Self::sha_comment_check(self, dep)
+    }
+
+    fn pinned_commit(&self, dep: &GitlabCiDependency) -> Option<CommitSha> {
+        dep.pinned_sha().cloned()
+    }
+
+    fn sha_pin_comment<'a>(&self, dep: &'a GitlabCiDependency) -> Option<&'a ShaPinComment> {
+        dep.sha_comment()
+    }
+
+    fn unknown_ref_target<'a>(&self, dep: &'a GitlabCiDependency) -> Option<UnknownRefTarget<'a>> {
+        unknown_ref_target(self, dep)
+    }
 }
 
 /// The `project:` tag pin `gl_dep` and the Tags list that can speak for it, shared by the
@@ -1231,15 +1204,15 @@ mod tests {
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         let found = diagnostics
             .iter()
@@ -1266,15 +1239,15 @@ mod tests {
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         let blocked: Vec<_> = diagnostics
             .iter()
@@ -1314,15 +1287,15 @@ mod tests {
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await;
 
         let blocked: Vec<_> = diagnostics
             .iter()
@@ -1361,7 +1334,8 @@ mod tests {
         let parse_result = eco.parse(content, uri).await.unwrap();
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
-        eco.diagnostics(
+        deps_core::ecosystem::diagnostics(
+            &eco,
             ParsedView::new(&parse_result),
             deps_core::VersionData::new(&cached, &resolved),
             uri,
@@ -1625,16 +1599,15 @@ mod tests {
         let cached = std::collections::HashMap::new();
         let resolved = std::collections::HashMap::new();
 
-        let diagnostics = eco
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                deps_core::VersionData::new(&cached, &resolved),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::lsp_helpers::DiagnosticSeverities::new()
-                    .with_mutable_ref_pin_enabled(false),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &eco,
+            ParsedView::new(&parse_result),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::new().with_mutable_ref_pin_enabled(false),
+        )
+        .await;
 
         assert!(
             !diagnostics
@@ -2848,14 +2821,14 @@ mod tests {
                 .with_ecosystem(deps_core::EcosystemId::GitlabCi)
                 .with_interactive_fetch_gate(&gate);
 
-            let first = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    versions,
-                    deps_core::FreshnessSettings::Disabled,
-                )
-                .await;
+            let first = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                versions,
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await;
             failing.assert_async().await;
             failing.remove_async().await;
             let sha = "a".repeat(40);
@@ -2867,14 +2840,14 @@ mod tests {
             .expect(0)
             .create_async()
             .await;
-            let second = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    versions,
-                    deps_core::FreshnessSettings::Disabled,
-                )
-                .await;
+            let second = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                versions,
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await;
 
             assert!(first.is_some() && second.is_some());
             assert_eq!(gate.len(), 1, "only the version list is recorded");
@@ -3399,15 +3372,15 @@ mod tests {
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
 
-            let actions = eco
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    Position::new(2, 11),
-                    &uri,
-                    deps_core::VersionData::new(&cached, &resolved),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &eco,
+                ParsedView::new(&parse_result),
+                Position::new(2, 11),
+                &uri,
+                deps_core::VersionData::new(&cached, &resolved),
+                content,
+            )
+            .await;
             assert!(
                 actions.is_empty(),
                 "expected no quickfix at an alias site: {actions:?}"
@@ -3611,15 +3584,15 @@ mod tests {
             let outdated_lines = [1_u32, 3];
             let control_line = 4_u32;
 
-            let diagnostics = eco
-                .diagnostics(
-                    ParsedView::new(&parse_result),
-                    versions(),
-                    &uri,
-                    deps_core::FreshnessSettings::default(),
-                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                )
-                .await;
+            let diagnostics = deps_core::ecosystem::diagnostics(
+                &eco,
+                ParsedView::new(&parse_result),
+                versions(),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
             let mut diagnostic_lines: Vec<u32> = diagnostics
                 .iter()
                 .filter(|d| d.message().contains("Newer version available"))
@@ -3660,15 +3633,15 @@ mod tests {
             assert!(!names_latest(control_line), "control: {hints:?}");
 
             for line in outdated_lines {
-                let hover = eco
-                    .hover(
-                        ParsedView::new(&parse_result),
-                        Position::new(line, 30),
-                        versions().with_network(deps_core::NetworkMode::Offline),
-                        deps_core::FreshnessSettings::default(),
-                    )
-                    .await
-                    .expect("hover");
+                let hover = deps_core::ecosystem::hover(
+                    &eco,
+                    ParsedView::new(&parse_result),
+                    Position::new(line, 30),
+                    versions().with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover");
                 assert!(
                     hover
                         .markdown()
@@ -3746,15 +3719,15 @@ mod tests {
                 severities: deps_core::lsp_helpers::DiagnosticSeverities,
             ) -> Vec<Diagnostic> {
                 let resolved = std::collections::HashMap::new();
-                self.eco
-                    .diagnostics(
-                        ParsedView::new(&self.parse_result),
-                        deps_core::VersionData::new(&self.cached, &resolved),
-                        &self.uri,
-                        deps_core::FreshnessSettings::default(),
-                        severities,
-                    )
-                    .await
+                deps_core::ecosystem::diagnostics(
+                    &self.eco,
+                    ParsedView::new(&self.parse_result),
+                    deps_core::VersionData::new(&self.cached, &resolved),
+                    &self.uri,
+                    deps_core::FreshnessSettings::default(),
+                    severities,
+                )
+                .await
             }
         }
 
@@ -3782,20 +3755,20 @@ mod tests {
             }
 
             fn fix_action(&self, line: u32, column: u32) -> Option<CodeAction> {
-                build_sha_comment_fix_action(
+                git_tags_sha_comment_fix_action(
                     &self.own().dependencies,
-                    Position::new(line, column),
-                    &self.uri,
                     &self.eco.formatter,
+                    deps_core::position::Position::new(line, column),
+                    &self.uri,
                 )
             }
 
             fn unknown_ref_fix(&self, line: u32, column: u32) -> Option<CodeAction> {
-                build_unknown_ref_fix_action(
-                    &ParsedView::new(&self.parse_result),
-                    Position::new(line, column),
-                    &self.uri,
+                git_tags_unknown_ref_fix_action(
+                    &self.own().dependencies,
                     &self.eco.formatter,
+                    deps_core::position::Position::new(line, column),
+                    &self.uri,
                 )
             }
 
@@ -3993,17 +3966,16 @@ mod tests {
             assert_eq!(mismatches[0].range.start.line, 2);
 
             let resolved = std::collections::HashMap::new();
-            let hover = fixture
-                .eco
-                .hover(
-                    ParsedView::new(&fixture.parse_result),
-                    Position::new(2, 30),
-                    deps_core::VersionData::new(&fixture.cached, &resolved)
-                        .with_network(deps_core::NetworkMode::Offline),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover");
+            let hover = deps_core::ecosystem::hover(
+                &fixture.eco,
+                ParsedView::new(&fixture.parse_result),
+                Position::new(2, 30),
+                deps_core::VersionData::new(&fixture.cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover");
             assert!(
                 hover.markdown().contains("comment says"),
                 "{}",

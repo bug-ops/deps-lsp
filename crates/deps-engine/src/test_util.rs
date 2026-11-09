@@ -84,6 +84,7 @@ pub struct StubDependency {
     version_req: VersionReq,
 }
 
+deps_core::impl_unprobed_dependency!(StubDependency);
 impl deps_core::Dependency for StubDependency {
     fn name(&self) -> &PackageName {
         &self.name

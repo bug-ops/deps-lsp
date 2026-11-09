@@ -2383,6 +2383,7 @@ pub fn vuln_key_for(
 ///     name_range: Range,
 /// }
 ///
+/// # deps_core::impl_unprobed_dependency!(SimpleDep);
 /// impl Dependency for SimpleDep {
 ///     fn name(&self) -> &PackageName {
 ///         &self.name
@@ -4212,7 +4213,7 @@ mod vulnerability_keys_candidates_tests {
     impl<D: 'static> crate::lsp_helpers::DiagnosticPolicy for PinByRequirementFormatter<D> {}
     impl<D: 'static> crate::lsp_helpers::SourcePolicy for PinByRequirementFormatter<D> {}
     impl<D: 'static> crate::lsp_helpers::OsvNaming for PinByRequirementFormatter<D> {}
-    impl<D: crate::Dependency + 'static> crate::lsp_helpers::DependencyFormatter
+    impl<D: crate::lsp_helpers::ProbeDependency + 'static> crate::lsp_helpers::DependencyFormatter
         for PinByRequirementFormatter<D>
     {
         type Dep = D;

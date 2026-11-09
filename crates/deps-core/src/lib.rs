@@ -255,7 +255,7 @@ pub use deps_dev::{
     DepsDevClient, FetchCompleteness, GossipCooldown, GossipFindings, GossipLowUsage,
     GossipRiskLevel, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal, TyposquatSignal,
 };
-pub use detached_flight::{FlightHandle, SingleFlight};
+pub use detached_flight::{FlightEnd, FlightHandle, SingleFlight};
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
     EcosystemBase, EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult,
@@ -287,8 +287,8 @@ pub use licenses::{
     evaluate as evaluate_license_policy, resolve_license_entries,
 };
 pub use lockfile::{
-    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_and_parse_lockfile,
-    read_lockfile_content,
+    EntryPlacement, LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
+    read_and_parse_lockfile, read_lockfile_content,
 };
 pub use lsp_helpers::{
     BoundDependency, CachedVersionsMap, DependencyFormatter, DependencyGate, DependencyOutcome,

@@ -924,15 +924,15 @@ dependencies = []
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let diagnostics = ecosystem
-            .diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(&cached_versions, &resolved_versions),
-                &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            )
-            .await;
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+        )
+        .await;
 
         assert!(diagnostics.is_empty());
     }
@@ -2598,14 +2598,14 @@ name = "test"
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             assert!(hover.is_none());
         }
@@ -2627,15 +2627,15 @@ name = "test"
             };
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
+            .await;
 
             assert!(actions.is_empty());
         }

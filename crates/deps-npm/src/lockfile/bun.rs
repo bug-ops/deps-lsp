@@ -4,16 +4,16 @@
 //! graphs are out of scope. The input is untrusted repository content, so the parse goes
 //! through the shared depth-bounded JSONC path ([`deps_core::json_ast::parse_jsonc_typed`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-use deps_core::error::{DepsError, Result};
+use deps_core::error::Result;
 use deps_core::json_ast::parse_jsonc_typed;
 use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
 use serde::Deserialize;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
 
-use super::split_specifier;
+use super::{lockfile_parse_error, split_specifier};
 
 const FILE_TYPE: &str = "bun.lock";
 
@@ -38,7 +38,7 @@ enum RawLockfileVersion {
 struct BunLock {
     lockfile_version: Option<RawLockfileVersion>,
     #[serde(default)]
-    packages: HashMap<String, BunPackageEntry>,
+    packages: BTreeMap<String, BunPackageEntry>,
 }
 
 /// One `packages` value: normally a tuple led by a `name@resolution` label, but a value of any
@@ -90,26 +90,28 @@ impl<'de> Deserialize<'de> for BunPackageLabel {
     }
 }
 
-fn parse_error(message: &str) -> DepsError {
-    DepsError::parse_error(FILE_TYPE, &message)
-}
-
 fn check_lockfile_version(raw: Option<RawLockfileVersion>) -> Result<()> {
     match raw {
-        None => Err(parse_error("missing lockfileVersion")),
+        None => Err(lockfile_parse_error(FILE_TYPE, "missing lockfileVersion")),
         Some(RawLockfileVersion::Integer(version))
             if (MIN_LOCKFILE_VERSION..=MAX_LOCKFILE_VERSION).contains(&version) =>
         {
             Ok(())
         }
-        Some(RawLockfileVersion::Integer(version)) => Err(parse_error(&format!(
-            "unsupported lockfileVersion '{version}' (supported \
+        Some(RawLockfileVersion::Integer(version)) => Err(lockfile_parse_error(
+            FILE_TYPE,
+            &format!(
+                "unsupported lockfileVersion '{version}' (supported \
              {MIN_LOCKFILE_VERSION}..={MAX_LOCKFILE_VERSION})"
-        ))),
-        Some(RawLockfileVersion::Other(value)) => Err(parse_error(&format!(
-            "unparseable lockfileVersion ({})",
-            describe_json_value(&value)
-        ))),
+            ),
+        )),
+        Some(RawLockfileVersion::Other(value)) => Err(lockfile_parse_error(
+            FILE_TYPE,
+            &format!(
+                "unparseable lockfileVersion ({})",
+                describe_json_value(&value)
+            ),
+        )),
     }
 }
 
@@ -124,14 +126,9 @@ fn describe_json_value(value: &serde_json::Value) -> String {
         serde_json::Value::Bool(flag) => format!("boolean {flag}"),
         serde_json::Value::Number(number) => format!("number {number}"),
         serde_json::Value::String(text) => {
-            let preview: String = text.chars().take(MAX_PREVIEW_CHARS).collect();
-            let ellipsis = if text.chars().count() > MAX_PREVIEW_CHARS {
-                "..."
-            } else {
-                ""
-            };
+            let preview = deps_core::lsp_helpers::truncate_for_diagnostic(text, MAX_PREVIEW_CHARS);
             format!(
-                "string '{}{ellipsis}'",
+                "string '{}'",
                 deps_core::redact::redact_declaration_key(&preview)
             )
         }
@@ -151,7 +148,7 @@ fn describe_json_value(value: &serde_json::Value) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::ParseError`] for malformed JSONC, nesting beyond the shared depth
+/// Returns [`deps_core::error::DepsError::ParseError`] for malformed JSONC, nesting beyond the shared depth
 /// bound, an absent, non-integer or unsupported `lockfileVersion`, or a document that is not
 /// an object.
 pub(super) fn parse_bun_lock(content: &str) -> Result<ResolvedPackages> {
@@ -201,6 +198,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use deps_core::error::DepsError;
 
     // Fixtures are trimmed from real Bun output, taken from the MIT-licensed
     // `dependabot/dependabot-core` repository (`bun/spec/fixtures/projects/bun/`:
@@ -391,7 +389,7 @@ mod tests {
         let content = format!(r#"{{"lockfileVersion": "{}"}}"#, "x".repeat(100_000));
         let message = parse_bun_lock(&content).unwrap_err().to_string();
         assert!(message.len() < 400, "{}", message.len());
-        assert!(message.contains("..."), "{message}");
+        assert!(message.contains('…'), "{message}");
     }
 
     #[test]

@@ -2154,6 +2154,7 @@ mod tests {
             version_req: deps_core::VersionReq,
             version_range: PosRange,
         }
+        deps_core::impl_unprobed_dependency!(FixtureDep);
         impl Dependency for FixtureDep {
             fn name(&self) -> &PackageName {
                 &self.name

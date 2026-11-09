@@ -417,16 +417,16 @@ fn first_code_match<'a>(line: &'a str, re: &Regex) -> Option<regex::Match<'a>> {
 /// [`BLOCK_END`]'s pops unbalanced against pushes, popping the wrong (e.g. an enclosing
 /// `source`) block early (critic finding S1).
 ///
-/// A `Group`/`Source` block's classification value lives on the parallel `group_stack`/
-/// `source_stack` in [`parse_gemfile`] instead of inside this enum (#1009): popping this stack
-/// tells which side-stack, if any, to also pop, so [`current_group`]/[`current_source_block`]
-/// become O(1) `.last()` reads instead of an O(depth) reverse scan of a value-carrying stack on
-/// every `gem` line.
+/// A `Group`/`Source` block's classification value lives on [`BlockStack`]'s parallel
+/// `groups`/`sources` stacks instead of inside this enum (#1009): popping `kinds` tells which
+/// side-stack, if any, to also pop, so [`BlockStack::current_group`]/
+/// [`BlockStack::current_source`] are O(1) `.last()` reads instead of an O(depth) reverse scan
+/// of a value-carrying stack on every `gem` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenBlockKind {
-    /// An open `group :name do ... end` block; its value is on `group_stack`'s top.
+    /// An open `group :name do ... end` block; its value is on `groups`' top.
     Group,
-    /// An open `source "url" do ... end` block; its value is on `source_stack`'s top.
+    /// An open `source "url" do ... end` block; its value is on `sources`' top.
     Source,
     /// Any other open `... do ... end` block this parser does not otherwise interpret
     /// (`platforms ... do`, `install_if ... do`, `git "..." do`, `path "..." do`, `env ...
@@ -434,15 +434,66 @@ enum OpenBlockKind {
     Other,
 }
 
-/// Returns the innermost open `group` block's classification, if any — O(1), the top of
-/// `group_stack`.
-fn current_group(group_stack: &[DependencyGroup]) -> Option<DependencyGroup> {
-    group_stack.last().cloned()
+/// The URL of an open `source "..." do ... end` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceBlockUrl(String);
+
+impl SourceBlockUrl {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// Returns the innermost open `source` block's URL, if any — O(1), the top of `source_stack`.
-fn current_source_block(source_stack: &[String]) -> Option<&str> {
-    source_stack.last().map(String::as_str)
+/// Every open `... do ... end` block, with the group and source values of the `Group` and
+/// `Source` ones.
+///
+/// One type owns the invariant that `groups` holds exactly one entry per `Group` in `kinds`
+/// and `sources` one per `Source` (the hand-paired pushes and pops it replaces desynced in
+/// #991 and #1017), so no caller can push to one stack without the others.
+#[derive(Debug, Default)]
+struct BlockStack {
+    kinds: Vec<OpenBlockKind>,
+    groups: Vec<DependencyGroup>,
+    sources: Vec<SourceBlockUrl>,
+}
+
+impl BlockStack {
+    fn open_group(&mut self, group: DependencyGroup) {
+        self.groups.push(group);
+        self.kinds.push(OpenBlockKind::Group);
+    }
+
+    fn open_source(&mut self, url: SourceBlockUrl) {
+        self.sources.push(url);
+        self.kinds.push(OpenBlockKind::Source);
+    }
+
+    fn open_other(&mut self) {
+        self.kinds.push(OpenBlockKind::Other);
+    }
+
+    /// Closes the innermost open block; a stray `end` with nothing open is a no-op.
+    fn close(&mut self) {
+        match self.kinds.pop() {
+            Some(OpenBlockKind::Group) => {
+                self.groups.pop();
+            }
+            Some(OpenBlockKind::Source) => {
+                self.sources.pop();
+            }
+            Some(OpenBlockKind::Other) | None => {}
+        }
+    }
+
+    /// The innermost open `group` block's classification, if any.
+    fn current_group(&self) -> Option<DependencyGroup> {
+        self.groups.last().cloned()
+    }
+
+    /// The innermost open `source` block's URL, if any.
+    fn current_source(&self) -> Option<&SourceBlockUrl> {
+        self.sources.last()
+    }
 }
 
 /// A `gem` declaration whose argument list is still open across multiple physical lines —
@@ -812,7 +863,7 @@ fn continues_gem_declaration(line: &str) -> bool {
 /// patterns (a new `gem`, a block opener/closer, `source`, or `ruby` declaration) — checked
 /// only while a [`PendingGem`] is open, to detect that its argument list implicitly ended one
 /// line early instead of swallowing this line as one of its segments. Tester-found bugs:
-/// swallowing a `BLOCK_END` line here skipped its `group_stack`/`source_stack` pop, leaking
+/// swallowing a `BLOCK_END` line here skipped its [`BlockStack::close`], leaking
 /// stale group/source state into every later gem in the file; swallowing a new `gem` line here
 /// silently dropped that gem's declaration entirely (the same "gem disappears" leak class
 /// #991 itself fixes, just with a different trigger).
@@ -841,7 +892,7 @@ fn finalize_pending_gem(
     content: &str,
     line_table: &LineOffsetTable,
     gemfile_source_url: Option<&str>,
-    block_source_url: Option<&str>,
+    block_source_url: Option<&SourceBlockUrl>,
     block_group: Option<DependencyGroup>,
 ) -> BundlerDependency {
     let stripped_segments: Vec<(&str, usize)> = pending
@@ -895,9 +946,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
     let mut dependencies = Vec::new();
     let mut ruby_version = None;
     let mut source_url = None;
-    let mut open_blocks: Vec<OpenBlockKind> = Vec::new();
-    let mut group_stack: Vec<DependencyGroup> = Vec::new();
-    let mut source_stack: Vec<String> = Vec::new();
+    let mut blocks = BlockStack::default();
     let mut pending_gem: Option<PendingGem<'_>> = None;
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
@@ -928,16 +977,16 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
                 // opener/closer, `source`, `ruby`, ...). Finalize the pending gem from what
                 // was already accumulated, without consuming this line, and let it fall
                 // through to the normal dispatch chain below. Swallowing it unconditionally
-                // previously either lost a `BLOCK_END` pop (desyncing `group_stack`/
-                // `source_stack` for the rest of the file) or silently dropped the next `gem`
+                // previously either lost a `BLOCK_END` pop (desyncing the
+                // block stack for the rest of the file) or silently dropped the next `gem`
                 // declaration entirely.
                 dependencies.push(finalize_pending_gem(
                     pending,
                     content,
                     &line_table,
                     source_url.as_deref(),
-                    current_source_block(&source_stack),
-                    current_group(&group_stack),
+                    blocks.current_source(),
+                    blocks.current_group(),
                 ));
                 // Falls through — `line` is reprocessed by the checks below.
             } else {
@@ -982,8 +1031,8 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
                         content,
                         &line_table,
                         source_url.as_deref(),
-                        current_source_block(&source_stack),
-                        current_group(&group_stack),
+                        blocks.current_source(),
+                        blocks.current_group(),
                     ));
                 }
                 continue;
@@ -994,8 +1043,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
         // `$`-anchored and never matches a `... do` opener, but checking this first keeps
         // the precedence explicit.
         if let Some(url) = parse_source_block_start(line) {
-            source_stack.push(url.to_string());
-            open_blocks.push(OpenBlockKind::Source);
+            blocks.open_source(SourceBlockUrl(url.to_string()));
             continue;
         }
 
@@ -1012,8 +1060,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
         }
 
         if let Some(caps) = GROUP_BLOCK_START.captures(line) {
-            group_stack.push(parse_group_symbols(&caps[1]));
-            open_blocks.push(OpenBlockKind::Group);
+            blocks.open_group(parse_group_symbols(&caps[1]));
             continue;
         }
 
@@ -1021,22 +1068,14 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
         // left to do` would otherwise match GENERIC_BLOCK_START's `do` first and be
         // mistaken for an opener instead of the closer it actually is.
         if BLOCK_END.is_match(line) {
-            match open_blocks.pop() {
-                Some(OpenBlockKind::Group) => {
-                    group_stack.pop();
-                }
-                Some(OpenBlockKind::Source) => {
-                    source_stack.pop();
-                }
-                Some(OpenBlockKind::Other) | None => {}
-            }
+            blocks.close();
             continue;
         }
 
         // Any other `... do` block opener (platforms, install_if, git, path, env, etc.) —
         // pushed only to keep BLOCK_END's pops balanced (critic finding S1).
         if GENERIC_BLOCK_START.is_match(line) {
-            open_blocks.push(OpenBlockKind::Other);
+            blocks.open_other();
             continue;
         }
 
@@ -1044,7 +1083,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
         // module/while/until/for) — pushed for the same balancing reason as
         // GENERIC_BLOCK_START above (code-review finding #1).
         if BARE_BLOCK_START.is_match(line) {
-            open_blocks.push(OpenBlockKind::Other);
+            blocks.open_other();
             continue;
         }
 
@@ -1125,13 +1164,9 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
 
             let scan = OptionScan::new(stripped_rest, is_paren_call);
             let group = extract_group(&scan)
-                .unwrap_or_else(|| current_group(&group_stack).unwrap_or(DependencyGroup::Default));
+                .unwrap_or_else(|| blocks.current_group().unwrap_or(DependencyGroup::Default));
 
-            let source = extract_source(
-                &scan,
-                source_url.as_deref(),
-                current_source_block(&source_stack),
-            );
+            let source = extract_source(&scan, source_url.as_deref(), blocks.current_source());
 
             let platforms = extract_platforms(&scan);
             let require = extract_require(&scan);
@@ -1158,8 +1193,8 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
             content,
             &line_table,
             source_url.as_deref(),
-            current_source_block(&source_stack),
-            current_group(&group_stack),
+            blocks.current_source(),
+            blocks.current_group(),
         ));
     }
 
@@ -1741,7 +1776,7 @@ fn classify_registry_url(url: &str) -> DependencySource {
 fn extract_source(
     scan: &OptionScan<'_>,
     gemfile_source_url: Option<&str>,
-    block_source_url: Option<&str>,
+    block_source_url: Option<&SourceBlockUrl>,
 ) -> DependencySource {
     if let Some(value) = option_string_value(scan, &GIT_OPTION) {
         return DependencySource::Git {
@@ -1768,7 +1803,7 @@ fn extract_source(
     }
 
     if let Some(url) = block_source_url {
-        return classify_registry_url(url);
+        return classify_registry_url(url.as_str());
     }
 
     gemfile_source_url.map_or(DependencySource::Registry, classify_registry_url)

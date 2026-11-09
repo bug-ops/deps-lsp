@@ -20,7 +20,7 @@ related:
 
 > [!info] Metadata
 > **Author**: live-testing session
-> **Branch**: `fix/change-during-initial-fetch` (no issue number yet)
+> **Branch**: `feat/1987-didchange-initial-fetch` (issue #1987)
 > **Type**: bug, P1, cross-ecosystem
 > **Observed on**: HEAD 971ae08ae, identical on 713d6368e (not a regression of the recent refactors)
 
@@ -101,7 +101,7 @@ OR the "not checked" notice is shown for the dependencies without an outcome
 | FR-005 | WHEN the OSV lookup of an aborted task did not commit THE SYSTEM SHALL re-run the OSV lookup for the dependencies lacking an OSV outcome, or publish the "vulnerability data was not checked" notice for them | must |
 | FR-006 | WHEN several didChange events arrive during the initial fetch THE SYSTEM SHALL converge to the same final state as a single calm open, with at most one in-flight fetch per URI | must |
 | FR-007 | WHEN a dependency's registry lookup definitively returned not-found THE SYSTEM SHALL keep reporting `Unknown package`, and SHALL NOT refetch it on every edit (a recorded miss counts as a committed outcome) | must |
-| FR-008 | THE SYSTEM SHALL NOT emit `Unknown package` for a dependency whose lookup has not yet been attempted or committed (see `Unresolved` handling in `document/resolved.rs`) | should |
+| FR-008 | WHEN a change commit leaves at least one dependency without a committed registry outcome THE SYSTEM SHALL call `set_loading()` right after that commit, so `Unknown package` is not emitted for a dependency whose lookup has not been attempted or committed | should |
 | FR-009 | THE SYSTEM SHALL apply FR-001 to FR-008 identically for every ecosystem through shared lifecycle code, with no per-ecosystem branch | must |
 
 ## 4. Non-Functional Requirements
@@ -123,8 +123,12 @@ OR the "not checked" notice is shown for the dependencies without an outcome
 | Committed OSV outcome | Per-dependency vulnerability lookup result or explicit "not checked" | dependency key, outcome |
 | Background task slot | Single task per URI, replaced (and the predecessor aborted) by `spawn_background_task` | URI, join handle |
 
-> [!question] Open data-model decision
-> [NEEDS CLARIFICATION: Is "committed registry data" best derived from the existing `cached_versions` map keyed by dependency and requirement, or does a distinct per-dependency fetch-outcome record exist or need to be added? The fix must treat a recorded miss or failure as committed (FR-007).]
+> [!success] Data-model decision (resolved)
+> "Committed registry data" is a new typed record, `PackageSignals::registry_baseline` (`RegistryBaseline`, a newtype over the per-package declared requirements as of the last committed outcome). `cached_versions` cannot serve: it has no entry for a recorded miss, failure, non-resolvable or collided package, which FR-007 requires to count as committed. User-approved.
+>
+> - `pending(declared)` is the added and requirement-changed names of `DependencyDiff::compute(baseline, declared)`; the change task derives its fetch list from it after the debounce and the pre-fetch re-parse, instead of receiving a parse-to-parse diff from the handler.
+> - Written by: the open commit (`replace`), the change merge (`record`, every requested name, including failures, misses, non-resolvable and collided ones), a version-changing commit (`invalidate`), a forced refetch (`clear`), and pruning of removed packages.
+> - Carried across edits by `preserve_cache`.
 
 ## 6. Edge Cases and Error Handling
 
@@ -140,6 +144,8 @@ OR the "not checked" notice is shown for the dependencies without an outcome
 | Document closed while the re-issued fetch runs | Task is cancelled with the document; no commit to a closed document |
 | Edit arrives between registry fetch commit and OSV commit | OSV lookup re-run or "not checked" notice shown (FR-005) |
 | didChange carries an older document version than the loaded state | Existing version-ordering rules apply unchanged |
+| An edit with pending dependencies commits (FR-008) | `set_loading()` runs right after the commit. `commit_parsed_document` always builds a fresh `Idle` state, so the loading start instant resets on every edit. While someone keeps typing with pending names, diagnostics stay suppressed and the loading ceiling cannot fire; the first debounced task that is not aborted fetches and settles the state. Accepted. |
+| Lock-file change arrives during the initial fetch | `handle_lockfile_change` runs a detached rescan and never aborts the open task, so it cannot lose the fetch. A lock-file-triggered re-parse goes through the same `pending` computation as an edit. |
 
 ## 7. Success Criteria
 
@@ -199,13 +205,13 @@ Additional rows to run once: three rapid edits (20, 40, 60 ms); edit that change
 
 ## 9. Open Questions
 
-> [!question] Open items
-> - [NEEDS CLARIFICATION: Preferred mechanism: (a) change task diffs against committed registry data so uncommitted dependencies enter `deps_to_fetch` (self-correcting, mirrors `typosquat_checked_names`), or (b) do not abort an in-flight open fetch when the new parse has the same dependency set? (a) is the recommended default; (b) avoids duplicate work but leaves the abort-model question open.]
-> - [NEEDS CLARIFICATION: Should the dependency key for "committed" include the requirement text, so a requirement edit during the fetch invalidates the committed entry?]
-> - [NEEDS CLARIFICATION: For the 300 to 600 ms window, is the OSV outcome re-run owned by the change task, or is there a separate OSV commit path that should be made idempotent (FR-005)?]
-> - [NEEDS CLARIFICATION: Is the same hazard present for lock-file-driven resolution (in-use versions) when a lock-file change arrives during the initial fetch (`reparse.rs` path)? Out of scope here unless confirmed by a live test.]
-> - [NEEDS CLARIFICATION: GitHub issue number for this bug (to be filed with labels `bug`, `P1`, `cross-ecosystem`).]
-> - [NEEDS CLARIFICATION: Cargo and GitHub Actions calm-open baselines are not yet recorded; capture them before writing RT-002 expectations.]
+> [!success] Resolved items
+> - Mechanism: (a). The change task compares the current declaration against the committed registry baseline, so uncommitted dependencies enter its fetch list; the abort model of `spawn_background_task` is unchanged.
+> - The committed key includes the requirement text: the baseline stores the requirements, and a changed requirement is pending again.
+> - OSV (FR-005): the change task owns the re-run. `osv_scan_plan_is_stale` (the check `rescan_osv_if_tag_index_now_warm` already used) is ORed into the OSV phase A gate, so a plan never committed by an aborted predecessor triggers phase A and B; it is false for an unchanged, fully scanned document.
+> - Lock-file path: no hazard from `handle_lockfile_change` (detached rescan, never aborts the open task); the re-parse path uses the same `pending` computation. See the edge-case table.
+> - Issue: #1987.
+> - Cargo and GitHub Actions regression tests run against a mock sparse index (`.cargo/config.toml` alias) and a mock GitHub API (`GithubActionsEcosystem::for_test`, `test-util` feature of `deps-github-actions`, dev-dependency only); their calm-open expectations are the same cached-versions and no-`Unknown package` assertions.
 
 ## 10. See Also
 

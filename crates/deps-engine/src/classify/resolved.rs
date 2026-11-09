@@ -559,6 +559,7 @@ mod tests {
             addr_tag: u32,
         }
 
+        deps_core::impl_unprobed_dependency!(MockDep);
         impl Dependency for MockDep {
             fn name(&self) -> &PackageName {
                 &self.name

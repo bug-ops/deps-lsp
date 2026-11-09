@@ -1117,6 +1117,7 @@ mod tests {
         fn version_range() -> Range {
             Range::new(DepPosition::new(1, 8), DepPosition::new(1, 15))
         }
+        deps_core::impl_unprobed_dependency!(Dep);
         impl deps_core::Dependency for Dep {
             fn name(&self) -> &deps_core::PackageName {
                 &self.name

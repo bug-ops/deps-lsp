@@ -142,6 +142,7 @@ pub fn requirement_is_placeholder_for(
 /// }
 ///
 /// struct PlainDependency(PackageName);
+/// # deps_core::impl_unprobed_dependency!(PlainDependency);
 /// impl Dependency for PlainDependency {
 ///     fn name(&self) -> &PackageName {
 ///         &self.0
@@ -656,6 +657,7 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 ///     version_range: Range,
 ///     name_range: Range,
 /// }
+/// # deps_core::impl_unprobed_dependency!(MockDep);
 /// impl Dependency for MockDep {
 ///     fn name(&self) -> &PackageName { &self.name }
 ///     fn name_range(&self) -> Range { self.name_range }
@@ -1446,6 +1448,7 @@ pub fn resolve_verified_fix(
 ///     version_range: Range,
 ///     name_range: Range,
 /// }
+/// # deps_core::impl_unprobed_dependency!(MockDep);
 /// impl Dependency for MockDep {
 ///     fn name(&self) -> &PackageName { &self.name }
 ///     fn name_range(&self) -> Range { self.name_range }
@@ -2759,6 +2762,7 @@ mod tests {
                 inner: MockDep,
                 literal: String,
             }
+            crate::impl_unprobed_dependency!(LiteralDep);
             impl Dependency for LiteralDep {
                 fn name(&self) -> &PackageName {
                     self.inner.name()

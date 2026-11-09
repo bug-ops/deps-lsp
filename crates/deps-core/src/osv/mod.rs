@@ -257,6 +257,11 @@ struct RawRecordCacheEntry {
 /// before that caller starts waiting, decremented via `fetch_sub` (whose return value is the
 /// pre-decrement count) when that caller stops waiting for any reason. Exactly one concurrent
 /// decrementer ever observes the count reaching zero, even if multiple solo timeouts race.
+///
+/// Deliberately not built on `single_flight::claim_or_follow` (#1986): that primitive has one
+/// leader whose channel followers await, so a caller's own deadline cannot abandon the work
+/// without every follower losing the result; here every caller drives the shared `cell` and
+/// may time out independently, which only the waiter count can arbitrate.
 struct InFlightRecord {
     cell: tokio::sync::OnceCell<Option<Arc<OsvVulnRecord>>>,
     waiters: std::sync::atomic::AtomicUsize,

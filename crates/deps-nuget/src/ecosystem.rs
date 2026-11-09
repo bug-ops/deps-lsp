@@ -21,7 +21,7 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
-use deps_core::hover::Hover;
+use deps_core::ecosystem::HoverDecorator;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{
     AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
@@ -35,8 +35,10 @@ use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 #[cfg(test)]
 use std::any::Any;
 use std::sync::Arc;
+#[cfg(test)]
+use tower_lsp_server::ls_types::Position;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 use crate::config::NuGetParseContext;
@@ -46,6 +48,8 @@ use crate::parser::NuGetParseResult;
 use crate::registry::NuGetRegistry;
 #[cfg(feature = "lsp-responses")]
 use crate::registry::NuGetRoute;
+#[cfg(feature = "lsp-responses")]
+use crate::types::NuGetDependency;
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -316,8 +320,8 @@ impl TypedEcosystem for NuGetEcosystem {
         VERSION_OPERATOR_CHARS
     }
 
-    /// Overrides the default (`lsp_helpers::generate_hover`) to add a hover-only unlisted
-    /// marker (D1, #451): alongside the ordinary hover render, a separate
+    /// Adds a hover-only unlisted marker (D1, #451): alongside the ordinary hover render, a
+    /// separate
     /// [`NuGetRegistry::unlisted_versions`] fetch decorates each unlisted entry
     /// in the "Recent versions" list with `*(unlisted)*`, matching how other ecosystems in
     /// this codebase mark a `*(yanked)*` version — see that method's doc comment for why
@@ -325,16 +329,15 @@ impl TypedEcosystem for NuGetEcosystem {
     /// completion/inlay hints/diagnostics, which all share the cached version list hover
     /// itself renders via the *ordinary*, non-enriched path above).
     ///
-    /// The two fetches run concurrently via `tokio::join!`, not sequentially (S4, #451
-    /// follow-up): serializing them would double hover's worst-case latency, and the
+    /// The two fetches run concurrently (`deps_core::ecosystem::hover` joins them), not
+    /// sequentially (S4, #451 follow-up): serializing them would double hover's worst-case
+    /// latency, and the
     /// unlisted fetch alone goes through the shared interactive gate as an
     /// [`AuxiliaryLookup::Decoration`] —
     /// without its 5 s bound, a pathological feed's registration-hive walk (up to
     /// `MAX_EXTERNAL_PAGE_FETCHES` sequential page fetches, each with its own HTTP-client
     /// timeout) could run unbounded, and without its failure memo every hover on a dead feed
-    /// would re-pay the bound. A degraded lookup simply renders no decoration. `dep` is
-    /// resolved once, up front, and reused for the unlisted lookup rather than re-derived
-    /// from the rendered hover afterward.
+    /// would re-pay the bound. A degraded lookup simply renders no decoration.
     ///
     /// **Issue #523 fix**: the unlisted fetch is only issued when `dep.source()` is plain
     /// `DependencySource::Registry` — `self.registry` here is always the `Public`-tier root,
@@ -347,36 +350,14 @@ impl TypedEcosystem for NuGetEcosystem {
     /// method's own tier gate), so this loses nothing a private-feed hover would have shown
     /// anyway.
     #[cfg(feature = "lsp-responses")]
-    fn hover<'a>(
+    fn decorate_hover<'a>(
         &'a self,
         parsed: ParsedView<'a, NuGetParseResult>,
-        position: Position,
+        hovered: &'a NuGetDependency,
         versions: deps_core::VersionData<'a>,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Option<Hover>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, HoverDecorator<'a>> {
         Box::pin(async move {
-            let base_hover = deps_core::lsp_generate_hover(
-                &parsed,
-                position,
-                versions,
-                self.registry.as_ref(),
-                self.own_formatter(),
-                freshness,
-                deps_core::PublishTime::now(),
-            );
-
-            // Same predicate `lsp_generate_hover` uses internally to pick a dependency: if
-            // it finds none, the render above resolves to `None` too, so the unlisted fetch
-            // is skipped rather than issued for a hover that will be empty anyway.
-            let dep = parsed.dependencies_slice().iter().find(|d| {
-                deps_core::position_in_range(position.into(), d.name_range())
-                    || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
-            });
-            let Some(dep) = dep else {
-                return base_hover.await;
-            };
-
+            let dep = hovered;
             // C1 fix (issue #523), widened by #562/FR-012: an `AlternateRegistry` dependency
             // now routes the unlisted-versions fetch through its own registered alternate
             // client (registration-hive enrichment is no longer skipped for alternate feeds) —
@@ -395,37 +376,37 @@ impl TypedEcosystem for NuGetEcosystem {
                 }
                 _ => None,
             };
-            let Some(unlisted_client) = unlisted_client else {
-                return base_hover.await;
+            let unlisted = match unlisted_client {
+                Some(client) => {
+                    await_interactive_fetch(
+                        // The root, not the chain head: only it resolves the alternate source's key.
+                        self.registry.as_ref(),
+                        client.unlisted_versions(dep.name().as_str()),
+                        InteractiveFetchRequest::for_dependency(
+                            versions,
+                            &parsed.typed().uri,
+                            dep,
+                            self.own_formatter(),
+                            FetchContext::Hover,
+                        ),
+                        AuxiliaryLookup::Decoration,
+                    )
+                    .await
+                }
+                None => {
+                    let no_op: HoverDecorator<'a> = Box::new(|_| {});
+                    return no_op;
+                }
             };
-
-            let unlisted_fetch = await_interactive_fetch(
-                // The root, not the chain head: only it resolves the alternate source's key.
-                self.registry.as_ref(),
-                unlisted_client.unlisted_versions(dep.name().as_str()),
-                InteractiveFetchRequest::for_dependency(
-                    versions,
-                    &parsed.typed().uri,
-                    dep,
-                    self.own_formatter(),
-                    FetchContext::Hover,
-                ),
-                AuxiliaryLookup::Decoration,
-            );
-
-            let (hover, unlisted_result) = tokio::join!(base_hover, unlisted_fetch);
-            let mut hover = hover?;
-
-            let InteractiveFetch::Live(unlisted) = unlisted_result else {
-                return Some(hover);
+            let decorator: HoverDecorator<'a> = match unlisted {
+                InteractiveFetch::Live(unlisted) if !unlisted.is_empty() => {
+                    Box::new(move |hover| {
+                        hover.rewrite_markdown(|md| annotate_unlisted_versions(md, &unlisted));
+                    })
+                }
+                _ => Box::new(|_| {}),
             };
-            if unlisted.is_empty() {
-                return Some(hover);
-            }
-
-            hover.rewrite_markdown(|md| annotate_unlisted_versions(md, &unlisted));
-
-            Some(hover)
+            decorator
         })
     }
 }
@@ -688,7 +669,8 @@ mod tests {
         );
         let resolved = std::collections::HashMap::new();
 
-        eco.diagnostics(
+        deps_core::ecosystem::diagnostics(
+            eco,
             ParsedView::new(&parse_result),
             VersionData::new(&cached, &resolved),
             uri,
@@ -1594,15 +1576,15 @@ mod tests {
             // `unlisted_versions`'s doc comment.
             let freshness = deps_core::FreshnessSettings::Disabled;
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    Position::new(0, 49), // inside "Newtonsoft.Json"
-                    deps_core::VersionData::new(&cached, &resolved),
-                    freshness,
-                )
-                .await
-                .expect("hover for a resolvable in-range dependency must not be None");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                Position::new(0, 49), // inside "Newtonsoft.Json"
+                deps_core::VersionData::new(&cached, &resolved),
+                freshness,
+            )
+            .await
+            .expect("hover for a resolvable in-range dependency must not be None");
 
             let content = hover.markdown();
             assert!(
@@ -1656,15 +1638,15 @@ mod tests {
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    Position::new(0, 49),
-                    deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings::Disabled,
-                )
-                .await
-                .expect("a registration-hive failure must still degrade to the base hover");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                Position::new(0, 49),
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await
+            .expect("a registration-hive failure must still degrade to the base hover");
 
             let content = hover.markdown();
             assert!(content.contains("`13.0.3`"));
@@ -1717,7 +1699,8 @@ mod tests {
             );
             let gate = interactive_gate();
             let hover = || async {
-                eco.hover(
+                deps_core::ecosystem::hover(
+                    &eco,
                     ParsedView::new(&parse_result),
                     Position::new(0, 49),
                     gated_versions(&cached, &resolved, &gate),
@@ -1797,7 +1780,8 @@ mod tests {
                 let (eco, parse_result, gate) = (&eco, &parse_result, &gate);
                 let (cached, resolved) = (&cached, &resolved);
                 async move {
-                    eco.hover(
+                    deps_core::ecosystem::hover(
+                        eco,
                         ParsedView::new(parse_result),
                         Position::new(0, column),
                         gated_versions(cached, resolved, gate),
@@ -1817,6 +1801,102 @@ mod tests {
                 "{b}"
             );
             assert!(!c.contains("- `13.0.3`"), "{c}");
+        }
+
+        /// #451 S4 regression: the unlisted-versions decoration is issued while the base version
+        /// list is still in flight. A loopback feed holds the base list's response until the
+        /// registration request has arrived, so a sequential hover (`HoverDecoration::AfterHover`)
+        /// would time the wait out and report that the two never overlapped.
+        #[tokio::test]
+        async fn test_unlisted_decoration_overlaps_the_base_hover_fetch() {
+            use std::io::{Read, Write};
+            use std::sync::{Condvar, Mutex};
+            use std::time::Duration;
+
+            const HOLD: Duration = Duration::from_secs(3);
+
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let registration_seen = Arc::new((Mutex::new(false), Condvar::new()));
+            let overlapped = Arc::new(Mutex::new(None::<bool>));
+            let index = nuget_service_index_body(&base);
+            std::thread::spawn({
+                let (registration_seen, overlapped) =
+                    (registration_seen.clone(), overlapped.clone());
+                move || {
+                    for stream in listener.incoming().flatten() {
+                        let (registration_seen, overlapped) =
+                            (registration_seen.clone(), overlapped.clone());
+                        let index = index.clone();
+                        std::thread::spawn(move || {
+                            let mut stream = stream;
+                            let mut buf = [0u8; 2048];
+                            let n = stream.read(&mut buf).unwrap_or(0);
+                            let request = String::from_utf8_lossy(&buf[..n]);
+                            let path = request.split_whitespace().nth(1).unwrap_or_default();
+                            let body = if path.contains("/registrations/") {
+                                *registration_seen.0.lock().unwrap() = true;
+                                registration_seen.1.notify_all();
+                                r#"{"count": 1, "items": [{"@id": "x", "count": 2, "items": [
+                                {"catalogEntry": {"version": "12.0.1", "listed": true}},
+                                {"catalogEntry": {"version": "13.0.3", "listed": false}}
+                            ]}]}"#
+                                    .to_string()
+                            } else if path.contains("/flatcontainer/") {
+                                let (seen, arrived) = &*registration_seen;
+                                let (guard, _) = arrived
+                                    .wait_timeout_while(seen.lock().unwrap(), HOLD, |seen| !*seen)
+                                    .unwrap();
+                                *overlapped.lock().unwrap() = Some(*guard);
+                                r#"{"versions": ["12.0.1", "13.0.3"]}"#.to_string()
+                            } else {
+                                index
+                            };
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                        });
+                    }
+                }
+            });
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+            let parse_result = eco.parse(content, &uri).await.unwrap();
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = interactive_gate();
+
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                Position::new(0, 49),
+                gated_versions(&cached, &resolved, &gate),
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await
+            .expect("hover for a resolvable dependency");
+
+            assert_eq!(
+                *overlapped.lock().unwrap(),
+                Some(true),
+                "the registration request must arrive while the base list is still held"
+            );
+            assert!(
+                hover.markdown().contains("*(unlisted)*"),
+                "{}",
+                hover.markdown()
+            );
         }
 
         /// S4 regression (#451 follow-up): with no dependency at `position`, the base render
@@ -1852,14 +1932,14 @@ mod tests {
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
 
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    Position::new(0, 0), // outside any dependency's name/version range
-                    deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings::Disabled,
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                Position::new(0, 0), // outside any dependency's name/version range
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await;
 
             assert!(hover.is_none());
             // `.expect(0)` above already asserts this, but check() surfaces a clear message.
@@ -2247,14 +2327,14 @@ mod tests {
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings::Disabled,
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await;
 
             assert!(
                 hover.is_some(),
@@ -2334,15 +2414,15 @@ mod tests {
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
-            let hover = eco
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings::Disabled,
-                )
-                .await
-                .expect("hover for a resolvable alternate-feed dependency must not be None");
+            let hover = deps_core::ecosystem::hover(
+                &eco,
+                ParsedView::new(&parse_result),
+                position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
+            )
+            .await
+            .expect("hover for a resolvable alternate-feed dependency must not be None");
 
             let content = hover.markdown();
             assert!(

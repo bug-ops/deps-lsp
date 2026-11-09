@@ -5,9 +5,9 @@ use std::marker::PhantomData;
 use super::StubDependency;
 use crate::lsp_helpers::{
     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, PinResolution, RequirementResolution, SourcePolicy,
+    PackageRendering, PinResolution, ProbeDependency, RequirementResolution, SourcePolicy,
 };
-use crate::{ConcreteVersion, Dependency, PackageName};
+use crate::{ConcreteVersion, PackageName};
 
 /// A `Copy`, const-constructible test double implementing every
 /// [`EcosystemFormatter`](crate::lsp_helpers::EcosystemFormatter) sub-trait through five knobs.
@@ -270,7 +270,7 @@ impl<D: 'static> OsvNaming for StubFormatter<D> {
     }
 }
 
-impl<D: Dependency + 'static> DependencyFormatter for StubFormatter<D> {
+impl<D: ProbeDependency + 'static> DependencyFormatter for StubFormatter<D> {
     type Dep = D;
 
     fn manifest_requirement_is_resolved_version(&self, dep: &D) -> bool {
@@ -299,6 +299,7 @@ mod tests {
     use crate::{ConcreteVersion, Dependency, PackageName};
 
     struct StubDep;
+    crate::impl_unprobed_dependency!(StubDep);
     impl Dependency for StubDep {
         fn name(&self) -> &PackageName {
             static NAME: std::sync::OnceLock<PackageName> = std::sync::OnceLock::new();

@@ -2677,6 +2677,63 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
     }
 }
 
+/// A dependency type that can be built from nothing but a name and a source.
+///
+/// This is the conformance hook behind the cross-ecosystem `non_public_route` guard
+/// (`deps-engine/tests/osv_non_public_routes.rs`): the test builds one real dependency per
+/// ecosystem with a chosen [`DependencySource`](crate::parser::DependencySource) and asks that
+/// ecosystem's own [`DependencyFormatter`] how it routes it, so no synthetic cross-ecosystem
+/// dependency is needed.
+///
+/// Implementors guarantee that [`Self::probe`] sets [`Dependency::name`] and
+/// [`Dependency::source`] to the given values and leaves every other field at the neutral value
+/// a plain registry dependency has (no version requirement, no registry or feed route, no
+/// parsed positions). A probe is never produced by a parser and never reaches a document.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::ProbeDependency;
+/// use deps_core::parser::DependencySource;
+/// use deps_core::position::Range;
+/// use deps_core::{Dependency, PackageName, VersionReq};
+///
+/// struct PlainDependency {
+///     name: PackageName,
+///     name_range: Range,
+///     version: Option<VersionReq>,
+///     version_range: Option<Range>,
+///     source: DependencySource,
+/// }
+///
+/// deps_core::impl_dependency!(PlainDependency {
+///     name: name,
+///     name_range: name_range,
+///     version: version,
+///     version_range: version_range,
+///     source: source,
+/// });
+///
+/// impl ProbeDependency for PlainDependency {
+///     fn probe(name: PackageName, source: DependencySource) -> Self {
+///         Self {
+///             name,
+///             name_range: Range::default(),
+///             version: None,
+///             version_range: None,
+///             source,
+///         }
+///     }
+/// }
+///
+/// let dep = PlainDependency::probe(PackageName::new("serde"), DependencySource::Registry);
+/// assert_eq!(dep.name().as_str(), "serde");
+/// ```
+pub trait ProbeDependency: Dependency + Sized {
+    /// A dependency named `name` that resolves from `source`, with every other field neutral.
+    fn probe(name: PackageName, source: crate::parser::DependencySource) -> Self;
+}
+
 /// The dependency-taking half of an ecosystem's formatter, typed to the one dependency kind
 /// the ecosystem parses.
 ///
@@ -2702,7 +2759,12 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
 /// ```
 pub trait DependencyFormatter: EcosystemFormatter + 'static {
     /// The dependency type this formatter reads.
-    type Dep: Dependency + 'static;
+    ///
+    /// [`ProbeDependency`] lets the erased [`Ecosystem::probe_non_public_route`] conformance
+    /// probe build one without a parser (#1977).
+    ///
+    /// [`Ecosystem::probe_non_public_route`]: crate::Ecosystem::probe_non_public_route
+    type Dep: ProbeDependency + 'static;
 
     /// Like [`format_version_replacing`](PackageRendering::format_version_replacing), but also
     /// carries the dependency identity `version`/`current` apply to.
@@ -2963,10 +3025,14 @@ pub trait DependencyFormatter: EcosystemFormatter + 'static {
     /// [`crate::osv::NonPublicRoute::UnverifiedMirror`] means the route plausibly proxies public
     /// content but cannot be verified as doing so (an npm `registry=` override), so the skipped
     /// OSV scan is reported to the user. Default: [`crate::osv::NonPublicRoute::Private`], which
-    /// stays silent. An ecosystem that overrides this must also map to an OSV ecosystem. The
-    /// opting-in ecosystems are a hard-coded static list in
-    /// `deps-engine/tests/osv_non_public_routes.rs`, not derived from this trait, so a new
-    /// override has to be added there by hand (a follow-up issue to derive it is pending).
+    /// stays silent. An ecosystem that overrides this must also map to an OSV ecosystem.
+    ///
+    /// `deps-engine/tests/osv_non_public_routes.rs` guards the opt-ins across every ecosystem
+    /// (#1977): it builds each ecosystem's own dependency through [`ProbeDependency`] and asserts
+    /// that only a `CustomRegistry` source in `deps-go` reports an unverified mirror, and that an
+    /// `AlternateRegistry { mirrors_public_registry: false }` source stays
+    /// [`crate::osv::NonPublicRoute::Private`] everywhere. A new opt-in therefore has to be
+    /// added to that test.
     fn non_public_route(&self, dep: &Self::Dep) -> crate::osv::NonPublicRoute {
         let _ = dep;
         crate::osv::NonPublicRoute::Private

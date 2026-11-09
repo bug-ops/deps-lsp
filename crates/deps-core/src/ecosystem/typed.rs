@@ -29,6 +29,24 @@ mod sealed {
 
 pub(super) use sealed::BlanketOnly;
 
+/// An edit of a finished [`Hover`], produced by [`TypedEcosystem::decorate_hover`].
+#[cfg(feature = "lsp-responses")]
+pub type HoverDecorator<'a> = Box<dyn FnOnce(&mut Hover) + Send + 'a>;
+
+/// When [`TypedEcosystem::decorate_hover`]'s lookup runs relative to the shared hover.
+#[cfg(feature = "lsp-responses")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoverDecoration {
+    /// Alongside the shared hover, so the two requests overlap instead of stacking. Pick it for
+    /// an independent fetch (NuGet's unlisted-versions lookup); the lookup cannot see anything
+    /// the shared hover's own fetches record.
+    Concurrent,
+    /// After the shared hover returned a hover, and not at all when it is empty. Pick it when
+    /// the lookup must see the interactive-fetch failure memo the shared fetch writes (GitLab
+    /// CI's component-pin resolution), so a dead endpoint is asked once, not twice.
+    AfterHover,
+}
+
 /// An ecosystem as its own crate writes it: [`EcosystemBase`] plus the typed pairing of a
 /// parser, its parse result, and the formatter that reads that parse result's dependencies.
 ///
@@ -63,6 +81,7 @@ pub(super) use sealed::BlanketOnly;
 ///     version: Option<VersionReq>,
 ///     version_range: Option<Range>,
 /// }
+/// # deps_core::impl_unprobed_dependency!(MyDependency);
 /// impl_dependency!(MyDependency {
 ///     name: name,
 ///     name_range: name_range,
@@ -136,6 +155,10 @@ pub trait TypedEcosystem: EcosystemBase + Sized + 'static {
     /// The formatter that reads [`Self::Parsed`]'s dependencies; the equality of the two
     /// dependency types is what ties formatter and parser together at compile time.
     type Formatter: DependencyFormatter<Dep = <Self::Parsed as TypedParseResult>::Dep>;
+
+    /// When [`Self::decorate_hover`]'s future runs relative to the shared hover.
+    #[cfg(feature = "lsp-responses")]
+    const HOVER_DECORATION: HoverDecoration = HoverDecoration::Concurrent;
 
     /// The ecosystem-specific formatter for LSP response generation.
     ///
@@ -248,103 +271,64 @@ pub trait TypedEcosystem: EcosystemBase + Sized + 'static {
         })
     }
 
-    /// Generate hover information for a position.
+    /// Appends this ecosystem's own diagnostics to the shared output, which
+    /// [`diagnostics`] always generates first.
     ///
-    /// Default implementation delegates to `lsp_helpers::generate_hover`
-    /// using `self.own_formatter()` and `self.registry()`. `versions.license_source` is
-    /// attached by the caller (`deps-lsp::handlers::hover`), not here — the single
-    /// `VersionData` construction site every path funnels through, override or not
-    /// (issue #688 critic M1: attaching it in this default only would silently drop it
-    /// for the ecosystems that override `generate_hover` instead of using this default).
-    #[cfg(feature = "lsp-responses")]
-    fn hover<'a>(
+    /// The shared generator cannot be skipped or re-run with different arguments, so anything
+    /// it attaches (the typosquat-suspect diagnostic, `versions.license_source`, ...) reaches
+    /// every ecosystem. Nothing by default.
+    ///
+    /// An implementation must stay cheap: it may read cached data but must not start a fetch,
+    /// since every diagnostics pass of the document waits for it.
+    fn decorate_diagnostics<'a>(
         &'a self,
         parsed: ParsedView<'a, Self::Parsed>,
-        position: Position,
-        versions: VersionData<'a>,
-        freshness: crate::freshness::FreshnessSettings,
-    ) -> BoxFuture<'a, Option<Hover>> {
-        Box::pin(async move {
-            let registry = self.registry();
-            crate::lsp_helpers::generate_hover(
-                &parsed,
-                position,
-                versions,
-                registry.as_ref(),
-                self.own_formatter(),
-                freshness,
-                crate::freshness::PublishTime::now(),
-            )
-            .await
-        })
-    }
-
-    /// Generate code actions for a position.
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_code_actions`
-    /// using `self.own_formatter()` and `self.registry()`. `versions` carries the
-    /// same OSV scan results `generate_hover` and `generate_diagnostics` use,
-    /// so a vulnerable dependency at `position` gets a "fix vulnerability"
-    /// quickfix alongside the plain version-update actions. `content` is the
-    /// manifest source, needed to guard against rewriting a `version_range`
-    /// that no longer slices to its declared requirement text (see
-    /// `lsp_helpers::literal_span_matches`).
-    #[cfg(feature = "lsp-responses")]
-    fn code_actions<'a>(
-        &'a self,
-        parsed: ParsedView<'a, Self::Parsed>,
-        position: Position,
-        uri: &'a url::Url,
-        versions: VersionData<'a>,
-        content: &'a str,
-    ) -> BoxFuture<'a, Vec<CodeAction>> {
-        Box::pin(async move {
-            let registry = self.registry();
-            crate::lsp_helpers::generate_code_actions(
-                &parsed,
-                position,
-                uri,
-                versions,
-                content,
-                registry.as_ref(),
-                self.own_formatter(),
-            )
-            .await
-        })
-    }
-
-    /// Generate diagnostics for the document.
-    ///
-    /// Default implementation delegates to `lsp_helpers::generate_diagnostics_from_cache`
-    /// using `self.own_formatter()`. `versions.license_source` is attached by the caller
-    /// (`deps-lsp::handlers::diagnostics`), not here — see [`Self::hover`]'s doc
-    /// for why (issue #688 critic M1).
-    ///
-    /// The typosquat-suspect diagnostic (issue #1437) needs no special handling from an
-    /// override: it is evaluated directly inside `generate_diagnostics_from_cache` itself,
-    /// reading `versions.typosquat_prefetch` — a background pre-fetch merged in by the
-    /// caller, the same way `versions.license_prefetch` already is — so every override that
-    /// calls `generate_diagnostics_from_cache` (this default impl included) gets it
-    /// automatically, with no `.await` on this path (NFR-002).
-    fn diagnostics<'a>(
-        &'a self,
-        parsed: ParsedView<'a, Self::Parsed>,
-        versions: VersionData<'a>,
-        uri: &'a url::Url,
-        freshness: crate::freshness::FreshnessSettings,
         severities: crate::lsp_helpers::DiagnosticSeverities,
-    ) -> BoxFuture<'a, Vec<Diagnostic>> {
-        Box::pin(async move {
-            crate::lsp_helpers::generate_diagnostics_from_cache(
-                &parsed,
-                versions,
-                self.own_formatter(),
-                uri,
-                freshness,
-                severities,
-                crate::freshness::PublishTime::now(),
-            )
-        })
+        out: &'a mut Vec<Diagnostic>,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (parsed, severities, out);
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Appends this ecosystem's own code actions to the shared output, which [`code_actions`]
+    /// always generates first.
+    ///
+    /// Async because an ecosystem may need a cached lookup (GitLab CI resolves a component
+    /// pin). Nothing by default.
+    #[cfg(feature = "lsp-responses")]
+    fn decorate_code_actions<'a>(
+        &'a self,
+        parsed: ParsedView<'a, Self::Parsed>,
+        position: Position,
+        uri: &'a url::Url,
+        versions: VersionData<'a>,
+        out: &'a mut Vec<CodeAction>,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (parsed, position, uri, versions, out);
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Prepares an edit of the shared hover for `hovered`, the dependency [`hover`] found once
+    /// for both the shared generator and this hook.
+    ///
+    /// The returned future runs concurrently with the shared hover's own fetches, so any lookup
+    /// belongs in it; the returned [`HoverDecorator`] is then applied to the finished hover and
+    /// must not block. The default decorates nothing.
+    ///
+    /// [`Self::HOVER_DECORATION`] says whether the future runs beside the shared hover or after
+    /// it. A decorator is applied after the shared hover either way, so it may read what the
+    /// shared hover's fetches warmed (a tag index).
+    #[cfg(feature = "lsp-responses")]
+    fn decorate_hover<'a>(
+        &'a self,
+        parsed: ParsedView<'a, Self::Parsed>,
+        hovered: &'a <Self::Parsed as TypedParseResult>::Dep,
+        versions: VersionData<'a>,
+    ) -> BoxFuture<'a, HoverDecorator<'a>> {
+        let _ = (parsed, hovered, versions);
+        Box::pin(std::future::ready(
+            Box::new(|_: &mut Hover| {}) as HoverDecorator<'a>
+        ))
     }
 
     /// Generate `textDocument/documentLink` targets for the document.
@@ -629,4 +613,169 @@ impl<T: TypedEcosystem> Ecosystem for T {
         let parsed = self.parse_sync(content, uri)?;
         Some(Box::new(EcosystemManifest::new(self, parsed)))
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn probe_non_public_route(
+        &self,
+        name: crate::PackageName,
+        source: crate::parser::DependencySource,
+    ) -> crate::osv::NonPublicRoute {
+        use crate::lsp_helpers::ProbeDependency;
+        let dep =
+            <<T::Formatter as DependencyFormatter>::Dep as ProbeDependency>::probe(name, source);
+        self.own_formatter().non_public_route(&dep)
+    }
+}
+
+/// Generates the hover for `position`: the shared hover, edited by
+/// [`TypedEcosystem::decorate_hover`] for the one dependency under the cursor.
+///
+/// Returns `None` when no dependency covers `position`. `versions.license_source` is attached
+/// by the caller (`deps-lsp::handlers::hover`), not here, so it reaches every ecosystem alike.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::ecosystem::hover;
+/// use deps_core::{FreshnessSettings, ParsedView, TypedEcosystem, VersionData};
+/// use tower_lsp_server::ls_types::Position;
+///
+/// async fn hover_at<E: TypedEcosystem>(
+///     eco: &E,
+///     parsed: ParsedView<'_, E::Parsed>,
+///     versions: VersionData<'_>,
+///     freshness: FreshnessSettings,
+/// ) {
+///     let _ = hover(eco, parsed, Position::new(0, 0), versions, freshness).await;
+/// }
+/// ```
+#[cfg(feature = "lsp-responses")]
+pub async fn hover<'a, E: TypedEcosystem>(
+    eco: &'a E,
+    parsed: ParsedView<'a, E::Parsed>,
+    position: Position,
+    versions: VersionData<'a>,
+    freshness: crate::freshness::FreshnessSettings,
+) -> Option<Hover> {
+    let hovered =
+        crate::lsp_helpers::find_hovered_dependency(parsed.dependencies_slice(), position)?;
+    let registry = eco.registry();
+    let shared = crate::lsp_helpers::generate_hover(
+        &parsed,
+        position,
+        versions,
+        registry.as_ref(),
+        eco.own_formatter(),
+        freshness,
+        crate::freshness::PublishTime::now(),
+    );
+    let decoration = eco.decorate_hover(parsed, hovered, versions);
+    let (mut hover, decorator) = match E::HOVER_DECORATION {
+        HoverDecoration::Concurrent => {
+            let (hover, decorator) = futures::join!(shared, decoration);
+            (hover?, decorator)
+        }
+        HoverDecoration::AfterHover => {
+            let hover = shared.await?;
+            (hover, decoration.await)
+        }
+    };
+    decorator(&mut hover);
+    Some(hover)
+}
+
+/// Generates the code actions for `position`: the shared actions, then
+/// [`TypedEcosystem::decorate_code_actions`]'s.
+///
+/// `versions` carries the OSV scan results the shared hover and diagnostics use, so a
+/// vulnerable dependency gets a "fix vulnerability" quickfix beside the plain version updates.
+/// `content` is the manifest source, needed to refuse rewriting a `version_range` that no
+/// longer slices to its declared requirement text.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::ecosystem::code_actions;
+/// use deps_core::{ParsedView, TypedEcosystem, VersionData};
+/// use tower_lsp_server::ls_types::Position;
+///
+/// async fn actions_at<E: TypedEcosystem>(
+///     eco: &E,
+///     parsed: ParsedView<'_, E::Parsed>,
+///     uri: &url::Url,
+///     versions: VersionData<'_>,
+///     content: &str,
+/// ) {
+///     let _ = code_actions(eco, parsed, Position::new(0, 0), uri, versions, content).await;
+/// }
+/// ```
+#[cfg(feature = "lsp-responses")]
+pub async fn code_actions<'a, E: TypedEcosystem>(
+    eco: &'a E,
+    parsed: ParsedView<'a, E::Parsed>,
+    position: Position,
+    uri: &'a url::Url,
+    versions: VersionData<'a>,
+    content: &'a str,
+) -> Vec<CodeAction> {
+    let registry = eco.registry();
+    let mut actions = crate::lsp_helpers::generate_code_actions(
+        &parsed,
+        position,
+        uri,
+        versions,
+        content,
+        registry.as_ref(),
+        eco.own_formatter(),
+    )
+    .await;
+    eco.decorate_code_actions(parsed, position, uri, versions, &mut actions)
+        .await;
+    actions
+}
+
+/// Generates the diagnostics for the document: the shared diagnostics, then
+/// [`TypedEcosystem::decorate_diagnostics`]'s.
+///
+/// `versions.license_source` is attached by the caller (`deps-lsp::handlers::diagnostics`),
+/// not here. The typosquat-suspect diagnostic needs nothing from an ecosystem: the shared
+/// generator reads it from `versions.typosquat_prefetch`, with no `.await` on this path.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::ecosystem::diagnostics;
+/// use deps_core::lsp_helpers::DiagnosticSeverities;
+/// use deps_core::{FreshnessSettings, ParsedView, TypedEcosystem, VersionData};
+///
+/// async fn diagnose<E: TypedEcosystem>(
+///     eco: &E,
+///     parsed: ParsedView<'_, E::Parsed>,
+///     versions: VersionData<'_>,
+///     uri: &url::Url,
+///     freshness: FreshnessSettings,
+///     severities: DiagnosticSeverities,
+/// ) {
+///     let _ = diagnostics(eco, parsed, versions, uri, freshness, severities).await;
+/// }
+/// ```
+pub async fn diagnostics<'a, E: TypedEcosystem>(
+    eco: &'a E,
+    parsed: ParsedView<'a, E::Parsed>,
+    versions: VersionData<'a>,
+    uri: &'a url::Url,
+    freshness: crate::freshness::FreshnessSettings,
+    severities: crate::lsp_helpers::DiagnosticSeverities,
+) -> Vec<Diagnostic> {
+    let mut out = crate::lsp_helpers::generate_diagnostics_from_cache(
+        &parsed,
+        versions,
+        eco.own_formatter(),
+        uri,
+        freshness,
+        severities,
+        crate::freshness::PublishTime::now(),
+    );
+    eco.decorate_diagnostics(parsed, severities, &mut out).await;
+    out
 }

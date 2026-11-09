@@ -5,7 +5,9 @@
 //! waiter drops the handle and leaves the task running, so its result still lands wherever the
 //! work stores it. The task owns the claim, so it is released when the work finishes, panics, or
 //! the runtime shuts down and drops the task; only then are waiters woken. Nothing outside the
-//! task can abort it, because its `JoinHandle` is dropped.
+//! task can abort it, because its `JoinHandle` is dropped. A panic is caught inside the task,
+//! logged inside the caller's span, and reported to waiters as [`FlightEnd::Abandoned`], never
+//! as completion.
 //!
 //! The in-flight map is an implementation detail: no map type appears in this module's public
 //! signatures.
@@ -13,8 +15,12 @@
 use std::fmt;
 use std::future::Future;
 use std::hash::Hash;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures::FutureExt;
+use tracing::Instrument;
 
 use crate::single_flight::{FlightMap, Follower, OwnedClaim, claim_or_follow_owned};
 
@@ -24,7 +30,7 @@ use crate::single_flight::{FlightMap, Follower, OwnedClaim, claim_or_follow_owne
 ///
 /// ```
 /// use std::time::Duration;
-/// use deps_core::SingleFlight;
+/// use deps_core::{FlightEnd, SingleFlight};
 ///
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
@@ -37,8 +43,8 @@ use crate::single_flight::{FlightMap, Follower, OwnedClaim, claim_or_follow_owne
 /// assert!(!second.issued());
 ///
 /// release.send(()).unwrap();
-/// assert!(first.wait(Duration::from_secs(5)).await);
-/// assert!(second.wait(Duration::from_secs(5)).await);
+/// assert_eq!(first.wait(Duration::from_secs(5)).await, FlightEnd::Completed);
+/// assert_eq!(second.wait(Duration::from_secs(5)).await, FlightEnd::Completed);
 /// # }
 /// ```
 pub struct SingleFlight<K>(Arc<FlightMap<K, ()>>);
@@ -76,10 +82,16 @@ impl<K: Hash + Eq + Clone + Send + Sync + 'static> SingleFlight<K> {
             },
             OwnedClaim::Leader(leader) => {
                 let follower = leader.follower();
-                tokio::spawn(async move {
-                    let _claim = leader;
-                    work.await;
-                });
+                tokio::spawn(
+                    async move {
+                        if AssertUnwindSafe(work).catch_unwind().await.is_err() {
+                            tracing::error!("detached single-flight work panicked");
+                            return;
+                        }
+                        leader.publish(());
+                    }
+                    .instrument(tracing::Span::current()),
+                );
                 FlightHandle {
                     follower,
                     issued: true,
@@ -103,15 +115,28 @@ impl FlightHandle {
         self.issued
     }
 
-    /// Waits up to `budget` for the flight to end; `false` only when the budget ran out.
+    /// Waits up to `budget` for the flight to end and reports how it ended.
     ///
-    /// A leader that panicked or was dropped by a runtime shutdown counts as ended. The work
-    /// keeps running when the budget runs out.
-    pub async fn wait(self, budget: Duration) -> bool {
-        tokio::time::timeout(budget, self.follower.wait())
-            .await
-            .is_ok()
+    /// The work keeps running when the budget runs out.
+    pub async fn wait(self, budget: Duration) -> FlightEnd {
+        match tokio::time::timeout(budget, self.follower.wait()).await {
+            Ok(Some(())) => FlightEnd::Completed,
+            Ok(None) => FlightEnd::Abandoned,
+            Err(_elapsed) => FlightEnd::TimedOut,
+        }
     }
+}
+
+/// How a flight ended from a waiter's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightEnd {
+    /// The work ran to completion.
+    Completed,
+    /// The leader panicked, or a runtime shutdown dropped it, before finishing. A panic is
+    /// logged at `error` level inside the caller's span.
+    Abandoned,
+    /// The budget ran out while the work was still running.
+    TimedOut,
 }
 
 #[cfg(test)]
@@ -140,24 +165,42 @@ mod tests {
         assert!(!second.issued());
 
         release.send(()).unwrap();
-        assert!(first.wait(BUDGET).await);
-        assert!(second.wait(BUDGET).await);
+        assert_eq!(first.wait(BUDGET).await, FlightEnd::Completed);
+        assert_eq!(second.wait(BUDGET).await, FlightEnd::Completed);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn a_finished_flight_frees_the_key() {
         let flights = SingleFlight::default();
-        assert!(flights.start_or_join("k", async {}).wait(BUDGET).await);
+        let end = flights.start_or_join("k", async {}).wait(BUDGET).await;
+        assert_eq!(end, FlightEnd::Completed);
         assert!(flights.start_or_join("k", async {}).issued());
     }
 
     #[tokio::test]
-    async fn a_panicking_leader_still_wakes_waiters_and_frees_the_key() {
+    async fn a_panicking_leader_is_abandoned_not_completed_and_frees_the_key() {
         let flights = SingleFlight::default();
         let handle = flights.start_or_join("k", async { panic!("leader failed") });
-        assert!(handle.wait(BUDGET).await);
+        assert_eq!(handle.wait(BUDGET).await, FlightEnd::Abandoned);
         assert!(flights.start_or_join("k", async {}).issued());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_leader_is_logged_inside_the_callers_span() {
+        let flights = SingleFlight::default();
+        let output = crate::test_util::capture_tracing_output_async(async {
+            let span = tracing::info_span!("request", document = "doc-1984");
+            let handle =
+                span.in_scope(|| flights.start_or_join("k", async { panic!("leader failed") }));
+            assert_eq!(handle.wait(BUDGET).await, FlightEnd::Abandoned);
+        })
+        .await;
+        assert!(
+            output.contains("detached single-flight work panicked"),
+            "{output}"
+        );
+        assert!(output.contains("doc-1984"), "{output}");
     }
 
     #[tokio::test]
@@ -196,24 +239,28 @@ mod tests {
             flights.0.is_empty(),
             "the dropped leader released the claim"
         );
-        assert!(
+        assert_eq!(
             build().block_on(handle.wait(BUDGET)),
+            FlightEnd::Abandoned,
             "waiters see the flight end"
         );
     }
 
     #[tokio::test]
-    async fn waiting_past_the_budget_reports_false() {
+    async fn waiting_past_the_budget_reports_timed_out() {
         let flights = SingleFlight::default();
         let handle = flights.start_or_join("k", std::future::pending());
-        assert!(!handle.wait(Duration::from_millis(20)).await);
+        assert_eq!(
+            handle.wait(Duration::from_millis(20)).await,
+            FlightEnd::TimedOut
+        );
     }
 
     #[tokio::test]
     async fn waiters_wake_only_after_the_key_is_free() {
         let flights = SingleFlight::default();
         let handle = flights.start_or_join("k", async {});
-        assert!(handle.wait(BUDGET).await);
+        assert_eq!(handle.wait(BUDGET).await, FlightEnd::Completed);
         assert!(flights.0.is_empty());
     }
 }

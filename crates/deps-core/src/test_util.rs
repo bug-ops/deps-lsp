@@ -1085,6 +1085,7 @@ pub async fn capture_tracing_span_fields_async(
 #[derive(Debug, Clone)]
 pub struct StubDependency {
     name: crate::PackageName,
+    source: crate::parser::DependencySource,
 }
 
 impl StubDependency {
@@ -1093,7 +1094,14 @@ impl StubDependency {
     pub fn new(name: &str) -> Self {
         Self {
             name: crate::PackageName::new(name),
+            source: crate::parser::DependencySource::Registry,
         }
+    }
+}
+
+impl crate::lsp_helpers::ProbeDependency for StubDependency {
+    fn probe(name: crate::PackageName, source: crate::parser::DependencySource) -> Self {
+        Self { name, source }
     }
 }
 
@@ -1115,7 +1123,7 @@ impl crate::Dependency for StubDependency {
     }
 
     fn source(&self) -> crate::parser::DependencySource {
-        crate::parser::DependencySource::Registry
+        self.source.clone()
     }
 }
 

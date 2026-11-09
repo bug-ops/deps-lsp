@@ -732,6 +732,52 @@ macro_rules! impl_get_versions_with_passthrough {
     };
 }
 
+/// Implements [`ProbeDependency`](crate::lsp_helpers::ProbeDependency) for a test double that
+/// the `non_public_route` conformance probe (#1977) never builds.
+///
+/// [`DependencyFormatter::Dep`](crate::lsp_helpers::DependencyFormatter::Dep) requires a
+/// probe, but a hand-written fixture dependency has no parser-free constructor; calling the
+/// generated [`probe`](crate::lsp_helpers::ProbeDependency::probe) panics, so a double that
+/// does get probed must implement the trait by hand instead.
+///
+/// # Examples
+///
+/// ```ignore
+/// use deps_core::{Dependency, PackageName, VersionReq};
+/// use deps_core::parser::DependencySource;
+/// use deps_core::position::Range;
+///
+/// struct Fixture(PackageName);
+///
+/// impl Dependency for Fixture {
+///     fn name(&self) -> &PackageName { &self.0 }
+///     fn name_range(&self) -> Range { Range::default() }
+///     fn version_requirement(&self) -> Option<&VersionReq> { None }
+///     fn version_range(&self) -> Option<Range> { None }
+///     fn source(&self) -> DependencySource { DependencySource::Registry }
+/// }
+///
+/// deps_core::impl_unprobed_dependency!(Fixture);
+/// ```
+#[cfg(any(test, feature = "test-util"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+#[macro_export]
+macro_rules! impl_unprobed_dependency {
+    ($type:ty) => {
+        impl $crate::lsp_helpers::ProbeDependency for $type {
+            fn probe(
+                _name: $crate::PackageName,
+                _source: $crate::parser::DependencySource,
+            ) -> Self {
+                unreachable!(concat!(
+                    stringify!($type),
+                    " is a test double that is never probed"
+                ))
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ConcreteVersion;
@@ -840,6 +886,8 @@ mod tests {
         dependency_truncation: Option<(usize, usize)>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
     }
+
+    crate::impl_unprobed_dependency!(TestDependency);
 
     impl_dependency!(TestDependency {
         name: name,

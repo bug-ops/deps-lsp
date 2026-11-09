@@ -2416,6 +2416,7 @@ macro_rules! registry_conformance {
 /// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// # struct FakeDep { name: deps_core::PackageName }
+/// # deps_core::impl_unprobed_dependency!(FakeDep);
 /// # impl deps_core::ecosystem::Dependency for FakeDep {
 /// #     fn name(&self) -> &deps_core::PackageName { &self.name }
 /// #     fn name_range(&self) -> Range { Range::default() }

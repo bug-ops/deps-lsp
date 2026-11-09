@@ -101,6 +101,23 @@ impl ShaComment {
     }
 }
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for GithubActionsDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            pin: None,
+            source,
+            is_plain_scalar: true,
+            is_last_on_line: true,
+        }
+    }
+}
+
 #[cfg(test)]
 impl PinStyle {
     /// A [`PinStyle::Sha`] with a synthetic `# tag` comment, for tests that build dependencies

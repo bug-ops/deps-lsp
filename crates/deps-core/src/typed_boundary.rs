@@ -8,6 +8,7 @@
 use crate::ecosystem::{
     BlockedRegistryOccurrence, Dependency, ParseResult, RejectedRegistryOccurrence,
 };
+use crate::lsp_helpers::ProbeDependency;
 use crate::selection::{InvalidStabilityOccurrence, SelectionContext};
 
 /// A [`ParseResult`] that also exposes its dependencies as their concrete type.
@@ -30,7 +31,11 @@ use crate::selection::{InvalidStabilityOccurrence, SelectionContext};
 /// ```
 pub trait TypedParseResult: ParseResult {
     /// The concrete dependency type this parse result holds.
-    type Dep: Dependency + 'static;
+    ///
+    /// [`ProbeDependency`] is required here as well as on `DependencyFormatter::Dep`: the two
+    /// types are equated by `TypedEcosystem::Formatter`, and the compiler resolves the
+    /// equality to this side.
+    type Dep: ProbeDependency + 'static;
 
     /// All dependencies of the document, uncapped and in manifest order.
     fn own_dependencies(&self) -> &[Self::Dep];

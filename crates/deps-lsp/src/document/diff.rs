@@ -65,6 +65,7 @@ pub(crate) fn drop_cache_for_forced_refetch(
     deps_to_fetch: &[NormalizedName],
 ) {
     doc.signals.cached_versions.clear();
+    doc.signals.registry_baseline.clear();
     doc.signals.outcomes.clear_all_fetch_failures();
     for name in deps_to_fetch {
         doc.signals
@@ -112,6 +113,61 @@ pub(crate) fn orphaned_for_test(names: &[&str]) -> OrphanedKeys {
         .map(|n| (NormalizedName::for_test(*n), Vec::new()))
         .collect();
     DependencyDiff::compute(&old, &HashMap::new()).removed
+}
+
+/// Declared version requirements of every occurrence of each package, in [`NormalizedName`]
+/// space — the shape [`DependencyDiff::compute`] compares.
+pub(crate) type DeclaredRequirements = HashMap<NormalizedName, Vec<Option<VersionReq>>>;
+
+/// The requirements each package had when a registry outcome (data, failure or miss) last
+/// committed for it (issue #1987).
+///
+/// A change task decides what to fetch by comparing the current declaration against this
+/// baseline instead of against the previous parse: an edit that aborts an in-flight fetch
+/// leaves the previous parse "unchanged" yet never fetched, so a parse-to-parse diff would
+/// skip the fetch for good. The comparison self-corrects across any number of aborted tasks,
+/// like [`super::state::PackageSignals::typosquat_checked_names`]. `Default` is "nothing
+/// committed". A recorded failure or miss counts as committed, so it is not refetched on every
+/// edit.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegistryBaseline(DeclaredRequirements);
+
+impl RegistryBaseline {
+    /// Packages declared in `declared` whose current requirements have no committed outcome:
+    /// never fetched, or fetched under different requirements.
+    pub(crate) fn pending(&self, declared: &DeclaredRequirements) -> Vec<NormalizedName> {
+        let diff = DependencyDiff::compute(&self.0, declared);
+        let mut names = diff.added;
+        names.extend(diff.version_changed);
+        names
+    }
+
+    /// Replaces the baseline with exactly what a completed whole-document fetch requested.
+    pub(crate) fn replace(&mut self, committed: DeclaredRequirements) {
+        self.0 = committed;
+    }
+
+    /// Records the requirements a completed partial fetch requested, keeping other entries.
+    pub(crate) fn record(&mut self, committed: DeclaredRequirements) {
+        self.0.extend(committed);
+    }
+
+    /// Forgets `names`, so they are pending again (their outcomes were cleared by an edit).
+    pub(crate) fn invalidate(&mut self, names: &[NormalizedName]) {
+        for name in names {
+            self.0.remove(name);
+        }
+    }
+
+    /// Forgets everything, as a forced refetch dropped every cached outcome.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Number of packages with a committed outcome.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// Diff between old and new dependency sets, in [`NormalizedName`] space.
@@ -2263,6 +2319,7 @@ time = "0.1"
             name: PackageName,
             version_req: Option<VersionReq>,
         }
+        deps_core::impl_unprobed_dependency!(StubDependency);
         impl deps_core::Dependency for StubDependency {
             fn name(&self) -> &PackageName {
                 &self.name
@@ -2569,5 +2626,76 @@ time = "0.1"
                  resolved_versions value (the highest entry, 0.3.36) stays unchanged"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_baseline_tests {
+    use super::*;
+
+    fn name(n: &str) -> NormalizedName {
+        NormalizedName::for_test(n)
+    }
+
+    fn declared(entries: &[(&str, &str)]) -> DeclaredRequirements {
+        entries
+            .iter()
+            .map(|(n, req)| (name(n), vec![Some(VersionReq::new(*req))]))
+            .collect()
+    }
+
+    #[test]
+    fn nothing_committed_makes_every_declared_package_pending() {
+        let pending = RegistryBaseline::default().pending(&declared(&[("a", "1"), ("b", "2")]));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn committed_packages_with_unchanged_requirements_are_not_pending() {
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(declared(&[("a", "1"), ("b", "2")]));
+        assert!(
+            baseline
+                .pending(&declared(&[("a", "1"), ("b", "2")]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn changed_or_added_requirements_are_pending() {
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(declared(&[("a", "1"), ("b", "2")]));
+        let mut pending = baseline.pending(&declared(&[("a", "1"), ("b", "3"), ("c", "1")]));
+        pending.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        assert_eq!(pending, [name("b"), name("c")]);
+    }
+
+    #[test]
+    fn record_keeps_other_entries_and_replace_drops_them() {
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(declared(&[("a", "1")]));
+        baseline.record(declared(&[("b", "2")]));
+        assert_eq!(baseline.len(), 2);
+        baseline.replace(declared(&[("c", "3")]));
+        assert_eq!(baseline.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_and_clear_make_packages_pending_again() {
+        let all = declared(&[("a", "1"), ("b", "2")]);
+        let mut baseline = RegistryBaseline::default();
+        baseline.replace(all.clone());
+        baseline.invalidate(&[name("a")]);
+        assert_eq!(baseline.pending(&all), [name("a")]);
+        baseline.clear();
+        assert_eq!(baseline.pending(&all).len(), 2);
+    }
+
+    #[test]
+    fn pruning_a_removed_package_forgets_its_baseline() {
+        let mut signals = crate::document::state::PackageSignals::default();
+        signals.registry_baseline.replace(declared(&[("a", "1")]));
+        signals.prune_removed(&orphaned_for_test(&["a"]));
+        assert_eq!(signals.registry_baseline.len(), 0);
     }
 }

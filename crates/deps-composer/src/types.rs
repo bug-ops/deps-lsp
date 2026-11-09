@@ -406,6 +406,21 @@ deps_core::impl_metadata!(ComposerPackage {
     latest_version: latest_version,
 });
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for ComposerDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            section: ComposerSection::Require,
+            source,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -585,15 +585,15 @@ gem 'rails', '~> 7.0'";
             let resolved_versions = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
 
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    versions,
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                versions,
+                content,
+            )
+            .await;
 
             mock.assert_async().await;
             assert!(
@@ -637,15 +637,15 @@ gem 'rails', '~> 7.0'";
             let resolved_versions = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
 
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    versions,
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                versions,
+                content,
+            )
+            .await;
 
             mock.assert_async().await;
             assert!(

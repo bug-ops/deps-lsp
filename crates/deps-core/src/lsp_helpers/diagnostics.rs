@@ -11251,7 +11251,7 @@ mod tests {
 
         impl<D> OsvNaming for TableFormatter<D> {}
 
-        impl<D: Dependency + 'static> DependencyFormatter for TableFormatter<D> {
+        impl<D: crate::lsp_helpers::ProbeDependency + 'static> DependencyFormatter for TableFormatter<D> {
             type Dep = D;
         }
 

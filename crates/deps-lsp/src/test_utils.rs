@@ -299,17 +299,14 @@ pub(crate) mod blocking_ecosystem {
             })
         }
 
-        fn diagnostics<'a>(
+        fn decorate_diagnostics<'a>(
             &'a self,
             _parsed: ParsedView<'a, StubParseResult>,
-            _versions: VersionData<'a>,
-            _uri: &'a url::Url,
-            _freshness: FreshnessSettings,
             _severities: DiagnosticSeverities,
-        ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
+            _out: &'a mut Vec<deps_core::diagnostic::Diagnostic>,
+        ) -> BoxFuture<'a, ()> {
             Box::pin(async move {
                 self.block_on(BlockingHook::Diagnostics).await;
-                vec![]
             })
         }
 

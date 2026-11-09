@@ -178,6 +178,22 @@ deps_core::impl_metadata!(GoMetadata {
     latest_version: latest_version,
 });
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for GoDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        Self {
+            module_path: name,
+            module_path_range: Range::default(),
+            version: None,
+            version_range: None,
+            directive: GoDirective::Require,
+            indirect: false,
+            source,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

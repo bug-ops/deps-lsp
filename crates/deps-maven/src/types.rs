@@ -261,6 +261,27 @@ impl deps_core::Metadata for ArtifactInfo {
     }
 }
 
+/// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
+/// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
+impl deps_core::lsp_helpers::ProbeDependency for MavenDependency {
+    fn probe(name: deps_core::PackageName, source: deps_core::parser::DependencySource) -> Self {
+        let (group_id, artifact_id) = name.as_str().split_once(':').map_or_else(
+            || (name.as_str().to_owned(), String::new()),
+            |(group, artifact)| (group.to_owned(), artifact.to_owned()),
+        );
+        Self {
+            group_id,
+            artifact_id,
+            name,
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            scope: MavenScope::default(),
+            source,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,7 @@
 //! [`deps_core::lsp_helpers::fetch_gossip_findings_batch`]) rather than one call per
 //! dependency.
 
-use super::state::ServerState;
+use super::state::{ServerState, spawn_supervised};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use deps_core::policy_config::FetchTimeout;
@@ -211,7 +211,7 @@ pub(crate) fn spawn_gossip_mismatch_refetch_if_needed(
         return;
     }
 
-    tokio::spawn(
+    spawn_supervised(
         run_gossip_mismatch_refetch(
             Arc::clone(state),
             client.clone(),
@@ -220,6 +220,7 @@ pub(crate) fn spawn_gossip_mismatch_refetch_if_needed(
             mismatched,
         )
         .instrument(tracing::Span::current()),
+        |error| tracing::error!(%error, "GOSSIP mismatch refetch task panicked"),
     );
 }
 

@@ -16,7 +16,7 @@ use deps_core::{
 };
 use std::collections::HashMap;
 
-use super::super::diff::OrphanedKeys;
+use super::super::diff::{OrphanedKeys, RegistryBaseline};
 use super::super::osv_scan::OsvScanPlan;
 use super::super::typosquat::TyposquatGate;
 use super::ResolvedGeneration;
@@ -175,6 +175,10 @@ pub struct PackageSignals {
     /// or when `policy.gossip.enabled` is `false`; carried across document edits by
     /// `preserve_cache` so the signal doesn't flicker off on every keystroke.
     pub gossip_findings: HashMap<NormalizedName, GossipFindings>,
+    /// Requirements each package had when its registry outcome last committed (issue #1987);
+    /// see [`RegistryBaseline`]. Carried across edits by `preserve_cache`, pruned with the
+    /// package by [`Self::prune_removed`].
+    pub(crate) registry_baseline: RegistryBaseline,
 }
 
 impl std::fmt::Debug for PackageSignals {
@@ -199,6 +203,7 @@ impl std::fmt::Debug for PackageSignals {
             typosquats,
             typosquat_checked_names,
             gossip_findings,
+            registry_baseline,
         } = self;
         f.debug_struct("PackageSignals")
             .field("cached_versions_count", &cached_versions.len())
@@ -219,6 +224,7 @@ impl std::fmt::Debug for PackageSignals {
                 &typosquat_checked_names.len(),
             )
             .field("gossip_findings_count", &gossip_findings.len())
+            .field("registry_baseline_count", &registry_baseline.len())
             .field("yanked_versions_count", &outcomes.yanked_count())
             .field("deprecations_count", &outcomes.deprecation_count())
             .field("fetch_failed_count", &outcomes.fetch_failure_count())
@@ -249,6 +255,7 @@ impl Default for PackageSignals {
             typosquats: HashMap::new(),
             typosquat_checked_names: TyposquatGate::default(),
             gossip_findings: HashMap::new(),
+            registry_baseline: RegistryBaseline::default(),
         }
     }
 }
@@ -282,7 +289,9 @@ impl PackageSignals {
             typosquats,
             typosquat_checked_names: _,
             gossip_findings,
+            registry_baseline,
         } = self;
+        registry_baseline.invalidate(orphaned.as_slice());
         for removed_dep in orphaned.as_slice() {
             cached_versions.remove(removed_dep);
             resolved_versions.remove(removed_dep);

@@ -112,6 +112,7 @@ pub struct PinNoun {
 ///     version_range: deps_core::position::Range,
 ///     name_range: deps_core::position::Range,
 /// }
+/// # deps_core::impl_unprobed_dependency!(MockDep);
 /// impl Dependency for MockDep {
 ///     fn name(&self) -> &PackageName { &self.name }
 ///     fn name_range(&self) -> deps_core::position::Range { self.name_range }
@@ -235,6 +236,7 @@ impl crate::edit::EditSpan for TextEdit {
 ///
 /// // An empty parse result yields no outdated dependencies, so no lens is generated.
 /// # struct EmptyDependency;
+/// # deps_core::impl_unprobed_dependency!(EmptyDependency);
 /// # impl Dependency for EmptyDependency {
 /// #     fn name(&self) -> &PackageName { unreachable!() }
 /// #     fn name_range(&self) -> deps_core::position::Range { unreachable!() }
@@ -372,6 +374,7 @@ mod tests {
             version_range: Option<Range>,
         }
 
+        crate::impl_unprobed_dependency!(UaeDep);
         impl Dependency for UaeDep {
             fn name(&self) -> &PackageName {
                 &self.name

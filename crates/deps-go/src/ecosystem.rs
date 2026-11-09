@@ -359,19 +359,20 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            ecosystem.diagnostics(
-                ParsedView::new(&parse_result),
-                VersionData::new(&cached_versions, &resolved_versions),
-                parse_result.uri(),
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-            ),
+        let diagnostics = deps_core::ecosystem::diagnostics(
+            &ecosystem,
+            ParsedView::new(&parse_result),
+            VersionData::new(&cached_versions, &resolved_versions),
+            parse_result.uri(),
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
         )
         .await;
 
-        assert!(result.is_ok(), "Diagnostic generation timed out");
+        assert!(
+            diagnostics.is_empty(),
+            "no cached versions means nothing to report: {diagnostics:?}"
+        );
     }
 
     #[tokio::test]
@@ -864,14 +865,14 @@ require github.com/gin-gonic/gin v1.9.1
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             // Returns hover with package URL and the mock-derived latest version (impl-critic
             // M1: without this, the assertions never depended on the mocked response at all).
@@ -942,14 +943,14 @@ require github.com/gin-gonic/gin v1.9.1
             let versions = VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities);
 
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    versions,
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                versions,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             assert!(hover.is_some());
             let hover_content = hover.unwrap();
@@ -984,14 +985,14 @@ require github.com/gin-gonic/gin v1.9.1
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
 
-            let hover = ecosystem
-                .hover(
-                    ParsedView::new(&parse_result),
-                    position,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            let hover = deps_core::ecosystem::hover(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
 
             assert!(hover.is_none());
         }
@@ -1040,15 +1041,15 @@ require github.com/gin-gonic/gin v1.9.1
             // guard in `generate_code_actions` to accept the edit.
             let content = "\n\n\n\n\nv1.9.0    \n";
 
-            let actions = ecosystem
-                .code_actions(
-                    ParsedView::new(&parse_result),
-                    position,
-                    &uri,
-                    VersionData::new(&cached_versions, &resolved_versions),
-                    content,
-                )
-                .await;
+            let actions = deps_core::ecosystem::code_actions(
+                &ecosystem,
+                ParsedView::new(&parse_result),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
+            .await;
 
             let ls_uri: tower_lsp_server::ls_types::Uri = uri.as_str().parse().unwrap();
 

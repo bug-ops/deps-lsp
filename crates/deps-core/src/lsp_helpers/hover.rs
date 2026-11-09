@@ -68,16 +68,15 @@ fn version_age_secs(version: &dyn Version, now: PublishTime) -> Option<u64> {
 /// The `Cmd+.` update-footer markdown this function appends when a code action may exist
 /// for the hovered dependency.
 ///
-/// `pub` (re-exported from `lsp_helpers`) so an ecosystem's own `generate_hover` override
-/// can restore it post-hoc for an action source this shared gate has no visibility into
+/// `pub` (re-exported from `lsp_helpers`) so an ecosystem's own
+/// [`crate::TypedEcosystem::decorate_hover`] can restore it post-hoc for an action source this shared gate has no visibility into
 /// (e.g. GHA's `TagIndex`-driven SHA-pin quickfix, #501) without hand-copying the literal
 /// and risking drift between the two.
 pub const CMD_DOT_FOOTER: &str = "\n---\n⌨️ **Press `Cmd+.` to update version**";
 
 /// Builds the hover response for the dependency under `position`, if any.
 ///
-/// Shared by every ecosystem's default [`crate::TypedEcosystem::hover`]
-/// implementation: locates the dependency whose name or version range contains
+/// Shared by every ecosystem through [`crate::ecosystem::hover`]: locates the dependency whose name or version range contains
 /// `position`, resolves its version data against `registry`, and renders the
 /// result through `formatter`. Returns `None` when no dependency covers the position.
 pub async fn generate_hover<R, P, F>(
@@ -94,7 +93,7 @@ where
     P: TypedParseResult,
     F: DependencyFormatter<Dep = P::Dep>,
 {
-    let dep = find_hovered_dependency(parse_result, position)?;
+    let dep = find_hovered_dependency(parse_result.own_dependencies(), position)?;
 
     // A non-resolvable source (`CustomRegistry`, Git, Path) must skip the registry lookup —
     // fetching by name would silently check an unrelated public-registry package (#248).
@@ -273,9 +272,7 @@ where
             resolvable,
             available_versions: available_versions.as_deref(),
             cached_latest,
-            vuln_outcome,
             deprecation,
-            offline,
             requirement_is_placeholder,
             latest_verdict: latest_verdict_result.clone(),
             registry_miss,
@@ -289,11 +286,10 @@ where
     Some(markdown.finish(Some(dep.name_range())))
 }
 
-fn find_hovered_dependency<P: TypedParseResult>(
-    parse_result: &P,
-    position: Position,
-) -> Option<&P::Dep> {
-    parse_result.own_dependencies().iter().find(|d| {
+/// The dependency whose name or version range holds `position`: the one lookup the shared
+/// hover and every ecosystem's hover decoration agree on.
+pub(crate) fn find_hovered_dependency<D: Dependency>(deps: &[D], position: Position) -> Option<&D> {
+    deps.iter().find(|d| {
         // #905: `position_in_range` is inclusive on both ends, so without this guard hovering
         // the document's first character (a synthetic `name_range()`'s `Range::default()`
         // sentinel) would match whichever synthetic-range dependency lists first.
@@ -1052,72 +1048,43 @@ fn push_recent_versions_hover_section(
     }
 }
 
-/// Appends the `Cmd+.` code-action footer — advertised only when a fix action could
-/// actually exist for this dependency, since none is ever offered for a source that
-/// is deliberately non-resolvable (e.g. a local composite action or a Docker image
-/// ref), so rendering it unconditionally is misleading there (#474).
+/// Appends the `Cmd+.` code-action footer — advertised only when `codeAction` can actually
+/// offer something for this dependency (#474, #1988).
 ///
-/// Gated on `resolvable` alone, not on `available_versions`/`cached_latest` also
-/// being populated: a vulnerability-fix or unsatisfiable-fix code action
-/// (`code_actions.rs`) can exist from `vuln_outcome` — populated independently of the
-/// registry fetch (`lifecycle.rs`) — even when both of those are empty (e.g. a
-/// registry fetch failure), so requiring them too would silently drop the footer
-/// while `Cmd+.` still offers a fix.
+/// The footer needs `resolvable` (a local composite action, a Docker image ref, a Git or path
+/// dependency never gets an action) and one of three sources of an action:
+/// - version data (a non-empty live list or a cached latest) whose latest is safe to suggest
+///   (`Verified` or `NotApplicable`; `Flagged`/`Unverified` must never be implied safe, #1517),
+/// - a verified OSV fix ([`VulnerabilityFix::Available`], decided by the planner `codeAction`
+///   uses — an advisory with no fixed version leaves `Cmd+.` empty),
+/// - a deprecation, which backs the replacement action.
 ///
-/// Also gated on offline data availability (#501): `HttpCache` deliberately serves
-/// warm entries while offline (it force-enables caching in that mode), and doc-state
-/// fields — vulnerabilities/cached latest/deprecation — survive an online-to-offline
-/// transition via `preserve_cache`, so `Cmd+.` can still produce a real
-/// REFACTOR/fix/replacement action offline as long as *some* version, vulnerability,
-/// or deprecation data was actually rendered above. Only suppress when offline AND
-/// none of that data is present — a cold process with nothing cached yet, where no
-/// producer in `generate_code_actions` has anything to act on.
+/// No version data at all (a dependency never looked up, a failed lookup, a private registry
+/// that answers nothing) therefore shows no footer, online or offline: every `codeAction`
+/// producer reads either the cached latest, the live list, the OSV outcome or the deprecation.
+/// A live fetch that succeeded with zero entries is definitive proof there is nothing to update
+/// to (#550).
 ///
-/// `matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))`, not
-/// `vuln_outcome.is_some()` (#501 C5): offline does not skip the OSV scan, it lets it
-/// run and fail, which writes `ScanOutcome::Skipped(_)` for every dependency —
-/// `is_some()` would be true in exactly #501's own cold-start repro and only
-/// `Vulnerable` ever backs `build_vulnerability_fix_action` (`code_actions.rs`).
+/// `HttpCache` deliberately serves warm entries while offline, and doc-state fields survive an
+/// online-to-offline transition via `preserve_cache` (#501), so the same rule applies offline.
 ///
-/// A live fetch that genuinely succeeded with zero entries (`Some(&[])`, distinct
-/// from `None` — a fetch that errored or never ran, where an unrelated Cmd+. action
-/// such as an unsatisfiable-fix might still exist per the reasoning above) is
-/// definitive proof there is nothing version-wise to update to (#550): combined with
-/// no cached/vulnerability/deprecation data either, the footer would otherwise
-/// advertise an action that provably does not exist — the "empty Recent versions
-/// section plus a stray footer" bug reported against GHA's
-/// `dtolnay/rust-toolchain@stable` but not specific to any one ecosystem. Every other
-/// online case (a non-empty live list, or no live fetch at all) keeps the pre-#550
-/// unconditional-when-resolvable behavior.
+/// `requirement_is_placeholder` (#1402) suppresses the footer independent of the above: an
+/// unexpanded template placeholder is rejected by the write-path guard every `codeAction` fix
+/// routes through ([`crate::edit::requirement_is_placeholder_for`], #1393).
 ///
-/// `requirement_is_placeholder` (#1402) suppresses the footer independent of all of the
-/// above: an unexpanded template placeholder (`{{ VAR }}`, `${VAR}`, `$var`, ...) is
-/// rejected by the same write-path guard every `codeAction` fix routes through
-/// ([`crate::edit::requirement_is_placeholder_for`], default-on across ecosystems since
-/// #1393), so `Cmd+.` would return zero actions regardless of how much version,
-/// vulnerability, or deprecation data was rendered above.
-///
-/// `registry_miss == Some(LookupMiss::NotFound)` (#1936) suppresses the footer: a 404 leaves
-/// no version list or deprecation data to act on. A `Vulnerable` outcome keeps it only when a
-/// verified OSV fix exists (`VulnerabilityFix::Available`); that action does not depend on the
-/// registry's version list, but an advisory with no fixed version leaves `Cmd+.` empty.
-///
-/// Issue #1517: whether `latest` is safe enough to justify advertising an "update to latest"
-/// action at all — `Verified` (checked, clean) or `NotApplicable` (OSV disabled/offline, or a
-/// structural skip); `Flagged`/`Unverified` must never be implied safe by this footer.
+/// `registry_miss == Some(LookupMiss::NotFound)` (#1936) suppresses the footer unless a
+/// verified OSV fix exists: a 404 leaves no version list or deprecation data to act on, while
+/// the fix action does not depend on the registry's version list.
 fn push_cmd_dot_footer_hover_section(markdown: &mut HoverMarkdown, state: CmdDotFooterState<'_>) {
     let latest_is_safe = matches!(
         state.latest_verdict,
         LatestVerdict::Verified | LatestVerdict::NotApplicable
     );
-    let has_offline_actionable_data = (state.cached_latest.is_some()
-        || state.available_versions.is_some_and(|v| !v.is_empty()))
-        && latest_is_safe
-        || matches!(state.vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
+    let has_version_data =
+        state.cached_latest.is_some() || state.available_versions.is_some_and(|v| !v.is_empty());
+    let footer_actionable = has_version_data && latest_is_safe
+        || state.vulnerability_fix == VulnerabilityFix::Available
         || state.deprecation.is_some();
-    let live_fetch_definitively_empty = state.available_versions.is_some_and(<[_]>::is_empty);
-    let footer_actionable = has_offline_actionable_data
-        || (!live_fetch_definitively_empty && !state.offline && latest_is_safe);
     let registry_knows_package = state.registry_miss != Some(LookupMiss::NotFound)
         || state.vulnerability_fix == VulnerabilityFix::Available;
     if state.resolvable
@@ -1135,9 +1102,7 @@ struct CmdDotFooterState<'a> {
     resolvable: bool,
     available_versions: Option<&'a [Box<dyn Version>]>,
     cached_latest: Option<&'a super::PackageVersions>,
-    vuln_outcome: Option<&'a ScanOutcome>,
     deprecation: Option<&'a Deprecation>,
-    offline: bool,
     requirement_is_placeholder: bool,
     /// See [`push_cmd_dot_footer_hover_section`]'s doc.
     latest_verdict: LatestVerdict,
@@ -7846,7 +7811,7 @@ mod tests {
             DependencyOutcomes::new().with_lookup_miss(crate::NormalizedName::for_test("pkg"), miss)
         }
 
-        fn vulnerable() -> ScanOutcome {
+        pub(super) fn vulnerable() -> ScanOutcome {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 sibling_matches: None,
                 advisories: Capped::new(
@@ -7868,7 +7833,7 @@ mod tests {
         }
 
         /// A removed package's advisory (for example `MAL-`) usually names no fixed version.
-        fn unfixable_vulnerable() -> ScanOutcome {
+        pub(super) fn unfixable_vulnerable() -> ScanOutcome {
             ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
                 vec![Arc::new(
                     Advisory::new(
@@ -7916,7 +7881,7 @@ mod tests {
             .to_string()
         }
 
-        fn scan(outcome: ScanOutcome) -> VulnerabilityMap {
+        pub(super) fn scan(outcome: ScanOutcome) -> VulnerabilityMap {
             let mut map = VulnerabilityMap::new();
             map.insert(crate::test_util::vuln_key("pkg"), outcome);
             map
@@ -7987,6 +7952,122 @@ mod tests {
             )
             .await;
             assert_eq!(quickfix_titles(&actions), ["Update to 1.1.0 (fixes A1)"]);
+        }
+    }
+
+    /// #1988: the hover footer advertises `Cmd+.` exactly when `codeAction` has something to
+    /// offer, whatever the source of the data (or its absence).
+    mod footer_matches_code_actions {
+        use super::registry_not_found::{scan, unfixable_vulnerable, vulnerable};
+        use super::*;
+        use crate::osv::VulnerabilityMap;
+
+        const FOOTER: &str = "Press `Cmd+.` to update version";
+
+        struct Scenario {
+            name: &'static str,
+            registry: Box<dyn Registry>,
+            vulnerabilities: VulnerabilityMap,
+            offers_actions: bool,
+        }
+
+        fn live_versions() -> Box<dyn Registry> {
+            Box::new(MockRegistryWithVersions {
+                versions: vec![MockVersionWithAge {
+                    version: "1.2.3".into(),
+                    yanked: false,
+                    published_at: None,
+                }],
+            })
+        }
+
+        #[tokio::test]
+        async fn footer_is_present_exactly_when_code_actions_are() {
+            let scenarios = [
+                Scenario {
+                    name: "live versions",
+                    registry: live_versions(),
+                    vulnerabilities: VulnerabilityMap::new(),
+                    offers_actions: true,
+                },
+                Scenario {
+                    name: "live fetch with zero entries",
+                    registry: Box::new(MockRegistry),
+                    vulnerabilities: VulnerabilityMap::new(),
+                    offers_actions: false,
+                },
+                Scenario {
+                    name: "failed lookup, nothing cached",
+                    registry: Box::new(ErrorRegistry),
+                    vulnerabilities: VulnerabilityMap::new(),
+                    offers_actions: false,
+                },
+                Scenario {
+                    name: "registry 404, nothing cached",
+                    registry: Box::new(NotFoundRegistry),
+                    vulnerabilities: VulnerabilityMap::new(),
+                    offers_actions: false,
+                },
+                Scenario {
+                    name: "failed lookup, fixable advisory",
+                    registry: Box::new(ErrorRegistry),
+                    vulnerabilities: scan(vulnerable()),
+                    offers_actions: true,
+                },
+                Scenario {
+                    name: "failed lookup, advisory without a fixed version",
+                    registry: Box::new(ErrorRegistry),
+                    vulnerabilities: scan(unfixable_vulnerable()),
+                    offers_actions: false,
+                },
+            ];
+
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            for scenario in scenarios {
+                let versions = VersionData::new(&cached, &resolved)
+                    .with_vulnerabilities(&scenario.vulnerabilities);
+                let hover = generate_hover(
+                    &parse_result,
+                    Position::new(0, 1).into(),
+                    versions,
+                    scenario.registry.as_ref(),
+                    &MOCK_FORMATTER,
+                    crate::FreshnessSettings::default(),
+                    PublishTime::now(),
+                )
+                .await
+                .expect("hover should be generated");
+                let actions = crate::lsp_helpers::generate_code_actions(
+                    &parse_result,
+                    version_range.start,
+                    parse_result.uri(),
+                    versions,
+                    &content,
+                    scenario.registry.as_ref(),
+                    &MOCK_FORMATTER,
+                )
+                .await;
+
+                assert_eq!(
+                    !actions.is_empty(),
+                    scenario.offers_actions,
+                    "{}: {actions:?}",
+                    scenario.name
+                );
+                assert_eq!(
+                    hover.markdown().contains(FOOTER),
+                    !actions.is_empty(),
+                    "{}: footer must match code actions {actions:?}; hover: {}",
+                    scenario.name,
+                    hover.markdown()
+                );
+            }
         }
     }
 }
