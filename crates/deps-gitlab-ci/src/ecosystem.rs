@@ -853,7 +853,6 @@ mod tests {
     use crate::types::EndpointKind;
     use crate::{MUTABLE_REF_PIN_DIAGNOSTIC_CODE, UNRESOLVED_HOST_DIAGNOSTIC_CODE};
     use dashmap::DashMap;
-    use deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS;
 
     #[test]
     fn test_ecosystem_exposes_tag_index_refreshes() {
@@ -1884,7 +1883,7 @@ mod tests {
 
         use deps_core::lsp_helpers::splice_resolved_line;
 
-        use deps_core::lsp_helpers::{CommitSha, TagIndex};
+        use deps_core::lsp_helpers::{CommitSha, MAX_DIAGNOSTIC_VALUE_CHARS, TagIndex};
 
         // #1137: regression guard, not independent parser verification (see
         // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
