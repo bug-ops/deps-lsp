@@ -177,6 +177,7 @@ async fn test_registry_transport_failure_is_visible_at_inlay_refresh() {
 
 /// A Cargo alternate registry records the 404 as a lookup miss (unlike npm's `.npmrc` route),
 /// rendered as the neutral `ℹ` marker.
+#[cfg(feature = "cargo")]
 #[tokio::test]
 async fn test_registry_lookup_miss_is_visible_at_inlay_refresh() {
     let mut index = mockito::Server::new_async().await;
