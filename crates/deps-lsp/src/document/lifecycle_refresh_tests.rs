@@ -13,9 +13,9 @@ use futures::{SinkExt as _, StreamExt as _};
 use std::time::Duration;
 use tower_lsp_server::jsonrpc::{Request, Response};
 use tower_lsp_server::ls_types::{
-    ClientCapabilities, DidChangeConfigurationParams, DidOpenTextDocumentParams, InitializeParams,
-    InlayHintLabel, InlayHintParams, InlayHintWorkspaceClientCapabilities, Position, Range,
-    TextDocumentIdentifier, TextDocumentItem, Uri, WorkspaceClientCapabilities,
+    ClientCapabilities, DidOpenTextDocumentParams, InitializeParams, InlayHintLabel,
+    InlayHintParams, InlayHintWorkspaceClientCapabilities, Position, Range, TextDocumentIdentifier,
+    TextDocumentItem, Uri, WorkspaceClientCapabilities,
 };
 
 const MANIFEST: &str = r#"{"dependencies": {"@acme-corp/secretpkg": "^1.0.0"}}"#;
@@ -69,7 +69,10 @@ fn npm_scenario(npmrc: &str) -> Scenario<'_> {
 /// Opens `scenario`, then answers the server's client requests and returns the labels served
 /// at the *first* `workspace/inlayHint/refresh`, or the last labels seen on timeout. Taking the
 /// first refresh pins the ordering: the fetch outcome must be recorded before the refresh is
-/// requested, so a refresh that raced ahead of it cannot be masked by a later one.
+/// requested, so a refresh that raced ahead of it cannot be masked by a later one. Config goes
+/// through `initialize` rather than `didChangeConfiguration`: the latter schedules a debounced
+/// reparse whose own (legitimate) refresh lands before a slow fetch, e.g. Windows' ~1 s refused
+/// connect, and would be taken as the first refresh.
 async fn labels_served_at_refresh(scenario: &Scenario<'_>) -> Vec<String> {
     use tower::Service as _;
     use tower_lsp_server::LanguageServer as _;
@@ -99,6 +102,9 @@ async fn labels_served_at_refresh(scenario: &Scenario<'_>) -> Vec<String> {
         .params(
             serde_json::to_value(InitializeParams {
                 capabilities,
+                initialization_options: Some(
+                    serde_json::json!({ "registries": { "workspace_registries": "all" } }),
+                ),
                 ..Default::default()
             })
             .unwrap(),
@@ -113,11 +119,6 @@ async fn labels_served_at_refresh(scenario: &Scenario<'_>) -> Vec<String> {
     );
     let backend = service.inner();
     assert!(backend.state().inlay_hint_refresh_supported());
-    backend
-        .did_change_configuration(DidChangeConfigurationParams {
-            settings: serde_json::json!({ "registries": { "workspace_registries": "all" } }),
-        })
-        .await;
     backend
         .did_open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
