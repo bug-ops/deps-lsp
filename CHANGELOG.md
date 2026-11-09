@@ -65,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm**: `package-lock.json` entries without `resolved` count as registry entries only under `node_modules/`, and `bun.lock` is parsed with visitors (peak RSS 551 to 259 MiB) (#2007)
 - **deps-core**: hover recent versions and update actions rank stable releases above prerelease builds (#2007)
 - **deps-gitlab-ci, deps-github-actions**: mutable-ref pin diagnostics share one builder and the GitLab rate-limit map is keyed by the typed host (#2007)
+- **ci**: bump pinned `codeql-action`, `action-gh-release`, `cosign-installer` and `docker/login-action` to clear outdated code-scanning alerts (#2021)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: the git-tags diagnostics and quick fixes live in the shared `lsp_helpers::git_tags` (#2006)
 - **deps-engine**: the cross-ecosystem `non_public_route` guard is restored through an erased `ProbeDependency` probe (#2006)
 - **deps-npm**: yarn.lock percent-decoding, bun.lock truncation and lock-file parse errors reuse shared helpers (#2006)
