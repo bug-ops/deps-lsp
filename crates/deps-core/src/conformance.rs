@@ -11,7 +11,7 @@
 //! Shared conformance-test scaffolding for ecosystem crates (#758).
 //!
 //! Every ecosystem crate historically hand-copied the same family of tests — "does
-//! `EcosystemBase::id()` match", "does `package_url` produce this exact link", "does locating a
+//! `Ecosystem::id()` match", "does `package_url` produce this exact link", "does locating a
 //! lock file work in the same directory", "does a too-short completion prefix return no
 //! results", "does JSON nesting beyond the shared depth cap get rejected", "does a registry
 //! actually override `select_latest_matching` instead of inheriting the trait's `None`
@@ -87,23 +87,10 @@ pub const HOSTILE_DISPLAY_LINK_PAYLOAD: &str = "evil\n<https://evil%zz.example>)
 // Macro 1: `ecosystem_conformance!` — exact `Ecosystem` identity values.
 // ---------------------------------------------------------------------------------------
 
-/// Asserts [`crate::EcosystemBase::id`] equals `expected`, and that [`crate::EcosystemBase::ecosystem_id`] agrees
-/// with it.
-///
-/// [`crate::EcosystemBase::id`] is a *provided* method with a default derived from
-/// [`crate::EcosystemBase::ecosystem_id`] — but, being provided, it stays overridable, so nothing else
-/// forces the two to stay in sync for an implementor that overrides `id()` directly. Without
-/// this second assertion, a crate could pass `expected` here via a compensating `id()`
-/// override while its `ecosystem_id()` names the wrong variant — silently wrong for every
-/// caller that branches on `ecosystem_id()` (`osv_ecosystem()`, `DocumentState`
-/// classification, formatter context) instead of the string.
+/// Asserts the ecosystem's string identity (`EcosystemId::id` of its
+/// [`crate::EcosystemBase::ecosystem_id`]) equals `expected`.
 pub fn assert_ecosystem_id(eco: &dyn Ecosystem, expected: &str) {
     assert_eq!(eco.id(), expected, "Ecosystem::id() mismatch");
-    assert_eq!(
-        eco.ecosystem_id().id(),
-        eco.id(),
-        "Ecosystem::ecosystem_id() disagrees with Ecosystem::id()"
-    );
 }
 
 /// Asserts [`crate::EcosystemBase::display_name`] equals `expected`.
@@ -1471,7 +1458,6 @@ impl<T: ?Sized> NotInherent for T {}
 /// # struct Fake { registry: Arc<FakeRegistry> }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
 /// # impl deps_core::EcosystemBase for Fake {
-/// #     fn id(&self) -> &'static str { "fake" }
 /// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
@@ -2451,7 +2437,6 @@ macro_rules! registry_conformance {
 /// # }
 /// # impl deps_core::DependencyFormatter for FakeFormatter { type Dep = FakeDep; }
 /// # impl deps_core::EcosystemBase for Fake {
-/// #     fn id(&self) -> &'static str { "fake" }
 /// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
@@ -2679,7 +2664,6 @@ macro_rules! operator_chars_conformance {
 /// # struct Fake { registry: Arc<FakeRegistry> }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
 /// # impl deps_core::EcosystemBase for Fake {
-/// #     fn id(&self) -> &'static str { "fake" }
 /// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
 /// #     fn display_name(&self) -> &'static str { "Fake" }
 /// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }

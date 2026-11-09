@@ -186,7 +186,7 @@ macro_rules! ecosystem_ids {
     ( $( $(#[$vmeta:meta])* $variant:ident => $id:literal ),+ $(,)? ) => {
         /// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
         ///
-        /// [`EcosystemBase::id`] returns a `&'static str` for registry lookups and document
+        /// `dyn Ecosystem::id` returns a `&'static str` for registry lookups and document
         /// storage, but any code that needs to *branch* on ecosystem identity should match on
         /// this enum instead of re-deriving its own partial match over that string: an
         /// unhandled variant here is a compile error, while an unhandled string is a silent
@@ -222,7 +222,7 @@ macro_rules! ecosystem_ids {
             /// missing-match compile error, not a silently incomplete set.
             pub const ALL: &'static [Self] = &[ $( Self::$variant ),+ ];
 
-            /// Returns the canonical string identifier, matching [`EcosystemBase::id`] for the
+            /// Returns the canonical string identifier, matching `dyn Ecosystem::id` for the
             /// corresponding ecosystem implementation.
             #[must_use]
             pub const fn id(self) -> &'static str {
@@ -1338,23 +1338,10 @@ pub trait EcosystemBase: Send + Sync + private::Sealed {
     /// Exhaustively typed ecosystem identity.
     ///
     /// Every implementor lives in this sealed trait's own workspace, so the enum is
-    /// authoritative for identity and [`Self::id`] is derived from it rather than
-    /// independently authored — a typo or rename here is a compile error instead of a
-    /// runtime mismatch between [`EcosystemId::ALL`] and this ecosystem's registration.
+    /// the single source of identity — the string form is [`EcosystemId::id`], and a typo
+    /// or rename here is a compile error instead of a runtime mismatch between
+    /// [`EcosystemId::ALL`] and this ecosystem's registration.
     fn ecosystem_id(&self) -> EcosystemId;
-
-    /// Unique identifier (e.g., "cargo", "npm", "pypi")
-    ///
-    /// This identifier is used for ecosystem registration and routing. The default
-    /// implementation derives it from [`Self::ecosystem_id`], so an implementor that leaves
-    /// `id()` at its default can no longer author a mismatched string independently — but
-    /// `id()` remains a provided (overridable) method, so this guarantee holds only for that
-    /// default, not for an implementor that overrides `id()` directly (as some test doubles
-    /// deliberately do). Code needing the two to agree should verify it explicitly, e.g. via
-    /// [`crate::conformance::assert_ecosystem_id`].
-    fn id(&self) -> &'static str {
-        self.ecosystem_id().id()
-    }
 
     /// Human-readable name (e.g., "Cargo (Rust)", "npm (JavaScript)")
     ///
@@ -1729,6 +1716,18 @@ pub trait Ecosystem: EcosystemBase + typed::BlanketOnly {
     ) -> crate::osv::NonPublicRoute;
 }
 
+impl dyn Ecosystem + '_ {
+    /// Unique string identifier (e.g. `"cargo"`, `"npm"`) used for registration and routing.
+    ///
+    /// Always [`EcosystemId::id`] of [`EcosystemBase::ecosystem_id`]: it is an inherent
+    /// method on the trait object rather than an overridable trait method, so an
+    /// implementor cannot author a second, mismatched identity string.
+    #[must_use]
+    pub fn id(&self) -> &'static str {
+        self.ecosystem_id().id()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1927,10 +1926,6 @@ mod tests {
     impl private::Sealed for StubEcosystem {}
 
     impl EcosystemBase for StubEcosystem {
-        fn id(&self) -> &'static str {
-            "stub"
-        }
-
         fn ecosystem_id(&self) -> EcosystemId {
             EcosystemId::Cargo
         }
