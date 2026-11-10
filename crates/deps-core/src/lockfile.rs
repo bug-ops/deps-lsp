@@ -853,6 +853,20 @@ fn owning_importer<'a>(
         .max_by_key(|importer| importer.depth())
 }
 
+/// Identity of a lock version string under [`compare_parsed_versions`] equality: parsed semver
+/// (build metadata included) or the raw string, which never equals a parsed one.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum SlotKey<'a> {
+    Semver(semver::Version),
+    Raw(&'a str),
+}
+
+impl<'a> SlotKey<'a> {
+    fn of(version: &'a str) -> Self {
+        semver::Version::parse(version).map_or(Self::Raw(version), Self::Semver)
+    }
+}
+
 /// One normalized name's collapsed version and, when it has more than one distinct version,
 /// its candidates (see [`ResolvedPackages::split_normalized_for`] for the rules).
 fn split_one_name(
@@ -893,20 +907,18 @@ fn split_one_name(
         seen_descriptors: HashSet<&'a str>,
     }
     let mut distinct: Vec<Distinct<'_>> = Vec::new();
+    let mut slot_index: HashMap<SlotKey<'_>, usize> = HashMap::new();
     for package in &packages {
         let version = package.version.as_str();
-        let index = distinct
-            .iter()
-            .position(|seen| compare_lockfile_versions(seen.version, version).is_eq())
-            .unwrap_or_else(|| {
-                distinct.push(Distinct {
-                    version,
-                    owned: false,
-                    descriptors: Vec::new(),
-                    seen_descriptors: HashSet::new(),
-                });
-                distinct.len() - 1
+        let index = *slot_index.entry(SlotKey::of(version)).or_insert_with(|| {
+            distinct.push(Distinct {
+                version,
+                owned: false,
+                descriptors: Vec::new(),
+                seen_descriptors: HashSet::new(),
             });
+            distinct.len() - 1
+        });
         let Some(slot) = distinct.get_mut(index) else {
             continue;
         };
@@ -3048,5 +3060,69 @@ mod tests {
         };
         assert_eq!(per_version[0].len(), 1);
         assert_eq!(per_version[1].len(), 2);
+    }
+
+    fn left_pad_candidate_versions(versions: &[&str]) -> Vec<String> {
+        let mut packages = ResolvedPackages::new();
+        for version in versions {
+            packages.insert(registry_pkg("left-pad", version));
+        }
+        let (_, candidates) = packages.split_normalized(&Lowercase);
+        candidates
+            .get(&normalized("left-pad"))
+            .map_or_else(Vec::new, |c| {
+                c.versions().iter().map(|v| v.as_str().to_owned()).collect()
+            })
+    }
+
+    #[test]
+    fn slot_key_folds_equal_semver_and_keeps_build_metadata_distinct() {
+        assert_eq!(SlotKey::of("1.0.0"), SlotKey::of("1.0.0"));
+        assert_ne!(SlotKey::of("1.0.0+a"), SlotKey::of("1.0.0+b"));
+        assert_ne!(SlotKey::of("1.0.0"), SlotKey::of("1.0.0+a"));
+        assert_eq!(SlotKey::of("not-semver"), SlotKey::of("not-semver"));
+        assert_ne!(SlotKey::of("not-semver"), SlotKey::of("other"));
+        assert_ne!(SlotKey::of("1.0"), SlotKey::of("1.0.0"));
+    }
+
+    #[test]
+    fn slot_key_equality_matches_compare_lockfile_versions() {
+        let samples = [
+            "1.0.0", "1.0.0+a", "1.0.0+b", "2.0.0", "1.0", "abc", "abd", "",
+        ];
+        for a in samples {
+            for b in samples {
+                assert_eq!(
+                    SlotKey::of(a) == SlotKey::of(b),
+                    compare_lockfile_versions(a, b).is_eq(),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_folds_repeated_versions_and_keeps_first_seen_order() {
+        let versions = left_pad_candidate_versions(&["1.0.0", "2.0.0", "1.0.0", "1.0.0+x"]);
+        assert_eq!(versions.len(), 3);
+        assert!(versions.iter().any(|v| v == "1.0.0+x"));
+    }
+
+    #[test]
+    fn split_keeps_unparsed_versions_apart_from_parsed_ones() {
+        assert_eq!(
+            left_pad_candidate_versions(&["1.0.0", "1.0", "1.0", "nightly"]).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn split_scales_to_many_distinct_versions_of_one_name() {
+        const DISTINCT: usize = 20_000;
+        let owned: Vec<String> = (0..DISTINCT)
+            .flat_map(|n| [format!("1.0.{n}"), format!("1.0.{n}")])
+            .collect();
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(left_pad_candidate_versions(&refs).len(), DISTINCT);
     }
 }

@@ -17,7 +17,7 @@
     <PackageReference Include="MyCompany.Shared" />
 
     <!-- Unresolvable MSBuild property expression -->
-    <PackageReference Include="AutoMapper" Version="$(AutoMapperVersion)" />
+    <PackageReference Include="Example.UnresolvedProperty" Version="$(ExampleVersion)" />
 
     <!-- Condition attribute containing a literal 'Version="' trap -->
     <PackageReference Include="System.Text.Json" Condition="'$(TargetFramework)' == 'net472' AND '$(Foo)' == 'Version=&quot;1.0.0&quot;'" Version="8.0.5" />

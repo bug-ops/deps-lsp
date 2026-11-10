@@ -1714,6 +1714,21 @@ pub trait Ecosystem: EcosystemBase + typed::BlanketOnly {
         name: crate::PackageName,
         source: crate::parser::DependencySource,
     ) -> crate::osv::NonPublicRoute;
+
+    /// How this ecosystem's own formatter routes each dependency of
+    /// [`ProbeDependency::route_probes`]: one entry per registry, index or feed route the
+    /// ecosystem's dependency type can carry, empty when it has none (#1999).
+    ///
+    /// Completes [`Self::probe_non_public_route`] for opt-ins that no source expresses. Only
+    /// available with the `test-util` feature, never reachable from a production build.
+    ///
+    /// [`ProbeDependency::route_probes`]: crate::lsp_helpers::ProbeDependency::route_probes
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    fn probe_route_non_public_routes(
+        &self,
+        name: crate::PackageName,
+    ) -> Vec<crate::osv::NonPublicRoute>;
 }
 
 impl dyn Ecosystem + '_ {

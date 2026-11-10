@@ -216,6 +216,8 @@ when:
   unresolved;
 - it is missing from a lock file that was found (a manifest edit that was never relocked) and so has
   no concrete version to match;
+- not every lock-file entry satisfying its requirement was scanned (more than the 16 nearest, or an
+  entry's version could not be matched), even when the scanned entries already carry advisories;
 - it falls beyond the per-document dependency ceiling (5000), so it was never scanned.
 
 These are not gaps: `peerDependencies` entries (never written to a lock file), dependencies that

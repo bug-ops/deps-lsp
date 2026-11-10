@@ -155,7 +155,7 @@ async fn edit(
         state,
         CommitOptions {
             diff: &diff,
-            guard: CommitGuard::Unconditional,
+            guard: CommitGuard::IfTracked,
         },
     ));
     diff

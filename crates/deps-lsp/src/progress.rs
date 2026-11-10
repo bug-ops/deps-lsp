@@ -148,7 +148,7 @@ impl RegistryProgress {
         uri: &str,
         total_deps: usize,
     ) -> Result<(Self, ProgressSender)> {
-        let token = ProgressToken::String(format!("deps-fetch-{}", uri));
+        let token = fetch_token(uri);
 
         client
             .send_request::<tower_lsp_server::ls_types::request::WorkDoneProgressCreate>(
@@ -231,6 +231,16 @@ impl RegistryProgress {
     }
 }
 
+/// The work-done progress token identifying the fetch for the document at `uri`.
+fn fetch_token(uri: &str) -> ProgressToken {
+    ProgressToken::String(format!("deps-fetch-{uri}"))
+}
+
+/// The per-update progress message shown while `fetched` of `total` packages are loaded.
+fn report_message(fetched: usize, total: usize) -> String {
+    format!("Fetched {fetched}/{total} packages")
+}
+
 /// Drains progress updates from the channel and sends LSP notifications.
 async fn consume_progress_updates(
     mut rx: mpsc::Receiver<ProgressUpdate>,
@@ -250,10 +260,7 @@ async fn consume_progress_updates(
                     token: token.clone(),
                     value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
                         WorkDoneProgressReport {
-                            message: Some(format!(
-                                "Fetched {}/{} packages",
-                                update.fetched, update.total
-                            )),
+                            message: Some(report_message(update.fetched, update.total)),
                             percentage: Some(percentage),
                             cancellable: Some(false),
                         },
@@ -434,19 +441,16 @@ mod tests {
 
     #[test]
     fn test_progress_token_format() {
-        let uri = "file:///test/Cargo.toml";
-        let token = format!("deps-fetch-{}", uri);
-        assert_eq!(token, "deps-fetch-file:///test/Cargo.toml");
+        assert_eq!(
+            fetch_token("file:///test/Cargo.toml"),
+            ProgressToken::String("deps-fetch-file:///test/Cargo.toml".to_string())
+        );
     }
 
     #[test]
     fn test_progress_message_format() {
-        let format_message = |fetched: usize, total: usize| -> String {
-            format!("Fetched {}/{} packages", fetched, total)
-        };
-
-        assert_eq!(format_message(5, 10), "Fetched 5/10 packages");
-        assert_eq!(format_message(0, 15), "Fetched 0/15 packages");
-        assert_eq!(format_message(20, 20), "Fetched 20/20 packages");
+        assert_eq!(report_message(5, 10), "Fetched 5/10 packages");
+        assert_eq!(report_message(0, 15), "Fetched 0/15 packages");
+        assert_eq!(report_message(20, 20), "Fetched 20/20 packages");
     }
 }

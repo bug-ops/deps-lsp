@@ -50,6 +50,15 @@ pub enum NuGetFeedRoute {
     Mapped,
 }
 
+impl NuGetFeedRoute {
+    pub(crate) const ALL: [Self; 3] = [Self::ReplacesPublic, Self::SupplementsPublic, Self::Mapped];
+}
+
+const _: fn(NuGetFeedRoute) = |route| match route {
+    NuGetFeedRoute::ReplacesPublic | NuGetFeedRoute::SupplementsPublic | NuGetFeedRoute::Mapped => {
+    }
+};
+
 impl NuGetDependency {
     /// How the `NuGet.Config` feed configuration routed this dependency, or `None` when it
     /// stayed on plain public nuget.org.
@@ -194,6 +203,16 @@ impl deps_core::lsp_helpers::ProbeDependency for NuGetDependency {
             source,
             feed_route: None,
         }
+    }
+
+    fn route_probes(name: deps_core::PackageName) -> Vec<Self> {
+        NuGetFeedRoute::ALL
+            .into_iter()
+            .map(|route| Self {
+                feed_route: Some(route),
+                ..Self::probe(name.clone(), deps_core::parser::DependencySource::Registry)
+            })
+            .collect()
     }
 }
 

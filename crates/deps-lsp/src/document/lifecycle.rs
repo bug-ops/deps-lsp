@@ -834,10 +834,12 @@ type ParseOutcome = std::result::Result<Box<dyn deps_core::ParsedManifest>, Pars
 /// committing — see that function's doc for why this exists.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CommitGuard {
-    /// Always commit — a real edit's own version is authoritative, nothing to guard against.
-    Unconditional,
-    /// Commit only if the document's *current* version in `state` still equals this value;
-    /// otherwise skip the commit entirely (impl-critic S1).
+    /// Commit while the document is still tracked — a real edit's own version is authoritative,
+    /// so no version check applies, but an edit whose document was closed meanwhile must not
+    /// resurrect it.
+    IfTracked,
+    /// Commit only if the document is still tracked and its *current* version in `state` still
+    /// equals this value; otherwise skip the commit entirely (impl-critic S1).
     ExpectVersion(Option<i32>),
 }
 
@@ -851,9 +853,11 @@ struct CommitOptions<'a> {
 /// Builds the new `DocumentState` from the parsed manifest (or a parse-result-less
 /// placeholder when parsing failed), carries over cache entries the previous state already
 /// held, prunes/invalidates entries `options.diff` says are now stale, and commits the result
-/// into `state` — unless `options.guard` is [`CommitGuard::ExpectVersion`] and the document's
-/// *current* version in `state` no longer matches, in which case the commit is skipped
-/// entirely and `false` is returned.
+/// into `state` — unless the document is no longer tracked, or `options.guard` is
+/// [`CommitGuard::ExpectVersion`] and the document's *current* version in `state` no longer
+/// matches, in which case the commit is skipped entirely and `false` is returned. Both checks
+/// run inside the one `documents` entry the commit then writes through, so a `did_close` cannot
+/// slip in between the check and the write (#2009).
 ///
 /// The guard exists for a reparse whose trigger is *not* the document's own edit stream —
 /// e.g. [`crate::server::Backend::handle_watched_config_change`] (issue #590), which reparses
@@ -861,8 +865,8 @@ struct CommitOptions<'a> {
 /// re-parse ran. Without this check, a `did_change` notification landing while that reparse
 /// is in flight gets silently reverted: this function would otherwise commit unconditionally,
 /// overwriting the newer edit with the older, watched-config-triggered content (impl-critic
-/// S1). [`handle_document_change`] passes [`CommitGuard::Unconditional`] — a real edit's own
-/// version is authoritative, there is nothing to guard against.
+/// S1). [`handle_document_change`] passes [`CommitGuard::IfTracked`] — a real edit's own
+/// version is authoritative, so only a closed document skips the commit.
 fn commit_parsed_document(
     uri: &Uri,
     ecosystem: &dyn Ecosystem,
@@ -873,18 +877,6 @@ fn commit_parsed_document(
     options: CommitOptions<'_>,
 ) -> bool {
     let diff = options.diff;
-    if let CommitGuard::ExpectVersion(expected) = options.guard {
-        let current = state.with_document(uri, |doc| doc.version);
-        if current != Some(expected) {
-            tracing::debug!(
-                ?uri,
-                ?expected,
-                ?current,
-                "skipping stale reparse commit: document version changed since this reparse started"
-            );
-            return false;
-        }
-    }
 
     let mut doc_state = match parse_result {
         Ok(pr) => DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr),
@@ -902,10 +894,26 @@ fn commit_parsed_document(
     // moment this commit lands. One `Entry` held for the whole read-preserve-prune-write
     // sequence makes it atomic with respect to any other `state.documents` access for this
     // same `uri`, since nothing below re-enters `state.documents`.
-    let entry = state.documents.entry(uri.clone());
-    if let dashmap::mapref::entry::Entry::Occupied(ref old_doc) = entry {
-        preserve_cache(&mut doc_state, old_doc.get());
+    let dashmap::mapref::entry::Entry::Occupied(mut old_doc) = state.documents.entry(uri.clone())
+    else {
+        tracing::debug!(
+            ?uri,
+            "skipping reparse commit: document is no longer tracked"
+        );
+        return false;
+    };
+    if let CommitGuard::ExpectVersion(expected) = options.guard
+        && old_doc.get().version != expected
+    {
+        tracing::debug!(
+            ?uri,
+            ?expected,
+            current = ?old_doc.get().version,
+            "skipping stale reparse commit: document version changed since this reparse started"
+        );
+        return false;
     }
+    preserve_cache(&mut doc_state, old_doc.get());
 
     // Prune stale cache entries for packages no longer declared under any spelling.
     doc_state.signals.prune_removed(&diff.removed);
@@ -945,16 +953,9 @@ fn commit_parsed_document(
         }
     }
 
-    // Consumes the same `entry` acquired above — see that binding's comment for why this
-    // must not be a fresh `state.update_document` lookup.
-    match entry {
-        dashmap::mapref::entry::Entry::Occupied(mut old_doc) => {
-            old_doc.insert(doc_state);
-        }
-        dashmap::mapref::entry::Entry::Vacant(vacant) => {
-            vacant.insert(doc_state);
-        }
-    }
+    // Writes through the same entry acquired above — see its comment for why this must not be
+    // a fresh `state.update_document` lookup.
+    old_doc.insert(doc_state);
     true
 }
 
@@ -968,6 +969,11 @@ fn commit_parsed_document(
 /// Returns an error if no ecosystem handler matches `uri`, or if `content` exceeds
 /// the configured maximum manifest size. A manifest-parse failure is not an error
 /// here: the document is stored without a parse result instead.
+///
+/// Returns `Ok(None)` when the document is not tracked at commit time: the change is dropped
+/// rather than creating the document, and no task is returned for the caller to register. That
+/// covers a close that raced the change and a `didOpen` that was rejected (for example for size),
+/// after which every edit is dropped until the document is closed and reopened.
 #[tracing::instrument(skip_all, fields(uri = ?uri, doc_version = ?version))]
 pub async fn handle_document_change(
     uri: Uri,
@@ -976,23 +982,19 @@ pub async fn handle_document_change(
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
-) -> Result<JoinHandle<()>> {
-    let task = handle_document_change_guarded(
+) -> Result<Option<JoinHandle<()>>> {
+    handle_document_change_guarded(
         uri,
         content,
         version,
-        CommitGuard::Unconditional,
+        CommitGuard::IfTracked,
         ParseTrigger::Content,
         RefetchPolicy::Diff,
         state,
         client,
         config,
     )
-    .await?;
-    // `CommitGuard::Unconditional` always commits, so `handle_document_change_guarded`
-    // never returns `Ok(None)` for it.
-    #[allow(clippy::expect_used)]
-    Ok(task.expect("CommitGuard::Unconditional never skips the commit"))
+    .await
 }
 
 /// Like [`handle_document_change`], but skips committing the reparse — and spawning its
@@ -1010,10 +1012,9 @@ pub async fn handle_document_change(
 /// keystroke. The caller must treat `None` as "do not touch the task registry for this URI at
 /// all", not as "install a no-op task".
 ///
-/// [`handle_document_change`] passes [`CommitGuard::Unconditional`] and unwraps the `Some`
-/// unconditionally (preserving its exact prior behavior and `Result<JoinHandle<()>>` return
-/// type) — only a reparse triggered by something other than the document's own edit stream
-/// needs a real guard, and therefore ever observes `None`.
+/// `None` also covers a document closed before the commit, for every guard: the commit never
+/// creates an untracked document. [`handle_document_change`] passes [`CommitGuard::IfTracked`],
+/// so it observes `None` only for that case.
 #[allow(
     clippy::too_many_arguments,
     reason = "issue #592 added `refetch: RefetchPolicy` alongside the pre-existing `guard: \
@@ -2537,7 +2538,8 @@ mod tests {
             config,
         )
         .await
-        .expect("manifest edit adding a dependency should be accepted");
+        .expect("manifest edit adding a dependency should be accepted")
+        .expect("document is open");
 
         tokio::time::timeout(Duration::from_secs(10), task)
             .await
@@ -2943,7 +2945,7 @@ mod tests {
                 uri.clone(),
                 content,
                 Some(2),
-                CommitGuard::Unconditional,
+                CommitGuard::IfTracked,
                 ParseTrigger::Config,
                 RefetchPolicy::Diff,
                 Arc::clone(&state),
@@ -2952,7 +2954,7 @@ mod tests {
             )
             .await
             .unwrap()
-            .expect("CommitGuard::Unconditional never skips the commit");
+            .expect("document is open");
             task.await.unwrap();
 
             let diags = diagnostics::generate_diagnostics_internal(
@@ -2996,7 +2998,7 @@ mod tests {
                 uri.clone(),
                 "[package]\nname = \"t\"\nversion = \"0.1.0\"\n".to_string(),
                 Some(version),
-                CommitGuard::Unconditional,
+                CommitGuard::IfTracked,
                 ParseTrigger::Config,
                 refetch,
                 Arc::clone(state),
@@ -3005,13 +3007,73 @@ mod tests {
             )
             .await
             .unwrap()
-            .expect("CommitGuard::Unconditional never skips the commit")
+            .expect("document is open")
+        }
+
+        fn open_empty_cargo_document(state: &ServerState, uri: &Uri) {
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_without_parse_result(
+                    deps_core::EcosystemId::Cargo,
+                    String::new(),
+                ),
+            );
+        }
+
+        /// #2009: a `did_change` whose document was closed before its commit must not
+        /// resurrect the document or leave an escalation behind.
+        #[tokio::test]
+        async fn guarded_change_to_a_closed_document_commits_nothing() {
+            let state = Arc::new(ServerState::new());
+            let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let skipped = handle_document_change_guarded(
+                uri.clone(),
+                "[package]\nname = \"t\"\nversion = \"0.1.0\"\n".to_string(),
+                Some(2),
+                CommitGuard::IfTracked,
+                ParseTrigger::Content,
+                RefetchPolicy::AllDependencies,
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap();
+
+            assert!(skipped.is_none());
+            assert!(state.get_document(&uri).is_none());
+            assert_eq!(state.pending_refetch_escalation(&uri), None);
+        }
+
+        #[tokio::test]
+        async fn change_to_a_closed_document_returns_no_task() {
+            let state = Arc::new(ServerState::new());
+            let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let task = handle_document_change(
+                uri.clone(),
+                "[package]\nname = \"t\"\nversion = \"0.1.0\"\n".to_string(),
+                Some(2),
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap();
+
+            assert!(task.is_none());
+            assert!(state.get_document(&uri).is_none());
+            assert_eq!(state.pending_refetch_escalation(&uri), None);
         }
 
         #[tokio::test]
         async fn aborted_escalation_is_served_by_the_next_change() {
             let state = Arc::new(ServerState::new());
             let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+            open_empty_cargo_document(&state, &uri);
 
             let first = change(&state, &uri, 1, RefetchPolicy::AllDependencies).await;
             first.abort();
@@ -3609,7 +3671,7 @@ anyhow = "1.0"
             &state,
             CommitOptions {
                 diff: &diff,
-                guard: CommitGuard::Unconditional,
+                guard: CommitGuard::IfTracked,
             },
         );
         assert!(committed);
@@ -4102,7 +4164,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("normal-sized change should be accepted");
+            .expect("normal-sized change should be accepted")
+            .expect("document is open");
 
             tokio::time::timeout(Duration::from_secs(10), task)
                 .await
@@ -4171,6 +4234,7 @@ serde = "1.1"
             )
             .await
             .expect("normal-sized change should be accepted")
+            .expect("document is open")
             .await
             .expect("background task must not panic");
 
@@ -4197,6 +4261,7 @@ tokio = "1.0"
             )
             .await
             .expect("normal-sized change should be accepted")
+            .expect("document is open")
             .await
             .expect("background task must not panic");
 
@@ -4258,6 +4323,7 @@ serde = "1.0"
             )
             .await
             .expect("normal-sized change should be accepted")
+            .expect("document is open")
             .await
             .expect("background task must not panic");
 
@@ -4324,7 +4390,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("normal-sized change should be accepted");
+            .expect("normal-sized change should be accepted")
+            .expect("document is open");
             state.spawn_background_task(uri.clone(), task_n).await;
 
             // Edit N+1 arrives before N's `DID_CHANGE_DEBOUNCE` (100ms) elapses: version-only
@@ -4345,7 +4412,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("normal-sized change should be accepted");
+            .expect("normal-sized change should be accepted")
+            .expect("document is open");
             state
                 .spawn_background_task(uri.clone(), task_n_plus_1)
                 .await;
@@ -4437,7 +4505,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("comment-only edit should be accepted");
+            .expect("comment-only edit should be accepted")
+            .expect("document is open");
 
             tokio::time::timeout(Duration::from_secs(10), task)
                 .await
@@ -4565,7 +4634,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("comment-only edit should be accepted");
+            .expect("comment-only edit should be accepted")
+            .expect("document is open");
 
             tokio::time::timeout(Duration::from_secs(10), task)
                 .await
@@ -4688,7 +4758,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("comment-only edit should be accepted");
+            .expect("comment-only edit should be accepted")
+            .expect("document is open");
 
             tokio::time::timeout(Duration::from_secs(10), task)
                 .await
@@ -4807,7 +4878,8 @@ tokio = "1.0"
                 config,
             )
             .await
-            .expect("comment-only edit should be accepted");
+            .expect("comment-only edit should be accepted")
+            .expect("document is open");
 
             tokio::time::timeout(Duration::from_secs(10), task)
                 .await
@@ -4913,7 +4985,7 @@ tokio = "1.0"
                 state,
                 CommitOptions {
                     diff: &diff,
-                    guard: CommitGuard::Unconditional,
+                    guard: CommitGuard::IfTracked,
                 },
             ));
             diff
@@ -5548,7 +5620,8 @@ mod parse_failure_tests {
             config,
         )
         .await
-        .expect("change must accept a manifest its parser rejects");
+        .expect("change must accept a manifest its parser rejects")
+        .expect("document is open");
         tokio::time::timeout(TASK_TIMEOUT, task)
             .await
             .expect("change's background task must finish promptly")

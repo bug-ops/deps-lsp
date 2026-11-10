@@ -625,6 +625,19 @@ impl<T: TypedEcosystem> Ecosystem for T {
             <<T::Formatter as DependencyFormatter>::Dep as ProbeDependency>::probe(name, source);
         self.own_formatter().non_public_route(&dep)
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn probe_route_non_public_routes(
+        &self,
+        name: crate::PackageName,
+    ) -> Vec<crate::osv::NonPublicRoute> {
+        use crate::lsp_helpers::ProbeDependency;
+        let formatter = self.own_formatter();
+        <<T::Formatter as DependencyFormatter>::Dep as ProbeDependency>::route_probes(name)
+            .iter()
+            .map(|dep| formatter.non_public_route(dep))
+            .collect()
+    }
 }
 
 /// Generates the hover for `position`: the shared hover, edited by

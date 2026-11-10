@@ -177,6 +177,7 @@ impl Fixture {
         )
         .await
         .unwrap()
+        .expect("document is open")
     }
 
     fn whitespace_edit(&self) -> String {

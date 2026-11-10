@@ -514,6 +514,38 @@ request@^2.88.2:
         assert_eq!(descriptors_of(&berry, "a"), [["^1.0.0", "~1.0.2"]]);
     }
 
+    /// A YAML simple key stops at 1024 characters, so a Berry key long enough to exceed the cap
+    /// cannot come through `parse_yarn_lock`; `berry_package` is called with the key directly.
+    #[test]
+    fn berry_descriptors_are_deduplicated_and_capped_per_entry() {
+        let key = (0..MAX_ENTRY_DESCRIPTORS * 4)
+            .flat_map(|n| [format!("a@npm:>=0.0.{n}"), format!("a@npm:>=0.0.{n}")])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let docs = YamlLoader::load_from_str("version: 1.0.5\nresolution: \"a@npm:1.0.5\"\n")
+            .expect("valid entry YAML");
+        let entry = docs.first().expect("one document");
+
+        let package = berry_package(&key, entry).expect("a registry entry");
+
+        let EntryPlacement::Hoisted {
+            owner: EntryOwner::Descriptors(declared),
+        } = package.placement()
+        else {
+            panic!("expected descriptors, got {:?}", package.placement());
+        };
+        assert_eq!(declared.len(), MAX_ENTRY_DESCRIPTORS);
+        assert_eq!(
+            declared
+                .iter()
+                .map(VersionReq::as_str)
+                .collect::<HashSet<_>>()
+                .len(),
+            MAX_ENTRY_DESCRIPTORS,
+            "duplicates must not consume the cap"
+        );
+    }
+
     #[test]
     fn berry_key_descriptors_drop_the_default_npm_protocol() {
         let packages = parse(

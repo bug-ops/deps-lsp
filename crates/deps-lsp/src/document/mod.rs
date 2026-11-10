@@ -60,7 +60,7 @@ pub use loader::load_document_from_disk;
 pub(crate) use osv_scan::{rescan_after_resolved_version_change, run_license_prefetch};
 pub(crate) use resolved::RefetchPolicy;
 pub(crate) use state::{
-    CLIENT_REFRESH_TIMEOUT, DocStamp, PrefetchVisibility, PublishTicket, RefreshKind,
+    CLIENT_REFRESH_TIMEOUT, DocStamp, PrefetchVisibility, PublishGate, PublishTicket, RefreshKind,
     refresh_with_timeout, spawn_supervised,
 };
 pub use state::{

@@ -173,6 +173,13 @@ jobs:
         # above at the same `-D warnings` strictness.
         run: cargo hack clippy -p deps-engine --each-feature --all-targets --keep-going -- -D warnings
 
+      - name: Check deps-cli test compilation and lints across the feature matrix
+        # deps-cli (issue #2018): its integration tests and helpers assume specific ecosystems,
+        # so a missing `#[cfg(feature = "...")]` gate compiles clean under --all-features yet
+        # fails `-D warnings` (dead code, unused imports) under a reduced feature set — the
+        # workspace-wide `--no-dev-deps` sweep above never builds those test targets.
+        run: cargo hack clippy -p deps-cli --each-feature --all-targets --keep-going -- -D warnings
+
   feature-matrix-test:
     name: Feature Matrix Test (${{ matrix.name }})
     needs: changes
@@ -217,6 +224,12 @@ jobs:
             # all-features case as one of its slices (`cargo hack --help`) — a standalone line
             # would duplicate that slice for zero extra coverage.
             run: cargo hack nextest run -p deps-engine --each-feature --keep-going --profile ci --no-fail-fast
+          - name: deps-cli
+            # deps-cli (issue #2018): its tests spawn the real binary and walk fixture trees
+            # that need specific ecosystems, so each reduced feature set must be run, not just
+            # compiled. A full local sweep of every slice took about two minutes warm, well
+            # inside this job's timeout, so one leg (like deps-engine above) is enough.
+            run: cargo hack nextest run -p deps-cli --each-feature --keep-going --profile ci --no-fail-fast
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

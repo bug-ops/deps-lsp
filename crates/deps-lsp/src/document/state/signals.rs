@@ -15,6 +15,7 @@ use deps_core::{
     ResolvedVersionsMap, TyposquatSignal, VersionData,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::super::diff::{OrphanedKeys, RegistryBaseline};
 use super::super::osv_scan::OsvScanPlan;
@@ -42,7 +43,7 @@ pub struct PackageSignals {
     /// file load. Additive: only names with more than one occurrence get an entry here —
     /// see [`deps_core::VersionData::resolved_candidates_for`] for the per-occurrence
     /// disambiguation this enables.
-    pub resolved_version_candidates: ResolvedCandidatesMap,
+    pub resolved_version_candidates: Arc<ResolvedCandidatesMap>,
     /// Set by every `DocumentState::update_resolved_versions` call (issue #1395 critic S3):
     /// distinguishes two resolved-version snapshots taken at the same `DocumentState::content`
     /// (a lock-file-only reload never changes content, so that guard alone cannot order two
@@ -244,7 +245,7 @@ impl Default for PackageSignals {
         Self {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
-            resolved_version_candidates: HashMap::new(),
+            resolved_version_candidates: Arc::default(),
             resolved_versions_generation: ResolvedGeneration::INITIAL,
             vulnerabilities: VulnerabilityMap::new(),
             osv_scan_plan: OsvScanPlan::default(),
@@ -295,7 +296,7 @@ impl PackageSignals {
         for removed_dep in orphaned.as_slice() {
             cached_versions.remove(removed_dep);
             resolved_versions.remove(removed_dep);
-            resolved_version_candidates.remove(removed_dep);
+            Arc::make_mut(resolved_version_candidates).remove(removed_dep);
             licenses.remove(removed_dep);
             typosquats.remove(removed_dep);
             gossip_findings.remove(removed_dep);
@@ -370,7 +371,7 @@ pub(crate) struct SignalsSnapshotBuilder<'a> {
     signals: &'a PackageSignals,
     cached: CachedVersionsMap,
     resolved: ResolvedVersionsMap,
-    candidates: Option<ResolvedCandidatesMap>,
+    candidates: Option<Arc<ResolvedCandidatesMap>>,
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
     candidate_status: Option<CandidateStatusMap>,
@@ -384,7 +385,7 @@ impl SignalsSnapshotBuilder<'_> {
     /// Attaches [`PackageSignals::resolved_version_candidates`].
     #[must_use]
     pub(crate) fn with_resolved_version_candidates(mut self) -> Self {
-        self.candidates = Some(self.signals.resolved_version_candidates.clone());
+        self.candidates = Some(Arc::clone(&self.signals.resolved_version_candidates));
         self
     }
 
@@ -511,7 +512,7 @@ impl SignalsSnapshotBuilder<'_> {
 pub(crate) struct SignalsSnapshot {
     cached: CachedVersionsMap,
     resolved: ResolvedVersionsMap,
-    candidates: Option<ResolvedCandidatesMap>,
+    candidates: Option<Arc<ResolvedCandidatesMap>>,
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
     candidate_status: Option<CandidateStatusMap>,
@@ -595,8 +596,7 @@ mod tests {
             signals
                 .resolved_versions
                 .insert(name(pkg), ConcreteVersion::new(latest));
-            signals
-                .resolved_version_candidates
+            Arc::make_mut(&mut signals.resolved_version_candidates)
                 .insert(name(pkg), vec![ConcreteVersion::new(latest)].into());
         }
         signals
@@ -723,6 +723,20 @@ mod tests {
             Some(true)
         );
         assert_eq!(data.license_prefetch.map(HashMap::len), Some(2));
+    }
+
+    /// #2011: the snapshot shares the document's candidates map, so the parse cached on its
+    /// `LockCandidates` is reused by every request instead of rebuilt per deep copy.
+    #[test]
+    fn snapshot_shares_the_candidates_map_with_the_signals() {
+        let signals = fixture();
+        let snapshot = signals
+            .snapshot()
+            .with_resolved_version_candidates()
+            .finish();
+
+        let shared = snapshot.candidates.as_ref().expect("candidates attached");
+        assert!(Arc::ptr_eq(shared, &signals.resolved_version_candidates));
     }
 
     #[test]

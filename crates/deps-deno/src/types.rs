@@ -309,6 +309,21 @@ impl deps_core::lsp_helpers::ProbeDependency for DenoDependency {
             registry_entry: None,
         }
     }
+
+    fn route_probes(name: deps_core::PackageName) -> Vec<Self> {
+        use deps_npm::types::NpmRegistryEntry;
+
+        const ALL: [NpmRegistryEntry; 2] = [NpmRegistryEntry::TopLevel, NpmRegistryEntry::Scope];
+        const _: fn(NpmRegistryEntry) = |entry| match entry {
+            NpmRegistryEntry::TopLevel | NpmRegistryEntry::Scope => {}
+        };
+        ALL.into_iter()
+            .map(|entry| Self {
+                registry_entry: Some(entry),
+                ..Self::probe(name.clone(), deps_core::parser::DependencySource::Registry)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

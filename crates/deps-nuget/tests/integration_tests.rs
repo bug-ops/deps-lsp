@@ -91,7 +91,11 @@ fn test_fixture_complex_csproj() {
     // Central package management: no version at all.
     assert!(by_name["MyCompany.Shared"].version_requirement.is_none());
     // Unresolvable MSBuild property expression degrades to None.
-    assert!(by_name["AutoMapper"].version_requirement.is_none());
+    assert!(
+        by_name["Example.UnresolvedProperty"]
+            .version_requirement
+            .is_none()
+    );
     // Condition attribute containing a literal `Version="` must not confuse the parser.
     assert_eq!(
         by_name["System.Text.Json"].version_requirement,

@@ -192,7 +192,21 @@ pub(crate) struct RefetchEscalation(u64);
 
 /// Held while one diagnostics publish (or a close's clearing publish) runs for a document; see
 /// [`ServerState::lock_publish`].
-pub(crate) type PublishGate = tokio::sync::OwnedMutexGuard<()>;
+///
+/// Dropping it releases the gate and prunes the document's map entry, including when the
+/// task awaiting [`ServerState::lock_publish`] is cancelled before the gate was granted.
+pub(crate) struct PublishGate<'a> {
+    state: &'a ServerState,
+    uri: Uri,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for PublishGate<'_> {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.state.prune_publish_gate(&self.uri);
+    }
+}
 
 /// Why a manifest's parser rejected it, kept on the [`DocumentState`] so diagnostics can
 /// surface the cause instead of silently publishing nothing.
@@ -600,7 +614,7 @@ impl DocumentState {
         candidates: ResolvedCandidatesMap,
     ) {
         self.signals.resolved_versions = versions;
-        self.signals.resolved_version_candidates = candidates;
+        self.signals.resolved_version_candidates = Arc::new(candidates);
     }
 
     /// Sets [`PackageSignals::resolved_versions_generation`] to `generation` (from
@@ -1289,7 +1303,8 @@ pub struct ServerState {
     /// finishes later (and so may have read older signals) never overwrites a newer publish.
     published: DashMap<Uri, PublishTicket>,
     /// Per-document gate serializing a diagnostics publish's claim-to-send window against
-    /// `did_close`'s removal and clearing publish (#1938); see [`Self::lock_publish`].
+    /// `did_close`'s clearing publish, which follows the document's removal (#1938); see
+    /// [`Self::lock_publish`].
     publish_gates: DashMap<Uri, Arc<tokio::sync::Mutex<()>>>,
     /// Flags tasks aborted through [`Self::tasks`] so their progress indicator ends quietly (#2001).
     abort_registry: Arc<crate::progress::AbortRegistry>,
@@ -1910,20 +1925,39 @@ impl ServerState {
     }
 
     /// Takes `uri`'s publish gate. A diagnostics publish holds it from its [`Self::claim_publish`]
-    /// to the end of its send, and `did_close` holds it across the removal and the clearing
-    /// publish, so no stale publish can be sent after the close's empty one (#1938).
-    ///
-    /// Release it by dropping the guard, then call [`Self::prune_publish_gate`].
-    pub(crate) async fn lock_publish(&self, uri: &Uri) -> PublishGate {
-        let gate = Arc::clone(&*self.publish_gates.entry(uri.clone()).or_default());
-        gate.lock_owned().await
+    /// to the end of its send, and `did_close` holds it across the clearing publish, so no stale
+    /// publish can be sent after the close's empty one (#1938). Dropping the returned
+    /// [`PublishGate`] releases the gate and prunes the map entry once nobody holds or awaits it.
+    pub(crate) async fn lock_publish(&self, uri: &Uri) -> PublishGate<'_> {
+        let mut gate = PublishGate {
+            state: self,
+            uri: uri.clone(),
+            guard: None,
+        };
+        let mutex = Arc::clone(&*self.publish_gates.entry(uri.clone()).or_default());
+        gate.guard = Some(mutex.lock_owned().await);
+        gate
     }
 
     /// Drops `uri`'s gate entry once nobody holds or awaits it, so the map does not grow with
-    /// every document ever opened. Call after dropping the [`PublishGate`].
-    pub(crate) fn prune_publish_gate(&self, uri: &Uri) {
+    /// every document ever opened.
+    fn prune_publish_gate(&self, uri: &Uri) {
         self.publish_gates
             .remove_if(uri, |_, gate| Arc::strong_count(gate) == 1);
+    }
+
+    /// Number of live gate entries.
+    #[cfg(test)]
+    pub(crate) fn publish_gate_entries(&self) -> usize {
+        self.publish_gates.len()
+    }
+
+    /// Strong count of `uri`'s gate entry (map + holder + each waiter), if present.
+    #[cfg(test)]
+    pub(crate) fn publish_gate_strong_count(&self, uri: &Uri) -> Option<usize> {
+        self.publish_gates
+            .get(uri)
+            .map(|gate| Arc::strong_count(&gate))
     }
 
     /// Claims the right to publish `uri`'s diagnostics for `ticket`; `false` when a generation
@@ -2106,6 +2140,29 @@ impl ServerState {
         drop(tasks);
         self.abort_typosquat_task(uri).await;
         self.abort_gossip_task(uri).await;
+    }
+
+    /// [`Self::cancel_background_task`], but only when the task registered for `uri` is still
+    /// `task_id`, so a task a later open installed for the same URI is left alone. Returns
+    /// whether it cancelled.
+    pub(crate) async fn cancel_background_task_if_current(
+        &self,
+        uri: &Uri,
+        task_id: tokio::task::Id,
+    ) -> bool {
+        {
+            let mut tasks = self.tasks.write().await;
+            if tasks.get(uri).is_none_or(|(id, _)| *id != task_id) {
+                return false;
+            }
+            if let Some((id, task)) = tasks.remove(uri) {
+                self.abort_registry.mark_aborted(id);
+                task.abort();
+            }
+        }
+        self.abort_typosquat_task(uri).await;
+        self.abort_gossip_task(uri).await;
+        true
     }
 
     /// Draws the next generation value for a typosquat pre-fetch spawn decision (issue #1455
@@ -3283,6 +3340,28 @@ mod tests {
         );
 
         state.cancel_background_task(&uri).await;
+    }
+
+    /// Critic M1: the re-check after a `did_change` registration must not cancel a task a
+    /// later open installed for the same URI.
+    #[tokio::test]
+    async fn test_cancel_if_current_leaves_a_superseding_task_alone() {
+        let state = Arc::new(ServerState::new());
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
+
+        let task_a = tokio::spawn(std::future::pending::<()>());
+        let id_a = task_a.id();
+        state.spawn_background_task(uri.clone(), task_a).await;
+        let task_b = tokio::spawn(std::future::pending::<()>());
+        let id_b = task_b.id();
+        state.spawn_background_task(uri.clone(), task_b).await;
+
+        assert!(!state.cancel_background_task_if_current(&uri, id_a).await);
+        assert!(state.is_current_background_task(&uri, id_b).await);
+
+        assert!(state.cancel_background_task_if_current(&uri, id_b).await);
+        assert!(!state.is_current_background_task(&uri, id_b).await);
     }
 
     // =========================================================================

@@ -86,8 +86,10 @@ pub struct CheckArgs {
     ///
     /// `unchecked` is a strict, additive run-level gate: the run also exits 1 when
     /// vulnerability data was not checked for at least one dependency (an unverified registry
-    /// mirror, an incomplete or failed scan, or a dependency missing from an existing lock
-    /// file), or when vulnerability scanning is disabled in the config. It adds to the
+    /// mirror, an incomplete or failed scan, a dependency missing from an existing lock
+    /// file, or a dependency whose satisfying lock-file entries were not all scanned even
+    /// though some already carry advisories), or when vulnerability scanning is disabled in
+    /// the config. It adds to the
     /// categories rather than replacing them: `--fail-on unchecked` keeps the default
     /// `vulnerable,yanked,unsatisfiable`, and `--fail-on outdated,unchecked` fails on `outdated`
     /// plus the gate. It cannot be combined with `--offline`, which checks nothing (exit 2).

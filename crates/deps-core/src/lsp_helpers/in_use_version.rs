@@ -431,13 +431,13 @@ type ParsedVersions = Arc<[Option<semver::Version>]>;
 /// What one pass keeps per candidate list: its semver parse for ordering, and the ecosystem's
 /// own parse of it for requirement matching (`None` for a formatter without a candidate set).
 #[derive(Clone)]
-struct CachedList {
+pub(crate) struct CachedList {
     parsed: ParsedVersions,
     set: Option<Arc<dyn CandidateSet>>,
 }
 
 impl CachedList {
-    fn new(entries: &[ConcreteVersion], formatter: &dyn EcosystemFormatter) -> Self {
+    pub(crate) fn new(entries: &[ConcreteVersion], formatter: &dyn EcosystemFormatter) -> Self {
         Self {
             parsed: parse_all(entries),
             set: formatter.candidate_set(entries).map(Arc::from),
@@ -596,20 +596,61 @@ fn keep_smallest(entries: &mut Vec<Entry<'_, '_>>, n: usize) {
     entries.sort_by(compare_entries);
 }
 
-/// Selections already computed within one pass: per `(name, requirement)` pair, and the parsed
-/// forms of each name's candidate list.
+/// Selections already computed within one pass, per `(name, requirement)` pair.
 ///
 /// A manifest can repeat one dependency (target-specific sections, markers) against a lock
-/// file holding thousands of entries for it; selecting once per distinct pair and parsing each
-/// list once per name keeps a pass linear in the lock entries instead of in occurrences times
-/// entries.
+/// file holding thousands of entries for it; selecting once per distinct pair keeps a pass
+/// linear in the lock entries instead of in occurrences times entries. Lookups borrow the name
+/// and requirement, so a hit allocates nothing for the key.
 #[derive(Debug, Default)]
 pub struct LockSelectionMemo {
-    selections: HashMap<MemoKey, Option<Selection>>,
-    lists: HashMap<NormalizedName, CachedList>,
+    by_name: HashMap<NormalizedName, RequirementMemo>,
 }
 
-type MemoKey = (NormalizedName, Option<String>);
+/// One name's memoized outcomes: for a bare occurrence, and per declared requirement.
+#[derive(Debug, Default)]
+struct RequirementMemo {
+    bare: Option<Outcome>,
+    by_requirement: HashMap<crate::VersionReq, Outcome>,
+}
+
+impl RequirementMemo {
+    fn get(&self, requirement: Option<&crate::VersionReq>) -> Option<&Outcome> {
+        match requirement {
+            Some(requirement) => self.by_requirement.get(requirement),
+            None => self.bare.as_ref(),
+        }
+    }
+
+    fn insert(&mut self, requirement: Option<&crate::VersionReq>, outcome: Outcome) {
+        match requirement {
+            Some(requirement) => {
+                self.by_requirement.insert(requirement.clone(), outcome);
+            }
+            None => self.bare = Some(outcome),
+        }
+    }
+}
+
+/// A memoized selection result; `NoMatch` is a cached FR-003 miss.
+#[derive(Debug, Clone)]
+enum Outcome {
+    Selected(Selection),
+    NoMatch,
+}
+
+impl Outcome {
+    fn of(selection: Option<Selection>) -> Self {
+        selection.map_or(Self::NoMatch, Self::Selected)
+    }
+
+    fn selection(&self) -> Option<Selection> {
+        match self {
+            Self::Selected(selection) => Some(selection.clone()),
+            Self::NoMatch => None,
+        }
+    }
+}
 
 /// A primary version and its lock alternatives.
 #[derive(Debug, Clone)]
@@ -640,14 +681,13 @@ struct Picked<'a> {
 /// satisfies it, and none satisfying (FR-003) is `None` rather than an arbitrary entry. Without
 /// a requirement, or with at most one candidate, the primary is the collapsed
 /// `resolved_versions` entry; a bare name with several candidates keeps all of them as possible.
-/// `list_cache` lets repeated selections from one list share its parse.
+/// The candidate list's parse is cached on its `LockCandidates`, so repeated selections share it.
 fn pick<'a>(
     dep: &dyn Dependency,
     key: &PackageKey,
     resolved_versions: &'a HashMap<NormalizedName, ConcreteVersion>,
     resolved_version_candidates: Option<&'a ResolvedCandidatesMap>,
     formatter: &dyn EcosystemFormatter,
-    list_cache: Option<&mut HashMap<NormalizedName, CachedList>>,
 ) -> Option<Picked<'a>> {
     let collapsed = resolved_versions.get(key.normalized());
     let Some(lock) = resolved_version_candidates
@@ -660,13 +700,7 @@ fn pick<'a>(
         });
     };
     let entries = lock.versions();
-    let list = match list_cache {
-        Some(cache) => cache
-            .entry(key.normalized().clone())
-            .or_insert_with(|| CachedList::new(entries, formatter))
-            .clone(),
-        None => CachedList::new(entries, formatter),
-    };
+    let list = lock.cached_list(formatter);
     let (primary, possible) = match dep.version_requirement() {
         Some(req) => (
             None,
@@ -676,7 +710,7 @@ fn pick<'a>(
     };
     let candidates = Candidates {
         entries,
-        parsed: list.parsed,
+        parsed: Arc::clone(&list.parsed),
         possible,
         preference: lock.preference(),
     };
@@ -699,7 +733,7 @@ fn select_occurrence(
     scope: AlternativeScope,
     memo: Option<&mut LockSelectionMemo>,
 ) -> Option<Selection> {
-    let select = |list_cache: Option<&mut HashMap<NormalizedName, CachedList>>| {
+    let select = || {
         let Picked {
             primary,
             candidates,
@@ -709,7 +743,6 @@ fn select_occurrence(
             resolved_versions,
             resolved_version_candidates,
             formatter,
-            list_cache,
         )?;
         let (alternatives, alternative_coverage) = match (scope, candidates) {
             (AlternativeScope::WithAlternatives, Some(candidates)) => {
@@ -728,16 +761,25 @@ fn select_occurrence(
     let multiple_candidates = resolved_version_candidates
         .and_then(|candidates| candidates.get(key.normalized()))
         .is_some_and(|candidates| candidates.len() > 1);
-    match memo.filter(|_| multiple_candidates && scope == AlternativeScope::WithAlternatives) {
-        Some(LockSelectionMemo { selections, lists }) => selections
-            .entry((
-                key.normalized().clone(),
-                dep.version_requirement().map(|r| r.as_str().to_string()),
-            ))
-            .or_insert_with(|| select(Some(lists)))
-            .clone(),
-        None => select(None),
+    let Some(memo) =
+        memo.filter(|_| multiple_candidates && scope == AlternativeScope::WithAlternatives)
+    else {
+        return select();
+    };
+    let requirement = dep.version_requirement();
+    if let Some(outcome) = memo
+        .by_name
+        .get(key.normalized())
+        .and_then(|memoized| memoized.get(requirement))
+    {
+        return outcome.selection();
     }
+    let selection = select();
+    memo.by_name
+        .entry(key.normalized().clone())
+        .or_default()
+        .insert(requirement, Outcome::of(selection.clone()));
+    selection
 }
 
 /// Resolves one dependency occurrence's lock-file version, disambiguating by its own
@@ -772,7 +814,6 @@ pub(crate) fn resolve_occurrence_version<'a>(
         resolved_versions,
         resolved_version_candidates,
         formatter,
-        None,
     )
     .map(|picked| picked.primary)
 }
@@ -2592,6 +2633,113 @@ mod tests {
         );
     }
 
+    fn counted_candidates(name: &NormalizedName, entries: usize) -> ResolvedCandidatesMap {
+        HashMap::from([(
+            name.clone(),
+            (0..entries)
+                .map(|n| ConcreteVersion::from(format!("1.0.{n}")))
+                .collect::<Vec<_>>()
+                .into(),
+        )])
+    }
+
+    /// #2011: the list's parse lives on its `LockCandidates`, so selections without any memo
+    /// still parse each candidate once.
+    #[test]
+    fn selections_without_a_memo_share_the_lock_candidates_parse() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        const ENTRIES: usize = 100;
+        let name = NormalizedName::for_test("pkg");
+        let candidates = counted_candidates(&name, ENTRIES);
+        let resolved = HashMap::from([(name, ConcreteVersion::from("1.0.99"))]);
+        let counting = CountingSetFormatter(CountingSemver::default());
+        let key = crate::test_util::package_key("pkg");
+
+        for n in 0..3 {
+            let dep = MockDep {
+                name: PackageName::new("pkg"),
+                version_req: VersionReq::new(format!(">=1.0.{n}")),
+                version_range: Range::default(),
+                name_range: Range::default(),
+            };
+            let picked = pick(&dep, &key, &resolved, Some(&candidates), &counting);
+            assert!(picked.is_some());
+        }
+
+        assert_eq!(
+            counting.0.parses.load(std::sync::atomic::Ordering::SeqCst),
+            ENTRIES
+        );
+    }
+
+    /// #2011: the cache keeps the first formatter's parse; a later formatter never builds its own.
+    #[test]
+    fn lock_candidates_cache_keeps_the_first_formatters_parse() {
+        let candidates = LockCandidates::from(vec![
+            ConcreteVersion::from("1.0.0"),
+            ConcreteVersion::from("1.0.1"),
+        ]);
+        let first = CountingSetFormatter(CountingSemver::default());
+        let second = CountingSetFormatter(CountingSemver::default());
+
+        candidates.cached_list(&first);
+        candidates.cached_list(&second);
+
+        assert_eq!(first.0.parses.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(second.0.parses.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// #2011: neither `Debug` nor equality depends on whether a selection filled the cache.
+    #[test]
+    fn lock_candidates_debug_and_eq_ignore_the_cache() {
+        let cold = LockCandidates::from(vec![ConcreteVersion::from("1.0.0")]);
+        let warm = cold.clone();
+        warm.cached_list(&CaretFormatter);
+
+        assert_eq!(format!("{cold:?}"), format!("{warm:?}"));
+        assert_eq!(cold, warm);
+    }
+
+    /// #2012: a requirement nothing satisfies is memoized as a miss and stays one.
+    #[test]
+    fn memo_remembers_a_requirement_nothing_satisfies() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let name = NormalizedName::for_test("pkg");
+        let candidates = counted_candidates(&name, 5);
+        let resolved = HashMap::from([(name.clone(), ConcreteVersion::from("1.0.4"))]);
+        let dep = MockDep {
+            name: PackageName::new("pkg"),
+            version_req: VersionReq::new(">=9.0.0"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let mut memo = LockSelectionMemo::default();
+
+        for _ in 0..2 {
+            assert!(
+                resolve_in_use_versions_memoized(
+                    &dep,
+                    &crate::test_util::package_key("pkg"),
+                    &resolved,
+                    Some(&candidates),
+                    &CaretFormatter,
+                    EcosystemId::Cargo,
+                    &mut memo,
+                )
+                .is_none()
+            );
+        }
+
+        assert!(matches!(
+            memo.by_name[&name].by_requirement[&VersionReq::new(">=9.0.0")],
+            Outcome::NoMatch
+        ));
+    }
+
     /// #1981 (security re-verification): a pass of many distinct requirements over one big
     /// candidate list must parse that list once, and each memoized selection must keep only
     /// its capped alternatives, not an allocation sized by the whole list.
@@ -2645,13 +2793,13 @@ mod tests {
             );
         }
 
-        assert_eq!(memo.selections.len(), REQUIREMENTS);
-        assert_eq!(
-            memo.lists.len(),
-            1,
-            "one parse cache per name, not per requirement"
-        );
-        for selection in memo.selections.values().flatten() {
+        assert_eq!(memo.by_name.len(), 1, "one memo per name");
+        let memoized = &memo.by_name[&NormalizedName::for_test("pkg")];
+        assert_eq!(memoized.by_requirement.len(), REQUIREMENTS);
+        for outcome in memoized.by_requirement.values() {
+            let Outcome::Selected(selection) = outcome else {
+                panic!("every requirement selects a primary");
+            };
             assert!(selection.alternatives.capacity() <= MAX_LOCK_ALTERNATIVES + 1);
         }
     }
