@@ -3,6 +3,7 @@
 //! `.npmrc`; the config lives outside the scanned tree because an auto-discovered `deps.toml`
 //! is never allowed to suppress findings (spec 062 F1).
 
+#![cfg(feature = "npm")]
 #![allow(clippy::expect_used)]
 
 use std::path::Path;

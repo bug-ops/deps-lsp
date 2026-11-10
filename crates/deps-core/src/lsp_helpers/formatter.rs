@@ -2807,6 +2807,18 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
 pub trait ProbeDependency: Dependency + Sized {
     /// A dependency named `name` that resolves from `source`, with every other field neutral.
     fn probe(name: PackageName, source: crate::parser::DependencySource) -> Self;
+
+    /// One registry-sourced dependency named `name` per registry, index or feed route this
+    /// dependency type can carry, so a cross-ecosystem guard can reach the opt-ins that no
+    /// [`DependencySource`](crate::parser::DependencySource) expresses (#1999).
+    ///
+    /// Default: no routes. An implementor whose type carries a route field returns one probe per
+    /// route variant. Deliberately not feature-gated: a gated method would be gated per crate,
+    /// and a crate built without its own `test-util` would silently fall back to this default.
+    fn route_probes(name: PackageName) -> Vec<Self> {
+        let _ = name;
+        Vec::new()
+    }
 }
 
 /// The dependency-taking half of an ecosystem's formatter, typed to the one dependency kind
@@ -3106,8 +3118,9 @@ pub trait DependencyFormatter: EcosystemFormatter + 'static {
     /// (#1977): it builds each ecosystem's own dependency through [`ProbeDependency`] and asserts
     /// that only a `CustomRegistry` source in `deps-go` reports an unverified mirror, and that an
     /// `AlternateRegistry { mirrors_public_registry: false }` source stays
-    /// [`crate::osv::NonPublicRoute::Private`] everywhere. A new opt-in therefore has to be
-    /// added to that test.
+    /// [`crate::osv::NonPublicRoute::Private`] everywhere. It also derives the full opt-in set,
+    /// including the registry, index and feed routes of [`ProbeDependency::route_probes`], and
+    /// compares it with a literal list, so a new opt-in, or an ecosystem losing every opt-in route, fails the test.
     fn non_public_route(&self, dep: &Self::Dep) -> crate::osv::NonPublicRoute {
         let _ = dep;
         crate::osv::NonPublicRoute::Private

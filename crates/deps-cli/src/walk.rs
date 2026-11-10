@@ -1693,6 +1693,7 @@ mod tests {
         assert!(outcome.unrecognized_explicit_paths().is_empty());
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn test_walk_multiple_ecosystems_in_one_tree() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1825,6 +1826,7 @@ mod tests {
 
     /// Regression test for issue #1829: `hidden(true)` dropped hidden manifest *files*, so a
     /// root `.gitlab-ci.yml` was never discovered ("no manifests discovered").
+    #[cfg(feature = "gitlab-ci")]
     #[test]
     fn test_walk_discovers_root_hidden_manifest_file() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1842,6 +1844,7 @@ mod tests {
 
     /// Issue #1829 fail-open layout: a nested `.gitlab-ci.yml` beside another ecosystem's
     /// manifest was silently skipped while the run still exited 0.
+    #[cfg(feature = "gitlab-ci")]
     #[test]
     fn test_walk_discovers_nested_hidden_manifest_file_beside_other_manifests() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1904,6 +1907,7 @@ mod tests {
 
     /// Issue #1829 / FR-012: `.gitlab-ci.yml` must be reported exactly once when a `.gitlab/`
     /// ecosystem directory also exists (primary walk plus the dot-directory pass).
+    #[cfg(feature = "gitlab-ci")]
     #[test]
     fn test_walk_hidden_manifest_file_reported_once_with_gitlab_directory_present() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1933,6 +1937,7 @@ mod tests {
 
     /// Issue #1829 / FR-008: a gitignored hidden manifest is reported under
     /// `GitignorePolicy::Respect` like any other ignore-suppressed manifest.
+    #[cfg(feature = "gitlab-ci")]
     #[test]
     fn test_walk_respect_gitignore_reports_ignored_hidden_manifest() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1957,6 +1962,7 @@ mod tests {
     /// Issue #1829 (tester G9): a nested `a/.gitlab-ci.yml` beside `a/.gitlab/ci/x.yml` is
     /// found once each, with and without `GitignorePolicy::Respect` (whose detection pass
     /// must not double-report either).
+    #[cfg(feature = "gitlab-ci")]
     #[test]
     fn test_walk_nested_hidden_manifest_and_gitlab_directory_each_reported_once() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -2011,6 +2017,7 @@ mod tests {
     /// Issue #1829 (tester G5): a symlinked hidden manifest follows the same classification
     /// as any other symlinked manifest — reported unfollowed by default, routed under
     /// `--follow-symlinks`.
+    #[cfg(feature = "gitlab-ci")]
     #[cfg(unix)]
     #[test]
     fn test_walk_symlinked_hidden_manifest_follows_symlink_policy() {
@@ -2067,6 +2074,7 @@ mod tests {
 
     /// Issue #1829: eligibility derives from the registry's `manifest_filenames()`, not a
     /// literal — a registry with no ecosystems admits no hidden file.
+    #[cfg(feature = "gitlab-ci")]
     #[test]
     fn test_hidden_manifest_names_derive_from_registry() {
         let registered = HiddenManifestNames::from_registry(&test_registry());

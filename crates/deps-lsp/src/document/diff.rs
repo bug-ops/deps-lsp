@@ -573,7 +573,7 @@ serde_old = { package = "serde", version = "0.9" }
                 doc.signals
                     .resolved_versions
                     .insert(NormalizedName::for_test("serde"), "1.0.219".into());
-                doc.signals.resolved_version_candidates.insert(
+                Arc::make_mut(&mut doc.signals.resolved_version_candidates).insert(
                     NormalizedName::for_test("serde"),
                     LockCandidates::from(vec!["0.9.15".into(), "1.0.219".into()]),
                 );
@@ -1006,7 +1006,7 @@ serde_old = { package = "serde", version = "0.9" }
                 doc.signals
                     .resolved_versions
                     .insert(NormalizedName::for_test("serde"), "1.0.219".into());
-                doc.signals.resolved_version_candidates.insert(
+                Arc::make_mut(&mut doc.signals.resolved_version_candidates).insert(
                     NormalizedName::for_test("serde"),
                     LockCandidates::from(vec!["0.9.15".into(), "1.0.219".into()]),
                 );
@@ -1037,9 +1037,7 @@ serde_old = { package = "serde", version = "0.9" }
             for removed_dep in diff.removed.as_slice() {
                 doc_state2.signals.cached_versions.remove(removed_dep);
                 doc_state2.signals.resolved_versions.remove(removed_dep);
-                doc_state2
-                    .signals
-                    .resolved_version_candidates
+                Arc::make_mut(&mut doc_state2.signals.resolved_version_candidates)
                     .remove(removed_dep);
             }
 

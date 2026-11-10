@@ -2,10 +2,11 @@
 //! every LSP response builder consumes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(all(doc, feature = "lsp-responses"))]
 use super::generate_hover;
+use super::in_use_version::CachedList;
 #[cfg(doc)]
 use super::{
     DependencyOutcome, REGISTRY_FETCH_BUDGET, await_interactive_fetch, candidate_verdict,
@@ -57,10 +58,33 @@ pub type ResolvedVersionsMap = HashMap<NormalizedName, ConcreteVersion>;
 /// assert_eq!(candidates.len(), 1);
 /// assert_eq!(candidates.versions(), [ConcreteVersion::new("1.0.0")]);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct LockCandidates {
     versions: Vec<ConcreteVersion>,
     preference: OwnerPreference,
+    /// The parse of `versions`, filled by the first selection and then shared by every later one
+    /// for the life of this value (#2011). It belongs to the one formatter that fills it:
+    /// production builds a single formatter per document, so the first fill is the only one;
+    /// a later call with a different formatter reuses that first parse.
+    cache: OnceLock<CachedList>,
+}
+
+impl PartialEq for LockCandidates {
+    fn eq(&self, other: &Self) -> bool {
+        self.versions == other.versions && self.preference == other.preference
+    }
+}
+
+impl Eq for LockCandidates {}
+
+impl std::fmt::Debug for LockCandidates {
+    /// Manual: the cache is omitted so the output does not depend on whether a selection ran.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockCandidates")
+            .field("versions", &self.versions)
+            .field("preference", &self.preference)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Which retained versions the requesting manifest owns, parallel to
@@ -108,7 +132,14 @@ impl LockCandidates {
         Self {
             versions,
             preference,
+            cache: OnceLock::new(),
         }
+    }
+
+    /// The versions' parse, built with `formatter` on first use; see the `cache` field.
+    pub(crate) fn cached_list(&self, formatter: &dyn EcosystemFormatter) -> &CachedList {
+        self.cache
+            .get_or_init(|| CachedList::new(&self.versions, formatter))
     }
 
     pub(crate) const fn preference(&self) -> &OwnerPreference {

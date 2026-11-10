@@ -256,6 +256,38 @@ mod tests {
         }
     }
 
+    /// #2017: a vulnerable dependency whose overflow is only a lower bound trips
+    /// `--fail-on unchecked` like a skipped one; the default categories stay clean.
+    #[test]
+    fn test_unchecked_gate_fails_on_vulnerable_lower_bound_overflow() {
+        use deps_core::osv::{
+            Capped, DependencyVulnerabilities, LockPresence, ScanOutcome, VulnerabilityMap,
+        };
+        use std::collections::HashSet;
+
+        let mut map = VulnerabilityMap::new();
+        map.insert(
+            deps_core::test_util::vuln_key("lodash"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(
+                Capped::new(vec![], 0).with_total_as_lower_bound(),
+            )),
+        );
+        let coverage =
+            OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Found, &HashSet::new());
+        let exit = |policy: &FailOnPolicy| {
+            exit_code(
+                &CheckReport::default(),
+                policy,
+                &coverage,
+                online(),
+                ExecutionOutcome::Clean,
+            )
+        };
+
+        assert_eq!(exit(&strict()), EXIT_POLICY_VIOLATION);
+        assert_eq!(exit(&FailOnPolicy::default_categories()), EXIT_CLEAN);
+    }
+
     #[test]
     fn test_unchecked_gate_passes_with_full_coverage() {
         assert_eq!(

@@ -389,6 +389,8 @@ pub enum NpmRegistryEntry {
 }
 
 impl NpmRegistryEntry {
+    pub(crate) const ALL: [Self; 2] = [Self::TopLevel, Self::Scope];
+
     /// The OSV non-public route this entry implies: a top-level `registry=` is an unverified
     /// mirror of npmjs, a scope entry a private registry (#1917, #1965).
     ///
@@ -412,6 +414,10 @@ impl NpmRegistryEntry {
         }
     }
 }
+
+const _: fn(NpmRegistryEntry) = |entry| match entry {
+    NpmRegistryEntry::TopLevel | NpmRegistryEntry::Scope => {}
+};
 
 impl NpmDependency {
     /// The `.npmrc` entry that routed this dependency, or `None` when none applied (the public
@@ -782,6 +788,16 @@ impl deps_core::lsp_helpers::ProbeDependency for NpmDependency {
             registry_entry: None,
             package: None,
         }
+    }
+
+    fn route_probes(name: deps_core::PackageName) -> Vec<Self> {
+        NpmRegistryEntry::ALL
+            .into_iter()
+            .map(|entry| Self {
+                registry_entry: Some(entry),
+                ..Self::probe(name.clone(), deps_core::parser::DependencySource::Registry)
+            })
+            .collect()
     }
 }
 

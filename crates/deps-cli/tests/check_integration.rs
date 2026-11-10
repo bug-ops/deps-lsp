@@ -156,6 +156,7 @@ async fn test_empty_directory_produces_no_findings_and_clean_exit() {
     );
 }
 
+#[cfg(feature = "npm")]
 #[tokio::test]
 async fn test_multi_ecosystem_fixture_tree_discovers_both_manifests() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -506,9 +507,11 @@ fn test_fail_on_other_exits_one_on_other_finding_and_default_policy_exits_zero()
 /// manifest (it is routed to the npm ecosystem by `EcosystemRegistry::for_uri`), and a
 /// duplicate default catalog surfaces as an `Other` finding that leaves the default exit code
 /// alone.
+#[cfg(feature = "npm")]
 const DUPLICATE_DEFAULT_WORKSPACE: &str =
     "catalog:\n  react: ^18.0.0\ncatalogs:\n  default:\n    vue: ^3.0.0\n";
 
+#[cfg(feature = "npm")]
 #[tokio::test]
 async fn test_pnpm_workspace_yaml_is_checked_as_an_npm_manifest() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -548,6 +551,7 @@ async fn test_pnpm_workspace_yaml_is_checked_as_an_npm_manifest() {
     );
 }
 
+#[cfg(feature = "npm")]
 #[test]
 fn test_fail_on_other_gates_a_duplicate_default_catalog_through_the_real_binary() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -604,6 +608,7 @@ fn test_offline_unknown_ref_run_prints_no_probe_note() {
 /// `pnpm-workspace.yaml` and once from each referencing `package.json`. The npm registry is a
 /// `mockito` server reached through the fixture's own `.npmrc` (loopback allowed via the
 /// private-registry allowlist), so no ecosystem crate is needed.
+#[cfg(feature = "npm")]
 mod catalog_duplicate_reporting {
     use super::*;
     use deps_core::policy_config::{
@@ -706,6 +711,7 @@ mod catalog_duplicate_reporting {
 /// `mockito`) is expected for packages the registry does not mirror, so a lock-file
 /// dependency stays silent. The reportable not-found path for the default registries is
 /// covered by the `deps-engine` fold and `deps-core` diagnostics tests.
+#[cfg(feature = "npm")]
 mod alternate_registry_not_found_with_lockfile {
     use super::*;
     use deps_core::policy_config::{
@@ -887,6 +893,7 @@ mod probe_notes {
 /// registry once, and both declarations get the same finding through the CLI's
 /// `analyze_manifest` → `generate_diagnostics` path. The index is a `mockito` server reached
 /// through the requirements file's own `--index-url`.
+#[cfg(feature = "pypi")]
 mod case_variant_names {
     use super::*;
     use deps_core::policy_config::{
@@ -977,6 +984,7 @@ mod case_variant_names {
 /// #5's rationale above for `--respect-gitignore`): a manifest replaced by a broken symlink
 /// must not be silently dropped from the scan, and the warning must distinguish this case
 /// (possible tampering) from an ordinary excluded manifest.
+#[cfg(feature = "npm")]
 #[cfg(unix)]
 #[test]
 fn test_broken_symlink_manifest_reaches_the_real_exit_code_wiring() {
@@ -1188,6 +1196,12 @@ async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_target
 /// [`CheckContext`] under `license_policy` — mirrors [`offline_context`] but leaves
 /// `HttpCache` free to make real requests, for the tier-3 license-prefetch parity tests
 /// below (issue #1133).
+#[cfg(any(
+    feature = "dart",
+    feature = "swift",
+    feature = "gradle",
+    feature = "deno"
+))]
 fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, CheckContext) {
     let policy = PolicyConfig {
         license_policy,
@@ -1233,6 +1247,12 @@ fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, Chec
 /// `evaluate_unknown_license_never_violates` contract) — so this can only produce a
 /// `Category::License` finding when a real, non-"0BSD" license genuinely reached the
 /// policy engine, which is exactly the property this test protects.
+#[cfg(any(
+    feature = "dart",
+    feature = "swift",
+    feature = "gradle",
+    feature = "deno"
+))]
 mod tier3_license_prefetch_parity {
     use super::*;
     use deps_cli::report::Category;
@@ -1764,6 +1784,7 @@ mod gossip_prefetch_wiring_regression {
 /// counted into the run's single stderr note. The npm registry is a `mockito` server reached
 /// through the fixture's `.npmrc`; no OSV request is made because every dependency is skipped
 /// before the scan.
+#[cfg(feature = "npm")]
 mod unverified_registry_note {
     use super::*;
     use deps_core::policy_config::{RegistriesConfig, WorkspaceRegistriesSetting};
@@ -1866,6 +1887,7 @@ mod unverified_registry_note {
 /// #1914/#1917/#1937 through the real binary: the Go environment reaches the child process only
 /// via `Command::env`, so the tests stay hermetic and need no ecosystem-crate dependency. Every
 /// scenario resolves before any network request (no OSV target, no registry URL).
+#[cfg(feature = "go")]
 mod go_env_subprocess {
     const GO_MOD: &str =
         "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
@@ -1931,6 +1953,7 @@ mod go_env_subprocess {
 /// #1946 through the real binary: `--fail-on unchecked` is a strict, additive run-level gate.
 /// The Go environment reaches the child process only via `Command::env`; every scenario
 /// resolves before any network request.
+#[cfg(feature = "go")]
 mod fail_on_unchecked_subprocess {
     const GO_MOD: &str =
         "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.0\n";

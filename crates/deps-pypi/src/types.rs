@@ -86,6 +86,20 @@ pub enum PypiIndexRoute {
     NamedSource,
 }
 
+impl PypiIndexRoute {
+    pub(crate) const ALL: [Self; 3] = [
+        Self::ReplacesPublic,
+        Self::SupplementsPublic,
+        Self::NamedSource,
+    ];
+}
+
+const _: fn(PypiIndexRoute) = |route| match route {
+    PypiIndexRoute::ReplacesPublic
+    | PypiIndexRoute::SupplementsPublic
+    | PypiIndexRoute::NamedSource => {}
+};
+
 impl PypiDependency {
     /// How the declared index configuration routed this dependency, or `None` when it stayed
     /// on plain public PyPI or is not a registry dependency.
@@ -450,6 +464,16 @@ impl deps_core::lsp_helpers::ProbeDependency for PypiDependency {
             source,
             index_route: None,
         }
+    }
+
+    fn route_probes(name: deps_core::PackageName) -> Vec<Self> {
+        PypiIndexRoute::ALL
+            .into_iter()
+            .map(|route| Self {
+                index_route: Some(route),
+                ..Self::probe(name.clone(), deps_core::parser::DependencySource::Registry)
+            })
+            .collect()
     }
 }
 

@@ -13,8 +13,8 @@
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use deps_core::lsp_helpers::{redact_name_for_diagnostic, redact_requirement_for_diagnostic};
 use deps_core::osv::{
-    CoverageGap, LockPresence, LockResolution, MAX_LOCK_ALTERNATIVES, OsvClient, OsvId,
-    ScanOutcome, SkipReason, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
+    AdvisoryCount, CoverageGap, LockPresence, LockResolution, MAX_LOCK_ALTERNATIVES, OsvClient,
+    OsvId, ScanOutcome, SkipReason, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
 };
 use deps_core::policy_config::{OsvChecks, PolicyConfig};
 use deps_core::position::Range;
@@ -670,6 +670,10 @@ impl OsvCoverage {
 
     /// Counts the dependencies in `vulnerabilities` skipped for a [`CoverageGap`], given whether
     /// `lock` backed the manifest's version resolution; zero when the scan did not run.
+    ///
+    /// A dependency whose advisories are already reported but whose "+N or more" overflow is
+    /// only a lower bound (more lock-file entries satisfy the requirement than were scanned)
+    /// counts as an unchecked lock alternative too.
     #[must_use]
     pub fn from_vulnerabilities(
         vulnerabilities: Option<&VulnerabilityMap>,
@@ -678,22 +682,29 @@ impl OsvCoverage {
     ) -> Self {
         let mut coverage = Self::default();
         for (key, outcome) in vulnerabilities.into_iter().flat_map(|map| map.iter()) {
-            if let ScanOutcome::Skipped(reason) = outcome {
-                if *reason == SkipReason::LockAlternativesUnchecked {
+            match outcome {
+                ScanOutcome::Skipped(SkipReason::LockAlternativesUnchecked) => {
                     coverage.lock_alternatives_unchecked += 1;
-                    continue;
                 }
-                let reason_lock = if unlocked.contains(key) {
-                    LockPresence::Absent
-                } else {
-                    lock
-                };
-                match reason.coverage_gap(reason_lock) {
-                    Some(CoverageGap::UnverifiedRegistry) => coverage.unverified_registry += 1,
-                    Some(CoverageGap::ScanIncomplete) => coverage.scan_incomplete += 1,
-                    Some(CoverageGap::QueryFailed) => coverage.query_failed += 1,
-                    None => {}
+                ScanOutcome::Skipped(reason) => {
+                    let reason_lock = if unlocked.contains(key) {
+                        LockPresence::Absent
+                    } else {
+                        lock
+                    };
+                    match reason.coverage_gap(reason_lock) {
+                        Some(CoverageGap::UnverifiedRegistry) => coverage.unverified_registry += 1,
+                        Some(CoverageGap::ScanIncomplete) => coverage.scan_incomplete += 1,
+                        Some(CoverageGap::QueryFailed) => coverage.query_failed += 1,
+                        None => {}
+                    }
                 }
+                ScanOutcome::Vulnerable(found)
+                    if matches!(found.advisories.overflow(), Some(AdvisoryCount::AtLeast(_))) =>
+                {
+                    coverage.lock_alternatives_unchecked += 1;
+                }
+                ScanOutcome::Vulnerable(_) | ScanOutcome::Clean => {}
             }
         }
         coverage
@@ -769,7 +780,8 @@ impl OsvCoverage {
     ///
     /// Kept apart from [`Self::note`] so a possibly missed advisory on a newer or older lock
     /// entry is not folded into the registry-coverage line. Human stderr only: the structured
-    /// reports do not carry it, and it does not change the exit code.
+    /// reports do not carry it. These dependencies still count toward [`Self::unchecked`], so
+    /// `--fail-on unchecked` exits 1 for them.
     #[must_use]
     pub fn lock_alternatives_warning(&self) -> Option<String> {
         (self.lock_alternatives_unchecked > 0).then(|| {
@@ -2053,6 +2065,41 @@ mod tests {
         assert_eq!(coverage.note(), None);
         assert_eq!(coverage.unchecked(), 2);
         assert_eq!(OsvCoverage::default().lock_alternatives_warning(), None);
+    }
+
+    /// #2017: a vulnerable dependency whose overflow is only a lower bound is a lock-alternative
+    /// gap; an exact overflow or a complete list is not.
+    #[test]
+    fn test_osv_coverage_counts_vulnerable_lower_bound_overflow_as_unchecked_lock_alternatives() {
+        use deps_core::osv::{Capped, DependencyVulnerabilities, LockPresence};
+
+        let vulnerable = |name: &str, advisories: Capped<Arc<deps_core::osv::Advisory>>| {
+            (
+                deps_core::test_util::vuln_key(name),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities::new(advisories)),
+            )
+        };
+        let coverage = |entries: Vec<_>| {
+            let map: VulnerabilityMap = entries.into_iter().collect();
+            OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Found, &HashSet::new())
+        };
+
+        assert_eq!(
+            coverage(vec![vulnerable(
+                "lodash",
+                Capped::new(vec![], 0).with_total_as_lower_bound()
+            )]),
+            OsvCoverage::default().with_lock_alternatives_unchecked(1)
+        );
+        assert_eq!(
+            coverage(vec![vulnerable("exact", Capped::new(vec![], 3))]),
+            OsvCoverage::default(),
+            "an exact overflow is fully counted"
+        );
+        assert_eq!(
+            coverage(vec![vulnerable("complete", Capped::new(vec![], 0))]),
+            OsvCoverage::default()
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@
 use crate::config::DepsConfig;
 use crate::document::config_epoch::ConfigEpoch;
 use crate::document::{
-    DocStamp, ParseFailure, PrefetchVisibility, PublishTicket, ServerState, ensure_document_loaded,
+    DocStamp, ParseFailure, PrefetchVisibility, PublishGate, PublishTicket, ServerState,
+    ensure_document_loaded,
 };
 use deps_core::policy_config::{
     FetchConcurrency, FetchTimeout, GossipChecks, OsvChecks, TyposquatChecks,
@@ -262,8 +263,8 @@ async fn publish_with<F, Fut>(
     F: FnMut(DiagnosticsSnapshot) -> Fut,
     Fut: std::future::Future<Output = Vec<Diagnostic>>,
 {
-    publish_via(state, uri, config, generate, |diagnostics| {
-        client.publish_diagnostics(uri.clone(), diagnostics, None)
+    publish_via(state, uri, config, generate, |uri, diagnostics| {
+        client.publish_diagnostics(uri, diagnostics, None)
     })
     .await;
     if let Some(notice) = state.take_egress_notice() {
@@ -278,8 +279,9 @@ async fn publish_with<F, Fut>(
 ///
 /// The claim and the send run under `uri`'s publish gate, which `did_close` also takes (see
 /// [`clear_diagnostics_on_close`]): a generation that loses the race to a close finds the
-/// document untracked at its claim, and one already past its claim finishes sending before the
-/// close's empty publish goes out (#1938).
+/// document untracked at [`ServerState::claim_publish`], and one already past its claim
+/// finishes sending before the close's empty publish goes out (#1938). `send` receives `uri`
+/// itself, the canonical key, so a publish and the close's clear always target the same URI.
 async fn publish_via<F, Fut, S, SFut>(
     state: &ServerState,
     uri: &Uri,
@@ -289,7 +291,7 @@ async fn publish_via<F, Fut, S, SFut>(
 ) where
     F: FnMut(DiagnosticsSnapshot) -> Fut,
     Fut: std::future::Future<Output = Vec<Diagnostic>>,
-    S: FnOnce(Vec<Diagnostic>) -> SFut,
+    S: FnOnce(Uri, Vec<Diagnostic>) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
     let generated = generate_until_current(state, uri, config, generate).await;
@@ -313,12 +315,11 @@ async fn publish_via<F, Fut, S, SFut>(
     {
         return;
     }
-    let gate = state.lock_publish(uri).await;
     if state.claim_publish(uri, generated.ticket) {
-        // The config read guard is still held here so no apply can start before the send is
-        // queued. A client that stops draining must not wedge config applies (and, behind a
-        // queued writer, every other config reader), so the send is bounded.
-        if !send_bounded(send(generated.value), PUBLISH_SEND_TIMEOUT).await {
+        // The gate and the config read guard are still held here, so no apply can start before
+        // the send is queued. A client that stops draining must not wedge config applies (and,
+        // behind a queued writer, every other config reader), so the send is bounded.
+        if !send_bounded(send(uri.clone(), generated.value), PUBLISH_SEND_TIMEOUT).await {
             tracing::warn!(
                 ?uri,
                 "client did not accept publishDiagnostics in time; dropped it"
@@ -330,34 +331,35 @@ async fn publish_via<F, Fut, S, SFut>(
             "a later diagnostics generation already published, or the document was closed"
         );
     }
-    drop(gate);
-    state.prune_publish_gate(uri);
 }
 
 /// Handles `textDocument/didClose` for `uri`: removes the document and, if it was tracked,
 /// sends an empty diagnostics set through `send` so the client drops what was published.
 ///
-/// Runs under `uri`'s publish gate, so every diagnostics publish is either sent before the
-/// clearing one or finds the document untracked at its claim (#1938).
+/// The document is removed before the publish gate is taken, so publishers queued on the gate
+/// find it untracked at [`ServerState::claim_publish`] and stay silent; only a send already in
+/// flight (bounded by [`PUBLISH_SEND_TIMEOUT`]) is waited for. Every diagnostics publish is
+/// therefore either sent before the clearing one or fails its claim (#1938). `send` receives
+/// `uri` itself, the canonical key the publishes were sent to.
 pub(crate) async fn clear_diagnostics_on_close<S, SFut>(state: &ServerState, uri: &Uri, send: S)
 where
-    S: FnOnce(Vec<Diagnostic>) -> SFut,
+    S: FnOnce(Uri, Vec<Diagnostic>) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
-    let gate = state.lock_publish(uri).await;
-    if state.remove_document(uri).is_some()
-        && !send_bounded(send(Vec::new()), PUBLISH_SEND_TIMEOUT).await
-    {
+    if state.remove_document(uri).is_none() {
+        return;
+    }
+    let _gate = state.lock_publish(uri).await;
+    if !send_bounded(send(uri.clone(), Vec::new()), PUBLISH_SEND_TIMEOUT).await {
         tracing::warn!(
             ?uri,
             "client did not accept the clearing publishDiagnostics in time; dropped it"
         );
     }
-    drop(gate);
-    state.prune_publish_gate(uri);
 }
 
-/// Longest a diagnostics publish may hold the config read guard waiting on the client.
+/// Longest a diagnostics publish may hold the publish gate and the config read guard waiting on
+/// the client.
 const PUBLISH_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs `send`, giving up after `limit`; `true` when it completed.
@@ -365,8 +367,9 @@ async fn send_bounded(send: impl std::future::Future<Output = ()>, limit: Durati
     tokio::time::timeout(limit, send).await.is_ok()
 }
 
-/// The outcome of [`generate_until_current`]. Holds the config read guard the currency check
-/// ran under, so the caller sends before any config apply can start.
+/// The outcome of [`generate_until_current`]. Holds the publish gate and then the config read
+/// guard the currency check ran under, so the caller sends before any config apply can start.
+/// Lock order is always gate, then config: no task takes the gate while holding the config lock.
 struct Generated<'a, T> {
     value: T,
     /// Whether `value` was generated from state no config apply or document change overtook;
@@ -375,6 +378,7 @@ struct Generated<'a, T> {
     /// Whether this is not the first generation attempt.
     retried: bool,
     ticket: PublishTicket,
+    _gate: PublishGate<'a>,
     _config: tokio::sync::RwLockReadGuard<'a, DepsConfig>,
 }
 
@@ -384,7 +388,7 @@ struct Generated<'a, T> {
 /// The ticket is drawn immediately before `generate` is first polled, with no yield before the
 /// document's signals are read, so ticket order is signal-read order.
 async fn generate_until_current<'a, T, F, Fut>(
-    state: &ServerState,
+    state: &'a ServerState,
     uri: &Uri,
     config: &'a RwLock<DepsConfig>,
     mut generate: F,
@@ -398,6 +402,9 @@ where
         let snapshot = DiagnosticsSnapshot::capture(state, uri, config).await;
         let ticket = state.next_publish_ticket();
         let value = generate(snapshot.clone()).await;
+        // Gate before config, so publishers queued on the gate hold no config guard and a config
+        // apply waits behind at most the one send in flight (#2010).
+        let gate = state.lock_publish(uri).await;
         let guard = config.read().await;
         let current = snapshot.is_current(state, uri);
         if current || attempt == MAX_PUBLISH_ATTEMPTS {
@@ -406,6 +413,7 @@ where
                 current,
                 retried: attempt > 1,
                 ticket,
+                _gate: gate,
                 _config: guard,
             };
         }
@@ -1447,7 +1455,7 @@ mod tests {
                             one_diagnostic()
                         }
                     },
-                    |diagnostics| async move { recorder.lock().unwrap().push(diagnostics.len()) },
+                    |_uri, diagnostics| async move { recorder.lock().unwrap().push(diagnostics.len()) },
                 )
                 .await;
             }
@@ -1455,7 +1463,7 @@ mod tests {
         entered.notified().await;
 
         let recorder = Arc::clone(&sent);
-        clear_diagnostics_on_close(&state, &uri, |diagnostics| async move {
+        clear_diagnostics_on_close(&state, &uri, |_uri, diagnostics| async move {
             recorder.lock().unwrap().push(diagnostics.len());
         })
         .await;
@@ -1491,7 +1499,7 @@ mod tests {
                     &uri,
                     &config,
                     |_snapshot| async { one_diagnostic() },
-                    |diagnostics| async move {
+                    |_uri, diagnostics| async move {
                         in_send.notify_one();
                         release.notified().await;
                         sent.lock().unwrap().push(diagnostics.len());
@@ -1505,7 +1513,7 @@ mod tests {
         let close = tokio::spawn({
             let (state, uri, sent) = (Arc::clone(&state), uri.clone(), Arc::clone(&sent));
             async move {
-                clear_diagnostics_on_close(&state, &uri, |diagnostics| async move {
+                clear_diagnostics_on_close(&state, &uri, |_uri, diagnostics| async move {
                     sent.lock().unwrap().push(diagnostics.len());
                 })
                 .await;
@@ -1536,12 +1544,158 @@ mod tests {
         let sent = publish_recorder();
         let recorder = Arc::clone(&sent);
 
-        clear_diagnostics_on_close(&state, &uri, |diagnostics| async move {
+        clear_diagnostics_on_close(&state, &uri, |_uri, diagnostics| async move {
             recorder.lock().unwrap().push(diagnostics.len());
         })
         .await;
 
         assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// Yields until `uri`'s gate entry has `count` strong references (map, holder, waiters).
+    async fn wait_for_gate_count(state: &ServerState, uri: &Uri, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.publish_gate_strong_count(uri) != Some(count) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gate waiter count never reached");
+    }
+
+    /// #2013: a publish and the close's clearing publish both target the canonical key.
+    #[tokio::test]
+    async fn publish_and_close_send_to_the_canonical_uri() {
+        let state = ServerState::new();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        let targets: Arc<std::sync::Mutex<Vec<Uri>>> = Arc::default();
+
+        let recorder = Arc::clone(&targets);
+        publish_via(
+            &state,
+            &uri,
+            &config,
+            |_snapshot| async { Vec::new() },
+            |target, _| async move { recorder.lock().unwrap().push(target) },
+        )
+        .await;
+        let recorder = Arc::clone(&targets);
+        clear_diagnostics_on_close(&state, &uri, |target, _| async move {
+            recorder.lock().unwrap().push(target);
+        })
+        .await;
+
+        assert_eq!(*targets.lock().unwrap(), vec![uri.clone(), uri]);
+    }
+
+    /// #2010: publishers queued on the gate hold no config guard, so a config apply is not
+    /// delayed by them.
+    #[tokio::test]
+    async fn queued_publisher_does_not_block_a_config_apply() {
+        let state = Arc::new(ServerState::new());
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        let holder = state.lock_publish(&uri).await;
+
+        let queued = tokio::spawn({
+            let (state, config, uri) = (Arc::clone(&state), Arc::clone(&config), uri.clone());
+            async move {
+                publish_via(
+                    &state,
+                    &uri,
+                    &config,
+                    |_snapshot| async { Vec::new() },
+                    |_, _| async {},
+                )
+                .await;
+            }
+        });
+        wait_for_gate_count(&state, &uri, 3).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), config.write())
+                .await
+                .is_ok(),
+            "a publisher parked on the gate must not hold the config read guard"
+        );
+
+        drop(holder);
+        queued.await.expect("queued publisher");
+    }
+
+    /// #2010: close removes the document before waiting on the gate, so a publisher queued ahead
+    /// of it fails its claim instead of sending a stale set first.
+    #[tokio::test]
+    async fn close_silences_publishers_queued_on_the_gate() {
+        let state = Arc::new(ServerState::new());
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        let sent = publish_recorder();
+        let holder = state.lock_publish(&uri).await;
+
+        let queued = tokio::spawn({
+            let (state, config, uri, sent) = (
+                Arc::clone(&state),
+                Arc::clone(&config),
+                uri.clone(),
+                Arc::clone(&sent),
+            );
+            async move {
+                publish_via(
+                    &state,
+                    &uri,
+                    &config,
+                    |_snapshot| async { one_diagnostic() },
+                    |_, diagnostics| async move { sent.lock().unwrap().push(diagnostics.len()) },
+                )
+                .await;
+            }
+        });
+        wait_for_gate_count(&state, &uri, 3).await;
+        let close = tokio::spawn({
+            let (state, uri, sent) = (Arc::clone(&state), uri.clone(), Arc::clone(&sent));
+            async move {
+                clear_diagnostics_on_close(&state, &uri, |_, diagnostics| async move {
+                    sent.lock().unwrap().push(diagnostics.len());
+                })
+                .await;
+            }
+        });
+        wait_for_gate_count(&state, &uri, 4).await;
+
+        drop(holder);
+        queued.await.expect("queued publisher");
+        close.await.expect("close");
+
+        assert_eq!(*sent.lock().unwrap(), vec![0], "only the clearing publish");
+    }
+
+    /// #2009: a waiter cancelled while parked on the gate leaves no map entry behind. The
+    /// holder is released and the waiter aborted before it is polled again, so the holder's own
+    /// prune cannot mask a waiter that fails to prune (it sees the waiter's reference).
+    #[tokio::test]
+    async fn cancelled_gate_waiter_leaves_no_entry() {
+        let state = Arc::new(ServerState::new());
+        let uri = epoch_test_uri();
+        let holder = state.lock_publish(&uri).await;
+
+        let waiter = tokio::spawn({
+            let (state, uri) = (Arc::clone(&state), uri.clone());
+            async move {
+                let _gate = state.lock_publish(&uri).await;
+            }
+        });
+        wait_for_gate_count(&state, &uri, 3).await;
+
+        drop(holder);
+        waiter.abort();
+        assert!(waiter.await.expect_err("waiter was aborted").is_cancelled());
+
+        assert_eq!(state.publish_gate_entries(), 0);
     }
 
     /// I1: a client that never drains the send must not hold the config guard forever.

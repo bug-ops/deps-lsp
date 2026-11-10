@@ -522,6 +522,10 @@ impl Backend {
     }
 
     /// Handles changes to a document using unified ecosystem registry.
+    ///
+    /// A change for a document that is not tracked is dropped: it was closed meanwhile, or its
+    /// `didOpen` was rejected (for example an oversized manifest). In the latter case the
+    /// document stays untracked, and every later edit is dropped, until it is closed and reopened.
     async fn handle_change(
         &self,
         uri: tower_lsp_server::ls_types::Uri,
@@ -538,8 +542,25 @@ impl Backend {
         )
         .await
         {
-            Ok(task) => {
-                self.state.spawn_background_task(uri, task).await;
+            Ok(Some(task)) => {
+                let task_id = task.id();
+                self.state.spawn_background_task(uri.clone(), task).await;
+                // A close that ran between the commit and this registration already cancelled
+                // its task; the one just registered would outlive the document. The task cannot
+                // publish for it either way: `claim_publish` fails on an untracked document.
+                // Id-matched, so a task a reopen installed meanwhile is left alone.
+                if !self.state.documents.contains_key(&uri) {
+                    self.state
+                        .cancel_background_task_if_current(&uri, task_id)
+                        .await;
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    ?uri,
+                    "dropped a change to a document that is not open (closed, or its open was \
+                     rejected); edits stay dropped until it is closed and reopened"
+                );
             }
             Err(e) => {
                 tracing::error!("failed to process document change {:?}: {}", uri, e);
@@ -1512,9 +1533,8 @@ impl LanguageServer for Backend {
         let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("document closed: {:?}", uri);
 
-        let client_uri = params.text_document.uri;
-        diagnostics::clear_diagnostics_on_close(&self.state, &uri, |cleared| {
-            self.client.publish_diagnostics(client_uri, cleared, None)
+        diagnostics::clear_diagnostics_on_close(&self.state, &uri, |uri, cleared| {
+            self.client.publish_diagnostics(uri, cleared, None)
         })
         .await;
         self.state.cancel_background_task(&uri).await;
@@ -5816,6 +5836,58 @@ let package = Package(
                  would instead mean canonicalize_uri was skipped before the \
                  ServerState::documents lookup"
             );
+        }
+
+        /// #2013: `did_close` sends its clearing `publishDiagnostics` to the canonical `Uri`
+        /// the document was published under, not to the raw spelling the client closed it with.
+        /// Reads the notification off `LspService`'s loopback `ClientSocket`.
+        #[tokio::test]
+        #[cfg(not(windows))]
+        async fn test_did_close_clears_diagnostics_on_the_canonical_uri() {
+            let canonical_url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let canonical_uri = crate::lsp_types_interop::to_lsp_uri(&canonical_url);
+            let non_canonical_uri: Uri =
+                format!("FILE://{}", canonical_url.path()).parse().unwrap();
+            assert_eq!(
+                crate::lsp_types_interop::canonicalize_uri(&non_canonical_uri),
+                canonical_uri,
+                "test premise: both spellings must canonicalize to the same Uri"
+            );
+            assert_ne!(
+                canonical_uri, non_canonical_uri,
+                "test premise: the close spelling must be non-canonical"
+            );
+
+            // `Client::publish_diagnostics` is gated on `State::Initialized`.
+            use tower::Service as _;
+            let (mut service, mut socket) =
+                tower_lsp_server::LspService::build(Backend::new).finish();
+            let init_request = tower_lsp_server::jsonrpc::Request::build("initialize")
+                .id(1_i64)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let init_response = service.call(init_request).await.unwrap();
+            assert!(init_response.is_some_and(|response| response.is_ok()));
+            let backend = service.inner();
+            backend.state.update_document(
+                canonical_uri.clone(),
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new()),
+            );
+
+            backend
+                .did_close(tower_lsp_server::ls_types::DidCloseTextDocumentParams {
+                    text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                        uri: non_canonical_uri,
+                    },
+                })
+                .await;
+
+            let message = next_client_message(&mut socket).await;
+            assert_eq!(message.method(), "textDocument/publishDiagnostics");
+            let params: tower_lsp_server::ls_types::PublishDiagnosticsParams =
+                serde_json::from_value(message.params().expect("params").clone()).unwrap();
+            assert_eq!(params.uri, canonical_uri);
+            assert!(params.diagnostics.is_empty());
         }
 
         /// Regression coverage for issue #1382: `apply_batch_edit`'s

@@ -1,9 +1,10 @@
 //! #1917 opt-in guard: only npm, Deno, Go, PyPI and NuGet may route a non-public registry as an
 //! unverified mirror, and each opting-in ecosystem must map to an OSV ecosystem.
 //!
-//! Two cross-ecosystem behavioral checks run against every registered ecosystem's own typed
-//! formatter through `Ecosystem::probe_non_public_route`,
-//! fed a real dependency built through `ProbeDependency` (#1977):
+//! Cross-ecosystem behavioral checks run against every registered ecosystem's own typed
+//! formatter through `Ecosystem::probe_non_public_route` and
+//! `Ecosystem::probe_route_non_public_routes`, fed real dependencies built through
+//! `ProbeDependency` (#1977, #1999):
 //!
 //! - a `CustomRegistry` source (a route every hop of which was rejected) is reported as an
 //!   unverified mirror by Go alone, so a new ecosystem silently opting in fails the test;
@@ -11,8 +12,11 @@
 //!   swizzled sources, Cargo alias registries, NuGet feeds, ...) stays
 //!   [`NonPublicRoute::Private`] in every ecosystem.
 //!
-//! The probe sets only the source; npm, Deno, PyPI and NuGet also opt in through registry or
-//! index routes that no source can express, which their own crates test.
+//! - the full opt-in set is derived from behavior: an ecosystem opts in when the `CustomRegistry`
+//!   probe or any `ProbeDependency::route_probes` dependency (the registry, index and feed routes
+//!   that no source can express) reports an unverified mirror. The derived set is compared with a
+//!   literal list, so a new opt-in, or an ecosystem losing every opt-in route, fails the test, and every member must map
+//!   to an OSV ecosystem.
 
 #![cfg(all(
     feature = "cargo",
@@ -40,16 +44,6 @@ use deps_core::policy_config::PolicyConfig;
 use deps_core::{EcosystemId, EcosystemRegistry, HttpCache, PackageName};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 
-/// Ecosystems that override `deps_core::lsp_helpers::DependencyFormatter::non_public_route` to
-/// report an unverified mirror.
-const UNVERIFIED_MIRROR_OPT_INS: [EcosystemId; 5] = [
-    EcosystemId::Go,
-    EcosystemId::Npm,
-    EcosystemId::Deno,
-    EcosystemId::Pypi,
-    EcosystemId::NuGet,
-];
-
 fn registered_ecosystems() -> EcosystemRegistry {
     let registry = EcosystemRegistry::new();
     let runtime = EcosystemRuntime::from_policy(
@@ -71,9 +65,41 @@ fn route_for(
         .probe_non_public_route(PackageName::new("probe"), source.clone())
 }
 
+fn custom_registry_source() -> DependencySource {
+    DependencySource::CustomRegistry {
+        url: "https://proxy.corp.example".into(),
+    }
+}
+
+fn opts_in_as_unverified_mirror(registry: &EcosystemRegistry, id: EcosystemId) -> bool {
+    let ecosystem = registry
+        .get(id)
+        .unwrap_or_else(|| panic!("{id:?} is not registered by register_ecosystems"));
+    route_for(registry, id, &custom_registry_source()) == NonPublicRoute::UnverifiedMirror
+        || ecosystem
+            .probe_route_non_public_routes(PackageName::new("probe"))
+            .contains(&NonPublicRoute::UnverifiedMirror)
+}
+
 #[test]
-fn every_unverified_mirror_opt_in_has_an_osv_mapping() {
-    for id in UNVERIFIED_MIRROR_OPT_INS {
+fn the_derived_unverified_mirror_opt_ins_are_exactly_the_known_set_and_map_to_osv() {
+    let registry = registered_ecosystems();
+    let derived: Vec<EcosystemId> = EcosystemId::ALL
+        .iter()
+        .copied()
+        .filter(|&id| opts_in_as_unverified_mirror(&registry, id))
+        .collect();
+    assert_eq!(
+        derived,
+        [
+            EcosystemId::Npm,
+            EcosystemId::Pypi,
+            EcosystemId::Go,
+            EcosystemId::NuGet,
+            EcosystemId::Deno,
+        ]
+    );
+    for id in derived {
         assert!(
             id.osv_ecosystem().is_some(),
             "{id:?} reports an unverified mirror but has no OSV ecosystem"
@@ -83,9 +109,7 @@ fn every_unverified_mirror_opt_in_has_an_osv_mapping() {
 
 #[test]
 fn only_go_reports_a_rejected_custom_registry_as_an_unverified_mirror() {
-    let source = DependencySource::CustomRegistry {
-        url: "https://proxy.corp.example".into(),
-    };
+    let source = custom_registry_source();
     let registry = registered_ecosystems();
     let opted_in: Vec<EcosystemId> = EcosystemId::ALL
         .iter()

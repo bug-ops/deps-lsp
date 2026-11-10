@@ -70,6 +70,7 @@ fn test_update_offline_empty_plan_is_clean_and_reports_no_eligible_updates() {
 /// Spec 078 SC-008: `update` accepts a `pnpm-workspace.yaml` as an npm manifest (an
 /// unrecognized manifest path is an execution error, see
 /// `test_update_unrecognized_manifest_path_is_execution_error`).
+#[cfg(feature = "npm")]
 #[test]
 fn test_update_recognizes_pnpm_workspace_yaml_as_an_npm_manifest() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -372,6 +373,7 @@ fn test_apply_plan_dry_run_leaves_the_manifest_byte_for_byte_intact() {
 /// rather than a subprocess: no ecosystem crate exposes a mock registry, and `--offline` leaves
 /// the cache empty. Composer rather than PyPI because the PyPI parser already normalizes the
 /// name it hands out, so its declared and normalized spellings never differ.
+#[cfg(feature = "composer")]
 fn plan_monolog(ignore_name: Option<&str>) -> String {
     let plan = plan_manifest(&ManifestFixture {
         ecosystem_id: deps_core::EcosystemId::Composer,
@@ -493,6 +495,7 @@ fn plan_manifest(fixture: &ManifestFixture<'_>) -> deps_cli::update::UpdatePlan 
 /// SC-024 (#1933): `deps-cli update` writes the operator-keeping text for Bundler and Composer
 /// constraints. It plans through the same `replacement_text` the LSP code actions use, so the
 /// expected strings are also the code actions' `newText`.
+#[cfg(all(feature = "bundler", feature = "composer"))]
 #[test]
 fn test_update_keeps_bundler_and_composer_constraint_operator_1933() {
     use deps_core::EcosystemId;
@@ -585,6 +588,7 @@ fn test_update_bare_cargo_requirement_satisfied_by_latest_never_becomes_a_no_op_
 
 /// N3: `--package monolog/monolog` selects `Monolog/Monolog`, and the JSON names it with the
 /// bytes the manifest declares, not the normalized spelling the cache and the filter use.
+#[cfg(feature = "composer")]
 #[test]
 fn test_update_json_names_the_declared_spelling_for_a_case_folding_ecosystem() {
     let json = plan_monolog(None);
@@ -598,6 +602,7 @@ fn test_update_json_names_the_declared_spelling_for_a_case_folding_ecosystem() {
 
 /// N3: a mixed-case ignore rule matches through the same normalization, and the skipped item
 /// still carries the declared spelling.
+#[cfg(feature = "composer")]
 #[test]
 fn test_update_mixed_case_ignore_rule_skips_the_declared_name() {
     let json = plan_monolog(Some("MONOLOG/monolog"));
@@ -616,6 +621,7 @@ fn test_update_mixed_case_ignore_rule_skips_the_declared_name() {
 /// `deps-cli update` prints the same current column for a catalog entry as for the equivalent
 /// `package.json` dependency. The npm registry is a `mockito` server reached through the
 /// fixture's `.npmrc`; the loopback host is allowed through an explicit `--config`.
+#[cfg(feature = "npm")]
 #[tokio::test]
 async fn test_update_current_column_matches_between_catalog_entry_and_package_json() {
     let mut server = mockito::Server::new_async().await;
