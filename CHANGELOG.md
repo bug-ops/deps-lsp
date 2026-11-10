@@ -8,9 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-cli**: `--fail-on unchecked` exits 1 when a vulnerable dependency's lock-alternative overflow is an at-least-N count (#PR)
-- **deps-lsp**: edits after a `didOpen` rejected for size are dropped until `didClose`, `CommitGuard::Unconditional` becomes `IfTracked`, and `handle_document_change` returns `Result<Option<_>>` (#PR)
-- **deps-core**: `ResolvedCandidatesMap` is shared as `Arc`, `LockCandidates` caches its parsed version list, and `ProbeDependency` gains `route_probes` (#PR)
+- **deps-cli**: `--fail-on unchecked` exits 1 when a vulnerable dependency's lock-alternative overflow is an at-least-N count (#2024)
+- **deps-lsp**: edits after a `didOpen` rejected for size are dropped until `didClose`, `CommitGuard::Unconditional` becomes `IfTracked`, and `handle_document_change` returns `Result<Option<_>>` (#2024)
+- **deps-core**: `ResolvedCandidatesMap` is shared as `Arc`, `LockCandidates` caches its parsed version list, and `ProbeDependency` gains `route_probes` (#2024)
 - **deps-core**: `ResolvedCandidatesMap` holds `LockCandidates`, `EntryPlacement` is no longer `Copy` and carries an `EntryOwner`, and `ImporterPath` is added (#2007)
 - **deps-core, deps-engine, deps-lsp**: `parse_known_lockfile` and `split_resolved_packages` take an importer scope (#2007)
 - **deps-core, deps-cli**: `Capped` gains a lower bound, and `InUseVersions` and `ScanTarget` gain `alternative_coverage`; lock alternatives are the nearest to the primary (#2007)
@@ -87,11 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps**: refresh `Cargo.lock` (#1956)
 
 ### Fixed
-- **deps-lsp**: `didClose` clears diagnostics on the canonical URI, and a queued publisher no longer holds the config guard or delays `didClose` (#PR)
-- **deps-lsp**: a `didChange` that parses across a `didClose` no longer resurrects the closed document, and publish gates and refetch escalations are pruned on every exit path (#PR)
-- **deps-core**: `split_one_name` is linear in the number of distinct versions, the lock selection memo hit allocates no key, and hover and inlay hints reuse one parsed candidate list per lock load (#PR)
-- **deps-cli**: the unchecked lock-alternatives stderr warning also prints for vulnerable overflow; the `--no-default-features` test build and its tests are gated on the ecosystem features and run in the CI feature matrix (#PR)
-- **tests**: Berry descriptor cap, progress token builders, the unverified-mirror opt-in guard and the NuGet fixture package now have non-tautological coverage (#PR)
+- **deps-lsp**: `didClose` clears diagnostics on the canonical URI, and a queued publisher no longer holds the config guard or delays `didClose` (#2024)
+- **deps-lsp**: a `didChange` that parses across a `didClose` no longer resurrects the closed document, and publish gates and refetch escalations are pruned on every exit path (#2024)
+- **deps-core**: `split_one_name` is linear in the number of distinct versions, the lock selection memo hit allocates no key, and hover and inlay hints reuse one parsed candidate list per lock load (#2024)
+- **deps-cli**: the unchecked lock-alternatives stderr warning also prints for vulnerable overflow; the `--no-default-features` test build and its tests are gated on the ecosystem features and run in the CI feature matrix (#2024)
+- **tests**: Berry descriptor cap, progress token builders, the unverified-mirror opt-in guard and the NuGet fixture package now have non-tautological coverage (#2024)
 - **deps-lsp**: a closed document no longer receives late diagnostics, and a forced full refetch survives a `didChange` inside the debounce window (#2007)
 - **deps-core, deps-npm**: yarn descriptors and bun owners are deduplicated, closing a quadratic CPU cost on hostile lock files (#2007)
 - **deps-core**: overflow advisory counts exclude hidden unmaintained advisories and no longer pad after a failed sub-scan (#2007)
