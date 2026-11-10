@@ -132,7 +132,7 @@ To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
-deps-cli = "4.0"
+deps-cli = "5.0"
 ```
 
 > [!IMPORTANT]
@@ -189,8 +189,12 @@ elsewhere in the run — one malformed manifest in a large workspace never hides
 ### `--fail-on` categories
 
 `outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`,
-`unknown-ref`, `license`, `deprecated`, `other`. Defaults to `vulnerable,yanked,unsatisfiable`
-when the flag is omitted. `sha-comment-mismatch` selects SHA pins whose trailing version comment
+`unknown-ref`, `license`, `deprecated`, `unchecked`, `other`. Defaults to
+`vulnerable,yanked,unsatisfiable` when the flag is omitted. With `vulnerable` selected (including
+the default), a failed or timed-out OSV query exits `1` instead of passing silently.
+`unchecked` is a strict, additive gate: it exits `1` when vulnerability data was not checked for
+any dependency, including an at-least-N lock-alternative overflow or disabled scanning, and exits `2`
+with `--offline`. `sha-comment-mismatch` selects SHA pins whose trailing version comment
 is not confirmed by the repository's tag index; `unknown-ref` selects tag pins whose ref is a
 full release, or a partial ref such as `@v40`, that is neither a published tag nor a branch (branch
 checks are rationed; set `GITHUB_TOKEN`/`GITLAB_TOKEN` in CI, `--offline` skips them); neither is part

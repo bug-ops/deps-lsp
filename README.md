@@ -41,7 +41,11 @@ install and keep in sync.
   repository's tag index, so a pin is checked, flagged as outdated, or re-pinned to the latest
   release's SHA, and a `# vX` comment that does not match the pinned commit is reported.
 - **Lock-file aware** — Reads the version you actually have installed, not just the range you
-  wrote, across every ecosystem that has a lock file.
+  wrote, across every ecosystem that has a lock file (including `yarn.lock` and `bun.lock`);
+  other lock entries that satisfy the range are scanned too and shown as "also locked at".
+- **Unverified-registry signal** — dependencies resolved through a non-public mirror are marked as
+  not checked for vulnerabilities instead of silently reported clean; `diagnostics.suppress`
+  silences chosen diagnostics for named packages or globs.
 - **One-click fixes** — Code actions to bump a version, resolve an unsatisfiable range, or patch a
   known vulnerability; a code lens batch-updates every outdated dependency in the file at once.
 - **Fast** — Parallel registry fetching and aggressive caching keep hover and inlay hints
