@@ -18,7 +18,7 @@ Every ecosystem crate implements two traits (`crates/deps-core/src/ecosystem.rs`
 `EcosystemBase` carries identity, routing, registry, lock-file and fallback-completion methods;
 `TypedEcosystem` adds the associated `Parsed` result and `Formatter` (whose
 `DependencyFormatter::Dep` must equal the parse result's `TypedParseResult::Dep`, checked at
-compile time) and the typed hooks (`parse`, `hover`, `diagnostics`, `completions`, ...), which
+compile time) and the typed hooks (`parse`, `completions`, the optional `decorate_hover` / `decorate_diagnostics` / `decorate_code_actions`, ...), which
 receive a `ParsedView` of the concrete parse result. A blanket impl turns every
 `TypedEcosystem` into the erased, object-safe `Ecosystem` that `EcosystemRegistry` stores, and
 `parse_manifest` returns a `ParsedManifest`: the parse result paired with its ecosystem, whose
@@ -76,8 +76,9 @@ documented contract enforced by code review, not a compiler-enforced wall.
 ### LSP response generation
 
 `hover` / `diagnostics` / `code_actions` / `code_lenses` /
-`inlay_hints` (the `TypedEcosystem` hooks behind the erased `ParsedManifest::generate_*`) all have default implementations delegating to shared logic in
-`deps-core::lsp_helpers`, driven by the ecosystem's own `own_formatter()` (a `DependencyFormatter`
+`inlay_hints` (behind the erased `ParsedManifest::generate_*`) are built by the free functions
+`deps_core::ecosystem::{hover, diagnostics, code_actions}` and the `TypedEcosystem` defaults, which delegate to shared logic in
+`deps-core::lsp_helpers`; an ecosystem adds only its optional `decorate_*` hooks (hover uses `HoverDecoration`), driven by the ecosystem's own `own_formatter()` (a `DependencyFormatter`
 implementation, see below) and `registry()` (a `Registry` implementation) — most ecosystem
 crates only need to supply parsing plus a formatter and a registry client, not reimplement LSP
 response generation. Override a hook only for genuine ecosystem-specific

@@ -85,3 +85,8 @@ impl deps_core::Version for {Ecosystem}Version {
 }
 ```
 
+
+The dependency type must also implement `deps_core::ProbeDependency`: `probe(name, source)` builds a
+neutral dependency for cross-ecosystem guards, and `route_probes(name)` returns one probe per
+registry, index or feed route the type can carry (the default is none; override it when the type
+has a route field).

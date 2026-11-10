@@ -10,7 +10,7 @@ tags:
   - cross-ecosystem
   - bug
 created: 2026-11-08
-status: ready
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

@@ -27,7 +27,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-npm = "4.0"
+deps-npm = "5.0"
 ```
 
 > [!IMPORTANT]
