@@ -1350,6 +1350,8 @@ pub fn has_unqueryable_resolved_pin<F: DependencyFormatter>(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::PackageName;
     use crate::lsp_helpers::LockCandidates;
@@ -2734,10 +2736,10 @@ mod tests {
             );
         }
 
-        assert!(matches!(
+        assert_matches!(
             memo.by_name[&name].by_requirement[&VersionReq::new(">=9.0.0")],
             Outcome::NoMatch
-        ));
+        );
     }
 
     /// #1981 (security re-verification): a pass of many distinct requirements over one big

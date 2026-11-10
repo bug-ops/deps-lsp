@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking
 - **deps-cli**: `--fail-on unchecked` exits 1 when a vulnerable dependency's lock-alternative overflow is an at-least-N count (#2024)
 - **deps-lsp**: edits after a `didOpen` rejected for size are dropped until `didClose`, `CommitGuard::Unconditional` becomes `IfTracked`, and `handle_document_change` returns `Result<Option<_>>` (#2024)
-- **deps-core**: `ResolvedCandidatesMap` is shared as `Arc`, `LockCandidates` caches its parsed version list, and `ProbeDependency` gains `route_probes` (#2024)
+- **deps-core**: `ResolvedCandidatesMap` is shared as `Arc`, `LockCandidates` caches its parsed version list and so is no longer `UnwindSafe`/`RefUnwindSafe` (nor is `deps-engine`'s `LockfileLoad`), and `ProbeDependency` gains `route_probes` (#2024)
 - **deps-core**: `ResolvedCandidatesMap` holds `LockCandidates`, `EntryPlacement` is no longer `Copy` and carries an `EntryOwner`, and `ImporterPath` is added (#2007)
 - **deps-core, deps-engine, deps-lsp**: `parse_known_lockfile` and `split_resolved_packages` take an importer scope (#2007)
 - **deps-core, deps-cli**: `Capped` gains a lower bound, and `InUseVersions` and `ScanTarget` gain `alternative_coverage`; lock alternatives are the nearest to the primary (#2007)
