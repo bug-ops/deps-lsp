@@ -112,6 +112,8 @@ missing_panics_doc = "allow"
 must_use_candidate = "allow"
 single_match_else = "allow"
 assert_is_empty = "allow"
+# Uninhabited `enum Marker {}` types are the sealed type-level marker pattern; `!` is unstable
+empty_enums = "allow"
 
 # Documentation lints - allow for now, can enable incrementally
 doc_markdown = "allow"
