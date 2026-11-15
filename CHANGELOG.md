@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **workspace, deps-maven**: allow `clippy::empty_enums` for sealed marker enums and drop redundant clones in the POM parser to pass clippy 1.100 (#2027)
+
 ## [5.0.0] - 2026-11-10
 
 ### Breaking

@@ -248,23 +248,23 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     {
                         match tag.as_str() {
                             "groupId" => {
-                                dep.group_id = Some(text.clone());
+                                dep.group_id = Some(text);
                             }
                             "artifactId" => {
-                                dep.artifact_id = Some(text.clone());
+                                dep.artifact_id = Some(text);
                                 dep.artifact_id_start = text_start;
                                 dep.artifact_id_end = text_end;
                             }
                             "version" => {
-                                dep.version = Some(text.clone());
+                                dep.version = Some(text);
                                 dep.version_start = text_start;
                                 dep.version_end = text_end;
                             }
                             "scope" => {
-                                dep.scope = Some(text.clone());
+                                dep.scope = Some(text);
                             }
                             "systemPath" => {
-                                dep.system_path = Some(text.clone());
+                                dep.system_path = Some(text);
                             }
                             _ => {}
                         }
@@ -279,7 +279,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                         "maven property",
                     );
                 } else if ctx == ParseContext::Repository && current_tag.as_deref() == Some("url") {
-                    repository_urls.push(text.clone());
+                    repository_urls.push(text);
                 } else if ctx == ParseContext::Root
                     && let Some(tag) = root_tag.take()
                 {
