@@ -745,7 +745,24 @@ pub fn register_ecosystems(
         workspace_registry_ecosystems.push(deps_core::EcosystemId::NuGet);
     }
 
+    // github-actions and pre-commit are two flavors of one ecosystem type over one registry
+    // (spec 044 NFR-002): when both are on they share its cache, rate gate, request
+    // coalescing and tag index.
+    #[cfg(all(feature = "github-actions", feature = "pre-commit"))]
+    {
+        let shared = Arc::new(deps_github_actions::GithubActionsRegistry::new(Arc::clone(
+            &cache,
+        )));
+        registry.register(Arc::new(GithubActionsEcosystem::with_registry(
+            Arc::clone(&shared),
+            deps_github_actions::GitTagsFlavor::Actions,
+        )));
+        registry.register(Arc::new(deps_precommit::ecosystem(shared)));
+    }
+    #[cfg(all(feature = "github-actions", not(feature = "pre-commit")))]
     register!("github-actions", GithubActionsEcosystem, registry, &cache);
+    #[cfg(all(feature = "pre-commit", not(feature = "github-actions")))]
+    registry.register(Arc::new(deps_precommit::standalone(Arc::clone(&cache))));
 
     // gitlab-ci is explicit, not via `register!` (#466, mirrors github-actions'/nuget's
     // precedent): the macro's default config would never see a live self-hosted-instance
@@ -912,10 +929,10 @@ mod tests {
     /// `registry.ecosystem_ids()`, so an ecosystem declared in the enum but never wired in
     /// fails this test instead of silently vanishing from coverage.
     ///
-    /// Gated on every ecosystem feature at once: `ALL` always lists 14 variants regardless of
-    /// which features are enabled for this build, so this specific claim — "all 14 are
+    /// Gated on every ecosystem feature at once: `ALL` always lists 15 variants regardless of
+    /// which features are enabled for this build, so this specific claim — "all 15 are
     /// present" — is only meaningful, and only makes sense to check, in an all-features build.
-    /// The per-ecosystem invariants that don't depend on all 14 being present live in the
+    /// The per-ecosystem invariants that don't depend on all 15 being present live in the
     /// ungated [`test_registered_ecosystems_universal_invariants`] instead (#758 impl-critic
     /// S2): unlike this completeness check, those must keep working under any feature subset,
     /// the way the two hand-written per-feature lists this pair replaces used to.
@@ -933,7 +950,8 @@ mod tests {
         feature = "nuget",
         feature = "deno",
         feature = "github-actions",
-        feature = "gitlab-ci"
+        feature = "gitlab-ci",
+        feature = "pre-commit"
     ))]
     #[test]
     fn test_ecosystem_id_all_registered() {
@@ -952,10 +970,10 @@ mod tests {
     /// Layer 1b (#758): universal, offline invariants every ecosystem this build actually
     /// registers must satisfy. Deliberately **ungated** — unlike
     /// [`test_ecosystem_id_all_registered`]'s completeness claim, none of these invariants
-    /// depend on all 14 ecosystems being present, so this iterates whatever
+    /// depend on all 15 ecosystems being present, so this iterates whatever
     /// `registry.ecosystem_ids()` this build's feature set produced (#758 impl-critic S2):
     /// under `--no-default-features --features npm`, it still covers `npm` alone; under the
-    /// default (all 14) build, it covers all 14, same as before the split.
+    /// default (all 15) build, it covers all 15, same as before the split.
     ///
     /// Per ecosystem: id round-trip; `display_name()` non-empty and unique across the set; at
     /// least one routing surface non-empty; `lockfile_filenames().is_empty() ==
@@ -1241,7 +1259,8 @@ mod tests {
             | deps_core::EcosystemId::Composer
             | deps_core::EcosystemId::Deno
             | deps_core::EcosystemId::GithubActions
-            | deps_core::EcosystemId::GitlabCi => Checked { test_partial: true },
+            | deps_core::EcosystemId::GitlabCi
+            | deps_core::EcosystemId::PreCommit => Checked { test_partial: true },
             // Go/Bundler/Dart/Maven/Gradle: no partial-version requirement concept exists (a
             // bare version is always complete), so only the full-version case is checked. Go's
             // comparator specifically treats a bare string as a version prefix, not a

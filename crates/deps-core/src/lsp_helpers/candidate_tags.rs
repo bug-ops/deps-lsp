@@ -157,8 +157,8 @@ impl CandidateTagSource {
         }
     }
 
-    /// A source for a dependency pinned to a tag or branch: only the candidate's own major
-    /// line counts, as for an exact-tag pin.
+    /// A source for a dependency pinned to a tag or branch: every release tag on the
+    /// candidate's commit is a sibling, across majors. Equal to [`Self::commit_pin`] since #1719.
     ///
     /// # Examples
     ///
@@ -169,14 +169,14 @@ impl CandidateTagSource {
     /// let source = CandidateTagSource::tag_pin(Arc::new(TagIndex::default()));
     /// assert!(matches!(
     ///     source,
-    ///     CandidateTagSource::Indexed { scope: SiblingScope::SameMajor, .. }
+    ///     CandidateTagSource::Indexed { scope: SiblingScope::WholeCommit, .. }
     /// ));
     /// ```
     #[must_use]
     pub const fn tag_pin(index: Arc<TagIndex>) -> Self {
         Self::Indexed {
             index,
-            scope: SiblingScope::SameMajor,
+            scope: SiblingScope::WholeCommit,
         }
     }
 

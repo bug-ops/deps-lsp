@@ -433,20 +433,15 @@ fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> 
 /// `deps-cli` reuses `PolicyConfig`'s existing `Deserialize` impl instead of writing a
 /// second, `toml_span::Deserialize`-based one.
 fn parse(content: &str, path: &Path) -> Result<CliConfig, ConfigError> {
-    let value = deps_core::parse_toml_checked(content).map_err(|source| ConfigError::Toml {
-        path: path.to_path_buf(),
-        message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
-            .into_owned(),
-    })?;
-    let json = serde_json::to_value(&value).map_err(|source| ConfigError::Deserialize {
-        path: path.to_path_buf(),
-        message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
-            .into_owned(),
-    })?;
-    serde_json::from_value(json).map_err(|source| ConfigError::Deserialize {
-        path: path.to_path_buf(),
-        message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
-            .into_owned(),
+    deps_core::parser::deserialize_toml_checked(content).map_err(|error| match error {
+        deps_core::parser::TomlDeserializeError::Toml(message) => ConfigError::Toml {
+            path: path.to_path_buf(),
+            message,
+        },
+        deps_core::parser::TomlDeserializeError::Deserialize(message) => ConfigError::Deserialize {
+            path: path.to_path_buf(),
+            message,
+        },
     })
 }
 

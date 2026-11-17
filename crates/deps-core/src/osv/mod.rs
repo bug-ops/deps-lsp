@@ -32,10 +32,10 @@ pub use types::{
     Advisory, AdvisoryCount, AlternativeCoverage, CandidateStatusMap, CandidateStatuses, Capped,
     CoverageGap, DependencyVulnerabilities, EmptyOsvPackageName, FixRecommendation, InvalidOsvId,
     LatestStatusMap, LockPresence, LockResolution, MatchOrigin, MatchedTags, NonPublicRoute,
-    OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget,
-    ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus,
-    VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, vuln_key_for,
-    vulnerability_keys,
+    OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, PrimaryRole, ScanOutcome,
+    ScanTarget, ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason,
+    UpgradeStatus, VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
+    vuln_key_for, vulnerability_keys,
 };
 use types::{
     BatchStubs, OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -827,6 +827,7 @@ impl OsvClient {
             .iter()
             .map(|s| (LocalVersion::parse(s.version()), s.display_version()))
             .collect();
+        let stand_in = target.primary_role() == PrimaryRole::StandIn;
         let mut affected = Vec::new();
         let mut sibling_only: HashMap<OsvId, MatchedTags> = HashMap::new();
         let mut undeterminable = 0usize;
@@ -845,9 +846,13 @@ impl OsvClient {
                     Verdict::Undeterminable => sibling_undeterminable = true,
                 }
             }
-            let is_affected = primary_verdict == Verdict::Affected || !matched_siblings.is_empty();
+            let primary_affected = primary_verdict == Verdict::Affected;
+            if stand_in && primary_affected {
+                matched_siblings.push(target.display_version.clone());
+            }
+            let is_affected = primary_affected || !matched_siblings.is_empty();
             if is_affected {
-                if primary_verdict != Verdict::Affected
+                if (stand_in || !primary_affected)
                     && let Some(id) = OsvId::parse(&record.id)
                     && let Some(tags) = MatchedTags::from_tags(matched_siblings)
                 {
@@ -2263,6 +2268,61 @@ mod tests {
             .map(ConcreteVersion::as_str)
             .collect();
         assert_eq!(tags, ["4.9.0"]);
+    }
+
+    async fn scan_stand_in_primary(stand_in: PrimaryRole, events: &str) -> ScanOutcome {
+        let (_server, client) = gha_sibling_fixture(events).await;
+        let mut stand_in_target = with_sibling_tags(
+            target("actions/download-artifact", "5.0.0"),
+            "5.0.0",
+            &["5.1.0"],
+        );
+        if stand_in == PrimaryRole::StandIn {
+            stand_in_target = stand_in_target.with_stand_in_primary();
+        }
+        client
+            .scan(EcosystemId::GithubActions, &[stand_in_target], TEST_TIMEOUT)
+            .await
+            .remove(&crate::test_util::vuln_key("actions/download-artifact"))
+            .expect("one outcome per target")
+    }
+
+    /// #1719: a match on a stand-in primary is attributed to that release tag, like a
+    /// sibling-only match.
+    #[tokio::test]
+    async fn stand_in_primary_match_is_attributed_to_its_release_tag() {
+        let ScanOutcome::Vulnerable(dv) = scan_stand_in_primary(
+            PrimaryRole::StandIn,
+            r#"[{"introduced":"5.0.0"},{"fixed":"5.0.1"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        let tags: Vec<&str> = dv
+            .sibling_match(&crate::test_util::osv_id("GHSA-cxww-7g56-2vh6"))
+            .expect("stand-in match is attributed")
+            .iter()
+            .map(ConcreteVersion::as_str)
+            .collect();
+        assert_eq!(tags, ["5.0.0"]);
+    }
+
+    /// #1719: an own primary keeps today's attribution (none for a direct match).
+    #[tokio::test]
+    async fn own_primary_match_stays_unattributed() {
+        let ScanOutcome::Vulnerable(dv) = scan_stand_in_primary(
+            PrimaryRole::Own,
+            r#"[{"introduced":"5.0.0"},{"fixed":"5.0.1"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert!(
+            dv.sibling_match(&crate::test_util::osv_id("GHSA-cxww-7g56-2vh6"))
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,18 @@ real vulnerability:
 an informational-only advisory is reported the same way there — visible in the output, but
 distinguishable from a graded finding via its severity field.
 
+## Exempted advisories (issue #1964)
+
+An operator can exempt a specific advisory id with a reason and optional expiry, from a file in
+their own user config directory (editor) or `deps-cli check --advisory-exemptions <PATH>`. A
+repository-controlled `deps.toml`, editor workspace setting or file inside an open workspace
+cannot grant one. Exempted advisories are not emitted as vulnerability diagnostics; instead each
+affected dependency gets one `INFORMATION` diagnostic with code `advisory-exempted` naming the count
+and up to five ids. A `MAL-` (confirmed malware) advisory is never exempted. Records OSV reported
+but that were not fetched (beyond the fetch cap) stay in the "+N more" count. See
+[Configuration](../configuration.md#exempting-an-advisory-operator-file) and the
+[CLI page](../cli.md#exempting-advisories).
+
 ## Lock alternatives (issue #1981)
 
 When a lock file holds several entries that satisfy one dependency's requirement, `deps-lsp` and

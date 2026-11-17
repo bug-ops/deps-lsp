@@ -12,6 +12,13 @@
 //! - Diagnostics and code actions for outdated tag pins and SHA-with-comment pins
 //! - GitHub tags API for version discovery, with per-repository commit SHA resolution
 //!
+//! # Flavors
+//!
+//! The same ecosystem type also serves `.pre-commit-config.yaml` (`repo:` + `rev:`) through
+//! [`GitTagsFlavor::PreCommit`] (#575). Both flavors resolve `owner/repo` against one
+//! [`GithubActionsRegistry`], so its cache, rate gate, tag index, `github-actions` log target
+//! and circuit-breaker attribution cover the shared GitHub tags endpoint for both.
+//!
 //! # Pin contract
 //!
 //! | `uses:` form | `version_range` spans | `version_requirement()` | `version_literal()` |
@@ -31,14 +38,18 @@
 #[cfg(test)]
 mod breaker_tests;
 pub mod ecosystem;
+pub mod flavor;
 pub mod formatter;
 pub mod parser;
+pub mod precommit;
 pub mod registry;
 pub mod types;
 
 pub use ecosystem::GithubActionsEcosystem;
+pub use flavor::GitTagsFlavor;
 pub use formatter::GithubActionsFormatter;
 pub use parser::parse_workflow_yaml;
+pub use precommit::parse_precommit_config;
 pub use registry::{GithubActionsRegistry, RepositoryIndexes};
 pub use types::{
     GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion, PinStyle, ShaComment,

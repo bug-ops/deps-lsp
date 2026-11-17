@@ -81,6 +81,7 @@ fn samples(id: EcosystemId) -> Vec<Sample> {
         EcosystemId::NuGet => vec![resolved("Newtonsoft.Json")],
         EcosystemId::Deno => vec![resolved("jsr:@std/fs"), resolved("npm:react")],
         EcosystemId::GithubActions => vec![resolved("actions/checkout")],
+        EcosystemId::PreCommit => vec![resolved("psf/black")],
         // The one registry that cannot name an endpoint without a registered route: the
         // default source carries no host.
         EcosystemId::GitlabCi => vec![

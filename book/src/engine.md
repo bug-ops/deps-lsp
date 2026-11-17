@@ -1,6 +1,6 @@
 # The deps-engine crate
 
-`deps-engine` is the workspace's composition root: the one place that wires all 14
+`deps-engine` is the workspace's composition root: the one place that wires all 15
 `deps-<ecosystem>` crates into a running `EcosystemRegistry`, and the one place that decides
 what a dependency's status actually is — outdated, yanked, vulnerable, unsatisfiable,
 deprecated, or fetch-failed. `deps-lsp` and `deps-cli` both depend on it instead of
@@ -9,7 +9,7 @@ reimplementing either piece themselves.
 ## Why this crate exists
 
 Cargo's dependency graph forbids a cycle: `deps-core` cannot depend on any `deps-<ecosystem>`
-crate, since all 14 already depend on `deps-core`. Something still has to know about all 14
+crate, since all 15 already depend on `deps-core`. Something still has to know about all 15
 crates at once to register them — before `deps-engine` existed, that something was
 `deps-lsp` itself, which meant a second driving adapter (`deps-cli`, added to check
 dependencies from the command line and in CI) would have had to either depend on the LSP
@@ -67,9 +67,9 @@ reports differently (or not at all, in a non-interactive CI run).
 ```text
 deps-core            — Ecosystem trait, Registry trait, shared LSP-response generation
    ↑
-deps-cargo, deps-npm, ...   — 14 ecosystem crates, each implementing deps-core's traits
+deps-cargo, deps-npm, ...   — 15 ecosystem crates, each implementing deps-core's traits
    ↑
-deps-engine           — registers all 14, classifies verdicts, reports progress
+deps-engine           — registers all 15, classifies verdicts, reports progress
    ↑              ↑
 deps-lsp        deps-cli   — driving adapters: LSP server, CLI
 ```

@@ -21,7 +21,7 @@ name = "deps_lsp"
 path = "src/lib.rs"
 
 [features]
-default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle", "swift", "composer", "nuget", "deno", "github-actions", "gitlab-ci"]
+default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle", "swift", "composer", "nuget", "deno", "github-actions", "gitlab-ci", "pre-commit"]
 cargo = ["deps-engine/cargo"]
 npm = ["deps-engine/npm"]
 pypi = ["deps-engine/pypi"]
@@ -35,6 +35,7 @@ composer = ["deps-engine/composer"]
 nuget = ["deps-engine/nuget"]
 github-actions = ["deps-engine/github-actions"]
 gitlab-ci = ["deps-engine/gitlab-ci"]
+pre-commit = ["deps-engine/pre-commit"]
 # Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it, D3) even
 # when the "npm" feature itself is disabled.
 deno = ["deps-engine/deno"]

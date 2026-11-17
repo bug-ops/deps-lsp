@@ -39,6 +39,7 @@ deps-lsp = { version = "5.0.0", path ="crates/deps-lsp" }
 deps-maven = { version = "5.0.0", path ="crates/deps-maven" }
 deps-npm = { version = "5.0.0", path ="crates/deps-npm" }
 deps-nuget = { version = "5.0.0", path ="crates/deps-nuget" }
+deps-precommit = { version = "5.0.0", path ="crates/deps-precommit" }
 deps-pypi = { version = "5.0.0", path ="crates/deps-pypi" }
 deps-swift = { version = "5.0.0", path ="crates/deps-swift" }
 dirs = "7.0"

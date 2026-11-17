@@ -1,8 +1,8 @@
 # CI/CD Pinning
 
-These two features are specific to GitHub Actions and GitLab CI/CD — the two YAML-based CI/CD
-ecosystems where a dependency reference is commonly a mutable tag or branch rather than a
-version range.
+These two features are specific to GitHub Actions, GitLab CI/CD and [pre-commit](../ecosystems/pre-commit.md)
+— the YAML-based ecosystems where a dependency reference is commonly a mutable tag or branch rather
+than a version range.
 
 ## Mutable-Ref-Pin Diagnostic (issue #473, #634)
 
@@ -65,6 +65,12 @@ Unlike every other diagnostic in this project, severity alone cannot silence thi
 `DiagnosticSeverity` has no suppression value. Set `diagnostics.mutable_ref_pin_enabled` to
 `false` in initialization options to turn it off entirely for teams that intentionally accept
 mutable pins.
+
+**pre-commit:** A `repos[].rev:` that pre-commit itself would treat as mutable — no `.` and not
+entirely hexadecimal (`v1`, `main`) — is flagged with code `pre-commit-mutable-ref-pin`; `v1.2`,
+`v1.2.3` and short hex revs are not. The quick fix rewrites the `rev:` to `<sha> # frozen: <tag>`,
+the spelling `pre-commit autoupdate --freeze` writes; an existing `# v1.2` or `# frozen: v1.2`
+comment keeps its spelling when the pin later moves.
 
 ## Bulk "Pin All to SHA" Code Lens (issue #633, generalized cross-ecosystem in #640)
 

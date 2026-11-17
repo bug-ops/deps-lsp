@@ -176,6 +176,14 @@ fn run_check_command(
         }
     };
 
+    let advisory_exemptions = match load_advisory_exemptions(args.advisory_exemptions.as_deref()) {
+        Ok(exemptions) => exemptions,
+        Err(message) => {
+            eprintln!("deps-cli: {message}");
+            return ExitCode::from(2);
+        }
+    };
+
     let fail_on = FailOnPolicy::from_tokens(&args.fail_on);
     let osv_checks = cli_config.policy.osv_checks();
     if fail_on.coverage_gate() == CoverageGate::Fail {
@@ -204,6 +212,7 @@ fn run_check_command(
     let (report, had_execution_error, probe_summary, osv_coverage) = runtime.block_on(run_check(
         walk_paths,
         cli_config,
+        Arc::new(advisory_exemptions),
         args.gitignore_policy(),
         args.symlink_policy(),
     ));
@@ -248,6 +257,30 @@ fn run_check_command(
     )
 }
 
+/// Loads the operator's `--advisory-exemptions` file, or no exemptions when the flag is absent.
+///
+/// A named file that is missing or invalid is an error (never silently ignored), and the
+/// message names the path but never echoes file content.
+fn load_advisory_exemptions(
+    path: Option<&Path>,
+) -> Result<deps_core::lsp_helpers::exemption::OperatorExemptions, String> {
+    use deps_core::lsp_helpers::exemption::{ExemptionFile, OperatorExemptions};
+
+    let Some(path) = path else {
+        return Ok(OperatorExemptions::none());
+    };
+    #[expect(clippy::disallowed_methods, reason = "operator CLI argument")]
+    let file = ExemptionFile::from_command_line(path.to_path_buf());
+    match OperatorExemptions::load(&file) {
+        Ok(Some(exemptions)) => Ok(exemptions),
+        Ok(None) => Err(format!(
+            "advisory exemption file {} does not exist",
+            path.display()
+        )),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
 /// Builds the shared runtime handles, walks `paths`, and classifies every discovered
 /// manifest, returning the assembled [`CheckReport`] and whether any manifest's registry
 /// fetch failed (offline excluded) or failed to parse — either of which makes the report
@@ -255,6 +288,7 @@ fn run_check_command(
 async fn run_check(
     paths: Vec<PathBuf>,
     cli_config: CliConfig,
+    advisory_exemptions: Arc<deps_core::lsp_helpers::exemption::OperatorExemptions>,
     gitignore_policy: walk::GitignorePolicy,
     symlink_policy: walk::SymlinkPolicy,
 ) -> (
@@ -271,6 +305,7 @@ async fn run_check(
         osv: handles.osv,
         deps_dev: handles.deps_dev,
         lockfile_cache: handles.lockfile_cache,
+        advisory_exemptions,
         policy,
     };
 
@@ -612,6 +647,7 @@ async fn run_update(
         osv: Arc::clone(&handles.osv),
         deps_dev: Arc::clone(&handles.deps_dev),
         lockfile_cache: handles.lockfile_cache,
+        advisory_exemptions: Arc::new(deps_core::lsp_helpers::exemption::OperatorExemptions::none()),
         policy,
     };
 

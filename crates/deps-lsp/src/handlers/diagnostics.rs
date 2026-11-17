@@ -112,6 +112,7 @@ pub(crate) struct DiagnosticsSnapshot {
     gossip: GossipChecks,
     license_policy: Arc<deps_core::LicensePolicy>,
     suppression: Arc<deps_core::lsp_helpers::SuppressionSet>,
+    advisory_exemptions: Arc<deps_core::lsp_helpers::exemption::OperatorExemptions>,
     pub(crate) fetch_timeout: FetchTimeout,
     pub(crate) max_concurrent_fetches: FetchConcurrency,
     epoch: ConfigEpoch,
@@ -137,6 +138,7 @@ impl DiagnosticsSnapshot {
             gossip: config.policy.gossip_checks(),
             license_policy: Arc::new(config.policy.license_policy.to_policy()),
             suppression: Arc::new(config.policy.diagnostics.suppress.clone()),
+            advisory_exemptions: state.advisory_exemptions(),
             fetch_timeout: config.policy.cache.fetch_timeout,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
             epoch,
@@ -207,6 +209,9 @@ impl DiagnosticsSnapshot {
             gossip: inactive.gossip_checks(),
             license_policy: Arc::new(deps_core::LicensePolicy::default()),
             suppression: Arc::default(),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             fetch_timeout: FetchTimeout::MIN,
             max_concurrent_fetches: FetchConcurrency::MIN,
             epoch: ConfigEpoch::default(),
@@ -613,7 +618,8 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_network(network)
         .with_license_source(ecosystem.license_source())
         .with_license_policy(&snapshot.license_policy)
-        .with_suppression(&snapshot.suppression);
+        .with_suppression(&snapshot.suppression)
+        .with_advisory_exemptions(&snapshot.advisory_exemptions);
 
     let domain_diagnostics = manifest
         .generate_diagnostics(version_data, &domain_uri, freshness, severities)

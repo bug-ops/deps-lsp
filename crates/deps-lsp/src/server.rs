@@ -14,6 +14,9 @@ use crate::file_watcher;
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
+use deps_core::lsp_helpers::exemption::{
+    ExemptionFile, OperatorExemptions, UserConfigLookup, WorkspaceRoots,
+};
 use deps_core::policy_config::{GossipChecks, OsvChecks, TyposquatChecks};
 use deps_engine::classify::resolved::LockfileLoad;
 use std::collections::HashMap;
@@ -76,6 +79,145 @@ mod commands {
     /// returns no edits, so the command is simply always a no-op for an ecosystem with
     /// no mutable-ref pin concept, rather than needing its own feature gate.
     pub(super) const PIN_ALL_TO_SHA: &str = deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID;
+}
+
+/// Every directory the client may treat as a workspace root: `workspaceFolders`, the
+/// deprecated `rootUri` / `rootPath`, and the server's own working directory (#1964).
+///
+/// Folders added after `initialize` are not tracked (spec 101 residual risk).
+fn initialize_workspace_roots(params: &InitializeParams) -> Vec<std::path::PathBuf> {
+    #[expect(deprecated, reason = "older clients only send rootUri / rootPath")]
+    let (root_uri, root_path) = (params.root_uri.as_ref(), params.root_path.as_ref());
+    let uri_path = |uri: &Uri| {
+        crate::lsp_types_interop::from_lsp_uri(uri).and_then(|url| url.to_file_path().ok())
+    };
+    params
+        .workspace_folders
+        .iter()
+        .flatten()
+        .filter_map(|folder| uri_path(&folder.uri))
+        .chain(root_uri.and_then(uri_path))
+        .chain(root_path.map(std::path::PathBuf::from))
+        .chain(std::env::current_dir().ok())
+        .collect()
+}
+
+/// Loads the operator's advisory exemptions from the user config directory, refusing a file
+/// that sits inside one of `roots`. Returns the exemptions to use (none on any failure, so a
+/// problem never hides an advisory) and a warning for the user when something was refused.
+///
+/// Blocks on the filesystem; call from `spawn_blocking`.
+fn load_operator_exemptions(
+    roots: Vec<std::path::PathBuf>,
+) -> (OperatorExemptions, Option<String>) {
+    let roots = WorkspaceRoots::new(
+        roots,
+        deps_core::config_trust::OperatorPath::home().as_ref(),
+    );
+    exemptions_for_lookup(ExemptionFile::user_config_default(&roots))
+}
+
+/// Turns a config-directory lookup into the exemptions to use and the warning to show.
+fn exemptions_for_lookup(lookup: UserConfigLookup) -> (OperatorExemptions, Option<String>) {
+    let file = match lookup {
+        UserConfigLookup::NoConfigDir | UserConfigLookup::Absent => {
+            return (OperatorExemptions::none(), None);
+        }
+        UserConfigLookup::InsideWorkspace { root } => {
+            return (
+                OperatorExemptions::none(),
+                Some(format!(
+                    "advisory exemptions ignored: the exemption file is inside the workspace {}; keep it in your user config directory",
+                    root.display()
+                )),
+            );
+        }
+        UserConfigLookup::Located(file) => file,
+    };
+    match OperatorExemptions::load(&file) {
+        Ok(Some(exemptions)) => {
+            tracing::info!(entries = exemptions.len(), "loaded advisory exemptions");
+            (exemptions, None)
+        }
+        Ok(None) => (OperatorExemptions::none(), None),
+        Err(error) => (
+            OperatorExemptions::none(),
+            Some(format!("advisory exemptions ignored: {error}")),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod exemption_lookup_tests {
+    use super::*;
+    use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
+    use deps_core::net_policy::MapEnv;
+
+    fn config_dir(path: &std::path::Path) -> OperatorPath {
+        let env = MapEnv::new().with_var("XDG_CONFIG_HOME", path.to_str().expect("utf8 path"));
+        match OperatorPath::from_env(&env, OperatorEnvVar::XdgConfigHome) {
+            EnvPath::Path(p) => p,
+            other => panic!("absolute path expected, got {other:?}"),
+        }
+    }
+
+    fn write_file(config: &std::path::Path, body: &str) {
+        let dir = config.join("deps-lsp");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("advisory-exemptions.toml"), body).expect("write file");
+    }
+
+    const VALID: &str = "[[advisory]]\nid = \"GHSA-aaaa-bbbb-cccc\"\nreason = \"accepted\"\n";
+
+    #[test]
+    fn absent_file_is_silently_no_exemptions() {
+        let (exemptions, warning) = exemptions_for_lookup(UserConfigLookup::Absent);
+        assert!(exemptions.is_empty());
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn located_valid_file_is_loaded_without_warning() {
+        let home = tempfile::tempdir().expect("home");
+        let config = home.path().join("cfg");
+        write_file(&config, VALID);
+        let lookup =
+            ExemptionFile::under_config_dir(config_dir(&config), &WorkspaceRoots::default());
+
+        let (exemptions, warning) = exemptions_for_lookup(lookup);
+
+        assert_eq!(exemptions.len(), 1);
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn malformed_file_fails_closed_with_a_warning() {
+        let home = tempfile::tempdir().expect("home");
+        let config = home.path().join("cfg");
+        write_file(&config, "[[advisory]]\nid = ");
+        let lookup =
+            ExemptionFile::under_config_dir(config_dir(&config), &WorkspaceRoots::default());
+
+        let (exemptions, warning) = exemptions_for_lookup(lookup);
+
+        assert!(exemptions.is_empty());
+        assert!(warning.is_some_and(|w| w.starts_with("advisory exemptions ignored")));
+    }
+
+    #[test]
+    fn file_inside_the_workspace_is_refused_with_a_warning() {
+        let home = tempfile::tempdir().expect("home");
+        let workspace = home.path().join("proj");
+        let config = workspace.join(".config");
+        write_file(&config, VALID);
+        let roots = WorkspaceRoots::new([workspace], None);
+        let lookup = ExemptionFile::under_config_dir(config_dir(&config), &roots);
+
+        let (exemptions, warning) = exemptions_for_lookup(lookup);
+
+        assert!(exemptions.is_empty());
+        assert!(warning.is_some_and(|w| w.contains("inside the workspace")));
+    }
 }
 
 /// Parses a [`DepsConfig`] from a raw JSON settings payload (client
@@ -1125,6 +1267,24 @@ impl LanguageServer for Backend {
             tracing::debug!(
                 "client did not declare workspace.codeLens.refreshSupport; code lenses won't auto-refresh after background fetches"
             );
+        }
+
+        let roots = initialize_workspace_roots(&params);
+        let (exemptions, exemption_warning) =
+            tokio::task::spawn_blocking(move || load_operator_exemptions(roots))
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "advisory exemption load task failed");
+                    (
+                        OperatorExemptions::none(),
+                        Some("advisory exemptions ignored: the load task failed".to_owned()),
+                    )
+                });
+        self.state.set_advisory_exemptions(Arc::new(exemptions));
+        if let Some(message) = exemption_warning {
+            self.client
+                .show_message(MessageType::WARNING, format!("deps-lsp: {message}"))
+                .await;
         }
 
         if let Some(init_options) = params.initialization_options

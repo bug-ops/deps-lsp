@@ -2,7 +2,7 @@
 
 The behaviors in this chapter are implemented once in `deps-core` (see
 [Architecture Overview](../architecture.md)) and apply, with the coverage noted in each section,
-across most or all of the 14 supported ecosystems — rather than being reimplemented per crate.
+across most or all of the 15 supported ecosystems — rather than being reimplemented per crate.
 
 - [Conventions](conventions.md) — the inlay hint icons and hover/diagnostic/code lens text
   conventions every ecosystem shares.

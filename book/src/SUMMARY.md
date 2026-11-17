@@ -36,6 +36,7 @@
   - [Deno](ecosystems/deno.md)
   - [GitHub Actions](ecosystems/github-actions.md)
   - [GitLab CI/CD](ecosystems/gitlab-ci.md)
+  - [pre-commit](ecosystems/pre-commit.md)
 
 # Architecture & Internals
 

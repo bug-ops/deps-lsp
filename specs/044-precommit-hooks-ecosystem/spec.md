@@ -10,7 +10,7 @@ tags:
   - new-ecosystem
   - priority/p4
 created: 2026-09-04
-status: draft
+status: shipped
 related:
   - "[[MOC-specs]]"
   - "[[014-github-actions-ecosystem/spec]]"
@@ -26,8 +26,8 @@ related:
 > in the 2026-08-23 competitive scan (`.local/testing/playbooks/competitive-parity.md`,
 > "pre-commit (7, near-free after GitHub Actions)") and acted on now that the prerequisite
 > (GitHub Actions, #208) has shipped.
-> **Branch**: [NEEDS CLARIFICATION: no tracking issue filed yet — assign issue number before
-> branching, e.g. `feat/<issue>-precommit-hooks`]
+> **Branch**: #575, `feat/1964-vulnerability-suppress-design` (shipped together with #1964,
+> #1719 and #1569).
 > **Type**: research / new ecosystem
 
 ## 1. Overview
@@ -192,7 +192,7 @@ THEN diagnostic severity mapping, hover section structure, and code-action wordi
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE SYSTEM SHALL detect `.pre-commit-config.yaml` (and `.pre-commit-config.yml`, if pre-commit accepts that extension) by filename and register it as a manifest document, routed through the existing LSP document-lifecycle handlers | must |
+| FR-001 | THE SYSTEM SHALL detect `.pre-commit-config.yaml` and `.pre-commit-config.yml` (see Resolved Decisions: pre-commit itself reads only `.yaml`) by filename and register it as a manifest document, routed through the existing LSP document-lifecycle handlers | must |
 | FR-002 | THE SYSTEM SHALL parse the YAML `repos:` list and, for each entry, extract `repo:` (string, GitHub URL) and `rev:` (string, tag or commit SHA) | must |
 | FR-003 | THE SYSTEM SHALL recognize `repo: local` and `repo: meta` as non-pinnable sentinels and exclude them from registry resolution and diagnostics entirely, with no error or false diagnostic | must |
 | FR-004 | THE SYSTEM SHALL recognize `repo:` values that are not GitHub URLs (any other git host, or a malformed URL) as out of phase-1 scope, logging a debug/info-level note and skipping gracefully — no diagnostic, no crash — mirroring `deps-github-actions`'s `validate_owner_repo` rejection of non-GitHub identities | must |
@@ -215,7 +215,7 @@ THEN diagnostic severity mapping, hover section structure, and code-action wordi
 | NFR-002 | Rate limiting | The existing unauthenticated 60 req/hr / tokened 5000 req/hr GitHub API budget and its cooldown/coalescing behavior (`RateLimitGate`, in-flight request coalescing in `deps-github-actions`) SHALL be shared across both GitHub Actions and pre-commit lookups for the same `owner/repo`, not double-counted or separately budgeted, since they hit the identical GitHub tags endpoint |
 | NFR-003 | Reliability | When the GitHub API is unreachable or rate-limited, the system SHALL degrade gracefully exactly as GitHub Actions already does: cached data served if available; otherwise an informational/loading state, never a false "outdated" positive |
 | NFR-004 | Consistency | Hover format, diagnostic wording, inlay-hint presentation, and code-action wording SHALL be identical in structure to the equivalent GitHub Actions behavior, adapted only where `rev:`/`repo:` field naming genuinely differs from `uses:@ref`, per the cross-ecosystem-consistency rule |
-| NFR-005 | YAML parsing | `.pre-commit-config.yaml` SHALL be parsed using `yaml-rust2` (already a workspace dependency, used by `deps-dart` and `deps-github-actions`); no new YAML parsing dependency SHALL be introduced [NEEDS CLARIFICATION: exact parsing approach — reuse `deps-github-actions`'s YAML-to-structured-list traversal pattern directly, or write a new, smaller traversal given the simpler `repos: [{repo, rev, hooks}]` shape vs. GitHub Actions' nested `jobs.<id>.steps[].uses` shape] |
+| NFR-005 | YAML parsing | `.pre-commit-config.yaml` SHALL be parsed using `yaml-rust2` (already a workspace dependency, used by `deps-dart` and `deps-github-actions`); no new YAML parsing dependency SHALL be introduced The parser is purpose-built for the flat `repos: [{repo, rev, hooks}]` shape, reusing this crate's scalar, closer and comment helpers (see Resolved Decisions) |
 | NFR-006 | Dependency-free ecosystem crate | Following the project's Simplicity principle and the precedent of `deps-github-actions`, this ecosystem SHALL be implemented as its own crate (`deps-precommit`) reusing existing workspace dependencies (`yaml-rust2`, `deps_core::github`) with no new external dependencies added to the workspace |
 
 ## 5. Data Model
@@ -274,35 +274,57 @@ and every other ecosystem.
 - Attempt to resolve non-GitHub `repo:` hosts, `repo: local`, or `repo: meta` entries against any registry.
 - Introduce ecosystem-specific divergence in hover format, diagnostic wording, or code-action behavior from the GitHub Actions precedent without a documented, justified reason.
 
-## 9. Open Questions
+## 9. Resolved Decisions
 
-- [NEEDS CLARIFICATION: Are `hooks[].additional_dependencies` version pins (e.g.
-  `additional_dependencies: [types-requests==2.31.0]` under a `mirrors-mypy` hook) in scope
-  for this ecosystem at all — even as a later phase — or are they a wholly separate concern
-  best left to the PyPI/npm ecosystems' own manifest detection (which do not currently look
-  inside `.pre-commit-config.yaml`)?]
-- [NEEDS CLARIFICATION: Exact YAML traversal approach for `repos: [{repo, rev, hooks}]` —
-  reuse `deps-github-actions`'s existing YAML-to-structured-list traversal helpers directly,
-  or is the flatter shape simple enough to warrant a smaller, purpose-built traversal in the
-  new crate?]
-- [NEEDS CLARIFICATION: Non-GitHub repo host handling — should this ecosystem merely skip
-  non-GitHub `repo:` values silently (current FR-004 proposal), or surface a low-severity
-  informational diagnostic/hover note ("this ecosystem currently supports GitHub-hosted
-  hooks only") so users understand why a Bitbucket/self-hosted-GitLab hook shows no version
-  data, rather than silence that could read as "nothing wrong here"?]
-- [NEEDS CLARIFICATION: Should `.pre-commit-config.yml` (the less common `.yml` extension
-  variant) be recognized alongside `.pre-commit-config.yaml`, or is `.yaml` the only form
-  pre-commit itself accepts? Needs a quick check against pre-commit's own source/docs before
-  `/sdd plan`.]
-- [NEEDS CLARIFICATION: No project constitution exists at `specs/constitution.md` yet —
-  cannot yet validate this spec against project-wide architectural principles beyond
-  precedent-matching against #208/#471/#473.]
-- [NEEDS CLARIFICATION: Should the filed tracking issue for this spec block on nothing
-  further (unlike [[042-docker-base-image-ecosystem/spec|the Docker ecosystem candidate]],
-  which explicitly recommended waiting on a second non-package-manager ecosystem to prove
-  the pattern), given GitHub Actions has already shipped and this candidate reuses its
-  registry client with zero new surface — or should team judgment still defer it behind
-  higher-priority backlog items given the P4/no-current-issue status?]
+All eight former open-question markers are closed.
+
+1. **Tracking issue and branch.** #575, branch `feat/1964-vulnerability-suppress-design`.
+2. **`hooks[].additional_dependencies`.** Out of scope for this ecosystem. Those pins belong to
+   the PyPI/npm managers and would need a new parser; FR-011 stands.
+3. **YAML traversal and where the parser lives.** A purpose-built parser, `parse_precommit_config`,
+   built on `yaml-rust2` and the existing scalar, closer and comment helpers of
+   `deps-github-actions`. It handles `repos[]` block and flow mappings and quoted or plain
+   scalars. Same answer for the inline NFR-005 marker.
+4. **Non-GitHub hosts.** Skipped silently (debug log), no informational diagnostic. Only
+   `https://github.com/<owner>/<repo>[.git][/]` is accepted: no userinfo, port, query or fragment,
+   and the identity must pass `is_valid_github_identity`. SSH forms (`git@github.com:...`) are
+   skipped too. `repo: local` and `repo: meta` are skipped silently.
+5. **`.yml` extension.** Recognized. pre-commit itself reads only `.pre-commit-config.yaml`
+   (`CONFIG_FILE` in `pre_commit/constants.py`, checked 2026-11-17) but accepts any name through
+   `-c`, and Renovate's manager pattern is `.pre-commit-config.ya?ml`, so both are routed.
+6. **Constitution.** `specs/constitution.md` exists; validated against principles 1 (type safety:
+   `GitTagsFlavor` is an exhaustive enum, no wrapper type that could silently fall back to default
+   trait behavior) and 2 (reuse: one registry, one tag index, no new network calls).
+7. **Blocking.** Nothing blocks implementation; GitHub Actions (#208) shipped.
+8. **Inline NFR-005 marker.** Same as item 3.
+
+## 9a. Design Record and Deviations
+
+- **Flavor, not a second ecosystem type.** The pre-commit ecosystem is `GithubActionsEcosystem`
+  built with `GitTagsFlavor::PreCommit` (`EcosystemId::PreCommit`, id `pre-commit`). Every
+  flavor-sensitive `EcosystemBase` method dispatches on an exhaustive match; the registry,
+  `refresh_events`, probes and lockfile names are shared. `deps-precommit` is constructor-only
+  (`ecosystem(registry)`, `standalone(cache)`) and keeps the crate NFR-006 names.
+- **Deviation (L4): the parser lives in `deps-github-actions`**, not in `deps-precommit`, because
+  `deps-precommit` depends on the former and the flavor dispatch calls the parser. This replaces
+  the earlier "parser in its own crate" assumption.
+- **Shared registry (NFR-002).** `deps-engine` builds one `GithubActionsRegistry` when both
+  `github-actions` and `pre-commit` are on and registers both flavors from it, so cache, rate
+  gate, request coalescing and tag index are shared. With only `pre-commit` on it uses
+  `standalone`. Each ecosystem's tag-refresh listener subscribes to the same broadcast and sweeps
+  only its own documents. The registry's `github-actions` log and breaker attribution covers both
+  flavors.
+- **Mutable-ref rule.** pre-commit's own: a `rev` is mutable iff it contains no `.` and is not
+  entirely hexadecimal, so `v1` and `main` are flagged while `v1.2`, `v1.2.3` and `abc1234` are
+  not (`MutablePinPolicy::DotlessNonHex`). Code `pre-commit-mutable-ref-pin`, noun "hook".
+- **Short hex revs.** A `rev` of 7 to 39 hex characters is non-resolvable in phase 1 (no version
+  diagnostics); a 40-hex `rev` is a SHA pin.
+- **Malformed entries.** A missing or non-string `repo`/`rev` is skipped with a warn log (FR-014).
+- **SHA comments.** `# v1.2` (bare) and `# frozen: v1.2` (what `pre-commit autoupdate --freeze`
+  writes) are both read; a rewrite keeps the style it parsed and an uncommented pin gets the
+  flavor default (`frozen:` for pre-commit).
+- **No OSV and no deps.dev coverage.** `EcosystemId::PreCommit` has no OSV coordinate;
+  vulnerability scanning of hook repositories is out of scope for phase 1.
 
 ## 10. See Also
 

@@ -1,6 +1,6 @@
 # Ecosystem Reference
 
-Each chapter here documents the ecosystem-specific behavior for one of the 14 supported package
+Each chapter here documents the ecosystem-specific behavior for one of the 15 supported package
 ecosystems — custom/private registry resolution, parser quirks, and any feature that is not
 shared broadly enough to belong in [Cross-Ecosystem Features](../cross-ecosystem/index.md).
 

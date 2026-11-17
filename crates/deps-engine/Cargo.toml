@@ -37,6 +37,9 @@ composer = ["dep:deps-composer"]
 nuget = ["dep:deps-nuget"]
 github-actions = ["dep:deps-github-actions"]
 gitlab-ci = ["dep:deps-gitlab-ci"]
+# pre-commit is the `PreCommit` flavor of the GitHub Actions ecosystem type, so it needs
+# `deps-github-actions` itself (and shares its registry when `github-actions` is also on).
+pre-commit = ["dep:deps-precommit", "dep:deps-github-actions"]
 # Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it, D3) even
 # when the "npm" feature itself is disabled.
 deno = ["dep:deps-deno"]
@@ -76,7 +79,7 @@ lsp-responses = [
 # Consumed only through the `ecosystem!`/`register!` macros in `src/setup.rs`, not via direct
 # `use` statements, so cargo-machete cannot see the usage and flags them as unused.
 [package.metadata.cargo-machete]
-ignored = ["deps-bundler", "deps-composer", "deps-dart", "deps-deno", "deps-github-actions", "deps-gitlab-ci", "deps-gradle", "deps-maven", "deps-pypi", "deps-swift"]
+ignored = ["deps-bundler", "deps-composer", "deps-dart", "deps-deno", "deps-github-actions", "deps-gitlab-ci", "deps-gradle", "deps-maven", "deps-precommit", "deps-pypi", "deps-swift"]
 
 [dependencies]
 deps-bundler = { workspace = true, optional = true }
@@ -92,6 +95,7 @@ deps-gradle = { workspace = true, optional = true }
 deps-maven = { workspace = true, optional = true }
 deps-npm = { workspace = true, optional = true }
 deps-nuget = { workspace = true, optional = true }
+deps-precommit = { workspace = true, optional = true }
 deps-pypi = { workspace = true, optional = true }
 deps-swift = { workspace = true, optional = true }
 futures = { workspace = true }

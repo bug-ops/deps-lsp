@@ -9,7 +9,7 @@
 The composition root for the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace.
 
 This crate exists only because Cargo forbids a cycle: `deps-core` cannot depend on any
-`deps-<ecosystem>` crate, since all 14 already depend on `deps-core`. `deps-engine` sits one
+`deps-<ecosystem>` crate, since all 15 already depend on `deps-core`. `deps-engine` sits one
 layer above `deps-core` and depends on every feature-gated `deps-<ecosystem>` crate instead,
 so every driving adapter (`deps-lsp` and `deps-cli`) shares one
 registration instead of each reimplementing it independently.

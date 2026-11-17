@@ -38,15 +38,27 @@ messages inline next to each dependency.
 
 ## Neovim
 
-```lua
-require('lspconfig').deps_lsp.setup({
-  cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml", "swift", "php", "requirements" },
-})
+`nvim-lspconfig` has no `deps_lsp` entry, so define the server yourself with the built-in LSP
+configuration API (Neovim 0.11+):
 
--- Enable inlay hints (Neovim 0.10+)
+```lua
+vim.lsp.config('deps_lsp', {
+  cmd = { 'deps-lsp', '--stdio' },
+  filetypes = {
+    'toml', 'json', 'jsonc', 'yaml', 'gomod', 'ruby', 'xml',
+    'groovy', 'kotlin', 'swift', 'requirements',
+  },
+  root_markers = { '.git' },
+})
+vim.lsp.enable('deps_lsp')
+
+-- Enable inlay hints
 vim.lsp.inlay_hint.enable(true)
 ```
+
+`deps-lsp` runs alongside any other server attached to the same buffer (for example
+`rust-analyzer` on `Cargo.toml`). On Neovim 0.10 and earlier, use `vim.lsp.start` from a `FileType`
+autocommand instead, with the same `cmd` and filetypes.
 
 For older Neovim versions, use [nvim-lsp-inlayhints](https://github.com/lvimuser/lsp-inlayhints.nvim).
 
@@ -195,7 +207,7 @@ primary language server already registered for the same syntax.
     "deps-lsp": {
       "command": "deps-lsp",
       "args": ["--stdio"],
-      "filetypes": ["toml", "json", "yaml", "gomod", "ruby", "xml", "swift", "php", "requirements"]
+      "filetypes": ["toml", "json", "jsonc", "yaml", "gomod", "ruby", "xml", "groovy", "kotlin", "swift", "requirements"]
     }
   }
 }

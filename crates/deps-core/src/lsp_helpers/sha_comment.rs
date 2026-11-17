@@ -217,6 +217,41 @@ impl fmt::Display for ClosingDelimiters {
     }
 }
 
+/// Spelling of the comment that names the tag a SHA pin was resolved from.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::CommentStyle;
+///
+/// assert_eq!(CommentStyle::Bare.prefix(), "");
+/// assert_eq!(CommentStyle::Frozen.prefix(), "frozen: ");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommentStyle {
+    /// `# v1.2.3`.
+    Bare,
+    /// `# frozen: v1.2.3`, the form `pre-commit autoupdate --freeze` writes.
+    Frozen,
+}
+
+impl CommentStyle {
+    /// The styles an ecosystem that only knows the bare `# tag` spelling accepts.
+    pub const BARE_ONLY: &'static [Self] = &[Self::Bare];
+
+    /// Every style, for an ecosystem that also reads `# frozen: tag`.
+    pub const ALL: &'static [Self] = &[Self::Bare, Self::Frozen];
+
+    /// Text written between the `# ` and the tag.
+    #[must_use]
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Self::Bare => "",
+            Self::Frozen => "frozen: ",
+        }
+    }
+}
+
 /// What follows a SHA pin comment's tag token on its line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentRemainder {
@@ -238,6 +273,8 @@ pub struct ShaPinComment {
     /// What follows the tag token; the pin's range ends at the token, so a rewrite that
     /// removes the `#` must know whether comment words would be left outside it.
     pub remainder: CommentRemainder,
+    /// How the comment spells the tag; a rewrite keeps it.
+    pub style: CommentStyle,
 }
 
 impl ShaPinComment {
@@ -265,7 +302,15 @@ impl ShaPinComment {
             tag_range,
             closing,
             remainder: CommentRemainder::Text,
+            style: CommentStyle::Bare,
         }
+    }
+
+    /// Replaces the recorded [`CommentStyle`].
+    #[must_use]
+    pub const fn with_style(mut self, style: CommentStyle) -> Self {
+        self.style = style;
+        self
     }
 
     /// Replaces the recorded [`CommentRemainder`].
@@ -386,11 +431,17 @@ fn is_last_token_on_line(rest: &str, window: WindowCoverage) -> bool {
 }
 
 /// The first whitespace-delimited token after a whitespace-preceded `#` in `rest`, as a
-/// [`CommentTag`], with the byte offset in `rest` where the token ends.
+/// [`CommentTag`], with its [`CommentStyle`] and the byte offset in `rest` where the token ends.
 ///
+/// A `frozen:` word before the token is read only when `accepted` lists
+/// [`CommentStyle::Frozen`]; otherwise it is the comment's first token and not a tag.
 /// A token that runs to the end of a [`WindowCoverage::Truncated`] window has an unknown
 /// true extent (`v4.2.100` cut to `v4.2.10` still looks valid) and is rejected.
-fn extract_comment_tag(rest: &str, window: WindowCoverage) -> Option<(CommentTag, usize)> {
+fn extract_comment_tag(
+    rest: &str,
+    window: WindowCoverage,
+    accepted: &[CommentStyle],
+) -> Option<(CommentTag, CommentStyle, usize)> {
     let mut previous_is_blank = false;
     let hash = rest.bytes().position(|b| {
         let found = b == b'#' && previous_is_blank;
@@ -399,14 +450,26 @@ fn extract_comment_tag(rest: &str, window: WindowCoverage) -> Option<(CommentTag
     })?;
     let after_hash = rest.get(hash + 1..)?;
     let after_ws = after_hash.trim_start();
-    let ws_len = after_hash.len() - after_ws.len();
-    let terminator = after_ws.find(char::is_whitespace);
+    let mut consumed = hash + 1 + (after_hash.len() - after_ws.len());
+    let frozen_tail = accepted
+        .contains(&CommentStyle::Frozen)
+        .then(|| after_ws.strip_prefix("frozen:"))
+        .flatten();
+    let (style, token_text) = match frozen_tail {
+        Some(tail) => {
+            let tag_text = tail.trim_start();
+            consumed += after_ws.len() - tag_text.len();
+            (CommentStyle::Frozen, tag_text)
+        }
+        None => (CommentStyle::Bare, after_ws),
+    };
+    let terminator = token_text.find(char::is_whitespace);
     if terminator.is_none() && window == WindowCoverage::Truncated {
         return None;
     }
-    let token_len = terminator.unwrap_or(after_ws.len());
-    let tag = CommentTag::parse(after_ws.get(..token_len)?)?;
-    Some((tag, hash + 1 + ws_len + token_len))
+    let token_len = terminator.unwrap_or(token_text.len());
+    let tag = CommentTag::parse(token_text.get(..token_len)?)?;
+    Some((tag, style, consumed + token_len))
 }
 
 /// Whether nothing but whitespace or a YAML comment follows the ref at `ref_end` on its
@@ -501,16 +564,27 @@ pub fn comment_slot_after(
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{LineOffsetTable, ShaPinTail, read_sha_pin_tail};
+/// use deps_core::lsp_helpers::{CommentStyle, LineOffsetTable, ShaPinTail, read_sha_pin_tail};
 /// use yaml_rust2::scanner::TScalarStyle;
 ///
 /// let sha = "a".repeat(40);
 /// let content = format!("ref: {sha} # v4.2.0\n");
 /// let table = LineOffsetTable::new(&content);
-/// let read = read_sha_pin_tail(&content, &table, 5 + 40, 1, TScalarStyle::Plain, true);
+/// let read = read_sha_pin_tail(
+///     &content,
+///     &table,
+///     5 + 40,
+///     1,
+///     TScalarStyle::Plain,
+///     true,
+///     CommentStyle::BARE_ONLY,
+/// );
 /// assert_eq!(read.tail.comment().unwrap().tag.as_str(), "v4.2.0");
 /// assert_eq!(read.range_end, content.trim_end().len());
 /// ```
+///
+/// `accepted` lists the comment spellings this ecosystem reads: [`CommentStyle::BARE_ONLY`]
+/// or [`CommentStyle::ALL`].
 #[must_use]
 pub fn read_sha_pin_tail(
     content: &str,
@@ -519,6 +593,7 @@ pub fn read_sha_pin_tail(
     line: usize,
     style: TScalarStyle,
     is_plain_scalar: bool,
+    accepted: &[CommentStyle],
 ) -> ShaPinTailRead {
     let (rest, window) = rest_of_line(content, line_table, ref_end, line);
     let is_last = is_last_token_on_line(rest, window);
@@ -526,24 +601,25 @@ pub fn read_sha_pin_tail(
     let closer_len = closing.byte_len();
     let comment = if closing.is_empty() {
         (is_plain_scalar && is_last)
-            .then(|| extract_comment_tag(rest, window))
+            .then(|| extract_comment_tag(rest, window, accepted))
             .flatten()
     } else {
         rest.get(closer_len..).and_then(|tail| {
             is_last_token_on_line(tail, window)
-                .then(|| extract_comment_tag(tail, window))
+                .then(|| extract_comment_tag(tail, window, accepted))
                 .flatten()
-                .map(|(tag, end)| (tag, closer_len + end))
+                .map(|(tag, comment_style, end)| (tag, comment_style, closer_len + end))
         })
     };
     match comment {
-        Some((tag, token_end)) => {
+        Some((tag, comment_style, token_end)) => {
             let end = ref_end + token_end;
             let tag_range = byte_span_to_range(content, line_table, end - tag.as_str().len(), end);
             ShaPinTailRead {
                 tail: ShaPinTail::Commented(
                     ShaPinComment::new(tag, closing, tag_range)
-                        .with_remainder(comment_remainder(rest, token_end, window)),
+                        .with_remainder(comment_remainder(rest, token_end, window))
+                        .with_style(comment_style),
                 ),
                 range_end: end,
             }
@@ -587,16 +663,54 @@ pub fn read_sha_pin_tail(
 /// ```
 #[must_use]
 pub fn sha_pin_rewrite(tail: &ShaPinTail, sha: &CommitSha, target: &ConcreteVersion) -> String {
+    sha_pin_rewrite_with_default_style(tail, sha, target, CommentStyle::Bare)
+}
+
+/// [`sha_pin_rewrite`] for an ecosystem whose comments may be spelled
+/// [`CommentStyle::Frozen`].
+///
+/// A [`ShaPinTail::Commented`] pin keeps the spelling it was read with; a pin that had no
+/// comment gets `default_style`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConcreteVersion;
+/// use deps_core::lsp_helpers::{
+///     CommentSlot, CommentStyle, CommitSha, ShaPinTail, sha_pin_rewrite_with_default_style,
+/// };
+///
+/// let sha = CommitSha::parse(&"b".repeat(40)).unwrap();
+/// let target = ConcreteVersion::new("v4.3.0");
+/// let appendable = ShaPinTail::Bare(CommentSlot::Appendable);
+/// assert_eq!(
+///     sha_pin_rewrite_with_default_style(&appendable, &sha, &target, CommentStyle::Frozen),
+///     format!("{} # frozen: v4.3.0", sha.as_str())
+/// );
+/// ```
+#[must_use]
+pub fn sha_pin_rewrite_with_default_style(
+    tail: &ShaPinTail,
+    sha: &CommitSha,
+    target: &ConcreteVersion,
+    default_style: CommentStyle,
+) -> String {
     let comment = CommentTag::parse(target.as_str()).filter(CommentTag::is_printable_ascii);
     match (tail, comment) {
         (ShaPinTail::Commented(existing), Some(tag)) => {
-            format!("{sha}{} # {tag}", existing.closing)
+            format!(
+                "{sha}{} # {}{tag}",
+                existing.closing,
+                existing.style.prefix()
+            )
         }
         (ShaPinTail::Commented(existing), None) => match existing.remainder {
             CommentRemainder::Empty => format!("{sha}{}", existing.closing),
             CommentRemainder::Text => format!("{sha}{} #", existing.closing),
         },
-        (ShaPinTail::Bare(CommentSlot::Appendable), Some(tag)) => format!("{sha} # {tag}"),
+        (ShaPinTail::Bare(CommentSlot::Appendable), Some(tag)) => {
+            format!("{sha} # {}{tag}", default_style.prefix())
+        }
         (ShaPinTail::Bare(CommentSlot::Appendable | CommentSlot::Unavailable), _) => {
             sha.to_string()
         }
@@ -924,7 +1038,15 @@ mod tests {
 
     fn read(content: &str, style: TScalarStyle, plain: bool, ref_end: usize) -> ShaPinTailRead {
         let table = LineOffsetTable::new(content);
-        read_sha_pin_tail(content, &table, ref_end, 1, style, plain)
+        read_sha_pin_tail(
+            content,
+            &table,
+            ref_end,
+            1,
+            style,
+            plain,
+            CommentStyle::BARE_ONLY,
+        )
     }
 
     fn comment(tag: &str, closing: &str, style: TScalarStyle) -> ShaPinComment {
@@ -1308,7 +1430,15 @@ mod tests {
         let content = format!("x: 1\r\nref: {s} # v4\r\ny: 2\r\n");
         let table = LineOffsetTable::new(&content);
         let ref_end = 6 + 5 + 40;
-        let read = read_sha_pin_tail(&content, &table, ref_end, 2, TScalarStyle::Plain, true);
+        let read = read_sha_pin_tail(
+            &content,
+            &table,
+            ref_end,
+            2,
+            TScalarStyle::Plain,
+            true,
+            CommentStyle::BARE_ONLY,
+        );
         assert_eq!(read.tail.comment().unwrap().tag.as_str(), "v4");
         assert_eq!(read.range_end, ref_end + " # v4".len());
     }
@@ -1317,7 +1447,15 @@ mod tests {
     fn test_read_tail_ref_end_past_line_does_not_panic() {
         let content = "ref: x\n";
         let table = LineOffsetTable::new(content);
-        let read = read_sha_pin_tail(content, &table, 100, 1, TScalarStyle::Plain, true);
+        let read = read_sha_pin_tail(
+            content,
+            &table,
+            100,
+            1,
+            TScalarStyle::Plain,
+            true,
+            CommentStyle::BARE_ONLY,
+        );
         assert_eq!(read.range_end, 100);
         assert_matches!(read.tail, ShaPinTail::Bare(_));
     }
@@ -1425,7 +1563,15 @@ mod tests {
         let content = format!("{head}{old}{quote}{comment_text}\n");
         let start = head.len();
         let table = LineOffsetTable::new(&content);
-        let read = read_sha_pin_tail(&content, &table, start + 40, 1, style, quote.is_empty());
+        let read = read_sha_pin_tail(
+            &content,
+            &table,
+            start + 40,
+            1,
+            style,
+            quote.is_empty(),
+            CommentStyle::BARE_ONLY,
+        );
         let rewritten = sha_pin_rewrite(&read.tail, &new, &ConcreteVersion::new("stable"));
         format!(
             "{}{}{}",
@@ -1635,5 +1781,83 @@ mod tests {
         assert!(!position_past_sha(range, Position::new(2, 9)));
         assert!(!position_past_sha(range, Position::new(2, 61)));
         assert!(!position_past_sha(range, Position::new(1, 55)));
+    }
+
+    fn read_with(content: &str, accepted: &[CommentStyle]) -> ShaPinTailRead {
+        let table = LineOffsetTable::new(content);
+        read_sha_pin_tail(
+            content,
+            &table,
+            "rev: ".len() + 40,
+            1,
+            TScalarStyle::Plain,
+            true,
+            accepted,
+        )
+    }
+
+    #[test]
+    fn test_frozen_comment_is_read_only_when_accepted() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let content = format!("rev: {sha}  # frozen: v1.2.3\n");
+
+        let comment = read_with(&content, CommentStyle::ALL)
+            .tail
+            .comment()
+            .cloned()
+            .expect("frozen comment is read");
+        assert_eq!(comment.style, CommentStyle::Frozen);
+        assert_eq!(comment.tag.as_str(), "v1.2.3");
+        let start = content.find("v1.2.3").unwrap();
+        assert_eq!(comment.tag_range.start.character as usize, start);
+
+        assert!(
+            read_with(&content, CommentStyle::BARE_ONLY)
+                .tail
+                .comment()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_bare_comment_keeps_bare_style_under_all_styles() {
+        let sha = "b".repeat(40);
+        let content = format!("rev: {sha} # v1.2.3\n");
+        let comment = read_with(&content, CommentStyle::ALL)
+            .tail
+            .comment()
+            .cloned()
+            .expect("bare comment is read");
+        assert_eq!(comment.style, CommentStyle::Bare);
+    }
+
+    #[test]
+    fn test_sha_pin_rewrite_keeps_the_parsed_comment_style() {
+        let old = "c".repeat(40);
+        let new = CommitSha::parse(&"d".repeat(40)).unwrap();
+        let target = ConcreteVersion::new("v2.0.0");
+        for (written, expected_prefix) in [("frozen: ", "frozen: "), ("", "")] {
+            let content = format!("rev: {old} # {written}v1.0.0\n");
+            let read = read_with(&content, CommentStyle::ALL);
+            assert_eq!(
+                sha_pin_rewrite_with_default_style(&read.tail, &new, &target, CommentStyle::Bare),
+                format!("{new} # {expected_prefix}v2.0.0")
+            );
+        }
+    }
+
+    #[test]
+    fn test_sha_pin_rewrite_default_style_applies_only_without_a_comment() {
+        let new = CommitSha::parse(&"e".repeat(40)).unwrap();
+        let target = ConcreteVersion::new("v2.0.0");
+        let appendable = ShaPinTail::Bare(CommentSlot::Appendable);
+        assert_eq!(
+            sha_pin_rewrite_with_default_style(&appendable, &new, &target, CommentStyle::Frozen),
+            format!("{new} # frozen: v2.0.0")
+        );
+        assert_eq!(
+            sha_pin_rewrite(&appendable, &new, &target),
+            format!("{new} # v2.0.0")
+        );
     }
 }

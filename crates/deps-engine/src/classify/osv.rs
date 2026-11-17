@@ -324,6 +324,10 @@ pub fn build_scan_targets(
         )
         .with_siblings(&versions, formatter)
         .with_lock_alternatives(&versions, formatter);
+        let target = match versions.primary_role() {
+            deps_core::osv::PrimaryRole::Own => target,
+            deps_core::osv::PrimaryRole::StandIn => target.with_stand_in_primary(),
+        };
         match target_index.entry(target.key.clone()) {
             Entry::Vacant(slot) => {
                 slot.insert(targets.len());

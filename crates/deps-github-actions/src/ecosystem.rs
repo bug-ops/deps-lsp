@@ -13,7 +13,7 @@ use deps_core::{
     EcosystemBase, ParsedView, Registry, Result, TypedEcosystem, TypedParseResult,
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{
-        FixAvailability, GitTagsPinning, MutableRefPin, PinSubject, git_tags_diagnostics,
+        FixAvailability, GitTagsPinning, MutablePinPolicy, MutableRefPin, git_tags_diagnostics,
     },
 };
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 use url::Url;
 
+use crate::GitTagsFlavor;
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle};
@@ -86,13 +87,43 @@ impl GithubActionsEcosystem {
     /// Creates a new GitHub Actions ecosystem with the given HTTP cache.
     #[must_use]
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
-        let registry = Arc::new(GithubActionsRegistry::new(cache));
+        Self::with_registry(
+            Arc::new(GithubActionsRegistry::new(cache)),
+            GitTagsFlavor::Actions,
+        )
+    }
+
+    /// Creates an ecosystem of `flavor` over an existing `registry`, so the pre-commit and
+    /// GitHub Actions ecosystems share one cache, rate gate, coalescing and tag index.
+    ///
+    /// The registry is flavor-agnostic: both flavors resolve `owner/repo` against the same
+    /// GitHub tags endpoint, so its logs and circuit-breaker attribution (`github-actions`)
+    /// cover both.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{EcosystemBase, EcosystemId, HttpCache};
+    /// use deps_github_actions::{GitTagsFlavor, GithubActionsEcosystem, GithubActionsRegistry};
+    /// use std::sync::Arc;
+    ///
+    /// let registry = Arc::new(GithubActionsRegistry::new(Arc::new(HttpCache::new())));
+    /// let precommit = GithubActionsEcosystem::with_registry(registry, GitTagsFlavor::PreCommit);
+    /// assert_eq!(precommit.ecosystem_id(), EcosystemId::PreCommit);
+    /// ```
+    #[must_use]
+    pub fn with_registry(registry: Arc<GithubActionsRegistry>, flavor: GitTagsFlavor) -> Self {
         let formatter = GithubActionsFormatter::new(registry.tag_index())
-            .with_probe_stores(registry.probe_stores());
+            .with_probe_stores(registry.probe_stores())
+            .with_flavor(flavor);
         Self {
             registry,
             formatter,
         }
+    }
+
+    const fn flavor(&self) -> GitTagsFlavor {
+        self.formatter.flavor
     }
 
     /// Creates an ecosystem whose registry talks to `api_base` (a mock server) instead of the
@@ -105,13 +136,10 @@ impl GithubActionsEcosystem {
     #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
     #[must_use]
     pub fn for_test(cache: Arc<deps_core::HttpCache>, api_base: impl Into<String>) -> Self {
-        let registry = Arc::new(GithubActionsRegistry::for_test(cache, api_base, false));
-        let formatter = GithubActionsFormatter::new(registry.tag_index())
-            .with_probe_stores(registry.probe_stores());
-        Self {
-            registry,
-            formatter,
-        }
+        Self::with_registry(
+            Arc::new(GithubActionsRegistry::for_test(cache, api_base, false)),
+            GitTagsFlavor::Actions,
+        )
     }
 }
 
@@ -186,11 +214,11 @@ impl deps_core::ecosystem::private::Sealed for GithubActionsEcosystem {}
 
 impl EcosystemBase for GithubActionsEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
-        deps_core::EcosystemId::GithubActions
+        self.flavor().ecosystem_id()
     }
 
     fn display_name(&self) -> &'static str {
-        "GitHub Actions"
+        self.flavor().display_name()
     }
 
     /// `action.yml`/`action.yaml` (issue #706): a composite (or Docker/JS) action's
@@ -201,7 +229,7 @@ impl EcosystemBase for GithubActionsEcosystem {
     /// `deps_core::EcosystemRegistry::for_filename`), so it applies regardless of
     /// which directory the file lives in, not just a repository root.
     fn manifest_filenames(&self) -> &[&'static str] {
-        &["action.yml", "action.yaml"]
+        self.flavor().manifest_filenames()
     }
 
     /// GHA workflows are routed solely by directory path (D1): a
@@ -215,10 +243,7 @@ impl EcosystemBase for GithubActionsEcosystem {
     /// nested layout is already fully covered by the exact-basename
     /// [`Self::manifest_filenames`] match, which applies regardless of directory depth.
     fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
-        &[
-            (".github/workflows", ".yml"),
-            (".github/workflows", ".yaml"),
-        ]
+        self.flavor().manifest_directory_patterns()
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
@@ -241,38 +266,45 @@ impl EcosystemBase for GithubActionsEcosystem {
         position: deps_core::position::Position,
     ) -> Option<&'a str> {
         let line = deps_core::fallback_completion::line_at(content, position)?;
-        if !is_in_dependencies_section(content, position.line as usize) {
+        if !is_in_dependencies_section(content, position.line as usize, self.flavor()) {
             return None;
         }
         Some(extract_prefix(line, position.character))
     }
 
+    /// `None` for [`GitTagsFlavor::PreCommit`]: a `repo:`/`rev:` pair has no single-line
+    /// `owner/repo@ref` form to insert.
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        // Unreachable today since `search()` always returns `Ok(vec![])`; kept total in case
-        // package-name search is added. Plain `contains('/')`, matching pre-#722 behavior.
-        if !name.as_str().contains('/') {
-            deps_core::lsp_helpers::warn_rejected_value(
-                "owner/repo shape",
-                "github actions package name completion item",
-                name.as_str(),
-            );
-            return None;
-        }
-        if latest.is_empty() {
-            Some(name.as_str().to_string())
-        } else {
-            Some(format!("{}@{latest}", name.as_str()))
+        match self.flavor() {
+            GitTagsFlavor::Actions => actions_completion_insert_text(metadata),
+            GitTagsFlavor::PreCommit => None,
         }
     }
 
     #[cfg(feature = "lsp-responses")]
     fn pin_all_to_sha_noun(&self) -> deps_core::lsp_helpers::PinNoun {
-        deps_core::lsp_helpers::PinNoun {
-            singular: "action",
-            plural: "actions",
-        }
+        let (singular, plural) = self.flavor().pin_noun();
+        deps_core::lsp_helpers::PinNoun { singular, plural }
+    }
+}
+
+fn actions_completion_insert_text(metadata: &dyn deps_core::Metadata) -> Option<String> {
+    let name = metadata.name();
+    let latest = metadata.latest_version().as_str();
+    // Unreachable today since `search()` always returns `Ok(vec![])`; kept total in case
+    // package-name search is added. Plain `contains('/')`, matching pre-#722 behavior.
+    if !name.as_str().contains('/') {
+        deps_core::lsp_helpers::warn_rejected_value(
+            "owner/repo shape",
+            "github actions package name completion item",
+            name.as_str(),
+        );
+        return None;
+    }
+    if latest.is_empty() {
+        Some(name.as_str().to_string())
+    } else {
+        Some(format!("{}@{latest}", name.as_str()))
     }
 }
 
@@ -289,7 +321,13 @@ impl TypedEcosystem for GithubActionsEcosystem {
         content: &'a str,
         uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<GithubActionsParseResult>> {
-        Box::pin(async move { crate::parser::parse_workflow_yaml(content, uri) })
+        let flavor = self.flavor();
+        Box::pin(async move {
+            match flavor {
+                GitTagsFlavor::Actions => crate::parser::parse_workflow_yaml(content, uri),
+                GitTagsFlavor::PreCommit => crate::precommit::parse_precommit_config(content, uri),
+            }
+        })
     }
 
     /// Branch probes for partial tag refs and lineage/membership probes for commentless SHA
@@ -383,6 +421,7 @@ impl TypedEcosystem for GithubActionsEcosystem {
                 parsed.own_dependencies(),
                 severities.mutable_ref_pin,
                 &self.formatter.tag_index,
+                self.flavor(),
             ));
         }
         out.extend(git_tags_diagnostics(
@@ -465,20 +504,21 @@ impl TypedEcosystem for GithubActionsEcosystem {
     }
 }
 
-/// Whether line `line_number` of `content` is a workflow `uses:` step key (`uses:
-/// owner/repo@ref` or, as a sequence item, `- uses: owner/repo@ref`), for
-/// `deps-lsp`'s raw-text fallback completion (parse-failure path).
+/// Whether line `line_number` of `content` is the flavor's ref key (`uses:
+/// owner/repo@ref` or, as a sequence item, `- uses: owner/repo@ref`; `rev: <ref>` for
+/// pre-commit), for `deps-lsp`'s raw-text fallback completion (parse-failure path).
 ///
-/// A `uses:` step key can appear at any nesting depth in a workflow file
-/// (`jobs.*.steps[].uses`, `jobs.<id>.uses`), so unlike TOML/JSON/other-YAML
-/// ecosystems there is no enclosing section header to track — the target line itself
-/// is the only signal needed.
-fn is_in_dependencies_section(content: &str, line_number: usize) -> bool {
+/// The key can appear at any nesting depth, so unlike TOML/JSON/other-YAML ecosystems there
+/// is no enclosing section header to track — the target line itself is the only signal
+/// needed.
+fn is_in_dependencies_section(content: &str, line_number: usize, flavor: GitTagsFlavor) -> bool {
     content
         .lines()
         .nth(line_number)
         .map(str::trim_start)
-        .is_some_and(|trimmed| trimmed.starts_with("uses:") || trimmed.starts_with("- uses:"))
+        .map(|trimmed| trimmed.strip_prefix("- ").unwrap_or(trimmed))
+        .and_then(|line| line.strip_prefix(flavor.ref_key()))
+        .is_some_and(|rest| rest.starts_with(':'))
 }
 
 /// Extracts the fallback-completion prefix on `line` up to `character` — a bare
@@ -519,21 +559,33 @@ pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
 /// `taiki-e/install-action@cargo-deny`: see [`is_registry_confirmed_tag`]).
 /// `PinStyle::Sha` and a `PinStyle::Branch` `tag_index` cannot (yet) confirm produce no
 /// diagnostic (FR-003).
+///
+/// `flavor` picks which refs count as mutable: every tag for Actions, only a dotless non-hex
+/// rev for pre-commit (which flags a branch without needing the registry to confirm it).
 fn mutable_ref_pin_diagnostics(
     dependencies: &[GithubActionsDependency],
     severity: Severity,
     tag_index: &RepositoryIndexes,
+    flavor: GitTagsFlavor,
 ) -> Vec<Diagnostic> {
+    let policy = flavor.mutable_pin_policy();
     dependencies
         .iter()
         .filter_map(|gha_dep| {
-            if !is_registry_confirmed_tag(gha_dep, tag_index) {
+            let is_pin_candidate = match policy {
+                MutablePinPolicy::AllTags => is_registry_confirmed_tag(gha_dep, tag_index),
+                MutablePinPolicy::DotlessNonHex => {
+                    matches!(gha_dep.pin, Some(PinStyle::Tag | PinStyle::Branch))
+                }
+            };
+            if !is_pin_candidate {
                 return None;
             }
             let ref_text = gha_dep
                 .version_req
                 .as_ref()
-                .map(deps_core::VersionReq::as_str)?;
+                .map(deps_core::VersionReq::as_str)
+                .filter(|ref_text| policy.is_mutable_ref(ref_text))?;
             let fix = if is_sha_pinnable_tag(gha_dep) {
                 FixAvailability::Automated
             } else {
@@ -541,7 +593,7 @@ fn mutable_ref_pin_diagnostics(
             };
             Some(
                 MutableRefPin::Ref {
-                    subject: PinSubject::GithubAction,
+                    subject: flavor.pin_subject(),
                     name: &gha_dep.name,
                     anchor: gha_dep.version_range?,
                     ref_text,
@@ -1366,14 +1418,26 @@ mod tests {
     #[test]
     fn test_is_in_dependencies_section_uses_line() {
         let content = "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n";
-        assert!(is_in_dependencies_section(content, 3));
-        assert!(!is_in_dependencies_section(content, 0));
+        assert!(is_in_dependencies_section(
+            content,
+            3,
+            GitTagsFlavor::Actions
+        ));
+        assert!(!is_in_dependencies_section(
+            content,
+            0,
+            GitTagsFlavor::Actions
+        ));
     }
 
     #[test]
     fn test_is_in_dependencies_section_composite_action_uses() {
         let content = "runs:\n  using: composite\n  steps:\n    - uses: actions/setup-node@v4\n";
-        assert!(is_in_dependencies_section(content, 3));
+        assert!(is_in_dependencies_section(
+            content,
+            3,
+            GitTagsFlavor::Actions
+        ));
     }
 
     struct MockMetadata {
@@ -1421,6 +1485,98 @@ mod tests {
             latest_version: "v4.1.1".into(),
         };
         assert!(eco.completion_insert_text(&meta).is_none());
+    }
+
+    fn precommit_ecosystem() -> GithubActionsEcosystem {
+        let registry = Arc::new(GithubActionsRegistry::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
+        GithubActionsEcosystem::with_registry(registry, GitTagsFlavor::PreCommit)
+    }
+
+    #[test]
+    fn test_completion_insert_text_is_none_for_precommit() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("psf/black"),
+            latest_version: "24.1.0".into(),
+        };
+        assert!(
+            precommit_ecosystem()
+                .completion_insert_text(&meta)
+                .is_none()
+        );
+    }
+
+    mod sha_comment_style {
+        use super::*;
+        use crate::precommit::parse_precommit_config;
+        use deps_core::lsp_helpers::{CommitSha, DependencyFormatter, TagIndex};
+
+        const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEW: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        fn rewritten(flavor: GitTagsFlavor, written_comment: &str) -> String {
+            let registry = Arc::new(GithubActionsRegistry::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let eco = GithubActionsEcosystem::with_registry(registry, flavor);
+            let index = TagIndex::from_tags([("v2.0.0", &CommitSha::parse(NEW).unwrap())]);
+            eco.formatter
+                .tag_index
+                .insert(deps_core::PackageName::new("psf/black"), Arc::new(index));
+            let content = format!(
+                "repos:\n  - repo: https://github.com/psf/black\n    rev: {OLD} # {written_comment}v1.0.0\n"
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.pre-commit-config.yaml");
+            let parsed = parse_precommit_config(&content, &uri).unwrap();
+            eco.formatter.format_version_replacing_for(
+                &parsed.dependencies[0],
+                &deps_core::ConcreteVersion::new("v2.0.0"),
+                "",
+            )
+        }
+
+        #[test]
+        fn frozen_comment_stays_frozen_on_rewrite() {
+            assert_eq!(
+                rewritten(GitTagsFlavor::PreCommit, "frozen: "),
+                format!("{NEW} # frozen: v2.0.0")
+            );
+        }
+
+        #[test]
+        fn bare_comment_stays_bare_on_rewrite() {
+            assert_eq!(
+                rewritten(GitTagsFlavor::PreCommit, ""),
+                format!("{NEW} # v2.0.0")
+            );
+        }
+
+        #[test]
+        fn new_sha_pin_gets_the_flavor_default_style() {
+            let sha = CommitSha::parse(NEW).unwrap();
+            for (flavor, expected) in [
+                (GitTagsFlavor::Actions, format!("{NEW} # v2.0.0")),
+                (GitTagsFlavor::PreCommit, format!("{NEW} # frozen: v2.0.0")),
+            ] {
+                let registry = Arc::new(GithubActionsRegistry::new(Arc::new(
+                    deps_core::HttpCache::new(),
+                )));
+                let eco = GithubActionsEcosystem::with_registry(registry, flavor);
+                let index = TagIndex::from_tags([("v2.0.0", &sha)]);
+                eco.formatter
+                    .tag_index
+                    .insert(deps_core::PackageName::new("psf/black"), Arc::new(index));
+                assert_eq!(
+                    eco.formatter.sha_pin_replacement_for(
+                        &deps_core::PackageName::new("psf/black"),
+                        "v2.0.0"
+                    ),
+                    Some(expected),
+                    "{flavor:?}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "lsp-responses")]

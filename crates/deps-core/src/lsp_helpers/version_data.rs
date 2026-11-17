@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+use super::exemption::OperatorExemptions;
 #[cfg(all(doc, feature = "lsp-responses"))]
 use super::generate_hover;
 use super::in_use_version::CachedList;
@@ -404,6 +405,9 @@ pub struct VersionData<'a> {
     /// [`generate_diagnostics_from_cache`] after each dependency's rules run. `None` means no
     /// rule is configured.
     pub suppression: Option<&'a SuppressionSet>,
+    /// Operator-supplied advisory exemptions (#1964), read only by the vulnerability
+    /// diagnostics rule. `None` and an empty set behave identically: nothing is hidden.
+    pub advisory_exemptions: Option<&'a OperatorExemptions>,
 }
 
 impl<'a> VersionData<'a> {
@@ -443,6 +447,7 @@ impl<'a> VersionData<'a> {
             candidate_status: None,
             interactive_fetch: None,
             suppression: None,
+            advisory_exemptions: None,
         }
     }
 
@@ -832,6 +837,27 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_suppression(mut self, suppression: &'a SuppressionSet) -> Self {
         self.suppression = Some(suppression);
+        self
+    }
+
+    /// Attaches the operator's advisory exemptions. See [`Self::advisory_exemptions`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use deps_core::lsp_helpers::exemption::OperatorExemptions;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let exemptions = OperatorExemptions::none();
+    /// let versions = VersionData::new(&cached, &resolved).with_advisory_exemptions(&exemptions);
+    /// assert!(versions.advisory_exemptions.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_advisory_exemptions(mut self, exemptions: &'a OperatorExemptions) -> Self {
+        self.advisory_exemptions = Some(exemptions);
         self
     }
 

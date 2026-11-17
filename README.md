@@ -12,9 +12,9 @@
 Know whether a dependency is safe to bump — without leaving your editor. `deps-lsp` is a
 universal Language Server Protocol (LSP) server that brings hover, completion, diagnostics, and
 quick fixes for outdated, vulnerable, yanked, and unsatisfiable dependencies to any manifest file,
-across 14 package ecosystems: Cargo, npm, Deno, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift,
-Composer, NuGet, GitHub Actions, and GitLab CI/CD. One binary, no per-language extensions to
-install and keep in sync.
+across 15 package ecosystems: Cargo, npm, Deno, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift,
+Composer, NuGet, GitHub Actions, GitLab CI/CD, and pre-commit. One binary, no per-language
+extensions to install and keep in sync.
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -69,6 +69,7 @@ install and keep in sync.
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` |
 | YAML | GitHub Actions | `.github/workflows/*.yml`, `*.yaml`; `action.yml`, `action.yaml` |
 | YAML | GitLab CI/CD | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` |
+| YAML | pre-commit | `.pre-commit-config.yaml`, `.pre-commit-config.yml` |
 
 Coverage depth (custom registries, lock file support, pseudo-versions, and other per-ecosystem
 detail) is documented per ecosystem in the
@@ -113,7 +114,7 @@ cargo install --path crates/deps-lsp
 
 ### Building with fewer ecosystems
 
-All 14 ecosystems are enabled by default. Build with only the ones you need via Cargo feature
+All 15 ecosystems are enabled by default. Build with only the ones you need via Cargo feature
 flags, e.g. `cargo install deps-lsp --no-default-features --features "cargo,npm"` — the flag name
 always matches the ecosystem's row in the table above (`cargo`, `npm`, `pypi`, `go`, ...). See
 `crates/deps-lsp/Cargo.toml` for the full flag list.

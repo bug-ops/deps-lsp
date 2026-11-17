@@ -379,7 +379,8 @@ pub const fn bare_meaning(ecosystem: EcosystemId) -> BareMeaning {
         | EcosystemId::Swift
         | EcosystemId::Deno
         | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => BareMeaning::ExactPin,
+        | EcosystemId::GitlabCi
+        | EcosystemId::PreCommit => BareMeaning::ExactPin,
     }
 }
 

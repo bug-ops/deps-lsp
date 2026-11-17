@@ -519,6 +519,10 @@ pub struct ScanTarget {
     /// only via [`Self::with_siblings`].
     #[raw]
     sibling_coverage: SiblingCoverage,
+    /// Whether [`Self::version`] is the dependency's own version or a stand-in release. Set
+    /// only via [`Self::with_stand_in_primary`].
+    #[raw]
+    primary_role: PrimaryRole,
     /// Other lock-file entries satisfying the same requirement; an advisory affecting any of
     /// them affects the dependency (#1981). Set only via [`Self::with_lock_alternatives`].
     #[raw]
@@ -527,6 +531,19 @@ pub struct ScanTarget {
     /// [`Self::with_lock_alternatives`].
     #[raw]
     alternative_coverage: AlternativeCoverage,
+}
+
+/// Whether a [`ScanTarget`]'s primary version is the dependency's own version or a release
+/// tag standing in for a floating pin that is not itself queryable (#1719).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryRole {
+    /// The primary is the version in use.
+    Own,
+    /// The primary is the highest queryable full release on the commit a floating pin (`v4`)
+    /// resolves to, scanned because `v4` itself cannot be matched. Highest, so a fix is only
+    /// proposed when it lies above every release scanned. A match on it is attributed to that
+    /// release tag, exactly like a sibling-only match.
+    StandIn,
 }
 
 /// Whether a scan target's sibling release tags were read from a complete tag list.
@@ -647,9 +664,24 @@ impl ScanTarget {
             display_version,
             siblings: Vec::new(),
             sibling_coverage: SiblingCoverage::Complete,
+            primary_role: PrimaryRole::Own,
             lock_alternatives: Vec::new(),
             alternative_coverage: AlternativeCoverage::Complete,
         }
+    }
+
+    /// Marks the primary as a stand-in release for a floating pin that cannot be queried
+    /// itself, so [`crate::osv::OsvClient`] attributes a match on it to that release tag.
+    #[must_use]
+    pub const fn with_stand_in_primary(mut self) -> Self {
+        self.primary_role = PrimaryRole::StandIn;
+        self
+    }
+
+    /// Whether the primary is the dependency's own version or a stand-in release.
+    #[must_use]
+    pub const fn primary_role(&self) -> PrimaryRole {
+        self.primary_role
     }
 
     /// Attaches the lock-file entries of `versions` that also satisfy the dependency's
@@ -784,6 +816,7 @@ mod scan_target_debug_redaction_tests {
             display_version: ConcreteVersion::new("1.0.0"),
             siblings: Vec::new(),
             sibling_coverage: crate::osv::SiblingCoverage::Complete,
+            primary_role: crate::osv::PrimaryRole::Own,
             lock_alternatives: Vec::new(),
             alternative_coverage: crate::osv::AlternativeCoverage::Complete,
         },
@@ -834,6 +867,34 @@ pub enum VulnSeverity {
     /// a maintenance-status notice rather than a security finding — see
     /// `crate::osv::severity::classify`'s two-pass precedence (issue #1007).
     Informational,
+}
+
+impl VulnSeverity {
+    /// Whether an operator exemption may hide an advisory of this severity.
+    ///
+    /// Exhaustive on purpose: a new severity forces a decision here. Confirmed malware is
+    /// never exemptible.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::VulnSeverity;
+    ///
+    /// assert!(VulnSeverity::High.is_exemptible());
+    /// assert!(!VulnSeverity::Malicious.is_exemptible());
+    /// ```
+    #[must_use]
+    pub const fn is_exemptible(self) -> bool {
+        match self {
+            Self::Critical
+            | Self::High
+            | Self::Medium
+            | Self::Low
+            | Self::Unknown
+            | Self::Informational => true,
+            Self::Malicious => false,
+        }
+    }
 }
 
 /// A single vulnerability advisory, converted from OSV's wire format at the
@@ -1602,6 +1663,37 @@ impl DependencyVulnerabilities {
             advisories,
             ..self.clone()
         }
+    }
+
+    /// A copy without the advisories `exemptions` hides at `now`, plus the ids removed (sorted).
+    ///
+    /// The total is reduced only by fetched records that matched: records beyond the fetch cap
+    /// (or an at-least total) cannot be matched and stay in "+N more", so the overflow entry
+    /// keeps flagging them (fail closed).
+    #[must_use]
+    pub(crate) fn without_exempted(
+        &self,
+        exemptions: &crate::lsp_helpers::exemption::OperatorExemptions,
+        now: crate::PublishTime,
+    ) -> (Self, Vec<OsvId>) {
+        let (exempted, kept): (Vec<_>, Vec<_>) = self
+            .advisories
+            .items()
+            .iter()
+            .cloned()
+            .partition(|a| exemptions.exempts(a, now));
+        let mut ids: Vec<OsvId> = exempted.iter().map(|a| a.id().clone()).collect();
+        ids.sort();
+        let mut advisories =
+            Capped::new(kept, self.advisories.total().saturating_sub(exempted.len()));
+        advisories.bound = self.advisories.bound;
+        (
+            Self {
+                advisories,
+                ..self.clone()
+            },
+            ids,
+        )
     }
 
     /// Attaches the independent verification of the recommended fix target. See

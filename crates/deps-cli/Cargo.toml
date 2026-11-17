@@ -36,6 +36,7 @@ default = [
     "deno",
     "github-actions",
     "gitlab-ci",
+    "pre-commit",
 ]
 cargo = ["deps-engine/cargo"]
 npm = ["deps-engine/npm"]
@@ -50,6 +51,7 @@ composer = ["deps-engine/composer"]
 nuget = ["deps-engine/nuget"]
 github-actions = ["deps-engine/github-actions"]
 gitlab-ci = ["deps-engine/gitlab-ci"]
+pre-commit = ["deps-engine/pre-commit"]
 # Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it) even when
 # the "npm" feature itself is disabled — mirrors deps-lsp/deps-engine's identical carve-out.
 deno = ["deps-engine/deno"]
@@ -98,6 +100,9 @@ deps-core = { workspace = true, features = ["test-util"] }
 # tag-index-backed formatter used by `update::security`'s #1779 end-to-end tests.
 deps-engine = { workspace = true, features = ["test-util", "cargo", "github-actions"] }
 dashmap = { workspace = true }
+# `tests/cross_major_siblings.rs` drives the real GitHub Actions fetch pipeline against a mock
+# GitHub API (`GithubActionsEcosystem::for_test`); dev-only.
+deps-github-actions = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonschema = { workspace = true }
 # `check_integration.rs`'s `gossip_prefetch_wiring_regression` module (issue #1521 item 2) —

@@ -4,6 +4,7 @@ use deps_core::HttpCache;
 use deps_core::NormalizeName;
 use deps_core::lockfile::LockFileCache;
 use deps_core::lsp_helpers::InteractiveFetchGate;
+use deps_core::lsp_helpers::exemption::OperatorExemptions;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::policy_config::{
@@ -17,7 +18,7 @@ use deps_core::{
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
@@ -1182,6 +1183,10 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.license_policy`.
     license_policy: RwLock<Arc<LicensePolicy>>,
+    /// Operator advisory exemptions (#1964, spec 101), loaded once in `initialize` from the
+    /// user config directory and never reloaded: a change needs a server restart. Unset (and
+    /// read as no exemptions) until then.
+    advisory_exemptions: OnceLock<Arc<OperatorExemptions>>,
     /// Live-updatable `policy.typosquat.enabled` setting (issue #1437), mirroring
     /// `license_policy`'s own rationale: read unconditionally by
     /// `handlers::diagnostics::generate_diagnostics_internal` on every diagnostics
@@ -1419,6 +1424,7 @@ impl ServerState {
             scm_to_registry,
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
+            advisory_exemptions: OnceLock::new(),
             typosquat_checks: AtomicToggle::new(default_policy.typosquat_checks()),
             gossip_checks: AtomicToggle::new(default_policy.gossip_checks()),
             osv_checks: AtomicToggle::new(default_policy.osv_checks()),
@@ -1526,6 +1532,19 @@ impl ServerState {
             .license_policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
+    }
+
+    /// The operator's advisory exemptions: none until [`Self::set_advisory_exemptions`] ran.
+    pub fn advisory_exemptions(&self) -> Arc<OperatorExemptions> {
+        self.advisory_exemptions
+            .get()
+            .map_or_else(|| Arc::new(OperatorExemptions::none()), Arc::clone)
+    }
+
+    /// Fixes the operator's advisory exemptions for the server's lifetime; only the first call
+    /// takes effect (`initialize` runs once per process).
+    pub fn set_advisory_exemptions(&self, exemptions: Arc<OperatorExemptions>) {
+        let _ = self.advisory_exemptions.set(exemptions);
     }
 
     /// Returns the typosquat-similarity gate as of the last applied config (issue #1437).

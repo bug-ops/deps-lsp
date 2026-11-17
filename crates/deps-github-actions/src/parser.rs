@@ -21,15 +21,15 @@
 
 use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle, ShaComment};
 use deps_core::lsp_helpers::{
-    CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range, read_sha_pin_tail,
-    ref_is_last_on_line, warn_rejected_value,
+    CommentStyle, CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range,
+    read_sha_pin_tail, ref_is_last_on_line, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
 use deps_core::{DepsError, Range, Result};
 use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
-use yaml_rust2::scanner::Marker;
+use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 /// Re-exported so existing `crate::parser::is_full_sha`/`is_tag_shaped` call sites
 /// (`ecosystem.rs`, `formatter.rs`) keep working after the #472/GitLab-CI-plan §6.1
@@ -232,6 +232,96 @@ impl MarkedEventReceiver for WorkflowReceiver {
     }
 }
 
+/// Where a pinned `owner/repo` ref sits in a manifest, as both the workflow and the pre-commit
+/// parser find it.
+pub(crate) struct RefSite<'a> {
+    pub(crate) content: &'a str,
+    pub(crate) line_table: &'a LineOffsetTable,
+    pub(crate) name: String,
+    pub(crate) name_range: Range,
+    pub(crate) ref_text: String,
+    /// Byte offset of the ref's first character.
+    pub(crate) ref_start: usize,
+    /// 1-indexed line of the ref.
+    pub(crate) line: usize,
+    pub(crate) style: TScalarStyle,
+    pub(crate) is_plain_scalar: bool,
+    /// SHA pin comment spellings the manifest family reads.
+    pub(crate) accepted_comments: &'a [CommentStyle],
+}
+
+/// Classifies `site`'s ref as a SHA (with or without comment), tag or branch pin.
+// Offsets build on `ref_start`, a char-boundary-aligned start, plus whole-substring byte
+// counts; `range_end` comes from `read_sha_pin_tail`, which clamps it to a char boundary.
+#[allow(clippy::string_slice)]
+pub(crate) fn build_ref_dependency(site: &RefSite<'_>) -> GithubActionsDependency {
+    let RefSite {
+        content,
+        line_table,
+        ref_start,
+        ..
+    } = *site;
+    let ref_end = ref_start + site.ref_text.len();
+    let make_range =
+        |start: usize, end: usize| -> Range { byte_span_to_range(content, line_table, start, end) };
+    // Computed for every ref-pinned form, not just SHA-with-comment below, since
+    // `sha_pin_text_edit_for` needs it for `PinStyle::Tag` too — a flow-style step
+    // has real YAML content after the ref that a trailing `# <tag>` would swallow
+    // (#633).
+    let is_last_on_line = ref_is_last_on_line(content, line_table, ref_end, site.line);
+    let dependency =
+        |version_req: String, version_range: Range, pin: PinStyle| GithubActionsDependency {
+            name: site.name.clone().into(),
+            name_range: site.name_range,
+            version_req: Some(version_req.into()),
+            version_range: Some(version_range),
+            pin: Some(pin),
+            source: DependencySource::Registry,
+            is_plain_scalar: site.is_plain_scalar,
+            is_last_on_line,
+        };
+
+    if let Some(sha) = CommitSha::parse(&site.ref_text) {
+        let read = read_sha_pin_tail(
+            content,
+            line_table,
+            ref_end,
+            site.line,
+            site.style,
+            site.is_plain_scalar,
+            site.accepted_comments,
+        );
+        return match read.tail {
+            ShaPinTail::Commented(pin_comment) => {
+                let tag = pin_comment.tag.as_str().to_string();
+                let comment_end = read.range_end;
+                let comment =
+                    ShaComment::new(pin_comment, content[ref_start..comment_end].to_string());
+                dependency(
+                    tag,
+                    make_range(ref_start, comment_end),
+                    PinStyle::Sha {
+                        sha,
+                        comment: Some(comment),
+                    },
+                )
+            }
+            ShaPinTail::Bare(_) => dependency(
+                site.ref_text.clone(),
+                make_range(ref_start, ref_end),
+                PinStyle::Sha { sha, comment: None },
+            ),
+        };
+    }
+
+    let pin = if is_tag_shaped(&site.ref_text) {
+        PinStyle::Tag
+    } else {
+        PinStyle::Branch
+    };
+    dependency(site.ref_text.clone(), make_range(ref_start, ref_end), pin)
+}
+
 /// Builds a [`GithubActionsDependency`] for one `uses:` candidate, or `None` if its
 /// `owner/repo` prefix does not look like a GitHub identifier (logged and skipped, FR-015).
 // `ref_start`/`ref_end` build on `span_start`, which is char-boundary-aligned (see the trim
@@ -311,7 +401,6 @@ fn build_dependency(
             // Not `name_end + 1`: `name` truncates at the second `/`, but `@` sits after
             // the full pre-`@` path — using `name_end` would shift every ref offset (critic S1).
             let ref_start = span_start + before_at_len + 1; // skip the '@'
-            let ref_end = ref_start + ref_text.len();
             let name_range = make_range(span_start, name_end);
 
             if is_reusable_workflow {
@@ -329,72 +418,18 @@ fn build_dependency(
                 });
             }
 
-            // Computed for every ref-pinned form, not just SHA-with-comment below, since
-            // `sha_pin_text_edit_for` needs it for `PinStyle::Tag` too — a flow-style step
-            // has real YAML content after the ref that a trailing `# <tag>` would swallow
-            // (#633).
-            let is_last_on_line =
-                ref_is_last_on_line(content, line_table, ref_end, candidate.line());
-
-            if let Some(sha) = CommitSha::parse(&ref_text) {
-                let read = read_sha_pin_tail(
-                    content,
-                    line_table,
-                    ref_end,
-                    candidate.line(),
-                    candidate.style(),
-                    is_plain_scalar,
-                );
-                return Some(match read.tail {
-                    ShaPinTail::Commented(pin_comment) => {
-                        let tag = pin_comment.tag.as_str().to_string();
-                        let comment_end = read.range_end;
-                        let comment = ShaComment::new(
-                            pin_comment,
-                            content[ref_start..comment_end].to_string(),
-                        );
-                        GithubActionsDependency {
-                            name: name.into(),
-                            name_range,
-                            version_req: Some(tag.into()),
-                            version_range: Some(make_range(ref_start, comment_end)),
-                            pin: Some(PinStyle::Sha {
-                                sha,
-                                comment: Some(comment),
-                            }),
-                            source: DependencySource::Registry,
-                            is_plain_scalar,
-                            is_last_on_line,
-                        }
-                    }
-                    ShaPinTail::Bare(_) => GithubActionsDependency {
-                        name: name.into(),
-                        name_range,
-                        version_req: Some(ref_text.into()),
-                        version_range: Some(make_range(ref_start, ref_end)),
-                        pin: Some(PinStyle::Sha { sha, comment: None }),
-                        source: DependencySource::Registry,
-                        is_plain_scalar,
-                        is_last_on_line,
-                    },
-                });
-            }
-
-            let pin = if is_tag_shaped(&ref_text) {
-                PinStyle::Tag
-            } else {
-                PinStyle::Branch
-            };
-            Some(GithubActionsDependency {
-                name: name.into(),
+            Some(build_ref_dependency(&RefSite {
+                content,
+                line_table,
+                name,
                 name_range,
-                version_req: Some(ref_text.into()),
-                version_range: Some(make_range(ref_start, ref_end)),
-                pin: Some(pin),
-                source: DependencySource::Registry,
+                ref_text,
+                ref_start,
+                line: candidate.line(),
+                style: candidate.style(),
                 is_plain_scalar,
-                is_last_on_line,
-            })
+                accepted_comments: CommentStyle::BARE_ONLY,
+            }))
         }
         ParsedUses::Malformed => {
             // Logs only the value's length, not the raw attacker-controlled text

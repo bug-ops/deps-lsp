@@ -24,6 +24,7 @@ related:
   - "[[076-cli-update-cooldown-fallback-no-lockfile/spec|076 CLI update cooldown fallback, no lockfile]]"
   - "[[072-deps-dev-gossip-signals/spec|072 deps.dev GOSSIP signals]]"
   - "[[094-lsp-per-package-diagnostic-suppression/spec|094 Per-package diagnostic suppression]]"
+  - "[[102-installer-level-cooldown-dart-swift/spec|102 Installer-level cooldown, Dart and Swift]]"
 ---
 
 # Feature: Honor the project's native package-manager release-age configuration
@@ -272,6 +273,7 @@ Each phase ships behind the same opt-out and updates `.local/testing/coverage.md
 - [[075-cli-update-cooldown-fallback/spec|075]], [[076-cli-update-cooldown-fallback-no-lockfile/spec|076]] — deps-cli update cooldown fallback and why a manifest-level exact pin was rejected
 - [[072-deps-dev-gossip-signals/spec|072]] — deps.dev GOSSIP cooldown signal
 - [[094-lsp-per-package-diagnostic-suppression/spec|094]] — `vulnerability` suppression rule and untrusted-repository threat model
+- [[102-installer-level-cooldown-dart-swift/spec|102]] — Dart and Swift have no native gate (verified 2026-11-17)
 - Issue #1569 (installer-level cooldown), #1964 (untrusted config must not hide advisories), #431 (Cargo registry config)
 - Cargo config reference: https://doc.rust-lang.org/beta/cargo/reference/config.html
 - Cargo cooldowns write-up (2026-10-20): https://socket.dev/blog/rust-cargo-cooldowns

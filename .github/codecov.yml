@@ -110,6 +110,10 @@ component_management:
       name: deps-nuget
       paths:
         - crates/deps-nuget/**
+    - component_id: deps-precommit
+      name: deps-precommit
+      paths:
+        - crates/deps-precommit/**
     - component_id: deps-pypi
       name: deps-pypi
       paths:

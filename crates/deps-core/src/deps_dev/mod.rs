@@ -299,7 +299,8 @@ const fn deps_dev_system(id: EcosystemId) -> Option<DepsDevSystem> {
         | EcosystemId::Swift
         | EcosystemId::Deno
         | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi => None,
+        | EcosystemId::GitlabCi
+        | EcosystemId::PreCommit => None,
     }
 }
 

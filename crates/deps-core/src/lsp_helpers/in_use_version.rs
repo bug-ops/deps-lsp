@@ -150,6 +150,7 @@ const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolic
         EcosystemId::Cargo => BareRequirementPolicy::AlwaysRange,
         EcosystemId::GithubActions
         | EcosystemId::GitlabCi
+        | EcosystemId::PreCommit
         | EcosystemId::Npm
         | EcosystemId::Composer
         | EcosystemId::Deno => BareRequirementPolicy::ConcreteIfFullVersion,
@@ -193,6 +194,7 @@ const fn plus_suffix_meaning(ecosystem: EcosystemId) -> PlusSuffixMeaning {
         EcosystemId::Cargo
         | EcosystemId::GithubActions
         | EcosystemId::GitlabCi
+        | EcosystemId::PreCommit
         | EcosystemId::Npm
         | EcosystemId::Composer
         | EcosystemId::Deno
@@ -916,6 +918,11 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     Some(ConcreteVersion::new("0.1.43"))
 /// );
 /// ```
+///
+/// A floating tag with no full release of its own (`@v4` on a commit tagged only `v4` and
+/// `v5.0.0`) has no in-use version: the release that stands in for it in an OSV scan
+/// ([`resolve_in_use_versions`]) is not what the pin names, so it is never reported here
+/// (#1684).
 pub fn resolve_in_use_version<F: DependencyFormatter>(
     dep: &F::Dep,
     key: &PackageKey,
@@ -934,6 +941,7 @@ pub fn resolve_in_use_version<F: DependencyFormatter>(
         AlternativeScope::PrimaryOnly,
         None,
     )
+    .filter(|versions| versions.primary_role() == crate::osv::PrimaryRole::Own)
     .map(InUseVersions::into_primary)
 }
 
@@ -953,6 +961,7 @@ pub struct InUseVersions {
     lock_alternatives: Vec<ConcreteVersion>,
     alternative_coverage: AlternativeCoverage,
     sibling_coverage: SiblingCoverage,
+    primary_role: crate::osv::PrimaryRole,
 }
 
 impl InUseVersions {
@@ -965,6 +974,7 @@ impl InUseVersions {
             lock_alternatives: Vec::new(),
             alternative_coverage: AlternativeCoverage::Complete,
             sibling_coverage: SiblingCoverage::Complete,
+            primary_role: crate::osv::PrimaryRole::Own,
         }
     }
 
@@ -977,6 +987,7 @@ impl InUseVersions {
             lock_alternatives: Vec::new(),
             alternative_coverage: AlternativeCoverage::Complete,
             sibling_coverage: SiblingCoverage::Truncated,
+            primary_role: crate::osv::PrimaryRole::Own,
         }
     }
 
@@ -989,6 +1000,7 @@ impl InUseVersions {
             lock_alternatives: Vec::new(),
             alternative_coverage: AlternativeCoverage::Complete,
             sibling_coverage: SiblingCoverage::NotYetIndexed,
+            primary_role: crate::osv::PrimaryRole::Own,
         }
     }
 
@@ -1015,6 +1027,7 @@ impl InUseVersions {
             lock_alternatives: Vec::new(),
             alternative_coverage: AlternativeCoverage::Complete,
             sibling_coverage,
+            primary_role: crate::osv::PrimaryRole::Own,
         }
     }
 
@@ -1045,6 +1058,13 @@ impl InUseVersions {
             alternative_coverage,
             ..Self::untagged(primary)
         }
+    }
+
+    /// Whether [`Self::primary`] is the version in use or a release standing in for a floating
+    /// pin that cannot be queried itself (#1719).
+    #[must_use]
+    pub const fn primary_role(&self) -> crate::osv::PrimaryRole {
+        self.primary_role
     }
 
     /// Whether [`Self::siblings`] was read from a complete tag list.
@@ -1268,14 +1288,14 @@ fn resolve_in_use_versions_scoped<F: DependencyFormatter>(
             pin,
             sibling_coverage,
         } => {
-            let primary = queryable_pin_version(&pin, ecosystem)?;
-            let siblings = queryable_siblings(&pin, ecosystem);
+            let (primary, siblings, primary_role) = scan_versions(&pin, ecosystem)?;
             Some(InUseVersions {
                 primary,
                 siblings,
                 lock_alternatives: Vec::new(),
                 alternative_coverage: AlternativeCoverage::Complete,
                 sibling_coverage: sibling_coverage.into(),
+                primary_role,
             })
         }
         PinResolution::Untagged
@@ -1293,6 +1313,29 @@ fn resolve_in_use_versions_scoped<F: DependencyFormatter>(
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
             .map(|v| InUseVersions::not_yet_indexed(ConcreteVersion::from(v))),
+    }
+}
+
+/// The primary and siblings a scan queries for `pin`.
+///
+/// A primary that is not queryable (a floating `v4`) falls back to the highest queryable
+/// release among the siblings the pin carries (its commit's full releases, #1719), the rest
+/// remaining siblings; `None` when there is none.
+fn scan_versions(
+    pin: &ResolvedPin,
+    ecosystem: EcosystemId,
+) -> Option<(
+    ConcreteVersion,
+    Vec<ConcreteVersion>,
+    crate::osv::PrimaryRole,
+)> {
+    use crate::osv::PrimaryRole;
+    let mut siblings = queryable_siblings(pin, ecosystem);
+    match queryable_pin_version(pin, ecosystem) {
+        Some(primary) => Some((primary, siblings, PrimaryRole::Own)),
+        None => siblings
+            .pop()
+            .map(|highest| (highest, siblings, PrimaryRole::StandIn)),
     }
 }
 
@@ -1344,7 +1387,7 @@ pub fn has_unqueryable_resolved_pin<F: DependencyFormatter>(
 ) -> bool {
     matches!(
         formatter.resolved_pin_version(dep),
-        PinResolution::Resolved { pin, .. } if queryable_pin_version(&pin, ecosystem).is_none()
+        PinResolution::Resolved { pin, .. } if scan_versions(&pin, ecosystem).is_none()
     )
 }
 
@@ -1806,6 +1849,33 @@ mod tests {
             &CaretFormatter,
             EcosystemId::GithubActions
         ));
+    }
+
+    /// #1719: a floating `v4` with full releases on its commit is scanned through the highest
+    /// one as a stand-in primary; with none it stays unqueryable.
+    #[test]
+    fn scan_versions_uses_highest_commit_release_as_stand_in_for_a_floating_pin() {
+        use crate::osv::PrimaryRole;
+
+        let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
+        let pin_for = |tags: &[&str]| {
+            let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
+            match index.floating_tag_resolution("v4") {
+                PinResolution::Resolved { pin, .. } => pin,
+                other => panic!("expected Resolved, got {other:?}"),
+            }
+        };
+
+        let (primary, siblings, role) = scan_versions(
+            &pin_for(&["v4", "v5.0.0", "v6.1.0"]),
+            EcosystemId::GithubActions,
+        )
+        .expect("full releases on the commit");
+        assert_eq!(primary.as_str(), "v6.1.0");
+        assert_eq!(siblings, [ConcreteVersion::new("v5.0.0")]);
+        assert_eq!(role, PrimaryRole::StandIn);
+
+        assert!(scan_versions(&pin_for(&["v4"]), EcosystemId::GithubActions).is_none());
     }
 
     #[test]

@@ -29,10 +29,10 @@ background, per-document pre-fetch mirroring the typosquat pre-fetch's design.
 - **Completion** gets its own, GOSSIP-free local cooldown baseline: every version
   candidate's relative-age label is badged (⏳) when it falls within the configured
   cooldown window, using the same locally-known publish timestamps completion already
-  collects. This works for all 14 ecosystems, including the six GOSSIP doesn't cover, and
+  collects. This works for all 15 ecosystems, including the seven GOSSIP doesn't cover, and
   needs no network call.
 
-Composer, GitHub Actions, GitLab CI/CD, Dart, Swift, and Deno have no
+Composer, GitHub Actions, GitLab CI/CD, pre-commit, Dart, Swift, and Deno have no
 [deps.dev](https://deps.dev) coverage — completion's local baseline still covers them,
 hover/diagnostics fall back to the local heuristic exactly as they did before this feature.
 

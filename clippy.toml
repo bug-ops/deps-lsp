@@ -26,3 +26,7 @@ await-holding-invalid-types = [
     { path = "dashmap::iter::Iter", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
     { path = "dashmap::iter::IterMut", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
 ]
+
+disallowed-methods = [
+    { path = "deps_core::lsp_helpers::exemption::ExemptionFile::from_command_line", reason = "only an operator-typed CLI argument may name an advisory-exemption file (#1964); never a path taken from a workspace" },
+]
