@@ -33,6 +33,9 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       workflows: ${{ steps.filter.outputs.workflows }}
       github_action: ${{ steps.filter.outputs.github_action }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+      manifests: ${{ steps.filter.outputs.manifests }}
+      benches: ${{ steps.filter.outputs.benches }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -51,6 +54,17 @@ jobs:
               - '.github/workflows/!(mdbook).{yml,yaml}'
             github_action:
               - 'crates/github-action/**'
+            fuzz:
+              - 'fuzz/**'
+              - 'crates/*/src/**/*parser*'
+              - 'crates/*/src/**/*lockfile*'
+              - 'crates/deps-core/src/json_ast*'
+            manifests:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '.github/Cross.toml'
+            benches:
+              - '**/benches/**'
 
   fmt:
     name: Format
@@ -61,13 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          channel: nightly
+          toolchain: nightly
           components: rustfmt
-          cache: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
@@ -81,12 +92,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: clippy
-          cache-extra-identifier: clippy
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -105,11 +119,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -121,20 +133,46 @@ jobs:
         run: cargo check --workspace
 
   feature-matrix:
-    name: Feature Matrix Check
+    name: Feature Matrix Check (${{ matrix.name }})
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        # `clippy` above only lints --all-features, which hides lints that only surface under a
+        # reduced feature set (#975); `--each-feature` is linear in feature count, not 2^n.
+        # `--keep-going` reports every failing slice in one run. One leg per crate so the
+        # slices run in parallel instead of summing on one runner.
+        include:
+          - name: workspace
+            # `--no-dev-deps` keeps this 15-crate sweep fast; crates below that need their
+            # test targets linted per feature get a dedicated `--all-targets` leg.
+            run: cargo hack clippy --workspace --each-feature --no-dev-deps --keep-going -- -D warnings
+          - name: deps-lsp
+            # #998/#1001: its `#[cfg(test)]` module and helpers must compile and lint clean
+            # under every reduced feature set.
+            run: cargo hack clippy -p deps-lsp --each-feature --all-targets --keep-going -- -D warnings
+          - name: deps-engine
+            # #1059: ~2000 lines of feature-gated test code moved here from deps-lsp.
+            run: cargo hack clippy -p deps-engine --each-feature --all-targets --keep-going -- -D warnings
+          - name: deps-cli
+            # #2018: tests assume specific ecosystems, so a missing `#[cfg(feature)]` gate fails
+            # `-D warnings` only under a reduced feature set.
+            run: cargo hack clippy -p deps-cli --each-feature --all-targets --keep-going -- -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: clippy
-          cache-extra-identifier: feature-matrix
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: feature-matrix-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -142,43 +180,7 @@ jobs:
           tool: cargo-hack
 
       - name: Check each feature individually
-        # `clippy` above only lints --all-features, which hides lints that only surface
-        # under a reduced feature set (issue #975) — `--each-feature` is linear in feature
-        # count (41 invocations here), not the 2^n a full --feature-powerset would cost.
-        # `cargo hack clippy` (not `check`) so this catches the same clippy-level lints as
-        # the `clippy` job, just per individual feature. `--no-dev-deps` keeps this
-        # workspace-wide sweep (15 crates) fast by skipping test-target compilation; deps-lsp
-        # is the one crate that needs its own dev-deps/test-target coverage per feature, so it
-        # gets a dedicated `--all-targets` step below instead of paying that cost here for
-        # every crate. `--keep-going` reports every failing slice in one run, not just the first.
-        run: cargo hack clippy --workspace --each-feature --no-dev-deps --keep-going -- -D warnings
-
-      - name: Check deps-lsp test compilation and lints across the feature matrix
-        # deps-lsp (issue #998, following #975's fix for lib/bin targets): its
-        # `#[cfg(test)]` module and test helpers must also compile, and lint clean, under
-        # every reduced feature set, not just under --all-features (#1001 fixed the
-        # remaining unused-import/dead-code warnings so this can run at the same
-        # `-D warnings` strictness as the workspace-wide `clippy` job above).
-        run: cargo hack clippy -p deps-lsp --each-feature --all-targets --keep-going -- -D warnings
-
-      - name: Check deps-engine test compilation and lints across the feature matrix
-        # deps-engine (issue #1059): the classification-layer extraction moved ~2000 lines
-        # of feature-gated test code out of deps-lsp (already covered by the step above) into
-        # this crate, which had no equivalent per-feature coverage — the workspace-wide
-        # `--no-dev-deps` sweep above skips test-target compilation entirely, so a
-        # feature-gated `#[cfg(feature = "...")]` import/module dropped or mis-scoped during a
-        # future move would compile clean under --all-features and still slip through review
-        # (exactly how a dropped `#[cfg(feature = "pypi")]` on deps-lsp's own `mod pypi_tests`
-        # was first caught for this crate's sibling). Mirrors the deps-lsp step immediately
-        # above at the same `-D warnings` strictness.
-        run: cargo hack clippy -p deps-engine --each-feature --all-targets --keep-going -- -D warnings
-
-      - name: Check deps-cli test compilation and lints across the feature matrix
-        # deps-cli (issue #2018): its integration tests and helpers assume specific ecosystems,
-        # so a missing `#[cfg(feature = "...")]` gate compiles clean under --all-features yet
-        # fails `-D warnings` (dead code, unused imports) under a reduced feature set — the
-        # workspace-wide `--no-dev-deps` sweep above never builds those test targets.
-        run: cargo hack clippy -p deps-cli --each-feature --all-targets --keep-going -- -D warnings
+        run: ${{ matrix.run }}
 
   feature-matrix-test:
     name: Feature Matrix Test (${{ matrix.name }})
@@ -233,11 +235,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache-extra-identifier: feature-matrix-test-${{ matrix.name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: feature-matrix-test-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack and cargo-nextest
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -307,11 +312,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache-extra-identifier: ecosystem-crate-test-${{ matrix.name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ecosystem-crate-test-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack and cargo-nextest
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -330,11 +338,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache-extra-identifier: doc-hygiene
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: doc-hygiene
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-machete
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -982,7 +993,7 @@ jobs:
           sarif_file: trivy-results.sarif
 
   test:
-    name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }})
+    name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }}${{ matrix.shards > 1 && format(' / shard {0}/{1}', matrix.shard, matrix.shards) || '' }})
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
@@ -990,27 +1001,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable]
-        include:
-          - os: ubuntu-latest
-            rust: beta
+        # Windows (the slowest leg) is split into 2 nextest partitions; the beta toolchain only
+        # runs outside PRs (push to main / weekly schedule).
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","rust":"stable","shard":1,"shards":1},{"os":"macos-latest","rust":"stable","shard":1,"shards":1},{"os":"windows-latest","rust":"stable","shard":1,"shards":2},{"os":"windows-latest","rust":"stable","shard":2,"shards":2}]' || '[{"os":"ubuntu-latest","rust":"stable","shard":1,"shards":1},{"os":"macos-latest","rust":"stable","shard":1,"shards":1},{"os":"windows-latest","rust":"stable","shard":1,"shards":2},{"os":"windows-latest","rust":"stable","shard":2,"shards":2},{"os":"ubuntu-latest","rust":"beta","shard":1,"shards":1}]') }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          channel: ${{ matrix.rust }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: ${{ matrix.rust }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test-${{ matrix.os }}-${{ matrix.rust }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: nextest
 
       - name: Run tests
-        run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
+        run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci ${{ matrix.shards > 1 && format('--partition count:{0}/{1}', matrix.shard, matrix.shards) || '' }}
 
       - name: Run redacting_debug_compile_fail (ignored for local speed, explicit in CI)
         # #[ignore]d in-crate for local speed (see the test's own module docs) — run explicitly
@@ -1027,7 +1039,7 @@ jobs:
         # because this is the first `-E '...'` filter expression in this file and the `windows-
         # latest` leg's default shell is `pwsh`, which quotes arguments differently; bash is
         # available on all 3 GitHub-hosted runner OSes.
-        if: '!cancelled()'
+        if: ${{ !cancelled() && matrix.shard == 1 && (github.event_name != 'pull_request' || (matrix.os == 'ubuntu-latest' && matrix.rust == 'stable')) }}
         shell: bash
         run: cargo nextest run --workspace --all-features -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only --profile ci --retries 0
 
@@ -1035,17 +1047,19 @@ jobs:
         # Same rationale and flags as the `redacting_debug_compile_fail` step above: the trybuild
         # test is `#[ignore]`d in-crate for local speed, so it is run explicitly here to keep
         # gating every PR.
-        if: '!cancelled()'
+        if: ${{ !cancelled() && matrix.shard == 1 && (github.event_name != 'pull_request' || (matrix.os == 'ubuntu-latest' && matrix.rust == 'stable')) }}
         shell: bash
         run: cargo nextest run --workspace --all-features -E 'test(probe_dependency_compile_fail)' --run-ignored ignored-only --profile ci --retries 0
 
       - name: Run doctests
+        if: matrix.shard == matrix.shards
         run: cargo test --workspace --doc --all-features
 
   test-aarch64-linux:
     name: Test (aarch64 Linux)
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    # Not on PRs; runs on main and schedule.
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true')
     # Native GitHub-hosted arm64 runner (#1358/#1359): catches Linux-arch-dependent constant/cfg
     # bugs (e.g. a hand-rolled O_NOFOLLOW value correct only on x86_64) that `cross-check`'s
     # build-only aarch64-unknown-linux-musl leg never runs a test binary for. Scoped to
@@ -1056,13 +1070,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          # Distinct from the default `test` job's implicit x86_64 cache key so this arm64
-          # runner never restores/saves a cache built for the wrong architecture.
-          cache-target: aarch64-unknown-linux-gnu
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test-aarch64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
@@ -1074,7 +1089,8 @@ jobs:
   cross-check:
     name: Cross-compile Check (${{ matrix.target }})
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    # Build-only legs: on PRs only when manifests or Cross.toml change; always on main and schedule.
+    if: ${{ (github.event_name != 'pull_request' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true')) || (github.event_name == 'pull_request' && needs.changes.outputs.manifests == 'true') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -1090,52 +1106,25 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             use_cross_tool: true
-          - os: ubuntu-latest
-            # 32-bit leg: gives `#[cfg(target_pointer_width = "32")]` fail-closed guards
-            # (e.g. crates/deps-core/src/xml_bounds.rs) a real 32-bit target to build
-            # and test against, since every other leg here is 64-bit. Built natively
-            # (gcc-multilib, no `cross`/Docker) rather than via musl-cross like the
-            # other Linux legs below: i686 binaries already run natively on this
-            # x86_64 runner (no QEMU needed either way), and glibc's multilib support
-            # lets the toolchain cross-compile directly, avoiding cross's musl-container
-            # apt-get/Docker overhead (see #815) for a leg that exists purely to
-            # exercise one guard. This leg alone also runs its test suite via
-            # `cargo nextest`, not just a build.
-            target: i686-unknown-linux-gnu
-            use_cross_tool: false
-            run_tests: true
-            native_multilib: true
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-          cache-target: ${{ matrix.target }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: cross-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cross
         if: matrix.use_cross_tool
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cross
-
-      # i686-unknown-linux-gnu builds natively on this x86_64 runner via glibc
-      # multilib support instead of `cross`/Docker (see the matrix comment above).
-      # gcc-multilib/libc6-dev-i386 provide the 32-bit C runtime and linker support
-      # rustc needs; cmake (for aws-lc-sys, pulled in transitively via reqwest's
-      # rustls/aws-lc-rs backend) already ships on the `ubuntu-latest` image.
-      - name: Install 32-bit multilib toolchain
-        if: matrix.native_multilib
-        run: sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386
-
-      - name: Install nextest
-        if: matrix.run_tests && matrix.native_multilib
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
-        with:
-          tool: nextest
 
       # `cross`'s `pre-build` steps for the musl targets (.github/Cross.toml) run `apt-get
       # update && apt-get install cmake` inside a fresh Docker image build on every
@@ -1191,30 +1180,55 @@ jobs:
             docker save $images -o "/tmp/cross-image-cache/${{ matrix.target }}.tar"
           fi
 
-      - name: Run tests for cross-compile target (exercises pointer-width guards)
-        # Native build (i686-unknown-linux-gnu, matrix.native_multilib) runs via
-        # `cargo nextest`, same as the main `test` job — nextest's per-test-process
-        # isolation avoids the shared-counter races that `deps_core::fs_probe`'s
-        # global stat/read counters (e.g. deps-gradle's
-        # test_load_gradle_properties_stats_exactly_once_per_ancestor) would otherwise
-        # hit under a single-process `cargo test`, so no `--test-threads=1` workaround
-        # is needed here.
-        if: matrix.run_tests && matrix.native_multilib
-        run: cargo nextest run --workspace --all-features --no-fail-fast --target ${{ matrix.target }}
+  test-i686:
+    name: Test (i686 Linux)
+    needs: changes
+    # 32-bit leg: gives `#[cfg(target_pointer_width = "32")]` fail-closed guards (e.g.
+    # crates/deps-core/src/xml_bounds.rs) a real 32-bit target to build and test against. Built
+    # natively via glibc multilib (no `cross`/Docker, see #815); i686 binaries run on x86_64.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Run redacting_debug_compile_fail for cross-compile target (ignored above, explicit here)
-        # Mirrors ci.yml's `test` job step of the same name: `#[ignore]`d in-crate for local
-        # speed, so it needs a dedicated `--run-ignored` invocation to still run here too — this
-        # is the exact leg `.config/nextest.toml`'s per-test slow-timeout override calls out
-        # ("cross-compilation (i686-unknown-linux-gnu)"), so dropping it here would silently
-        # stop testing the 32-bit pointer-width path this test exercises.
-        if: matrix.run_tests && matrix.native_multilib && !cancelled()
-        run: cargo nextest run --workspace --all-features -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only --target ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: i686-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: cross-i686-unknown-linux-gnu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install 32-bit multilib toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386
+
+      - name: Install nextest
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: nextest
+
+      - name: Build for i686
+        run: cargo build --workspace --target i686-unknown-linux-gnu
+
+      - name: Run tests (exercises pointer-width guards)
+        # nextest's per-test-process isolation avoids the shared-counter races that
+        # `deps_core::fs_probe`'s global stat/read counters would hit under `cargo test`.
+        run: cargo nextest run --workspace --all-features --no-fail-fast --target i686-unknown-linux-gnu
+
+      - name: Run redacting_debug_compile_fail for i686 (ignored above, explicit here)
+        # `#[ignore]`d in-crate for local speed; this is the 32-bit leg `.config/nextest.toml`'s
+        # slow-timeout override calls out, so dropping it would stop testing that path.
+        if: '!cancelled()'
+        run: cargo nextest run --workspace --all-features -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only --target i686-unknown-linux-gnu
 
   coverage:
     name: Code Coverage
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    # Not on PRs (duplicates the full `test` build, non-blocking upload); runs on main and schedule.
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true')
     runs-on: ubuntu-latest
     # Was 10: the job now does a second instrumented nextest pass (redacting_debug_compile_fail's
     # trybuild sandbox rebuild, slower under coverage instrumentation than natively) plus a
@@ -1224,9 +1238,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
@@ -1279,11 +1298,14 @@ jobs:
           MSRV=$(grep '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$MSRV" >> $GITHUB_OUTPUT
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          channel: ${{ steps.msrv.outputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check with MSRV
         run: cargo check --workspace --all-features
@@ -1291,15 +1313,21 @@ jobs:
   benchmark:
     name: Check Benchmarks
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    # On PRs only when benches or manifests change; always on main and schedule.
+    if: ${{ (github.event_name != 'pull_request' && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true')) || (github.event_name == 'pull_request' && (needs.changes.outputs.benches == 'true' || needs.changes.outputs.manifests == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: benchmark
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build benchmarks
         # `deps-core/test-util` is currently unified in for free via every ecosystem crate's
@@ -1315,19 +1343,16 @@ jobs:
     name: Build cargo-fuzz
     needs: changes
     # Same trigger condition as `fuzz` below: the weekly scheduled sweep always builds the
-    # tool it needs, and PR/push runs only build it when there's something to fuzz.
-    if: github.event_name == 'schedule' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    # tool it needs, and PR/push runs only build it when parser/lockfile/fuzz sources changed.
+    if: github.event_name == 'schedule' || needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          channel: nightly
-          cache: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: nightly
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
@@ -1370,7 +1395,7 @@ jobs:
     # because `changes.outputs.rust`/`workflows` reflect only the most recent commit's diff
     # (#701) — without this, a doc-only last commit on `main` would skip the entire weekly
     # regression sweep, not just report it quietly.
-    if: github.event_name == 'schedule' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    if: github.event_name == 'schedule' || needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: ${{ github.event_name != 'schedule' }}
@@ -1414,25 +1439,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          channel: nightly
-          cache: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: nightly
 
-      # `moonrepo/setup-rust`'s own caching (`cache-target`/`target-dirs`) saves/restores the
-      # raw `target/` directory verbatim, but its pre-save `cargo cache --autoclean` step
-      # deletes the extracted registry `src/` checkouts (keeping only the compressed `.crate`
-      # archives) to shrink the cache. On restore, cargo has to re-extract every dependency's
-      # source with a fresh mtime, which invalidates the mtime-based fingerprint checks in the
-      # restored `target/` dir and cascades into a full rebuild of the entire dependency graph
-      # (verified empirically: even foundational, unchanged crates like `proc-macro2` were
-      # recompiled after a confirmed cache hit and successful restore). `Swatinem/rust-cache`
-      # is the standard tool for this exact scenario — nested Cargo workspaces via
-      # `workspaces:`, one shared cache across matrix legs via `shared-key:` (they compile the
-      # same dependency tree; only the final fuzz-target binary differs) — and specifically
-      # designed to avoid the mtime-invalidation trap above.
+      # Swatinem/rust-cache (not a raw target/ cache) so restored registry sources keep valid
+      # mtimes; `shared-key` shares one cache across all matrix legs (same dependency tree).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz -> target
@@ -1498,11 +1510,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache-target: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         # Deliberately not --all-features: this must mirror the shipped binary's
@@ -1531,6 +1546,7 @@ jobs:
         test,
         test-aarch64-linux,
         cross-check,
+        test-i686,
         coverage,
         msrv,
         benchmark,
@@ -1569,6 +1585,7 @@ jobs:
           check_job "${{ needs.test.result }}" "test" || failed=1
           check_job "${{ needs.test-aarch64-linux.result }}" "test-aarch64-linux" || failed=1
           check_job "${{ needs.cross-check.result }}" "cross-check" || failed=1
+          check_job "${{ needs.test-i686.result }}" "test-i686" || failed=1
           check_job "${{ needs.coverage.result }}" "coverage" || failed=1
           check_job "${{ needs.msrv.result }}" "msrv" || failed=1
           check_job "${{ needs.benchmark.result }}" "benchmark" || failed=1
