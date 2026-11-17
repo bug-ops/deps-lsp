@@ -2,6 +2,7 @@
 //! repository-controlled files, so memory and time stay bounded on hostile input.
 
 #![allow(clippy::expect_used)]
+use std::assert_matches;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,10 +59,10 @@ fn repeated_names_merge_and_a_bare_name_wins() {
         ExemptionSyntax::Npm,
     )
     .expect("parses");
-    assert!(matches!(
+    assert_matches!(
         list.lookup("lodash"),
         Exemption::Versions(versions) if versions.len() == 2
-    ));
+    );
     assert_eq!(list.lookup("express"), Exemption::AllVersions);
 }
 

@@ -4,6 +4,7 @@
 //!
 //! Written tests-first; fixtures live in `tests/common/mod.rs`.
 
+use std::assert_matches;
 mod common;
 
 use common::{DAY, cooldown_of, ctx, hold_at_age, honor, label_of, parse_manifest, root, write};
@@ -33,7 +34,7 @@ fn minimum_release_age_is_read_in_seconds() {
     let (_g, root) = bun_repo(ONE_DAY_IN_SECONDS);
     let result = parse_manifest(&root, &[("lodash", "^4")], &honor());
     let cooldown = cooldown_of(&result, "lodash").expect("window applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::MinAge(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::MinAge(_));
     assert!(cooldown.to_string().contains("minimumReleaseAge"));
     assert_eq!(
         hold_at_age(&cooldown, "4.17.21", 3600),

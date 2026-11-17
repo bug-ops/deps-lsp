@@ -544,7 +544,7 @@ struct ConfigNotices {
 }
 
 impl Backend {
-    #[cfg(all(test, feature = "npm"))]
+    #[cfg(all(test, any(feature = "npm", feature = "gradle")))]
     pub(crate) const fn state(&self) -> &Arc<ServerState> {
         &self.state
     }

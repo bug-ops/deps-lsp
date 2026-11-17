@@ -6,6 +6,7 @@
 //! `PypiEcosystem::with_native_cooldown_toggle(Arc<AtomicToggle<NativeCooldownMode>>)`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use std::assert_matches;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,7 +81,7 @@ async fn assert_control_applies() {
     let cooldown = requests_window(&root, "exclude-newer = \"7 days\"")
         .await
         .expect("control: a valid window must resolve");
-    assert!(matches!(cooldown.limit(), NativeLimit::MinAge(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::MinAge(_));
 }
 
 #[tokio::test]
@@ -89,7 +90,7 @@ async fn timestamp_pins_a_fixed_cutoff_and_holds_newer_files_indefinitely() {
     let cooldown = requests_window(&root, "exclude-newer = \"2026-01-01T00:00:00Z\"")
         .await
         .expect("cutoff applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::PublishedAfter(_));
     assert!(cooldown.to_string().contains("exclude-newer"));
     let v = ConcreteVersion::new("2.32.0");
     let now = PublishTime::from_unix_secs(NOW);
@@ -164,14 +165,15 @@ async fn exclude_newer_package_overrides_the_global_value_for_that_package_only(
     let requests = cooldown_in(&eco, &root, "pyproject.toml", &content, "requests")
         .await
         .unwrap();
-    assert!(matches!(requests.limit(), NativeLimit::PublishedAfter(_)));
+    assert_matches!(requests.limit(), NativeLimit::PublishedAfter(_));
     assert!(requests.to_string().contains("exclude-newer-package"));
     assert!(requests.to_string().contains("requests"));
     let urllib3 = cooldown_in(&eco, &root, "pyproject.toml", &content, "urllib3")
         .await
         .unwrap();
-    assert!(
-        matches!(urllib3.limit(), NativeLimit::MinAge(_)),
+    assert_matches!(
+        urllib3.limit(),
+        NativeLimit::MinAge(_),
         "global still applies to others"
     );
 }
@@ -215,7 +217,7 @@ async fn invalid_per_package_value_falls_back_to_the_global_window() {
     let cooldown = requests_window(&root, tool_uv)
         .await
         .expect("global applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::MinAge(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::MinAge(_));
 }
 
 #[tokio::test]
@@ -228,8 +230,9 @@ async fn uv_toml_beats_pyproject_tool_uv_in_the_same_directory() {
     let cooldown = requests_window(&root, "exclude-newer = \"7 days\"")
         .await
         .expect("window");
-    assert!(
-        matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)),
+    assert_matches!(
+        cooldown.limit(),
+        NativeLimit::PublishedAfter(_),
         "uv.toml wins: got {cooldown}"
     );
 }
@@ -317,8 +320,9 @@ async fn workspace_member_reads_the_workspace_root_config_only() {
     let cooldown = cooldown_in(&eco, &member, "pyproject.toml", &member_content, "requests")
         .await
         .expect("root window applies to the member");
-    assert!(
-        matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)),
+    assert_matches!(
+        cooldown.limit(),
+        NativeLimit::PublishedAfter(_),
         "member's own [tool.uv] is ignored in a workspace, got {cooldown}"
     );
 }
@@ -341,7 +345,7 @@ async fn workspace_root_uv_toml_beats_root_pyproject_for_members() {
     let cooldown = cooldown_in(&eco, &member, "pyproject.toml", &member_content, "requests")
         .await
         .expect("root config applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::PublishedAfter(_));
 }
 
 #[tokio::test]
@@ -376,7 +380,7 @@ async fn closer_directory_config_wins_over_a_farther_one() {
     let cooldown = cooldown_in(&eco, &project, "pyproject.toml", content, "requests")
         .await
         .unwrap();
-    assert!(matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::PublishedAfter(_));
 }
 
 #[tokio::test]

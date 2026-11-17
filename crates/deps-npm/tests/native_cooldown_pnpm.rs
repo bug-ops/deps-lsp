@@ -4,6 +4,7 @@
 //!
 //! Written tests-first; fixtures live in `tests/common/mod.rs`.
 
+use std::assert_matches;
 mod common;
 
 use common::{
@@ -36,7 +37,7 @@ fn minimum_release_age_is_read_in_minutes() {
     let (_g, root) = pnpm_repo(ONE_DAY_IN_MINUTES);
     let result = parse_manifest(&root, &[("lodash", "^4")], &honor());
     let cooldown = cooldown_of(&result, "lodash").expect("window applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::MinAge(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::MinAge(_));
     let label = cooldown.to_string();
     assert!(
         label.contains("minimumReleaseAge") && label.contains("1440 minutes"),

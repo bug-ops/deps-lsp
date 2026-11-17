@@ -8,6 +8,7 @@
 //! all in `deps_core::native_cooldown`.
 
 #![allow(clippy::expect_used)]
+use std::assert_matches;
 
 use std::time::{Duration, Instant};
 
@@ -97,10 +98,7 @@ fn lookup_name_at_version_yields_versions_exemption_not_all() {
         ("lodash@4.17.21", ExemptionSyntax::Bun),
     ] {
         let l = list(&[entry], syntax);
-        assert!(
-            matches!(l.lookup("lodash"), Exemption::Versions(_)),
-            "{syntax:?}"
-        );
+        assert_matches!(l.lookup("lodash"), Exemption::Versions(_), "{syntax:?}");
         assert!(is_none(&l, "express"), "{syntax:?}");
     }
 }
@@ -109,17 +107,14 @@ fn lookup_name_at_version_yields_versions_exemption_not_all() {
 fn lookup_pnpm_and_bun_or_separated_versions_yield_versions_exemption() {
     for syntax in [ExemptionSyntax::Pnpm, ExemptionSyntax::Bun] {
         let l = list(&["foo@1.0.0 || 1.0.1"], syntax);
-        assert!(
-            matches!(l.lookup("foo"), Exemption::Versions(_)),
-            "{syntax:?}"
-        );
+        assert_matches!(l.lookup("foo"), Exemption::Versions(_), "{syntax:?}");
     }
 }
 
 #[test]
 fn lookup_scoped_name_at_version_splits_on_the_last_at_sign() {
     let l = list(&["@scope/pkg@1.2.3"], ExemptionSyntax::Pnpm);
-    assert!(matches!(l.lookup("@scope/pkg"), Exemption::Versions(_)));
+    assert_matches!(l.lookup("@scope/pkg"), Exemption::Versions(_));
     assert!(is_none(&l, "@scope/other"));
 }
 

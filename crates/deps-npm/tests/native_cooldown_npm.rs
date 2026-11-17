@@ -7,6 +7,7 @@
 //! (D5) and `20-32-28-architect`. Fixtures live in `tests/common/mod.rs`.
 
 #![allow(clippy::expect_used)]
+use std::assert_matches;
 
 mod common;
 
@@ -47,7 +48,7 @@ fn min_release_age_days_applies_to_registry_dependency() {
     let (_g, root) = npm_repo(SEVEN_DAYS);
     let result = parse_manifest(&root, &[("lodash", "^4.0.0")], &honor());
     let cooldown = cooldown_of(&result, "lodash").expect("window applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::MinAge(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::MinAge(_));
     assert_eq!(
         hold_at_age(&cooldown, "4.17.21", DAY),
         Some(NativeHold::For(6 * DAY as u64))
@@ -87,7 +88,7 @@ fn before_alone_pins_a_cutoff_and_holds_newer_versions_indefinitely() {
     let (_g, root) = npm_repo("before=2026-01-01T00:00:00Z\n");
     let result = parse_manifest(&root, &[("lodash", "^4.0.0")], &honor());
     let cooldown = cooldown_of(&result, "lodash").expect("before alone is a gate");
-    assert!(matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::PublishedAfter(_));
     let label = cooldown.to_string();
     assert!(label.contains("before"), "{label}");
     let newer = PublishTime::from_unix_secs(1_767_225_600 + 1);
@@ -122,7 +123,7 @@ fn before_wins_over_min_release_age_in_the_same_file() {
     let (_g, root) = npm_repo("min-release-age=7\nbefore=2026-01-01T00:00:00Z\n");
     let result = parse_manifest(&root, &[("lodash", "^4.0.0")], &honor());
     let cooldown = cooldown_of(&result, "lodash").expect("window applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::PublishedAfter(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::PublishedAfter(_));
 }
 
 #[test]
@@ -130,7 +131,7 @@ fn malformed_before_falls_back_to_min_release_age() {
     let (_g, root) = npm_repo("min-release-age=7\nbefore=not-a-date\n");
     let result = parse_manifest(&root, &[("lodash", "^4.0.0")], &honor());
     let cooldown = cooldown_of(&result, "lodash").expect("min-release-age still applies");
-    assert!(matches!(cooldown.limit(), NativeLimit::MinAge(_)));
+    assert_matches!(cooldown.limit(), NativeLimit::MinAge(_));
 }
 
 #[test]
