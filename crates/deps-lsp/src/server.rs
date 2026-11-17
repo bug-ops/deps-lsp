@@ -576,7 +576,7 @@ impl Backend {
     }
 
     /// Points the advisory exemption lookup at `dir` instead of the user's config directory.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     fn with_exemption_config_dir(mut self, dir: deps_core::config_trust::OperatorPath) -> Self {
         self.exemption_config_dir = Some(dir);
         self

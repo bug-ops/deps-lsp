@@ -437,6 +437,7 @@ impl<'a> ExemptionCheck<'a> {
     }
 
     /// Whether `advisory` is exempted at this check's instant.
+    #[cfg(any(test, feature = "lsp-responses"))]
     pub(crate) fn exempts(&self, advisory: &Advisory) -> bool {
         self.exemptions.exempts(advisory, self.now)
     }
