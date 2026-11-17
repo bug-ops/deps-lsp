@@ -756,6 +756,9 @@ pub enum UnplannableReason {
     /// version is never distinguishable from a flagged one at write time, so neither is ever
     /// planned.
     LatestUnverified,
+    /// The cached `latest` is still inside the native package-manager publish-age window
+    /// (spec 099 Phase 1): explained, never proposed.
+    WithinNativeCooldown,
 }
 
 /// One [`crate::lsp_helpers::RequirementStatus::Outdated`] dependency's planning outcome.

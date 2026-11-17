@@ -5367,6 +5367,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7045,6 +7046,7 @@ mod tests {
                 )),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7104,6 +7106,7 @@ mod tests {
                 )),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7171,6 +7174,7 @@ mod tests {
                 )),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7242,6 +7246,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7395,6 +7400,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7457,6 +7463,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -7588,6 +7595,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         // The lock file resolves this dependency to exactly the flagged `latest`.
@@ -7685,6 +7693,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         // The lock file resolves this dependency to exactly the flagged `latest`.
@@ -7784,6 +7793,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         // The lock file resolves this dependency to an older version than the flagged latest.
@@ -8168,6 +8178,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -8236,6 +8247,7 @@ mod tests {
                 )),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -8302,6 +8314,7 @@ mod tests {
                 )),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -8351,6 +8364,7 @@ mod tests {
                 )),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -8404,6 +8418,7 @@ mod tests {
                 published_at: Some(published_at_at_boundary),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -8460,6 +8475,7 @@ mod tests {
                 published_at: Some(published_at_just_inside),
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let resolved_versions = HashMap::new();
@@ -9324,6 +9340,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             m
@@ -9380,6 +9397,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             m
@@ -9429,6 +9447,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             m
@@ -9484,6 +9503,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             m
@@ -9567,6 +9587,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             m
@@ -10410,6 +10431,7 @@ mod tests {
                 published_at: None,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
         let mut resolved_versions = HashMap::new();
@@ -11741,6 +11763,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -11797,6 +11820,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -11871,6 +11895,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -11944,6 +11969,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -12027,6 +12053,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -12096,6 +12123,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -12146,6 +12174,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -12245,6 +12274,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();
@@ -12310,6 +12340,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             let resolved_versions = HashMap::new();

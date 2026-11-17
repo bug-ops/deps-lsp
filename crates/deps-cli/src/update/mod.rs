@@ -289,6 +289,9 @@ pub enum SkipReason {
     /// package publishing faster than the cooldown window can still resolve via its fallback,
     /// provided one clears every guard.
     WithinFreshnessCooldown,
+    /// The package manager's own publish-age window holds back `latest` (spec 099 Phase 1):
+    /// explained and skipped, never an error (exit 0).
+    WithinNativeCooldown,
 }
 
 /// Why a `--security-only` candidate could not be fixed.
@@ -509,6 +512,14 @@ impl PlannedUpdateItem {
                 reason: SkipReason::WithinFreshnessCooldown,
                 ..
             } => "the selected update target was published within the freshness cooldown window",
+            Outcome::Skipped {
+                reason:
+                    SkipReason::WithinNativeCooldown
+                    | SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::WithinNativeCooldown,
+                    ),
+                ..
+            } => todo!("native cooldown skip note"),
             Outcome::RequiresLockfileUpdate { .. } => {
                 "declared requirement already admits the fix target; regenerate the lock file (see #1116)"
             }

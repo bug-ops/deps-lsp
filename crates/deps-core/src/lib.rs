@@ -174,6 +174,7 @@ pub mod lsp_helpers;
 pub mod macros;
 pub mod matched_spans;
 pub mod mtime_cache;
+pub mod native_cooldown;
 pub mod net_policy;
 pub mod netrc;
 pub mod osv;

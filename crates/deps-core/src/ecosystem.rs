@@ -651,6 +651,11 @@ pub trait Dependency: Send + Sync {
     /// Package name
     fn name(&self) -> &crate::PackageName;
 
+    /// The native package-manager publish-age window that applies to this dependency, if any.
+    fn native_cooldown(&self) -> Option<&crate::native_cooldown::NativeCooldown> {
+        None
+    }
+
     /// Range of the dependency name
     fn name_range(&self) -> Range;
 

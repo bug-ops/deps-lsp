@@ -4482,6 +4482,7 @@ mod tests {
                     published_at: None,
                     gossip_excluded_version: None,
                     cooldown_fallback: None,
+                    publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
             m

@@ -196,6 +196,22 @@ impl CargoParseContext {
         self.env = Arc::new(env);
         self
     }
+
+    /// Selects whether the native `min-publish-age` window is read (STUB: not wired yet).
+    #[must_use]
+    pub fn with_native_cooldown(self, mode: deps_core::policy_config::NativeCooldownMode) -> Self {
+        let _ = mode;
+        self
+    }
+
+    /// Test-only: treats `home` as the user home directory whose config is never read
+    /// (STUB: not wired yet).
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_user_home_for_test(self, home: deps_core::UserHome) -> Self {
+        let _ = home;
+        self
+    }
 }
 
 /// [`parse_cargo_toml`], but threading `ctx` through to alternate-registry resolution.

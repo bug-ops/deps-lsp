@@ -608,6 +608,7 @@ impl PolicyConfig {
         let FreshnessConfig {
             enabled: _,
             cooldown_secs: _,
+            honor_native_cooldown: _,
         } = new_freshness;
         let SupplyChainConfig { enabled: _ } = new_supply_chain;
         let NetworkConfig { offline: _ } = new_network;
@@ -1342,6 +1343,27 @@ pub struct FreshnessConfig {
         deserialize_with = "deserialize_cooldown_secs"
     )]
     pub cooldown_secs: u64,
+    /// Whether the package manager's own publish-age window is honored (explain-only).
+    #[serde(default, deserialize_with = "deserialize_native_cooldown_mode")]
+    pub honor_native_cooldown: NativeCooldownMode,
+}
+
+/// Whether native package-manager publish-age windows are honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NativeCooldownMode {
+    /// Read and apply the window.
+    #[default]
+    Honor,
+    /// Ignore the window entirely.
+    Ignore,
+}
+
+fn deserialize_native_cooldown_mode<'de, D>(deserializer: D) -> Result<NativeCooldownMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = deserializer;
+    todo!()
 }
 
 impl Default for FreshnessConfig {
@@ -1366,6 +1388,7 @@ impl FreshnessConfig {
         Self {
             enabled: true,
             cooldown_secs: default_cooldown_secs(),
+            honor_native_cooldown: NativeCooldownMode::Honor,
         }
     }
 

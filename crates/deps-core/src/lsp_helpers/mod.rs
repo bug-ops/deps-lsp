@@ -914,6 +914,9 @@ pub struct PackageVersions {
     /// freshness is disabled, no lockfile-resolved in-use version exists to floor the search
     /// (spec 075 OQ1), or no candidate passed every guard.
     pub cooldown_fallback: Option<CooldownFallback>,
+    /// Publish time of each entry of [`Self::available`], same order and length; empty when
+    /// unknown. Window-independent data read by the native publish-age gate.
+    pub publish_times: Arc<[Option<crate::freshness::PublishTime>]>,
 }
 
 impl PackageVersions {
@@ -948,6 +951,7 @@ impl PackageVersions {
             published_at: None,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            publish_times: Arc::from(Vec::new()),
         }
     }
 
@@ -971,6 +975,25 @@ impl PackageVersions {
     pub fn with_gossip_excluded_version(mut self, excluded: ConcreteVersion) -> Self {
         self.gossip_excluded_version = Some(excluded);
         self
+    }
+
+    /// Attaches per-version publish times. See [`Self::publish_times`].
+    #[must_use]
+    pub fn with_publish_times(
+        mut self,
+        publish_times: Arc<[Option<crate::freshness::PublishTime>]>,
+    ) -> Self {
+        self.publish_times = publish_times;
+        self
+    }
+
+    /// Publish time of `version`, indexed by its position in [`Self::available`].
+    #[must_use]
+    pub fn published_at_of(
+        &self,
+        _version: &ConcreteVersion,
+    ) -> Option<crate::freshness::PublishTime> {
+        todo!()
     }
 
     /// Attaches the computed cooldown-fallback candidate. See [`Self::cooldown_fallback`].
@@ -1013,6 +1036,7 @@ impl PackageVersions {
             published_at: None,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            publish_times: Arc::from(Vec::new()),
         }
     }
 
@@ -1039,6 +1063,7 @@ impl PackageVersions {
             published_at: None,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            publish_times: Arc::from(Vec::new()),
         }
     }
 }
