@@ -64,6 +64,14 @@ static ECOSYSTEMS: LazyLock<Vec<Arc<dyn Ecosystem>>> = LazyLock::new(|| {
                 EcosystemId::GithubActions => Arc::new(
                     deps_github_actions::GithubActionsEcosystem::new(Arc::clone(&cache)),
                 ),
+                EcosystemId::PreCommit => {
+                    Arc::new(deps_github_actions::GithubActionsEcosystem::with_registry(
+                        Arc::new(deps_github_actions::GithubActionsRegistry::new(Arc::clone(
+                            &cache,
+                        ))),
+                        deps_github_actions::GitTagsFlavor::PreCommit,
+                    ))
+                }
                 EcosystemId::GitlabCi => {
                     Arc::new(deps_gitlab_ci::GitlabCiEcosystem::new(Arc::clone(&cache)))
                 }

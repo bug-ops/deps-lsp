@@ -7,6 +7,7 @@
 #![cfg(feature = "test-util")]
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::path::{Path, PathBuf};
 
 use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
@@ -52,8 +53,9 @@ fn under_config_dir_absolute_xdg_inside_workspace_is_inside_workspace() {
 
     let lookup = ExemptionFile::under_config_dir(operator_path(&config), &roots(h.path(), [w]));
 
-    assert!(
-        matches!(lookup, UserConfigLookup::InsideWorkspace { .. }),
+    assert_matches!(
+        lookup,
+        UserConfigLookup::InsideWorkspace { .. },
         "{lookup:?}"
     );
 }
@@ -70,7 +72,7 @@ fn under_config_dir_filesystem_root_workspace_is_ignored() {
         &roots(h.path(), [PathBuf::from("/")]),
     );
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// (c) `cwd = $HOME` (Neovim default) must not refuse the operator's file.
@@ -85,7 +87,7 @@ fn under_config_dir_home_as_workspace_is_ignored() {
         &roots(h.path(), [h.path().to_path_buf()]),
     );
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// A root that is an ancestor of home is dropped for the same reason as `$HOME` itself.
@@ -103,7 +105,7 @@ fn under_config_dir_ancestor_of_home_as_workspace_is_ignored() {
     let lookup =
         ExemptionFile::under_config_dir(operator_path(&config), &roots(h.path(), [parent]));
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// (d) A sibling workspace below home does not contain the operator's config dir.
@@ -117,7 +119,7 @@ fn under_config_dir_sibling_workspace_is_located() {
 
     let lookup = ExemptionFile::under_config_dir(operator_path(&config), &roots(h.path(), [w]));
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// (e) The (a) layout with no file: `Absent`, decided before containment (no warning path).
@@ -130,7 +132,7 @@ fn under_config_dir_absent_file_inside_workspace_is_absent() {
 
     let lookup = ExemptionFile::under_config_dir(operator_path(&config), &roots(h.path(), [w]));
 
-    assert!(matches!(lookup, UserConfigLookup::Absent), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Absent, "{lookup:?}");
 }
 
 #[test]
@@ -144,7 +146,7 @@ fn under_config_dir_without_home_still_drops_filesystem_root() {
         &WorkspaceRoots::new([PathBuf::from("/")], None),
     );
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// A root that cannot be canonicalized is dropped, not treated as containing everything.
@@ -159,7 +161,7 @@ fn under_config_dir_nonexistent_workspace_root_is_dropped() {
         &roots(h.path(), [h.path().join("does-not-exist")]),
     );
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// Containment is component-wise: `/w/proj` does not contain `/w/proj-other/...`.
@@ -173,7 +175,7 @@ fn under_config_dir_prefix_sibling_is_not_contained() {
 
     let lookup = ExemptionFile::under_config_dir(operator_path(&config), &roots(h.path(), [w]));
 
-    assert!(matches!(lookup, UserConfigLookup::Located(_)), "{lookup:?}");
+    assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
 }
 
 /// The decision is made on the canonical path: a config dir that is a symlink into the
@@ -190,8 +192,9 @@ fn under_config_dir_symlink_into_workspace_is_inside_workspace() {
 
     let lookup = ExemptionFile::under_config_dir(operator_path(&link), &roots(h.path(), [w]));
 
-    assert!(
-        matches!(lookup, UserConfigLookup::InsideWorkspace { .. }),
+    assert_matches!(
+        lookup,
+        UserConfigLookup::InsideWorkspace { .. },
         "{lookup:?}"
     );
 }
@@ -239,9 +242,7 @@ proptest! {
         let lookup =
             ExemptionFile::under_config_dir(operator_path(&config), &roots(h.path(), [root]));
 
-        prop_assert!(
-            matches!(lookup, UserConfigLookup::InsideWorkspace { .. }),
-            "{lookup:?}"
-        );
+        let inside = matches!(lookup, UserConfigLookup::InsideWorkspace { .. });
+        prop_assert!(inside, "{lookup:?}");
     }
 }

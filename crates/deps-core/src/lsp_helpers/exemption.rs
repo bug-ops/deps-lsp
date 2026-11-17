@@ -415,6 +415,7 @@ impl OperatorExemptions {
 mod tests {
     use super::*;
     use crate::osv::VulnSeverity;
+    use std::assert_matches;
 
     fn advisory(id: &str, aliases: &[&str], severity: VulnSeverity) -> Advisory {
         Advisory::new(id.to_owned(), "2023-01-01T00:00:00Z".to_owned(), severity)
@@ -464,7 +465,7 @@ mod tests {
         let body = "[[advisory]]\nid = \"CVE-1\"\nreason = \"r\"\n[[advisory]]\nid = \"cve-1\"\nreason = \"r\"\n";
         std::fs::write(&path, body).expect("write");
         let result = OperatorExemptions::load(&ExemptionFile::for_test(path));
-        assert!(matches!(result, Err(ExemptionFileError::DuplicateId(_))));
+        assert_matches!(result, Err(ExemptionFileError::DuplicateId(_)));
     }
 
     #[test]

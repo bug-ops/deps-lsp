@@ -5,6 +5,7 @@
 #![cfg(feature = "test-util")]
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::path::{Path, PathBuf};
 
 use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
@@ -47,10 +48,7 @@ fn subfolder_workspace_of_a_git_repository_refuses_the_repository_file() {
 
     let found = lookup(h.path(), vec![app], &config);
 
-    assert!(
-        matches!(found, UserConfigLookup::InsideWorkspace { .. }),
-        "{found:?}"
-    );
+    assert_matches!(found, UserConfigLookup::InsideWorkspace { .. }, "{found:?}");
 }
 
 /// A repository top level at or above home is not a repository boundary.
@@ -65,7 +63,7 @@ fn git_directory_at_home_does_not_widen_the_workspace() {
 
     let found = lookup(h.path(), vec![w], &config);
 
-    assert!(matches!(found, UserConfigLookup::Located(_)), "{found:?}");
+    assert_matches!(found, UserConfigLookup::Located(_), "{found:?}");
 }
 
 /// A workspace outside any git repository keeps the opened folder as its only boundary.
@@ -79,7 +77,7 @@ fn workspace_without_a_git_repository_is_not_widened() {
 
     let found = lookup(h.path(), vec![w], &config);
 
-    assert!(matches!(found, UserConfigLookup::Located(_)), "{found:?}");
+    assert_matches!(found, UserConfigLookup::Located(_), "{found:?}");
 }
 
 /// A committed `deps-lsp` directory symlink in the workspace pointing outside it.
@@ -96,10 +94,7 @@ fn committed_directory_symlink_out_of_the_workspace_is_refused() {
 
     let found = lookup(h.path(), vec![w.clone()], &w.join(".config"));
 
-    assert!(
-        matches!(found, UserConfigLookup::InsideWorkspace { .. }),
-        "{found:?}"
-    );
+    assert_matches!(found, UserConfigLookup::InsideWorkspace { .. }, "{found:?}");
 }
 
 /// A committed file symlink in the workspace pointing outside it.
@@ -116,10 +111,7 @@ fn committed_file_symlink_out_of_the_workspace_is_refused() {
 
     let found = lookup(h.path(), vec![w.clone()], &w.join(".config"));
 
-    assert!(
-        matches!(found, UserConfigLookup::InsideWorkspace { .. }),
-        "{found:?}"
-    );
+    assert_matches!(found, UserConfigLookup::InsideWorkspace { .. }, "{found:?}");
 }
 
 #[cfg(unix)]

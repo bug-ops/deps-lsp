@@ -122,6 +122,7 @@ fn lockfile_filenames_are_empty_for_both_flavors() {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 #[test]
 fn pin_all_to_sha_noun_follows_the_flavor() {
     let actions = ecosystem(GitTagsFlavor::Actions).pin_all_to_sha_noun();

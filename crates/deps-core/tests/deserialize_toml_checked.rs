@@ -6,6 +6,7 @@
 
 use deps_core::parser::{TomlDeserializeError, deserialize_toml_checked};
 use serde::Deserialize;
+use std::assert_matches;
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -30,25 +31,19 @@ fn deserialize_toml_checked_accepts_valid_document() {
 #[test]
 fn deserialize_toml_checked_syntax_error_is_the_toml_variant() {
     let err = deserialize_toml_checked::<Sample>("name = ").expect_err("syntax error");
-    assert!(matches!(err, TomlDeserializeError::Toml(_)), "{err:?}");
+    assert_matches!(err, TomlDeserializeError::Toml(_), "{err:?}");
 }
 
 #[test]
 fn deserialize_toml_checked_unknown_field_is_the_deserialize_variant() {
     let err = deserialize_toml_checked::<Sample>("name = \"x\"\nextra = 1\n").expect_err("unknown");
-    assert!(
-        matches!(err, TomlDeserializeError::Deserialize(_)),
-        "{err:?}"
-    );
+    assert_matches!(err, TomlDeserializeError::Deserialize(_), "{err:?}");
 }
 
 #[test]
 fn deserialize_toml_checked_wrong_type_is_the_deserialize_variant() {
     let err = deserialize_toml_checked::<Sample>("name = 5\n").expect_err("type error");
-    assert!(
-        matches!(err, TomlDeserializeError::Deserialize(_)),
-        "{err:?}"
-    );
+    assert_matches!(err, TomlDeserializeError::Deserialize(_), "{err:?}");
 }
 
 #[test]

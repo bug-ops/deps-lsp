@@ -8,6 +8,7 @@
 #![allow(clippy::expect_used)]
 
 use deps_core::lsp_helpers::exemption::{ExemptionFile, ExemptionFileError, OperatorExemptions};
+use std::assert_matches;
 
 fn load_body(body: &str) -> Result<Option<OperatorExemptions>, ExemptionFileError> {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -30,7 +31,7 @@ fn assert_variant(result: Result<Option<OperatorExemptions>, ExemptionFileError>
 fn load_absent_file_is_none() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file = ExemptionFile::for_test(dir.path().join("advisory-exemptions.toml"));
-    assert!(matches!(OperatorExemptions::load(&file), Ok(None)));
+    assert_matches!(OperatorExemptions::load(&file), Ok(None));
 }
 
 #[test]
@@ -41,24 +42,24 @@ fn load_valid_entry_with_and_without_expiry_is_some() {
         entry("CVE-2099-0001", "tracked in JIRA-1")
     );
     // The second entry's `expires` lands in the second table because it follows its fields.
-    assert!(matches!(load_body(&body), Ok(Some(_))));
+    assert_matches!(load_body(&body), Ok(Some(_)));
 }
 
 #[test]
 fn load_reason_is_trimmed_before_validation() {
-    assert!(matches!(
+    assert_matches!(
         load_body(&entry("GHSA-aaaa-bbbb-cccc", "   padded   ")),
         Ok(Some(_))
-    ));
+    );
 }
 
 #[test]
 fn load_reason_of_exactly_500_chars_is_accepted() {
     let reason = "r".repeat(500);
-    assert!(matches!(
+    assert_matches!(
         load_body(&entry("GHSA-aaaa-bbbb-cccc", &reason)),
         Ok(Some(_))
-    ));
+    );
 }
 
 #[test]
@@ -139,7 +140,7 @@ fn many_entries(count: usize) -> String {
 
 #[test]
 fn load_1024_entries_is_accepted() {
-    assert!(matches!(load_body(&many_entries(1024)), Ok(Some(_))));
+    assert_matches!(load_body(&many_entries(1024)), Ok(Some(_)));
 }
 
 #[test]
