@@ -9,6 +9,8 @@ updates:
       time: "09:00"
       timezone: "Etc/GMT"
     open-pull-requests-limit: 10
+    cooldown:
+      default-days: 3
     labels:
       - "dependencies"
       - "rust"
@@ -47,6 +49,8 @@ updates:
       time: "09:00"
       timezone: "Etc/GMT"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
     labels:
       - "dependencies"
       - "github-actions"
@@ -66,6 +70,8 @@ updates:
       time: "09:00"
       timezone: "Etc/GMT"
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 3
     labels:
       - "dependencies"
       - "docker"
