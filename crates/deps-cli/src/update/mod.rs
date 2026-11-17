@@ -182,6 +182,18 @@ pub struct PlannedUpdateItem {
     /// release tags of the version's commit, the tags it matched (#1767). Never set for a
     /// `--security-only` row without a verified fix, which reports no verdict of its own.
     pub osv_sibling_match: Option<deps_core::lsp_helpers::SiblingMatchNote>,
+    /// The package manager's own publish-age hold that kept `latest` out of this item
+    /// (spec 099), set on [`SkipReason::WithinNativeCooldown`] items only.
+    pub native_hold: Option<NativeHoldNote>,
+}
+
+/// The native publish-age window that holds a package's `latest`, and how long until it clears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeHoldNote {
+    /// The configured window that excludes `latest`.
+    pub cooldown: deps_core::native_cooldown::NativeCooldown,
+    /// Seconds until `latest` becomes eligible.
+    pub eligible_in_secs: u64,
 }
 
 /// Why [`PlannedUpdateItem::cooldown_fallback`] is set (spec 075 FR-013) — mirrors
@@ -415,7 +427,15 @@ impl PlannedUpdateItem {
             gossip_excluded_version,
             cooldown_fallback,
             osv_sibling_match: None,
+            native_hold: None,
         }
+    }
+
+    /// Attaches the native publish-age hold ([`Self::native_hold`]).
+    #[must_use]
+    pub fn with_native_hold(mut self, native_hold: Option<NativeHoldNote>) -> Self {
+        self.native_hold = native_hold;
+        self
     }
 
     /// Attaches the sibling-tag attribution of this item's OSV verdict
@@ -519,7 +539,7 @@ impl PlannedUpdateItem {
                         deps_core::edit::UnplannableReason::WithinNativeCooldown,
                     ),
                 ..
-            } => todo!("native cooldown skip note"),
+            } => "the latest version is held back by the package manager's own publish-age window",
             Outcome::RequiresLockfileUpdate { .. } => {
                 "declared requirement already admits the fix target; regenerate the lock file (see #1116)"
             }
@@ -569,6 +589,18 @@ impl PlannedUpdateItem {
         }
         if let Some(note) = &self.osv_sibling_match {
             reason.push_str(&format!(" ({note})"));
+        }
+        if let Some(hold) = &self.native_hold {
+            match &self.outcome {
+                Outcome::Applied { .. } => {
+                    reason.push_str(&format!(" (inside {})", hold.cooldown));
+                }
+                _ => reason.push_str(&format!(
+                    " (excluded by {}; eligible in {})",
+                    hold.cooldown,
+                    deps_core::format_remaining_duration(hold.eligible_in_secs)
+                )),
+            }
         }
         reason
     }
@@ -632,6 +664,9 @@ fn resolve_cooldown_fallback_view(
     }
     let view = crate::analyze::cooldown_fallback_view(
         &analysis.cached_versions,
+        &analysis.resolved_versions,
+        &analysis.resolved_version_candidates,
+        &deps_core::native_cooldown::native_cooldowns_by_name(analysis.parse_result.as_ref()),
         Some(&analysis.gossip_findings),
         freshness,
         now,
@@ -795,7 +830,8 @@ pub fn plan_updates(
             let mut fallback_version_data =
                 deps_core::VersionData::new(view, &analysis.resolved_versions)
                     .with_resolved_version_candidates(&analysis.resolved_version_candidates)
-                    .with_ecosystem(analysis.ecosystem_id);
+                    .with_ecosystem(analysis.ecosystem_id)
+                    .with_now(analysis.now);
             fallback_version_data = match analysis.fallback_status.as_ref() {
                 Some(fallback_status) => fallback_version_data.with_latest_status(fallback_status),
                 None if analysis.latest_status.is_some() => {
@@ -1239,15 +1275,43 @@ fn resolve_occurrence(
     }
 
     let package_versions = analysis.cached_versions.get(package_key.normalized());
+    let version_data = analysis.version_data();
+    let native_gate = dep.and_then(|dep| {
+        deps_core::native_cooldown::NativeGate::for_dependency(
+            dep.dependency(),
+            &package_key,
+            &version_data,
+        )
+    });
     let disposition = package_versions.map_or(CooldownDisposition::NotEvaluated, |versions| {
         cooldown_disposition(
             versions,
             package_key.normalized(),
             freshness,
             Some(&analysis.gossip_findings),
+            native_gate.as_ref(),
             now,
         )
     });
+    let native_hold_note = match (&disposition, &native_gate, package_versions) {
+        (CooldownDisposition::NativeHeld { cooldown, .. }, Some(gate), Some(versions)) => gate
+            .remaining(
+                versions.published_at_of(&versions.latest),
+                &versions.latest,
+                gate.now(),
+            )
+            .map(|eligible_in_secs| NativeHoldNote {
+                cooldown: (*cooldown).clone(),
+                eligible_in_secs,
+            }),
+        _ => None,
+    };
+    let hold_reason = match disposition {
+        CooldownDisposition::NativeHeld { .. } => SkipReason::WithinNativeCooldown,
+        CooldownDisposition::NotEvaluated
+        | CooldownDisposition::Cleared
+        | CooldownDisposition::Blocked { .. } => SkipReason::WithinFreshnessCooldown,
+    };
     let latest_is_osv_unplannable = matches!(
         &latest_candidate,
         UpdateCandidate::Unplannable {
@@ -1286,19 +1350,21 @@ fn resolve_occurrence(
         build(
             current,
             Outcome::Skipped {
-                reason: SkipReason::WithinFreshnessCooldown,
+                reason: hold_reason,
                 target,
             },
             Vec::new(),
             None,
         )
+        .with_native_hold(native_hold_note.clone())
     };
 
     match disposition {
         CooldownDisposition::NotEvaluated | CooldownDisposition::Cleared => {
             resolve_latest_only(latest_candidate)
         }
-        CooldownDisposition::Blocked { fallback: None, .. } => {
+        CooldownDisposition::Blocked { fallback: None, .. }
+        | CooldownDisposition::NativeHeld { fallback: None, .. } => {
             if latest_is_osv_unplannable {
                 // Row 5: never demoted by a routine cooldown pause.
                 resolve_latest_only(latest_candidate)
@@ -1312,6 +1378,10 @@ fn resolve_occurrence(
         // planner's — it only ever decides fallback-vs-latest, never which blocker to name.
         CooldownDisposition::Blocked {
             by: _,
+            fallback: Some(fallback),
+        }
+        | CooldownDisposition::NativeHeld {
+            cooldown: _,
             fallback: Some(fallback),
         } => {
             let latest_version = package_versions.map(|v| v.latest.clone());
@@ -2685,6 +2755,7 @@ mod tests {
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
                 osv_sibling_match: None,
+                native_hold: None,
             }],
         };
 
@@ -2723,6 +2794,7 @@ mod tests {
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
                 osv_sibling_match: None,
+                native_hold: None,
             }],
         };
 
@@ -2761,6 +2833,7 @@ mod tests {
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
                 osv_sibling_match: None,
+                native_hold: None,
             }],
         };
 
@@ -2796,6 +2869,7 @@ mod tests {
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
                 osv_sibling_match: None,
+                native_hold: None,
             }],
         };
 
@@ -2831,6 +2905,7 @@ mod tests {
             gossip_excluded_version: None,
             cooldown_fallback: None,
             osv_sibling_match: None,
+            native_hold: None,
         }
     }
 

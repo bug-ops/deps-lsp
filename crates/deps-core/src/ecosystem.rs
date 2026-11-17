@@ -997,7 +997,9 @@ impl UserHome {
         &self.raw
     }
 
-    fn is(&self, dir: &Path) -> bool {
+    /// Whether `dir` is this home directory, in either its raw or its canonical spelling.
+    #[must_use]
+    pub fn is(&self, dir: &Path) -> bool {
         self.raw == dir || self.canonical.as_deref() == Some(dir)
     }
 }

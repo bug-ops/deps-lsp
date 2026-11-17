@@ -276,6 +276,7 @@ fn applied_plan(range: Range, new_text: &str) -> UpdatePlan {
             gossip_excluded_version: None,
             cooldown_fallback: None,
             osv_sibling_match: None,
+            native_hold: None,
         }],
     }
 }

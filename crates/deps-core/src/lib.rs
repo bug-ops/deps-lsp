@@ -276,7 +276,8 @@ pub use error::{
     DepsError, ErrorOrigin, FetchFailure, ParseFailureKind, RateLimitEvidence, Result,
 };
 pub use freshness::{
-    CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age,
+    CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_duration_bucket,
+    format_relative_age, format_remaining_duration,
 };
 pub use interpolation::{
     MAX_INTERPOLATED_VALUE_BYTES, OversizedPropertyValue, PropertyValue, insert_bounded,

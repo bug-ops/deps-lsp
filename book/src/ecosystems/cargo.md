@@ -155,11 +155,72 @@ registry rather than requiring the document to be edited or reopened first
 (issue #592).
 
 **Known limitations**:
-- Editing `.cargo/config.toml` does not take effect until the affected `Cargo.toml`
-  is next reparsed (edited, or the document reopened) — there is no dedicated file
-  watcher for it yet.
+- Editing `.cargo/config.toml` re-parses and re-fetches the open manifests it affects (it is a
+  watched file).
 - The sparse index protocol has no search endpoint, so package-*name* completion
   (typing a brand-new dependency) always searches crates.io, even inside a
   workspace whose default registry is mirrored elsewhere.
 - Git-index (non-sparse) private registries remain unsupported, matching prior
   behavior.
+
+## Cargo's Publish-Age Window (`min-publish-age`)
+
+Cargo can refuse releases younger than a configured age. deps-lsp reads the same settings from
+the repository's `.cargo/config.toml` files and **explains** the hold; it never proposes the
+held version, and the window itself never causes an older version to be written (a freshness
+cooldown fallback in `deps-cli update` is a separate feature).
+
+```toml
+# .cargo/config.toml
+[registry]
+global-min-publish-age = "7 days"     # every registry
+
+[registries.crates-io]
+min-publish-age = "2 weeks"           # wins over the global key for crates.io
+
+[resolver]
+incompatible-publish-age = "allow"    # "allow" turns the window off
+```
+
+Values use Cargo's grammar: `<integer> <unit>` with `second`, `minute`, `hour`, `day`, `week` or
+`month` (a month is 2 629 746 seconds), singular or plural. `0` disables the window at that key.
+A malformed value is ignored with one logged warning per config file. A window above ten years is
+clamped.
+
+**What changes while `latest` is inside the window:**
+
+- The *outdated* diagnostic keeps its kind, range and severity, and reads
+  `... : 3.9.0 (excluded by cargo registry.global-min-publish-age = 7 days; eligible in 4 days)`.
+- Hover keeps the true `Latest` line and adds a "Held back" callout naming the setting.
+- The update-all code lens, the *Update to X* refactor actions and `deps-cli update` do not offer
+  the held version; `deps-cli update` reports it as skipped (`within-native-cooldown`, exit 0).
+- A vulnerability fix is **never** moved by the window: the fix keeps its target and the quick fix
+  title notes `inside <setting>` when the target is still younger than the window.
+
+**Which versions stay eligible:** a version with no known publish time, one published at least
+the window ago (the boundary is exclusive), and any version that appears in `Cargo.lock` for that
+package (including a transitive duplicate). The lock is read when you ask, so a `Cargo.lock`
+change lifts the hold immediately, and a release published after the last fetch is judged on the
+live version list the hover and code actions use.
+
+**Scope and limits:**
+
+- Only the repository's own config is read: `.cargo/config.toml` from the manifest directory up
+  to the workspace root (the manifest directory alone when there is no workspace root). A config
+  in a parent of the workspace root, your `~/.cargo/config.toml`, `$CARGO_HOME/config.toml` and
+  `CARGO_*` environment variables are **ignored**, so an opened repository cannot be influenced
+  by files outside it and your own settings are not guessed at.
+- A `registry-index` URL dependency gets only the global key (it has no name to key on). Git and
+  path dependencies have no window.
+- The window is explain-only. Inlay hints are display-only and still name the true latest
+  version, and the diagnostic and the code lens read the last fetched list while hover and code
+  actions read a fresh one, so right after a new release they can briefly name different
+  versions.
+- A same-version git or path lock entry also keeps the registry release eligible (the lock maps
+  do not record sources).
+- A malformed value is ignored (with one warning per config file naming the file, the count and
+  the first keys) and the next valid value in a farther file applies; Cargo itself would reject
+  the config. A malformed `resolver.incompatible-publish-age` reads as the `deny` default.
+- Set `freshness.honor_native_cooldown` to `false` to ignore the window entirely; it works
+  independently of `freshness.enabled`. The keys are still parsed as part of the shared
+  `.cargo/config.toml` reading; only the window and its warnings are switched off.

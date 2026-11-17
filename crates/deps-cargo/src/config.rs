@@ -48,6 +48,10 @@ use toml_span::value::Table;
 use deps_core::config_trust::{
     EnvPath, OperatorEnvName, OperatorEnvValue, OperatorEnvVar, OperatorPath,
 };
+use deps_core::native_cooldown::{
+    NativeCooldown, NativeCooldownSource, NativeTimeSpan, RegistryAlias, TimeSpanValue,
+    parse_time_span,
+};
 use deps_core::net_policy::{
     BlockedHost, DeclaredRegistry, EnvSource, IndexUrlError, OperatorRegistries, ProcessEnv,
     RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RegistryRejectionReason,
@@ -773,6 +777,7 @@ fn env_var_name(alias: &str, suffix: &'static str) -> OperatorEnvName {
 struct ParsedConfigFile {
     tier: CachedTier,
     sources: HashMap<String, SourceEntry>,
+    native: NativeConfigFile,
 }
 
 /// Which tier a [`ParsedConfigFile`] belongs to, chosen once — by the same
@@ -789,6 +794,189 @@ enum CachedTier {
     Workspace(HashMap<String, String>),
     /// `$CARGO_HOME/config.toml`. Alias -> (raw index string, token).
     CargoHome(HashMap<String, (String, Option<AuthToken>)>),
+}
+
+/// What one config file says about a single publish-age key.
+#[derive(Debug, Clone, Copy)]
+enum RawNativeValue {
+    /// A valid non-zero span.
+    Window(NativeTimeSpan),
+    /// A zero value: the window is explicitly off at this key.
+    Disabled,
+    /// A malformed, overflowing or non-string value: treated as if the key were absent.
+    Invalid,
+}
+
+/// The publish-age keys of one `.cargo/config.toml` (`registry.global-min-publish-age`,
+/// `registries.<name>.min-publish-age`, `resolver.incompatible-publish-age`), parsed once per
+/// cached file together with the one-shot warning for its invalid values.
+///
+/// The warning is emitted by [`Self::warn_invalid_once`] from the read path, not at parse
+/// time, so a file read only with the window ignored never logs.
+#[derive(Debug, Default)]
+struct NativeConfigFile {
+    global: Option<RawNativeValue>,
+    per_registry: HashMap<String, RawNativeValue>,
+    allow_incompatible: Option<bool>,
+    invalid_keys: Vec<String>,
+    warned: std::sync::Once,
+}
+
+impl NativeConfigFile {
+    fn parse(content: &str) -> Self {
+        let mut file = Self::default();
+        let Ok(doc) = deps_core::parse_toml_checked(content) else {
+            return file;
+        };
+        let Some(root) = doc.as_table() else {
+            return file;
+        };
+        if let Some(registry) = root.get("registry").and_then(|v| v.as_table()) {
+            file.global = file.read_span(registry, "global-min-publish-age", "registry.");
+        }
+        if let Some(registries) = root.get("registries").and_then(|v| v.as_table()) {
+            for (alias, entry) in registries {
+                let Some(entry) = entry.as_table() else {
+                    continue;
+                };
+                let prefix = format!(
+                    "registries.{}.",
+                    deps_core::redact::sanitize_invisible(&alias.name)
+                );
+                if let Some(value) = file.read_span(entry, "min-publish-age", &prefix) {
+                    file.per_registry.insert(alias.name.to_string(), value);
+                }
+            }
+        }
+        // Only `allow` disables the window; anything else reads as `deny`.
+        if let Some(mode) = root
+            .get("resolver")
+            .and_then(|v| v.as_table())
+            .and_then(|resolver| resolver.get("incompatible-publish-age"))
+        {
+            match mode.as_str() {
+                Some("allow") => file.allow_incompatible = Some(true),
+                Some("deny") => file.allow_incompatible = Some(false),
+                Some(_) | None => file
+                    .invalid_keys
+                    .push("resolver.incompatible-publish-age".to_owned()),
+            }
+        }
+        file
+    }
+
+    fn read_span(&mut self, table: &Table<'_>, key: &str, prefix: &str) -> Option<RawNativeValue> {
+        let value = table.get(key)?;
+        Some(match value.as_str().map(parse_time_span) {
+            Some(Ok(TimeSpanValue::Span(span))) => RawNativeValue::Window(span),
+            Some(Ok(TimeSpanValue::Disabled)) => RawNativeValue::Disabled,
+            Some(Err(_)) | None => {
+                self.invalid_keys.push(format!("{prefix}{key}"));
+                RawNativeValue::Invalid
+            }
+        })
+    }
+
+    /// Emits one warning for the whole file, naming it, the number of malformed keys and the
+    /// first few, so a hostile config cannot flood the log.
+    fn warn_invalid_once(&self, path: &Path) {
+        const MAX_NAMED_KEYS: usize = 5;
+        if self.invalid_keys.is_empty() {
+            return;
+        }
+        self.warned.call_once(|| {
+            let keys = self
+                .invalid_keys
+                .iter()
+                .take(MAX_NAMED_KEYS)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                path = %path.display(),
+                count = self.invalid_keys.len(),
+                %keys,
+                "ignoring malformed Cargo publish-age settings; no window applies from them"
+            );
+        });
+    }
+}
+
+/// Which publish-age setting scope a dependency falls under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum NativeScope {
+    /// A plain registry dependency, or one whose crates.io source is replaced by a mirror:
+    /// `registries.crates-io.min-publish-age`, then the global key. Cargo keys the lookup on the
+    /// package's original source id (`resolver/version_prefs.rs`, `min_age`), so a replacement
+    /// keeps the `crates-io` key.
+    CratesIo,
+    /// `registry = "<alias>"`: `registries.<alias>.min-publish-age`, then the global key.
+    Alias(String),
+    /// A literal `registry-index`: only the global key (the index has no name to key on).
+    LiteralIndex,
+}
+
+impl NativeScope {
+    fn registry_key(&self) -> Option<&str> {
+        match self {
+            Self::CratesIo => Some("crates-io"),
+            Self::Alias(alias) => Some(alias),
+            Self::LiteralIndex => None,
+        }
+    }
+}
+
+/// Resolves the publish-age window for `scope` from `config_paths` (closest-first, already
+/// limited to the repository boundary by the caller).
+///
+/// Follows Cargo's per-key config merge: the closest file declaring a valid value for a key
+/// wins; the scope's own registry key beats the global key; a zero value at the winning key
+/// turns the window off; `resolver.incompatible-publish-age = "allow"` turns it off outright.
+/// An invalid value counts as absent, so a nearer malformed value falls through to the next valid
+/// one in a farther file (Cargo itself would reject the config), and is reported in one warning
+/// per cached file. A malformed `incompatible-publish-age` reads as the `deny` default.
+pub(crate) fn resolve_native_cooldown(
+    scope: &NativeScope,
+    config_paths: &[PathBuf],
+    config_cache: &ConfigFileCache,
+) -> Option<NativeCooldown> {
+    let files: Vec<Arc<ParsedConfigFile>> = config_paths
+        .iter()
+        .filter_map(|path| {
+            let file = config_cache.get_or_parse_workspace(path)?;
+            file.native.warn_invalid_once(path);
+            Some(file)
+        })
+        .collect();
+    if files
+        .iter()
+        .find_map(|file| file.native.allow_incompatible)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let first_valid = |lookup: &dyn Fn(&NativeConfigFile) -> Option<RawNativeValue>| {
+        files.iter().find_map(|file| {
+            lookup(&file.native).filter(|value| !matches!(value, RawNativeValue::Invalid))
+        })
+    };
+    if let Some(alias) = scope.registry_key().and_then(RegistryAlias::new)
+        && let Some(value) = first_valid(&|file| file.per_registry.get(alias.as_str()).copied())
+    {
+        return match value {
+            RawNativeValue::Window(span) => Some(NativeCooldown::new(
+                span,
+                NativeCooldownSource::CargoRegistry { alias },
+            )),
+            RawNativeValue::Disabled | RawNativeValue::Invalid => None,
+        };
+    }
+    match first_valid(&|file| file.global)? {
+        RawNativeValue::Window(span) => {
+            Some(NativeCooldown::new(span, NativeCooldownSource::CargoGlobal))
+        }
+        RawNativeValue::Disabled | RawNativeValue::Invalid => None,
+    }
 }
 
 /// Per-config-file memoization for `.cargo/config.toml`/`$CARGO_HOME/config.toml` parsing
@@ -829,6 +1017,7 @@ impl ConfigFileCache {
         self.0.get_or_parse(path, |content| ParsedConfigFile {
             tier: CachedTier::Workspace(parse_workspace_registries_raw(content)),
             sources: parse_source_entries_raw(content),
+            native: NativeConfigFile::parse(content),
         })
     }
 
@@ -837,6 +1026,7 @@ impl ConfigFileCache {
         self.0.get_or_parse(path, |content| ParsedConfigFile {
             tier: CachedTier::CargoHome(parse_cargo_home_registries_raw(content)),
             sources: parse_source_entries_raw(content),
+            native: NativeConfigFile::parse(content),
         })
     }
 }
@@ -2311,6 +2501,7 @@ token = "secret-token"
                 section: CargoDependencySection::Dependencies,
                 package: None,
                 custom_registry_origin: None,
+                native_cooldown: None,
             },
             CargoDependency {
                 name: "b".into(),
@@ -2323,6 +2514,7 @@ token = "secret-token"
                 section: CargoDependencySection::Dependencies,
                 package: None,
                 custom_registry_origin: None,
+                native_cooldown: None,
             },
         ];
 

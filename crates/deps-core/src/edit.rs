@@ -908,6 +908,24 @@ where
             }
         }
 
+        // Spec 099: a `latest` inside the native publish-age window is explained, never proposed.
+        if let Some(gate) = crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions)
+            && gate.excludes(
+                versions
+                    .cached_for(&key)
+                    .and_then(|v| v.published_at_of(latest)),
+                latest,
+                gate.now(),
+            )
+        {
+            candidates.push(UpdateCandidate::Unplannable {
+                key,
+                name_range,
+                reason: UnplannableReason::WithinNativeCooldown,
+            });
+            continue;
+        }
+
         // Intentionally not calling `dependency_version_range_is_literal` (#919) —
         // empty-requirement semantics differ (edit: nothing to update; completion: everything
         // to offer).

@@ -38,6 +38,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `diagnostics` | `ignore` | `[]` | List of package patterns whose outdated, deprecated, yanked and license diagnostics and inlay hint are all hidden; see [Suppressing diagnostics per package](#suppressing-diagnostics-per-package) |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
+| `freshness` | `honor_native_cooldown` | `true` | Honor Cargo's own `min-publish-age` window from the repository's `.cargo/config.toml` (explain-only, independent of `enabled`); `false` ignores it. See [Cargo's Publish-Age Window](ecosystems/cargo.md#cargos-publish-age-window-min-publish-age) |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`. A registry you declared yourself is exempt: Go's `$GOENV` `GOPROXY`, your user `~/.npmrc`, your user-profile `NuGet.Config` and your user-level `registries.json`, and any repository URL equal to one of them, ignore this setting (see [Operator-owned registries](#operator-owned-registries)). See [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
 | `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds) |
 | `registries` | `swift_keychain_credentials` | `"disabled"` | `"enabled"` also reads macOS Keychain credentials for user-declared Swift SE-0292 registries (may show a macOS access prompt; ignored by `deps-cli`); see [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials) |
@@ -306,7 +307,8 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
   },
   "freshness": {
     "enabled": true,
-    "cooldown_secs": 259200
+    "cooldown_secs": 259200,
+    "honor_native_cooldown": true
   },
   "cache": {
     "enabled": true,

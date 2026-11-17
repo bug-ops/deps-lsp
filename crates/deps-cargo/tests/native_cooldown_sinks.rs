@@ -46,12 +46,17 @@ struct Fx {
     manifest: Box<dyn ParsedManifest>,
 }
 
+/// Hover fetches the live list regardless of the network mode: point the registry at a
+/// refused loopback port so the tests stay hermetic and fall back to the cached data.
+const UNREACHABLE_MIRROR: &str = "[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"sparse+http://127.0.0.1:1/\"\n";
+
 async fn fixture(config: Option<&str>) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    if let Some(config) = config {
-        write(&root.join(".cargo/config.toml"), config);
-    }
+    write(
+        &root.join(".cargo/config.toml"),
+        &format!("{UNREACHABLE_MIRROR}{}", config.unwrap_or_default()),
+    );
     let path = root.join("Cargo.toml");
     write(&path, MANIFEST);
     let uri = Url::from_file_path(&path).unwrap();

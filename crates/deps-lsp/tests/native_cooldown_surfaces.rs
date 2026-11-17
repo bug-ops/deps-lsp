@@ -152,6 +152,10 @@ fn settings_json(extra: Value, vulnerabilities: bool) -> Value {
     base
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear fixture: index and OSV mocks, repository files, state, document open"
+)]
 async fn fixture(setup: Setup) -> Fixture {
     let mut server = mockito::Server::new_async().await;
     let index_hits = Arc::new(AtomicUsize::new(0));
@@ -181,10 +185,29 @@ async fn fixture(setup: Setup) -> Fixture {
         mocks.push(
             osv.mock("POST", "/v1/querybatch")
                 .with_status(200)
-                .with_body_from_request(move |_| {
+                .with_body_from_request(move |request| {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    format!(r#"{{"results":[{{"vulns":[{{"id":"{ADVISORY}","modified":"2026-01-01T00:00:00Z"}}]}}]}}"#)
-                        .into_bytes()
+                    let body: Value =
+                        serde_json::from_slice(request.body().expect("body")).expect("batch json");
+                    let results = body
+                        .get("queries")
+                        .and_then(Value::as_array)
+                        .expect("queries")
+                        .iter()
+                        .map(|q| {
+                            let in_use = q.get("version") == Some(&json!("3.8.0"));
+                            let list = if in_use {
+                                format!(
+                                    r#"{{"id":"{ADVISORY}","modified":"2026-01-01T00:00:00Z"}}"#
+                                )
+                            } else {
+                                String::new()
+                            };
+                            format!(r#"{{"vulns":[{list}]}}"#)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(r#"{{"results":[{results}]}}"#).into_bytes()
                 })
                 .expect_at_least(0)
                 .create_async()
@@ -254,6 +277,9 @@ async fn fixture(setup: Setup) -> Fixture {
     let vulnerabilities = setup.advisory_fixed_in.is_some();
     let config: DepsConfig =
         serde_json::from_value(settings_json(setup.settings, vulnerabilities)).expect("config");
+    state
+        .native_cooldown
+        .set(config.policy.freshness.honor_native_cooldown);
     let config = Arc::new(RwLock::new(config));
 
     let slot = std::sync::Mutex::new(None);
@@ -355,7 +381,7 @@ impl Fixture {
         let diagnostics = self.diagnostics().await;
         let params = serde_json::from_value(json!({
             "textDocument": {"uri": self.uri.as_str()},
-            "range": {"start": {"line": DEP_LINE, "character": 2}, "end": {"line": DEP_LINE, "character": 2}},
+            "range": {"start": {"line": DEP_LINE, "character": 10}, "end": {"line": DEP_LINE, "character": 10}},
             "context": {"diagnostics": diagnostics},
         }))
         .expect("action params");

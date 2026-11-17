@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
@@ -217,10 +217,10 @@ where
     let fix = dv.recommended_fix(latest)?;
 
     // The edit above stays the full-set fix phase B verified; operator exemptions only decide
-    // whether an advisory it resolves is still worth announcing. ASSUMPTION: no caller supplies
-    // the clock here, so expiry is evaluated at request time.
+    // whether an advisory it resolves is still worth announcing, at the one instant every
+    // read-time decision of this request shares.
     let (unexempted_view, exempted_ids) = ExemptionCheck::apply(
-        ExemptionCheck::new(versions.advisory_exemptions, PublishTime::now()),
+        ExemptionCheck::new(versions.advisory_exemptions, versions.now),
         dv,
     );
     let surviving_ids: Vec<&crate::osv::OsvId> = fix
@@ -267,10 +267,27 @@ where
     } else {
         format!("{first_id} +{} more", rest_ids.len())
     };
+    // The fix target never changes because of a native publish-age window; the title only says
+    // when the written version is still inside it.
+    let inside_window = crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions)
+        .filter(|gate| {
+            let target = ConcreteVersion::new(version_native.as_str());
+            gate.excludes(
+                versions
+                    .cached_for(&key)
+                    .and_then(|cached| cached.published_at_of(&target)),
+                &target,
+                gate.now(),
+            )
+        })
+        .map(|gate| format!("; inside {}", gate.cooldown()))
+        .unwrap_or_default();
     let title = if lockfile_hit {
-        format!("Update to {version_native} (fixes {fixes}; update lockfile to apply)")
+        format!(
+            "Update to {version_native} (fixes {fixes}; update lockfile to apply{inside_window})"
+        )
     } else {
-        format!("Update to {version_native} (fixes {fixes})")
+        format!("Update to {version_native} (fixes {fixes}{inside_window})")
     };
 
     let edits = single_file_edit(uri, version_range.into(), new_text.clone());
@@ -362,13 +379,27 @@ fn build_unsatisfiable_fix_action<F: DependencyFormatter>(
         return None;
     }
 
-    let package_versions = versions.cached_for(&PackageKey::new(dep.name(), formatter))?;
+    let key = PackageKey::new(dep.name(), formatter);
+    let package_versions = versions.cached_for(&key)?;
 
     if !requirement_is_unsatisfiable(formatter, version_req, &package_versions.available) {
         return None;
     }
 
     let latest = package_versions.latest.clone();
+    // Explain-only: a `latest` still inside the package manager's publish-age window is never
+    // proposed as the fix.
+    if crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions).is_some_and(
+        |gate| {
+            gate.excludes(
+                package_versions.published_at_of(&latest),
+                &latest,
+                gate.now(),
+            )
+        },
+    ) {
+        return None;
+    }
     if !is_safe_version_string(latest.as_str()) {
         warn_rejected_value(
             "is_safe_version_string",
@@ -1052,6 +1083,13 @@ where
     // the first action must never edit the manifest to it (#1940).
     display_items.sort_by_key(|item| !item.is_latest);
 
+    // Judged on live publish times so a release newer than the last fetch is covered too.
+    let native_gate = crate::native_cooldown::NativeGate::for_dependency(dep, &key, versions);
+    let live_published_at: HashMap<&str, Option<PublishTime>> = registry_versions
+        .iter()
+        .map(|v| (v.version_string().as_str(), v.published_at()))
+        .collect();
+
     let mut targets = Vec::new();
     for item in display_items {
         if !is_safe_version_string(item.version.as_str()) {
@@ -1060,6 +1098,18 @@ where
                 "update-to-version refactor code action",
                 item.version.as_str(),
             );
+            continue;
+        }
+        if native_gate.as_ref().is_some_and(|gate| {
+            gate.excludes(
+                live_published_at
+                    .get(item.version.as_str())
+                    .copied()
+                    .flatten(),
+                &item.version,
+                gate.now(),
+            )
+        }) {
             continue;
         }
         // Issue #1517/#1524: never offer an "update to X" quickfix unless OSV has

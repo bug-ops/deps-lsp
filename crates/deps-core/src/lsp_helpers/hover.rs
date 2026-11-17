@@ -198,6 +198,11 @@ where
         &latest_verdict_result,
         formatter,
     );
+    push_native_hold_hover_section(
+        &mut markdown,
+        native_hold(dep, &key, &versions, latest_line),
+        &latest_verdict_result,
+    );
 
     let vuln_outcome = versions
         .vulnerabilities
@@ -262,15 +267,45 @@ where
         .push(&mut markdown);
     }
 
-    // #1402: an unexpanded template placeholder (`{{ VAR }}`, `${VAR}`, ...) is refused by
-    // the same write-path guard `codeAction` routes every fix through (`edit::replacement_text`
-    // / #1393), so `Cmd+.` would return zero actions here regardless of what data was rendered
-    // above — the footer must consult the identical predicate to avoid advertising a dead action.
-    let requirement_is_placeholder = declares_placeholder_requirement(dep, formatter);
     let offline = versions.network.is_offline();
-    let code_actions = match &fetched {
+    let code_actions = code_actions_state(
+        parse_result,
+        dep,
+        versions,
+        fetched.as_ref(),
+        registry,
+        formatter,
+    );
+    push_cmd_dot_footer_hover_section(&mut markdown, code_actions);
+
+    push_offline_footer_hover_section(&mut markdown, resolvable, offline);
+    push_skip_reason_footer_hover_section(&mut markdown, resolvable, offline, vuln_outcome);
+
+    Some(markdown.finish(Some(dep.name_range())))
+}
+
+/// Whether the `Cmd+.` footer may advertise an update action for `dep`.
+///
+/// An unexpanded template placeholder (`{{ VAR }}`, `${VAR}`, ...) is refused by the same
+/// write-path guard `codeAction` routes every fix through (`edit::replacement_text` / #1393), so
+/// `Cmd+.` would return zero actions regardless of the data rendered above; the footer must
+/// consult the identical predicate to avoid advertising a dead action (#1402).
+fn code_actions_state<R, P, F>(
+    parse_result: &P,
+    dep: &P::Dep,
+    versions: VersionData<'_>,
+    fetched: Option<&FetchedVersions>,
+    registry: &R,
+    formatter: &F,
+) -> CodeActions
+where
+    R: Registry + ?Sized,
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
+    match fetched {
         Some(fetched)
-            if !requirement_is_placeholder
+            if !declares_placeholder_requirement(dep, formatter)
                 && code_actions_offered(
                     parse_result,
                     dep,
@@ -283,13 +318,7 @@ where
             CodeActions::Offered
         }
         Some(_) | None => CodeActions::None,
-    };
-    push_cmd_dot_footer_hover_section(&mut markdown, code_actions);
-
-    push_offline_footer_hover_section(&mut markdown, resolvable, offline);
-    push_skip_reason_footer_hover_section(&mut markdown, resolvable, offline, vuln_outcome);
-
-    Some(markdown.finish(Some(dep.name_range())))
+    }
 }
 
 /// Whether `dep`'s declared requirement is an unexpanded template placeholder (#1402).
@@ -989,6 +1018,72 @@ fn push_latest_hover_section(
         }
         CooldownPrecedence::Cleared => {}
     }
+}
+
+/// The package manager's own publish-age hold on the displayed latest version.
+struct NativeHold<'a> {
+    version: &'a str,
+    cooldown: &'a crate::native_cooldown::NativeCooldown,
+    remaining_secs: u64,
+}
+
+/// The native hold on the displayed latest version, judged at [`VersionData::now`].
+///
+/// Keyed on the version actually rendered (its live publish time when a live list was shown,
+/// the cached one otherwise), never on whether the display agrees with the cache.
+fn native_hold<'a>(
+    dep: &'a dyn Dependency,
+    key: &PackageKey,
+    versions: &VersionData<'a>,
+    latest_line: Option<(&'a str, Option<PublishTime>)>,
+) -> Option<NativeHold<'a>> {
+    let (version, published_at) = latest_line?;
+    let gate = crate::native_cooldown::NativeGate::for_dependency(dep, key, versions)?;
+    let remaining_secs =
+        gate.remaining(published_at, &ConcreteVersion::new(version), gate.now())?;
+    Some(NativeHold {
+        version,
+        cooldown: gate.cooldown(),
+        remaining_secs,
+    })
+}
+
+/// Appends the callout naming the package manager's publish-age window that excludes the
+/// displayed latest version. The `**Latest**` line itself is never rewritten: this is
+/// explain-only. A flagged latest keeps only its OSV callout.
+fn push_native_hold_hover_section(
+    markdown: &mut HoverMarkdown,
+    hold: Option<NativeHold<'_>>,
+    latest_verdict: &LatestVerdict,
+) {
+    use crate::native_cooldown::NativeCooldownSource;
+    let Some(hold) = hold else {
+        return;
+    };
+    if matches!(latest_verdict, LatestVerdict::Flagged { .. }) {
+        return;
+    }
+    markdown.push_static("> ⏳ **Held back** — ");
+    markdown.push_code(hold.version, FieldKind::Version);
+    markdown.push_static(" is excluded by ");
+    // The alias is the only free-form part; the rest is fixed text and a digits-plus-unit span.
+    match hold.cooldown.source() {
+        NativeCooldownSource::CargoGlobal => {
+            markdown.push_static("cargo registry.global-min-publish-age = ");
+        }
+        NativeCooldownSource::CargoRegistry { alias } => {
+            markdown.push_static("cargo registries.");
+            markdown.push_text(alias.as_str(), FieldKind::Name);
+            markdown.push_static(".min-publish-age = ");
+        }
+    }
+    markdown.push_text(&hold.cooldown.span().to_string(), FieldKind::Prose);
+    markdown.push_static("; eligible in ");
+    markdown.push_text(
+        &crate::format_remaining_duration(hold.remaining_secs),
+        FieldKind::Prose,
+    );
+    markdown.push_static(".\n\n");
 }
 
 /// Appends the hover low-usage/slopsquatting-risk callout when GOSSIP flagged the pinned

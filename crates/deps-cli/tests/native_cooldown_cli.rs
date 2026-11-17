@@ -424,14 +424,14 @@ async fn security_only_applies_the_fix_inside_the_window_and_annotates_the_reaso
     held.advisory = Some(Advisory {
         introduced: "0",
         fixed: Some("3.9.0"),
-        only_version: None,
+        only_version: Some("3.8.0"),
     });
     let held = fixture(held).await;
     let mut plain = Setup::latest_age(None, 3 * DAY);
     plain.advisory = Some(Advisory {
         introduced: "0",
         fixed: Some("3.9.0"),
-        only_version: None,
+        only_version: Some("3.8.0"),
     });
     let plain = fixture(plain).await;
 
@@ -462,7 +462,7 @@ async fn check_reports_the_advisory_identically_with_and_without_a_window() {
     let advisory = || Advisory {
         introduced: "0",
         fixed: Some("3.9.0"),
-        only_version: None,
+        only_version: Some("3.8.0"),
     };
     let mut held = Setup::latest_age(Some(WINDOW_7D), 3 * DAY);
     held.advisory = Some(advisory());
@@ -545,7 +545,7 @@ async fn hostile_maximum_window_keeps_advisories_and_writes_no_default_edit() {
     held.advisory = Some(Advisory {
         introduced: "0",
         fixed: Some("3.9.0"),
-        only_version: None,
+        only_version: Some("3.8.0"),
     });
     let held = fixture(held).await;
     assert!(applied(&held.update_plan().await).is_empty());

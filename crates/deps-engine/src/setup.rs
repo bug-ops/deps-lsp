@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use deps_core::net_policy::RegistryEnvironment;
-use deps_core::policy_config::{AtomicToggle, PolicyConfig, UserProfileSources};
+use deps_core::policy_config::{
+    AtomicToggle, NativeCooldownMode, PolicyConfig, UserProfileSources,
+};
 use deps_core::{EcosystemRegistry, HttpCache};
 
 /// Live-updatable settings [`register_ecosystems`] threads into every ecosystem that needs them.
@@ -29,6 +31,11 @@ pub struct EcosystemRuntime {
     /// user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a
     /// routing hop, not just a credential source. Default `false`.
     pub nuget_user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
+    /// `freshness.honor_native_cooldown` — whether Cargo's own publish-age window
+    /// (`min-publish-age`) is read at parse time. Like [`Self::lockfile_cache`], not a
+    /// [`Self::new`] parameter: set it with [`Self::with_native_cooldown`] or derive it with
+    /// [`Self::from_policy`]. Defaults to `Honor`.
+    pub native_cooldown: Arc<AtomicToggle<NativeCooldownMode>>,
     /// `registries.gitlab_instance_host` (issue #466, spec FR-005a/FR-011a) — the raw
     /// configured GitLab instance host string, or `None` when unset. A feature-agnostic
     /// `Arc<RwLock<Option<String>>>` (not a `deps-gitlab-ci` type) since this struct is
@@ -91,12 +98,34 @@ impl EcosystemRuntime {
         Self {
             policy,
             nuget_user_profile_sources,
+            native_cooldown: Arc::new(AtomicToggle::new(NativeCooldownMode::default())),
             gitlab_instance_host,
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
             keychain_credentials: Arc::default(),
             #[cfg(feature = "swift")]
             scm_to_registry: Arc::default(),
         }
+    }
+
+    /// Overrides [`Self::native_cooldown`]'s default (a toggle at `Honor`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::{AtomicToggle, NativeCooldownMode, PolicyConfig};
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
+    /// use deps_engine::setup::EcosystemRuntime;
+    /// use std::sync::Arc;
+    ///
+    /// let toggle = Arc::new(AtomicToggle::new(NativeCooldownMode::Ignore));
+    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv))
+    ///     .with_native_cooldown(Arc::clone(&toggle));
+    /// assert!(Arc::ptr_eq(&runtime.native_cooldown, &toggle));
+    /// ```
+    #[must_use]
+    pub fn with_native_cooldown(mut self, toggle: Arc<AtomicToggle<NativeCooldownMode>>) -> Self {
+        self.native_cooldown = toggle;
+        self
     }
 
     /// Overrides [`Self::scm_to_registry`]'s default (a handle at `Disabled`).
@@ -225,6 +254,9 @@ impl EcosystemRuntime {
             Arc::new(AtomicToggle::new(resolved.nuget_user_profile_sources)),
             Arc::new(std::sync::RwLock::new(resolved.gitlab_instance_host)),
         )
+        .with_native_cooldown(Arc::new(AtomicToggle::new(
+            policy.freshness.honor_native_cooldown,
+        )))
         .with_keychain_credentials(Arc::new(
             deps_core::keychain_credentials::KeychainCredentialsHandle::new(
                 resolved.swift_keychain_credentials,
@@ -595,7 +627,8 @@ pub fn register_ecosystems(
         let context = deps_cargo::parser::CargoParseContext::new(
             Arc::clone(&policy),
             Arc::new(deps_cargo::config::ConfigFileCache::new()),
-        );
+        )
+        .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown));
         registry.register(Arc::new(CargoEcosystem::with_context(
             Arc::clone(&cache),
             context,

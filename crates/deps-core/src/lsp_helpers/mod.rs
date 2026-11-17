@@ -7,6 +7,7 @@ use std::time::Duration;
 #[cfg(doc)]
 use crate::EcosystemId;
 use crate::error::DepsError;
+use crate::native_cooldown::{NativeCooldown, NativeGate};
 use crate::osv::{
     CandidateStatusMap, CandidateStatuses, LatestStatusMap, ScanOutcome, UpgradeStatus, VulnKey,
     VulnSeverity, VulnerabilityMap,
@@ -262,6 +263,17 @@ pub enum CooldownDisposition<'a> {
         /// The fallback candidate, if one was computed and stored for this dependency.
         fallback: Option<&'a CooldownFallback>,
     },
+    /// `latest` is held back by the package manager's own publish-age window (spec 099).
+    /// Independent of the freshness feature: it is reported even when freshness is disabled.
+    /// `fallback` is the stored cooldown-fallback candidate, kept only when the freshness
+    /// cooldown would also have blocked `latest` and the candidate itself clears the native
+    /// window; surfaces that only explain the hold ignore it.
+    NativeHeld {
+        /// The configured window that holds `latest` back.
+        cooldown: &'a NativeCooldown,
+        /// The fallback candidate that survives both windows, if any.
+        fallback: Option<&'a CooldownFallback>,
+    },
 }
 
 /// Outcome of [`cooldown_precedence`]: whether a single version is currently blocked by the
@@ -410,6 +422,7 @@ pub fn local_cooldown_precedence(
 ///         cooldown: deps_core::CooldownWindow::from_secs(500),
 ///     },
 ///     None,
+///     None,
 ///     PublishTime::from_unix_secs(2_000),
 /// );
 /// assert_eq!(disposition, CooldownDisposition::Cleared);
@@ -421,12 +434,49 @@ pub fn local_cooldown_precedence(
 ///         cooldown: deps_core::CooldownWindow::from_secs(5_000),
 ///     },
 ///     None,
+///     None,
 ///     PublishTime::from_unix_secs(2_000),
 /// );
 /// assert!(matches!(blocked, CooldownDisposition::Blocked { .. }));
 /// ```
 #[must_use]
 pub fn cooldown_disposition<'a>(
+    versions: &'a PackageVersions,
+    name: &NormalizedName,
+    freshness: crate::freshness::FreshnessSettings,
+    gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
+    native: Option<&NativeGate<'a>>,
+    now: PublishTime,
+) -> CooldownDisposition<'a> {
+    let freshness_disposition =
+        freshness_disposition(versions, name, freshness, gossip_prefetch, now);
+    let Some(gate) = native else {
+        return freshness_disposition;
+    };
+    if !gate.excludes(
+        versions.published_at_of(&versions.latest),
+        &versions.latest,
+        gate.now(),
+    ) {
+        return freshness_disposition;
+    }
+    let fallback = match freshness_disposition {
+        CooldownDisposition::Blocked { fallback, .. } => fallback.filter(|fallback| {
+            !gate.excludes(Some(fallback.published_at), &fallback.version, gate.now())
+        }),
+        CooldownDisposition::NotEvaluated
+        | CooldownDisposition::Cleared
+        | CooldownDisposition::NativeHeld { .. } => None,
+    };
+    CooldownDisposition::NativeHeld {
+        cooldown: gate.cooldown(),
+        fallback,
+    }
+}
+
+/// The freshness-cooldown half of [`cooldown_disposition`]: GOSSIP-vs-local precedence plus the
+/// read-time fallback re-evaluation, with no native window involved.
+fn freshness_disposition<'a>(
     versions: &'a PackageVersions,
     name: &NormalizedName,
     freshness: crate::freshness::FreshnessSettings,
@@ -987,13 +1037,43 @@ impl PackageVersions {
         self
     }
 
-    /// Publish time of `version`, indexed by its position in [`Self::available`].
+    /// Publish time of `version`.
+    ///
+    /// Looked up by the version's position in [`Self::available`] when [`Self::publish_times`]
+    /// is aligned with it. Otherwise (empty, or a length mismatch) only [`Self::latest`] is
+    /// known, through [`Self::published_at`]. A version with no known time is `None`, which the
+    /// native gate reads as eligible.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{ConcreteVersion, PackageVersions, PublishTime};
+    /// use std::sync::Arc;
+    ///
+    /// let versions = PackageVersions::new(
+    ///     ConcreteVersion::new("2.0.0"),
+    ///     Arc::from(vec![ConcreteVersion::new("2.0.0"), ConcreteVersion::new("1.0.0")]),
+    /// )
+    /// .with_publish_times(Arc::from(vec![None, Some(PublishTime::from_unix_secs(7))]));
+    /// assert_eq!(
+    ///     versions.published_at_of(&ConcreteVersion::new("1.0.0")),
+    ///     Some(PublishTime::from_unix_secs(7))
+    /// );
+    /// assert_eq!(versions.published_at_of(&ConcreteVersion::new("2.0.0")), None);
+    /// ```
     #[must_use]
     pub fn published_at_of(
         &self,
-        _version: &ConcreteVersion,
+        version: &ConcreteVersion,
     ) -> Option<crate::freshness::PublishTime> {
-        todo!()
+        if self.publish_times.len() == self.available.len()
+            && let Some(index) = self.available.iter().position(|v| v == version)
+        {
+            return self.publish_times.get(index).copied().flatten();
+        }
+        (*version == self.latest)
+            .then_some(self.published_at)
+            .flatten()
     }
 
     /// Attaches the computed cooldown-fallback candidate. See [`Self::cooldown_fallback`].
@@ -3938,6 +4018,80 @@ mod tests {
 
     // --- cooldown_disposition (spec 075 FR-004/NFR-002) ---
 
+    /// Spec 099: a native publish-age hold is reported even with freshness disabled, and keeps a
+    /// stored fallback only when that fallback itself clears the native window.
+    #[test]
+    fn cooldown_disposition_native_hold_is_independent_of_freshness_and_vets_the_fallback() {
+        use crate::native_cooldown::{
+            NativeCooldown, NativeCooldownSource, NativeGate, TimeSpanValue, parse_time_span,
+        };
+        let TimeSpanValue::Span(span) = parse_time_span("1 hour").expect("span") else {
+            panic!("a span");
+        };
+        let cooldown = NativeCooldown::new(span, NativeCooldownSource::CargoGlobal);
+        let now = PublishTime::from_unix_secs(100_000);
+        let name = NormalizedName::for_test("pkg");
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let version_data = VersionData::new(&cached, &resolved).with_now(now);
+        let gate = NativeGate::for_name(&cooldown, &name, &version_data);
+
+        let held = |fallback_published: i64| {
+            PackageVersions::new(
+                "2.0.0".into(),
+                Arc::from(vec!["2.0.0".into(), "1.9.0".into()]),
+            )
+            .with_published_at(PublishTime::from_unix_secs(99_000))
+            .with_publish_times(Arc::from(vec![
+                Some(PublishTime::from_unix_secs(99_000)),
+                Some(PublishTime::from_unix_secs(fallback_published)),
+            ]))
+            .with_cooldown_fallback(CooldownFallback::new(
+                "1.9.0".into(),
+                PublishTime::from_unix_secs(fallback_published),
+            ))
+        };
+
+        let old_fallback = held(1_000);
+        let disposition = cooldown_disposition(
+            &old_fallback,
+            &name,
+            crate::freshness::FreshnessSettings::Disabled,
+            None,
+            Some(&gate),
+            now,
+        );
+        assert_matches!(
+            disposition,
+            CooldownDisposition::NativeHeld { fallback: None, .. },
+            "freshness disabled never yields a fallback, but the native hold is still reported"
+        );
+
+        let enabled = crate::freshness::FreshnessSettings::Enabled {
+            cooldown: CooldownWindow::from_secs(5_000),
+        };
+        assert_matches!(
+            cooldown_disposition(&old_fallback, &name, enabled, None, Some(&gate), now),
+            CooldownDisposition::NativeHeld {
+                fallback: Some(_),
+                ..
+            }
+        );
+
+        let young_fallback = held(99_500);
+        assert_matches!(
+            cooldown_disposition(&young_fallback, &name, enabled, None, Some(&gate), now),
+            CooldownDisposition::NativeHeld { fallback: None, .. },
+            "a fallback inside the native window is dropped"
+        );
+
+        assert_matches!(
+            cooldown_disposition(&old_fallback, &name, enabled, None, None, now),
+            CooldownDisposition::Blocked { .. },
+            "without a gate the disposition is the freshness one"
+        );
+    }
+
     /// Fix-cycle item 8 (M3/NFR-002): a stored fallback candidate is re-evaluated against
     /// read-time `now`/cooldown window, not trusted as a fetch-time snapshot. A
     /// fallback whose own `published_at` no longer clears a (narrower, read-time)
@@ -3962,6 +4116,7 @@ mod tests {
                 cooldown: CooldownWindow::from_secs(150),
             },
             None,
+            None,
             now,
         );
         assert_matches!(
@@ -3982,6 +4137,7 @@ mod tests {
             crate::freshness::FreshnessSettings::Enabled {
                 cooldown: CooldownWindow::from_secs(10_000),
             },
+            None,
             None,
             now,
         );

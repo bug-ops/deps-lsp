@@ -8,7 +8,8 @@ use deps_core::lsp_helpers::exemption::OperatorExemptions;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::policy_config::{
-    AtomicToggle, GossipChecks, OsvChecks, PolicyConfig, TyposquatChecks, UserProfileSources,
+    AtomicToggle, GossipChecks, NativeCooldownMode, OsvChecks, PolicyConfig, TyposquatChecks,
+    UserProfileSources,
 };
 use deps_core::{
     CachedVersionsMap, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
@@ -1215,6 +1216,10 @@ pub struct ServerState {
     /// the same handle `crate::register_ecosystems` hands to `NuGetEcosystem`'s
     /// `NuGetParseContext`, bundled inside `EcosystemRuntime`. See that struct's docs.
     pub nuget_user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
+    /// Live-updatable `freshness.honor_native_cooldown` setting — the same handle
+    /// `crate::register_ecosystems` hands to `CargoParseContext`, bundled inside
+    /// `EcosystemRuntime`.
+    pub native_cooldown: Arc<AtomicToggle<NativeCooldownMode>>,
     /// Live-updatable `registries.swift_keychain_credentials` setting (#1771) — the same handle
     /// `crate::register_ecosystems` hands to `SwiftParseContext::with_keychain`, bundled inside
     /// `EcosystemRuntime`, and the source of the "credential resolved" event.
@@ -1441,6 +1446,7 @@ impl ServerState {
         let runtime = crate::EcosystemRuntime::from_policy(&default_policy, &registry_environment);
         let registry_policy = Arc::clone(&runtime.policy);
         let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
+        let native_cooldown = Arc::clone(&runtime.native_cooldown);
         let keychain_credentials = Arc::clone(&runtime.keychain_credentials);
         #[cfg(feature = "swift")]
         let scm_to_registry = Arc::clone(&runtime.scm_to_registry);
@@ -1486,6 +1492,7 @@ impl ServerState {
                 deps_core::policy_config::WorkspaceRegistriesEffect::AsConfigured,
             ),
             nuget_user_profile_sources,
+            native_cooldown,
             keychain_credentials,
             #[cfg(feature = "swift")]
             scm_to_registry,

@@ -384,18 +384,23 @@ fn classify_vulnerable_dependency(
         // FR-014: `--security-only`'s fix target comes from the advisory, never a
         // GOSSIP-filtered registry `latest` (issue #1521 item 1) — `gossip_excluded_version`
         // and `cooldown_fallback` both stay `None` (PlannedUpdateItem::new's defaults).
-        Ok(planned) => PlannedUpdateItem::new(
-            dep.name().as_str().to_string(),
-            current,
-            Outcome::Applied {
-                edit: planned.edit,
-                target: deps_core::ConcreteVersion::new(version_native),
-            },
-            fix.advisory_ids,
-            ignore_rule_overridden,
-            None,
-            None,
-        ),
+        Ok(planned) => {
+            let target = deps_core::ConcreteVersion::new(version_native);
+            let native_hold = native_hold_of(dep, key, analysis, &target);
+            PlannedUpdateItem::new(
+                dep.name().as_str().to_string(),
+                current,
+                Outcome::Applied {
+                    edit: planned.edit,
+                    target,
+                },
+                fix.advisory_ids,
+                ignore_rule_overridden,
+                None,
+                None,
+            )
+            .with_native_hold(native_hold)
+        }
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
         // forward to the fix target — see `bounded_requirement_already_resolves_to`'s and
         // `NuGetFormatter`'s doc for why this is not simply "the requirement admits the fix")
@@ -499,6 +504,29 @@ fn classify_vulnerable_dependency(
         )
         .with_osv_sibling_match(sibling_match_note(dv, formatter)),
     }
+}
+
+/// The native publish-age window `target` is still inside, if any.
+///
+/// `--security-only` never lets the window change the fix target; the note only tells the user
+/// the written version is younger than their package manager would normally accept.
+fn native_hold_of(
+    dep: &dyn deps_core::Dependency,
+    key: &PackageKey,
+    analysis: &ManifestAnalysis,
+    target: &deps_core::ConcreteVersion,
+) -> Option<super::NativeHoldNote> {
+    let version_data = analysis.version_data();
+    let gate = deps_core::native_cooldown::NativeGate::for_dependency(dep, key, &version_data)?;
+    let published_at = analysis
+        .cached_versions
+        .get(key.normalized())
+        .and_then(|versions| versions.published_at_of(target));
+    let eligible_in_secs = gate.remaining(published_at, target, gate.now())?;
+    Some(super::NativeHoldNote {
+        cooldown: gate.cooldown().clone(),
+        eligible_in_secs,
+    })
 }
 
 /// The note naming the sibling release tags `dv`'s verdict holds through, when it holds through
