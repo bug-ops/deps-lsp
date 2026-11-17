@@ -25,10 +25,10 @@ use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DependencyFormatter, DiagnosticMessages,
     EcosystemFormatter, FetchContext, HOVER_RECENT_VERSIONS, HoverProvenance,
-    InteractiveFetchRequest, LatestVerdict, LookupMiss, SiblingMatchNote, VersionData,
-    await_interactive_fetch, await_interactive_versions, cooldown_precedence, escape_markdown,
-    in_use_version, latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
-    resolve_scan_outcome,
+    InteractiveFetchRequest, LatestVerdict, LookupMiss, SiblingMatchNote, SuppressionKind,
+    VersionData, await_interactive_fetch, await_interactive_versions, cooldown_precedence,
+    escape_markdown, in_use_version, latest_verdict, markdown_code_span, position_in_range,
+    resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -202,22 +202,18 @@ where
     let vuln_outcome = versions
         .vulnerabilities
         .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &key));
-    let deprecation = versions
-        .outcomes
-        .and_then(|o| o.deprecation(key.normalized()));
-    // Package-level context (#205) renders before per-version security advisories:
-    // deprecation is a property of the package, advisories of the version.
-    push_deprecation_hover_section(&mut markdown, formatter, deprecation);
-    let latest_status_for_dep = versions
-        .latest_status
-        .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys.as_ref(), &key));
-    let registry_miss = versions.lookup_miss_for(&key);
-    push_vulnerability_hover_section(
+    let suppressed = versions.suppressed_kinds_for(formatter, &key);
+    push_package_context_hover_sections(
         &mut markdown,
         formatter,
-        vuln_outcome,
-        latest_status_for_dep,
-        registry_miss,
+        PackageContext {
+            dep,
+            key: &key,
+            versions: &versions,
+            vuln_keys: vuln_keys.as_ref(),
+            vuln_outcome,
+            suppressed,
+        },
     );
 
     let (trust_signal, gossip_low_usage) =
@@ -237,12 +233,14 @@ where
         live_latest_idx: latest.live_idx,
     }
     .resolve();
-    push_license_hover_section(
-        &mut markdown,
-        &licenses.resolved,
-        licenses.latest.as_deref(),
-        licenses.is_detected,
-    );
+    if !suppressed.contains(SuppressionKind::License) {
+        push_license_hover_section(
+            &mut markdown,
+            &licenses.resolved,
+            licenses.latest.as_deref(),
+            licenses.is_detected,
+        );
+    }
 
     // `!v.is_empty()`, not just `Some(_)` (#550): a resolvable source's live fetch can
     // succeed with a genuinely empty list — e.g. a real GitHub repository whose only
@@ -293,6 +291,66 @@ where
     push_skip_reason_footer_hover_section(&mut markdown, resolvable, offline, vuln_outcome);
 
     Some(markdown.finish(Some(dep.name_range())))
+}
+
+/// What the deprecation and advisory hover sections are rendered from.
+struct PackageContext<'a, D> {
+    dep: &'a D,
+    key: &'a PackageKey,
+    versions: &'a VersionData<'a>,
+    vuln_keys: Option<&'a crate::osv::VulnKeys>,
+    vuln_outcome: Option<&'a ScanOutcome>,
+    suppressed: super::SuppressedKinds,
+}
+
+/// Appends the package-level deprecation section and the per-version advisory section, minus
+/// whatever the user's per-package suppression hides.
+fn push_package_context_hover_sections<D: Dependency>(
+    markdown: &mut HoverMarkdown,
+    formatter: &dyn EcosystemFormatter,
+    ctx: PackageContext<'_, D>,
+) {
+    let PackageContext {
+        dep,
+        key,
+        versions,
+        vuln_keys,
+        vuln_outcome,
+        suppressed,
+    } = ctx;
+    let deprecation = versions
+        .outcomes
+        .and_then(|o| o.deprecation(key.normalized()))
+        .filter(|_| !suppressed.contains(SuppressionKind::Deprecated));
+    // Package-level context (#205) renders before per-version security advisories:
+    // deprecation is a property of the package, advisories of the version.
+    push_deprecation_hover_section(markdown, formatter, deprecation);
+    let latest_status = versions
+        .latest_status
+        .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys, key));
+    let filtered;
+    let advisories = match vuln_outcome {
+        Some(ScanOutcome::Vulnerable(dv)) => match suppressed.visible_advisories(dv) {
+            std::borrow::Cow::Borrowed(_) => vuln_outcome,
+            std::borrow::Cow::Owned(kept)
+                if kept.advisories.items().is_empty() && kept.advisories.total() == 0 =>
+            {
+                None
+            }
+            std::borrow::Cow::Owned(kept) => {
+                filtered = ScanOutcome::Vulnerable(kept);
+                Some(&filtered)
+            }
+        },
+        Some(ScanOutcome::Clean | ScanOutcome::Skipped(_)) | None => vuln_outcome,
+    };
+    push_vulnerability_hover_section(
+        markdown,
+        formatter,
+        advisories,
+        latest_status,
+        versions.lookup_miss_for(key),
+    );
 }
 
 /// The dependency whose name or version range holds `position`: the one lookup the shared

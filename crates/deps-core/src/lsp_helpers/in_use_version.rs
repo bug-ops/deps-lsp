@@ -84,9 +84,9 @@ enum BareRequirementPolicy {
 ///   `npm:` specifiers through the identical `node_semver::Range` grammar
 ///   npm itself uses, so the same full-vs-partial distinction applies
 ///   unchanged. This matters more for Deno than for npm/Composer:
-///   `deps-deno` has no lockfile support at all (`DenoEcosystem`'s
-///   `LockFileProvider` is unimplemented), so `concrete_pin_version` is the
-///   *only* possible source of an in-use version for any Deno dependency — a
+///   `deno.lock` only resolves ranges (`DenoLockParser`, #1924), so for a
+///   project without one `concrete_pin_version` is the *only* possible source
+///   of an in-use version for a Deno dependency — a
 ///   `deno.json` `"npm:express@4.17.0"` import parses to the bare
 ///   requirement `"4.17.0"`, and grouping Deno with Cargo under
 ///   `AlwaysRange` meant that requirement could never resolve to a concrete
@@ -3179,9 +3179,8 @@ mod tests {
     }
 
     /// #667's exact repro: a `deno.json` `"npm:express@4.17.0"` import with no lock
-    /// file — `deps-deno` has no `LockFileProvider` implementation at all, so this is
-    /// the *only* path through which a Deno dependency can ever resolve an in-use
-    /// version. Before this fix, Deno was grouped with Cargo under `AlwaysRange`, so
+    /// file — without a `deno.lock` (`DenoLockParser`, #1924), this is the *only* path
+    /// through which a Deno dependency can resolve an in-use version. Before this fix, Deno was grouped with Cargo under `AlwaysRange`, so
     /// this bare full-version pin resolved to `None` and never received an OSV scan.
     #[test]
     fn in_use_version_deno_bare_full_version_no_lockfile_resolves_667_repro() {

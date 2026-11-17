@@ -24,8 +24,8 @@ use crate::{
 use super::{
     CooldownBlocker, CooldownDisposition, DependencyFormatter, DependencyGate, DiagnosticMessages,
     EcosystemFormatter, LatestVerdict, LookupMiss, PackageVersions, RequirementMatcher,
-    RequirementStatus, SuppressedKinds, SuppressionKind, VersionData, cooldown_disposition,
-    resolve_scan_outcome, version_range_is_synthetic_empty,
+    RequirementStatus, SuppressedKinds, VersionData, cooldown_disposition, resolve_scan_outcome,
+    version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -1139,7 +1139,7 @@ where
         .unwrap_or_default();
 
     for (dep, key) in &keyed_deps {
-        let suppressed = suppression.kinds_for(key.normalized());
+        let suppressed = suppression.for_package(key.normalized()).kinds();
         let ctx = RuleContext {
             dep: *dep,
             key,
@@ -3206,21 +3206,15 @@ fn push_vulnerability_diagnostics(
 ) {
     let range: Range = version_anchor_range(dep);
 
-    let visible;
-    let dv = if suppressed.contains(SuppressionKind::Deprecated) {
-        visible = dv.without_informational();
-        &visible
-    } else {
-        dv
-    };
+    let visible = suppressed.visible_advisories(dv);
     let unexempted;
     let mut exempted_ids = Vec::new();
     let dv = match exemptions {
         Some((exemptions, now)) if !exemptions.is_empty() => {
-            (unexempted, exempted_ids) = dv.without_exempted(exemptions, now);
+            (unexempted, exempted_ids) = visible.without_exempted(exemptions, now);
             &unexempted
         }
-        _ => dv,
+        _ => &*visible,
     };
     let display_advisories = dv.advisories_for_display();
     for advisory in display_advisories.items() {

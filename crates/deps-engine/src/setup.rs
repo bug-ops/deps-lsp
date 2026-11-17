@@ -279,11 +279,8 @@ pub fn validate_gitlab_instance_host(
 /// (or ecosystem-specific-named lock parser, e.g. `GoSumParser`) type the ecosystem crate
 /// actually defines and re-exports from its own crate root.** Omit only when the crate
 /// genuinely has none — e.g. `deps-gradle` has no `GradleRegistry` (reuses
-/// `deps_maven::MavenCentralRegistry` directly), and several ecosystems omit a
-/// `*LockParser` entry because the crate has no `lockfile` module at all (Maven, Gradle,
-/// GitHub Actions, GitLab CI — no lock file format exists for these; Deno — `deno.lock`
-/// exists as a format, but this crate has no parser for it yet, a real coverage gap rather
-/// than "no format" like the other four).
+/// `deps_maven::MavenCentralRegistry` directly), and Maven, GitHub Actions and GitLab CI
+/// omit a `*LockParser` entry because no lock file format exists for them.
 macro_rules! ecosystem {
     ($feature:literal, $crate_name:ident, $ecosystem:ident, [$($types:ident),* $(,)?]) => {
         #[cfg(feature = $feature)]
@@ -427,6 +424,7 @@ ecosystem!(
         GradleParseResult,
         GradleVersion,
         GradleFormatter,
+        GradleLockParser,
         parse_gradle,
     ]
 );
@@ -491,6 +489,7 @@ ecosystem!(
         DenoDependency,
         DenoDependencySection,
         DenoFormatter,
+        DenoLockParser,
         DenoMetadata,
         DenoParseResult,
         DenoRegistry,

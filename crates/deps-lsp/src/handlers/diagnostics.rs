@@ -137,7 +137,7 @@ impl DiagnosticsSnapshot {
             typosquat: config.policy.typosquat_checks(),
             gossip: config.policy.gossip_checks(),
             license_policy: Arc::new(config.policy.license_policy.to_policy()),
-            suppression: Arc::new(config.policy.diagnostics.suppress.clone()),
+            suppression: Arc::new(config.policy.diagnostics.effective_suppression()),
             advisory_exemptions: state.advisory_exemptions(),
             fetch_timeout: config.policy.cache.fetch_timeout,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,

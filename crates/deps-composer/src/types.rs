@@ -419,6 +419,10 @@ impl deps_core::lsp_helpers::ProbeDependency for ComposerDependency {
             source,
         }
     }
+
+    fn route_probes(_name: deps_core::PackageName) -> Vec<Self> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

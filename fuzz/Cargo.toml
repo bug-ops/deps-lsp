@@ -71,6 +71,7 @@ features = ["fuzzing"]
 
 [dependencies.deps-deno]
 path = "../crates/deps-deno"
+features = ["fuzzing"]
 
 # `default-features = false`: the `deps_cli_config` target only exercises
 # `config::fuzz_parse_config`, which never touches any ecosystem-specific code, so the
@@ -129,6 +130,13 @@ bench = false
 [[bin]]
 name = "swift_parser"
 path = "fuzz_targets/swift_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gradle_lockfile"
+path = "fuzz_targets/gradle_lockfile.rs"
 test = false
 doc = false
 bench = false

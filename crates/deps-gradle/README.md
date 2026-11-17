@@ -15,6 +15,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Version Catalog** — Parse `gradle/libs.versions.toml` with `[versions]`, `[libraries]`, and `[plugins]` sections
 - **Kotlin DSL** — Parse `build.gradle.kts` dependency declarations
 - **Groovy DSL** — Parse `build.gradle` dependency declarations
+- **Lock file** — `gradle.lockfile` (dependency locking) supplies the in-use version, read from the manifest's own directory (a catalog in `<project>/gradle/` also checks the project root); `buildscript-gradle.lockfile` and legacy `gradle/dependency-locks/` are not read
 - **Multi-registry** — Resolves from Maven Central, Google Maven, and Gradle Plugin Portal
 - **Maven version comparison** — Full qualifier-aware comparison (`alpha`, `beta`, `RC`, `SNAPSHOT`)
 - **Property/`version.ref` resolution** — Resolves `$name`/`${name}` and catalog `version.ref` values, each bounded to 1 KiB; columns are computed as UTF-16 offsets

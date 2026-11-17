@@ -8,7 +8,7 @@ pip's line-oriented requirements-file format from one crate.
 | | |
 |---|---|
 | Manifest files | `pyproject.toml` (PEP 621, PEP 735, Poetry, PEP 517/518 `build-system.requires`); `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, `constraints*.txt`; any `.txt` directly under a `requirements/` directory |
-| Lock file (in-use version) | `poetry.lock` or `uv.lock` |
+| Lock file (in-use version) | `poetry.lock`, `uv.lock`, `pdm.lock` or `Pipfile.lock` |
 | Registry | PyPI — PEP 691 Simple API JSON (`pypi.org/simple/{package}/`) for version lookups, JSON API (`pypi.org/pypi/{package}/json`) for hover metadata |
 | Version syntax | PEP 440 version specifiers, parsed via `pep440_rs`; full PEP 508 requirement strings (extras, environment markers) via `pep508_rs` |
 
@@ -19,6 +19,14 @@ dependencies = [
     "numpy>=1.24; python_version>='3.9'",
 ]
 ```
+
+### Lock files
+
+When several lock files sit in one directory the first of `poetry.lock`, `uv.lock`, `pdm.lock`, `Pipfile.lock` wins; the manifest's directory is checked before its ancestors.
+
+- `pdm.lock` needs `[metadata] lock_version` 4.x; all groups are read.
+- `Pipfile.lock` needs `_meta.pipfile-spec` 6; `default` and `develop` are read, and only exact `==` pins count (git, path, editable and range entries show no in-use version).
+- A `Pipfile` is not a recognised manifest: `Pipfile.lock` helps only projects that also have a `pyproject.toml` or `requirements*.txt`.
 
 Hover shows the requirement's PEP 440 satisfaction against the latest PyPI release, extras
 (`requests[socks]`), and — when present — the environment marker in a readable "Active when:"

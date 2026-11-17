@@ -14,6 +14,7 @@
 
 pub mod ecosystem;
 pub mod formatter;
+pub mod lockfile;
 pub mod parser;
 pub mod registry;
 pub mod specifier;
@@ -21,6 +22,12 @@ pub mod types;
 
 pub use ecosystem::DenoEcosystem;
 pub use formatter::DenoFormatter;
+pub use lockfile::DenoLockParser;
+// Exposed only under the non-default `fuzzing` feature (spec 091 FR-016) so `fuzz/` can reach
+// the otherwise-private lock-file parser; mirrors `deps-pypi`'s `fuzz_parse_pdm_lock`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_deno_lock;
 pub use parser::{
     DenoParseContext, DenoParseResult, parse_deno_json, parse_deno_json_with_context,
 };

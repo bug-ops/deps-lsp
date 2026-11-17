@@ -35,6 +35,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `diagnostics` | `mutable_ref_pin_enabled` | `true` | Turns the mutable-ref-pin diagnostic and its bulk code lens off entirely — unlike the other diagnostics, severity alone cannot silence it |
 | `diagnostics` | `vulnerabilities_enabled` | `true` | Whether OSV.dev-backed vulnerability diagnostics run at all |
 | `diagnostics` | `suppress` | `[]` | List of `{ package, kinds }` rules that silence diagnostics per package; see [Suppressing diagnostics per package](#suppressing-diagnostics-per-package) |
+| `diagnostics` | `ignore` | `[]` | List of package patterns whose outdated, deprecated, yanked and license diagnostics and inlay hint are all hidden; see [Suppressing diagnostics per package](#suppressing-diagnostics-per-package) |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`. A registry you declared yourself is exempt: Go's `$GOENV` `GOPROXY`, your user `~/.npmrc`, your user-profile `NuGet.Config` and your user-level `registries.json`, and any repository URL equal to one of them, ignore this setting (see [Operator-owned registries](#operator-owned-registries)). See [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
@@ -83,10 +84,28 @@ kinds = ["deprecated"]
 - A suppressed package is still fetched and checked for every kind you did not list.
 - An invalid rule (unknown kind, empty `kinds`, bare `*`, `*` in the middle of a pattern, unknown key)
   rejects the whole configuration and keeps the previous one.
-- `deps-cli check` honors the rules from an explicit `--config` only; the `suppress` list of an
-  auto-discovered `deps.toml` is dropped with a warning.
-- The "Update N outdated" code lens and update-all still count suppressed packages, and the
-  "+N more advisories" line can still count a hidden unmaintained advisory.
+- `deps-cli check` honors the rules from an explicit `--config` only; the `suppress` and `ignore`
+  lists of an auto-discovered `deps.toml` are dropped with a warning.
+- The rules apply to hover (`deprecated` hides the deprecation section, `license` the license
+  section), the inlay hint (`outdated` renders it as up to date), and the "Update N outdated" code
+  lens and update-all command (`outdated` excludes the package). Per-dependency code actions are not
+  affected. The "+N more advisories" line can still count a hidden unmaintained advisory.
+
+To skip a package entirely, list it under `diagnostics.ignore`:
+
+```json
+{ "diagnostics": { "ignore": ["request", "@types/*"] } }
+```
+
+```toml
+[diagnostics]
+ignore = ["request", "@types/*"]
+```
+
+`ignore` takes the same patterns as `package` above and hides all four kinds, the inlay hint, and the
+package from the update lens and update-all. It never hides vulnerability, unknown-package,
+unsatisfiable or typosquat diagnostics, nor the mutable-ref-pin, SHA-comment-mismatch and unknown-ref
+diagnostics. When a package matches both `ignore` and a `suppress` rule, `ignore` wins.
 
 ### Exempting an advisory (operator file)
 
@@ -138,6 +157,7 @@ are therefore never bound to a settings value; they come from your process envir
 | `registries.swift_keychain_credentials` | Trigger a macOS Keychain access prompt; the credential goes only to registries declared in your user-level `registries.json` |
 | `registries.swift_scm_to_registry` | Send the repository URLs of your `Package.swift` dependencies (userinfo, query and fragment removed) to the default registry in your user-level `registries.json`; a registry declared by the repository is never asked |
 | `diagnostics.vulnerabilities_enabled`, `network.offline` | Hide vulnerability findings or all registry data in the editor |
+| `diagnostics.suppress`, `diagnostics.ignore` | Hide deprecated, yanked, outdated and license findings (and a package's unmaintained advisories) for chosen packages. They can never hide vulnerability, unknown-package, unsatisfiable or typosquat diagnostics |
 
 > **Warning:** If your editor lets a repository's settings change the server's environment or
 > binary (for example Zed's `lsp.<id>.binary`), that is already code execution under the
@@ -279,7 +299,8 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
     "unknown_ref_severity": "warning",
     "mutable_ref_pin_enabled": true,
     "vulnerabilities_enabled": true,
-    "suppress": []
+    "suppress": [],
+    "ignore": []
   },
   "freshness": {
     "enabled": true,

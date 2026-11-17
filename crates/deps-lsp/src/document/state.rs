@@ -252,6 +252,42 @@ impl std::fmt::Debug for ManifestParse {
     }
 }
 
+/// Identity of one open of a document, distinguishing a reopened URI from its predecessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenEpoch(u64);
+
+/// An epoch reserved for an open still parsing; dropping it without
+/// [`ServerState::insert_opened`] releases the reservation.
+pub(crate) struct OpenReservation<'a> {
+    state: &'a ServerState,
+    uri: Uri,
+    epoch: OpenEpoch,
+}
+
+impl std::fmt::Debug for OpenReservation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenReservation")
+            .field("uri", &self.uri)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OpenReservation<'_> {
+    fn drop(&mut self) {
+        // Epoch-matched, so a newer open's reservation for the same URI is left alone.
+        self.state
+            .opening
+            .remove_if(&self.uri, |_, epoch| *epoch == self.epoch);
+    }
+}
+
+impl OpenEpoch {
+    /// Placeholder of a state not yet inserted by [`ServerState::update_document`]; no real open
+    /// ever carries it.
+    const UNSTAMPED: Self = Self(0);
+}
+
 /// State for a single open document.
 ///
 /// Stores the document content, parsed dependency information, and cached
@@ -323,6 +359,10 @@ pub struct DocumentState {
     /// edit whose ranges were computed against a buffer state it has since moved past
     /// (see `handlers::code_lens`).
     pub version: Option<i32>,
+    /// Which open of the URI this state belongs to; stamped by [`ServerState::update_document`]
+    /// and carried across edits by the commit, so work started under a previous open can be told
+    /// apart from the current one even when both sit at the same LSP version (#2022).
+    open_epoch: OpenEpoch,
 }
 
 /// [`DocumentState`]'s load lifecycle, carrying [`LoadingState::Loading`]'s start [`Instant`]
@@ -467,11 +507,23 @@ impl std::fmt::Debug for DocumentState {
             .field("loading_state", &self.loading_state())
             .field("loading_started_at", &self.loading_started_at())
             .field("version", &self.version)
+            .field("open_epoch", &self.open_epoch)
             .finish()
     }
 }
 
 impl DocumentState {
+    /// Carries `previous`'s open epoch over, for a state that replaces it within the same open
+    /// (an edit, not a reopen). The only way besides [`ServerState::update_document`] to set it.
+    pub(super) const fn inherit_open_epoch(&mut self, previous: &Self) {
+        self.open_epoch = previous.open_epoch;
+    }
+
+    /// Returns the epoch of the open this state belongs to; see [`OpenEpoch`].
+    pub(crate) const fn open_epoch(&self) -> OpenEpoch {
+        self.open_epoch
+    }
+
     /// Shared body for [`Self::new_from_parse_result`]/[`Self::new_without_parse_result`]
     /// (issue #1477): the two constructors differ only in whether they have a parse result
     /// to hand, so every other field's initial value lives here once.
@@ -484,6 +536,7 @@ impl DocumentState {
             parsed_at: Instant::now(),
             load_phase: LoadPhase::Idle,
             version: None,
+            open_epoch: OpenEpoch::UNSTAMPED,
         }
     }
 
@@ -1107,6 +1160,10 @@ impl SupersedingTaskRegistry {
 /// assert_eq!(state.document_count(), 0);
 /// ```
 pub struct ServerState {
+    /// Epochs reserved by an in-flight `didOpen` before its parse, so a `didChange` dispatched
+    /// concurrently with that open can capture the open it will land on (#2022); see
+    /// [`Self::reserve_open`].
+    opening: DashMap<Uri, OpenEpoch>,
     /// Open documents keyed by canonical `Uri` (issue #1086): every `server.rs`
     /// `LanguageServer` trait method runs [`crate::lsp_types_interop::canonicalize_uri`]
     /// on a request's `textDocument.uri` before it ever reaches this map, so two requests
@@ -1296,6 +1353,8 @@ pub struct ServerState {
     /// Generation counter bumped by [`Self::queue_reparse`], letting a debounce worker
     /// detect it was superseded by a newer config change before draining `pending_reparse`.
     reparse_generation: AtomicU64,
+    /// Source of [`OpenEpoch`] values, drawn by [`Self::update_document`].
+    open_epochs: AtomicU64,
     /// Epoch bracketing every config apply, so a diagnostics generation that overlapped one is
     /// detected and redone (#1799). Bumped only through [`Self::begin_config_apply`].
     config_epoch: ConfigEpochCell,
@@ -1406,6 +1465,7 @@ impl ServerState {
         ));
 
         Self {
+            opening: DashMap::new(),
             documents: DashMap::new(),
             cache,
             osv,
@@ -1442,6 +1502,7 @@ impl ServerState {
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(FETCH_PERMITS)),
             pending_reparse: std::sync::Mutex::new(None),
             reparse_generation: AtomicU64::new(0),
+            open_epochs: AtomicU64::new(OpenEpoch::UNSTAMPED.0 + 1),
             config_epoch: ConfigEpochCell::default(),
             republish: tokio::sync::Notify::new(),
             publish_tickets: AtomicU64::new(0),
@@ -1881,9 +1942,51 @@ impl ServerState {
     /// Updates or inserts document state.
     ///
     /// If a document already exists at the given URI, it is replaced.
-    /// Otherwise, a new entry is created.
-    pub fn update_document(&self, uri: Uri, state: DocumentState) {
+    /// Otherwise, a new entry is created. Either way the state is stamped with a fresh
+    /// open epoch, so a repeated `didOpen` also invalidates work of the open it replaces.
+    pub fn update_document(&self, uri: Uri, mut state: DocumentState) {
+        state.open_epoch = self.next_open_epoch();
         self.documents.insert(uri, state);
+    }
+
+    fn next_open_epoch(&self) -> OpenEpoch {
+        OpenEpoch(self.open_epochs.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Reserves the epoch the open of `uri` now starting will carry, before its parse runs.
+    ///
+    /// The reservation is visible to [`Self::capture_open_epoch`] until
+    /// [`Self::insert_opened`] consumes it or it is dropped (an open that failed or was
+    /// rejected), so a `didChange` racing the open's parse is not mistaken for an edit of a
+    /// closed document (#2022).
+    pub(crate) fn reserve_open(&self, uri: &Uri) -> OpenReservation<'_> {
+        let epoch = self.next_open_epoch();
+        self.opening.insert(uri.clone(), epoch);
+        OpenReservation {
+            state: self,
+            uri: uri.clone(),
+            epoch,
+        }
+    }
+
+    /// Inserts the document an open produced, stamped with the epoch `reservation` holds.
+    pub(crate) fn insert_opened(&self, reservation: OpenReservation<'_>, mut state: DocumentState) {
+        state.open_epoch = reservation.epoch;
+        self.documents.insert(reservation.uri.clone(), state);
+        drop(reservation);
+    }
+
+    /// The open a change to `uri` would land on: the tracked document's, else the one a
+    /// `didOpen` still parsing has reserved, else `None` (the document is not open).
+    ///
+    /// The documents map is read again last: an open finishing between the first two reads
+    /// moves its epoch from `opening` to `documents`.
+    pub(crate) fn capture_open_epoch(&self, uri: &Uri) -> Option<OpenEpoch> {
+        self.documents
+            .get(uri)
+            .map(|doc| doc.open_epoch())
+            .or_else(|| self.opening.get(uri).map(|epoch| *epoch))
+            .or_else(|| self.documents.get(uri).map(|doc| doc.open_epoch()))
     }
 
     /// Removes document state and returns the removed entry.
@@ -1894,6 +1997,7 @@ impl ServerState {
         // Documents first, then the claim: [`Self::claim_publish`] re-checks the document after
         // inserting, so a generation racing this close cannot leave an entry behind.
         let removed = self.documents.remove(uri);
+        self.opening.remove(uri);
         self.published.remove(uri);
         self.refetch_escalations.remove(uri);
         removed
@@ -2042,6 +2146,55 @@ impl ServerState {
             }
         }
 
+        self.supervise_background_task(uri, task, task_id);
+    }
+
+    /// Registers `task` as `uri`'s change task only if `epoch` is still the open that started
+    /// it, deciding under the `tasks` lock (#2022).
+    ///
+    /// A task of the current open replaces (and aborts) the previously registered task, exactly
+    /// as [`Self::spawn_background_task`] does. A task of a closed or superseded open is aborted
+    /// itself and registered nowhere; the task a reopen installed, and its typosquat and gossip
+    /// tasks, are left alone. Returns whether `task` was registered.
+    ///
+    /// Sound because an open inserts its document before registering any task and a close
+    /// removes the document before cancelling the task, so an epoch seen here under the lock
+    /// cannot be resurrected.
+    #[tracing::instrument(skip_all, fields(uri = ?uri))]
+    pub(crate) async fn register_change_task(
+        self: &Arc<Self>,
+        uri: Uri,
+        task: JoinHandle<()>,
+        epoch: OpenEpoch,
+    ) -> bool {
+        let task_id = task.id();
+        {
+            let mut tasks = self.tasks.write().await;
+            let current = self.documents.get(&uri).map(|doc| doc.open_epoch());
+            if current != Some(epoch) {
+                self.abort_registry.mark_aborted(task_id);
+                task.abort();
+                return false;
+            }
+            if let Some((old_id, old_task)) =
+                tasks.insert(uri.clone(), (task_id, task.abort_handle()))
+            {
+                self.abort_registry.mark_aborted(old_id);
+                old_task.abort();
+            }
+        }
+        self.supervise_background_task(uri, task, task_id);
+        true
+    }
+
+    /// Spawns the supervisor that forces `uri`'s document to `Failed` if `task` panics while
+    /// still the registered task; see [`Self::spawn_background_task`].
+    fn supervise_background_task(
+        self: &Arc<Self>,
+        uri: Uri,
+        task: JoinHandle<()>,
+        task_id: tokio::task::Id,
+    ) {
         let state = Arc::clone(self);
         // Captured before `tokio::spawn` (rather than relying on `#[instrument]` on a
         // supervisor fn) so this detached supervisor's panic/debug logs stay correlated
@@ -2161,29 +2314,6 @@ impl ServerState {
         self.abort_gossip_task(uri).await;
     }
 
-    /// [`Self::cancel_background_task`], but only when the task registered for `uri` is still
-    /// `task_id`, so a task a later open installed for the same URI is left alone. Returns
-    /// whether it cancelled.
-    pub(crate) async fn cancel_background_task_if_current(
-        &self,
-        uri: &Uri,
-        task_id: tokio::task::Id,
-    ) -> bool {
-        {
-            let mut tasks = self.tasks.write().await;
-            if tasks.get(uri).is_none_or(|(id, _)| *id != task_id) {
-                return false;
-            }
-            if let Some((id, task)) = tasks.remove(uri) {
-                self.abort_registry.mark_aborted(id);
-                task.abort();
-            }
-        }
-        self.abort_typosquat_task(uri).await;
-        self.abort_gossip_task(uri).await;
-        true
-    }
-
     /// Draws the next generation value for a typosquat pre-fetch spawn decision (issue #1455
     /// critic M2) — see [`SupersedingTaskRegistry::next_generation`].
     pub(crate) fn next_typosquat_task_generation(&self) -> u64 {
@@ -2264,6 +2394,10 @@ impl Default for ServerState {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "state_open_epoch_tests.rs"]
+mod open_epoch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3359,28 +3493,6 @@ mod tests {
         );
 
         state.cancel_background_task(&uri).await;
-    }
-
-    /// Critic M1: the re-check after a `did_change` registration must not cancel a task a
-    /// later open installed for the same URI.
-    #[tokio::test]
-    async fn test_cancel_if_current_leaves_a_superseding_task_alone() {
-        let state = Arc::new(ServerState::new());
-        let uri =
-            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
-
-        let task_a = tokio::spawn(std::future::pending::<()>());
-        let id_a = task_a.id();
-        state.spawn_background_task(uri.clone(), task_a).await;
-        let task_b = tokio::spawn(std::future::pending::<()>());
-        let id_b = task_b.id();
-        state.spawn_background_task(uri.clone(), task_b).await;
-
-        assert!(!state.cancel_background_task_if_current(&uri, id_a).await);
-        assert!(state.is_current_background_task(&uri, id_b).await);
-
-        assert!(state.cancel_background_task_if_current(&uri, id_b).await);
-        assert!(!state.is_current_background_task(&uri, id_b).await);
     }
 
     // =========================================================================

@@ -171,8 +171,17 @@ where
     P: TypedParseResult,
     F: DependencyFormatter<Dep = P::Dep>,
 {
+    let suppression = versions
+        .suppression
+        .map(|set| set.resolve(formatter))
+        .unwrap_or_default();
     crate::edit::collect_update_edits(parse_result, content, versions, formatter)
         .into_iter()
+        .filter(|planned| {
+            !suppression
+                .for_package(planned.key.normalized())
+                .hides_outdated()
+        })
         .map(|planned| planned.edit.into())
         .collect()
 }

@@ -1,0 +1,17 @@
+{
+    "_meta": {
+        "hash": {"sha256": "0000"},
+        "pipfile-spec": 6,
+        "requires": {"python_version": "3.11"},
+        "sources": [{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]
+    },
+    "default": {
+        "requests": {"hashes": ["sha256:aa"], "index": "pypi", "version": "==2.31.0"},
+        "mylib": {"git": "https://github.com/example/mylib.git", "ref": "0123456789abcdef"},
+        "localpkg": {"path": "./localpkg", "editable": true},
+        "loose": {"version": ">=1.0"}
+    },
+    "develop": {
+        "pytest": {"hashes": [], "index": "pypi", "version": "==7.4.0"}
+    }
+}

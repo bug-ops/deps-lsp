@@ -18,12 +18,17 @@
 pub mod ecosystem;
 pub mod formatter;
 mod license;
+pub mod lockfile;
 pub mod parser;
 pub mod range;
 pub mod types;
 
 pub use ecosystem::GradleEcosystem;
 pub use formatter::GradleFormatter;
+pub use lockfile::GradleLockParser;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_gradle_lock;
 // `license` itself stays unconditionally private (impl-critic M1): only this one
 // fuzz-only wrapper is re-exported, and only under the non-default `fuzzing` feature
 // (issue #691, see this crate's Cargo.toml) — `fuzz/`'s `registry_xml_parser` target

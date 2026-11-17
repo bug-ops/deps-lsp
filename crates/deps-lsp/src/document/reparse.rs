@@ -1,11 +1,11 @@
 //! Shared reparse driver for issue #590 (watched config file changes) and issue #592
 //! (live-reloadable `DepsConfig` settings): reparses every currently open document matching
 //! a [`ReparseScope`], reusing the version-guarded, sequential-await machinery
-//! [`handle_document_change_guarded`] already provides against a concurrent `did_change`.
+//! [`commit_document_change`] already provides against a concurrent `did_change`.
 
-use super::lifecycle::{CommitGuard, ParseTrigger, handle_document_change_guarded};
+use super::lifecycle::{CommitGuard, CommittedChange, ParseTrigger, commit_document_change};
 use super::resolved::RefetchPolicy;
-use super::state::{RefreshKind, ServerState, refresh_with_timeout};
+use super::state::{OpenEpoch, RefreshKind, ServerState, refresh_with_timeout};
 use crate::config::{DepsConfig, ReparseScope};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ pub(crate) const RECONFIGURE_DEBOUNCE: Duration = Duration::from_millis(250);
 pub(crate) const MAX_DEBOUNCE_WAIT: Duration = Duration::from_secs(2);
 
 /// Reparses every open document matching `scope`, sharing the version-guarded,
-/// sequential-await machinery [`handle_document_change_guarded`] provides.
+/// sequential-await machinery [`commit_document_change`] provides.
 ///
 /// A free function rather than a `Backend` method (issue #592 critic S6): `Backend` is a
 /// plain struct, never `Arc`-shared, so a `did_change_configuration`-triggered reparse
@@ -43,11 +43,11 @@ pub(crate) const MAX_DEBOUNCE_WAIT: Duration = Duration::from_secs(2);
 /// by a `didChangeWatchedFiles` notification handler that already returns promptly.
 ///
 /// Reparses are awaited one at a time, not concurrently: this preserves the version-guard
-/// semantics `commit_parsed_document`'s `CommitGuard::ExpectVersion` relies on (a
+/// semantics `commit_parsed_document`'s `CommitGuard::SameOpenAndVersion` relies on (a
 /// concurrent `did_change` for one document must never be reverted by a stale reparse for
 /// another in this loop), and bounds peak memory to one document's content/AST at a time.
 /// An `Ok(None)` skip must never touch the task registry — see
-/// [`handle_document_change_guarded`]'s doc for why.
+/// [`commit_document_change`]'s doc for why.
 pub(crate) async fn reparse_open_documents(
     scope: ReparseScope,
     refetch: RefetchPolicy,
@@ -62,13 +62,17 @@ pub(crate) async fn reparse_open_documents(
         .map(|entry| (entry.key().clone(), entry.value().ecosystem))
         .collect();
     let in_scope = crate::config::uris_in_scope(&scope, candidates).await;
-    let affected: Vec<(Uri, String, Option<i32>)> = in_scope
+    let affected: Vec<(Uri, String, Option<i32>, OpenEpoch)> = in_scope
         .iter()
         .filter_map(|uri| {
-            state
-                .documents
-                .get(uri)
-                .map(|entry| (uri.clone(), entry.content.clone(), entry.version))
+            state.documents.get(uri).map(|entry| {
+                (
+                    uri.clone(),
+                    entry.content.clone(),
+                    entry.version,
+                    entry.open_epoch(),
+                )
+            })
         })
         .collect();
 
@@ -108,12 +112,12 @@ pub(crate) async fn reparse_open_documents(
         affected.len()
     );
 
-    for (uri, content, version) in affected {
-        match handle_document_change_guarded(
+    for (uri, content, version, epoch) in affected {
+        match commit_document_change(
             uri.clone(),
             content,
             version,
-            CommitGuard::ExpectVersion(version),
+            CommitGuard::SameOpenAndVersion { epoch, version },
             ParseTrigger::Config,
             refetch,
             Arc::clone(&state),
@@ -122,7 +126,9 @@ pub(crate) async fn reparse_open_documents(
         )
         .await
         {
-            Ok(Some(task)) => state.spawn_background_task(uri, task).await,
+            Ok(Some(CommittedChange { task, epoch })) => {
+                state.register_change_task(uri, task, epoch).await;
+            }
             // A skip (superseded by a concurrent `did_change`) must never touch the task
             // registry for this URI — `spawn_background_task` unconditionally aborts
             // whatever task is already registered there, which would cancel the

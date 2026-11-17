@@ -1,5 +1,5 @@
 use crate::diagnostic::Severity;
-use crate::lsp_helpers::SuppressionSet;
+use crate::lsp_helpers::{PackagePattern, SuppressionSet};
 use serde::Deserialize;
 
 /// The policy-relevant subset of `deps-lsp`'s configuration.
@@ -598,6 +598,7 @@ impl PolicyConfig {
             unknown_ref_severity: _,
             vulnerabilities_enabled: _,
             suppress: _,
+            ignore: _,
         } = new_diagnostics;
         let CacheConfig {
             enabled: _,
@@ -757,6 +758,10 @@ pub struct DiagnosticsConfig {
     /// is read on every diagnostics generation.
     #[serde(default)]
     pub suppress: SuppressionSet,
+    /// Packages whose outdated/deprecated/yanked/license diagnostics and hints are all hidden
+    /// (#1967, spec 094). Same pattern grammar as `suppress`; wins over a `suppress` rule.
+    #[serde(default)]
+    pub ignore: Vec<PackagePattern>,
 }
 
 impl Default for DiagnosticsConfig {
@@ -791,7 +796,14 @@ impl DiagnosticsConfig {
             unknown_ref_severity: default_unknown_ref_severity(),
             vulnerabilities_enabled: true,
             suppress: SuppressionSet::new(Vec::new()),
+            ignore: Vec::new(),
         }
+    }
+
+    /// The `suppress` rules merged with the `ignore` patterns, as one compiled set.
+    #[must_use]
+    pub fn effective_suppression(&self) -> SuppressionSet {
+        self.suppress.clone().with_ignored(self.ignore.clone())
     }
 
     /// Overrides [`Self::outdated_severity`]. See [`Self::new`].

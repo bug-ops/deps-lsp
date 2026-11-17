@@ -40,8 +40,7 @@ const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
 /// - Inlay hints, hover, code actions, and diagnostics via the shared `deps-core`
 ///   handlers
 ///
-/// No lock file support in the MVP (D9): `deno.lock` resolved-version parsing is a
-/// follow-up increment.
+/// In-use versions come from `deno.lock` (schema versions 3-5) via [`crate::lockfile::DenoLockParser`].
 pub struct DenoEcosystem {
     registry: Arc<DenoRegistry>,
     formatter: DenoFormatter,
@@ -187,6 +186,14 @@ impl EcosystemBase for DenoEcosystem {
     /// `npm:`-scope imports (#1202/#1212/#1227), mirroring `NpmEcosystem`.
     fn watched_configs(&self) -> &[WatchedConfig] {
         &WATCHED_CONFIGS
+    }
+
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        crate::lockfile::LOCKFILE_NAMES
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(Arc::new(crate::lockfile::DenoLockParser))
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
@@ -357,10 +364,6 @@ mod tests {
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
     // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
-    // `lockfile_filenames` is omitted — deno.lock resolved-version parsing is a documented
-    // MVP gap (D9), not yet a `LockFileProvider` impl in this crate; `no_lockfile_support:
-    // true;` (#782 gap 2) replaces the hand-written test_ecosystem_no_lockfile_support that
-    // used to cover that absence-of-both-halves invariant.
     deps_core::ecosystem_conformance! {
         mod deno_ecosystem_conformance;
         build: DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
@@ -368,7 +371,7 @@ mod tests {
         id: "deno";
         display_name: "Deno (JSR/npm)";
         manifest_filenames: &["deno.json", "deno.jsonc"];
-        no_lockfile_support: true;
+        lockfile_filenames: &["deno.lock"];
         no_non_registry_fixture: "Deno's non-Registry classification (parser::classify_npm_imports) only fires once a real .npmrc file resolves from disk for an npm: import's scope — the shared macro's fixture has no filesystem backing to supply one. Covered instead by parser::tests::test_npm_scoped_import_resolves_via_npmrc, which builds a real tempfile::tempdir() with a .npmrc and asserts the same gate properties end-to-end.";
     }
 

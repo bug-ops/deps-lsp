@@ -15,7 +15,7 @@ use super::{
 };
 use super::{
     DependencyOutcomes, EcosystemFormatter, GossipFindings, InteractiveFetchGate, LookupMiss,
-    SuppressionSet,
+    PackageSuppression, SuppressedKinds, SuppressionSet,
 };
 use crate::ecosystem::Dependency;
 use crate::error::FetchFailure;
@@ -859,6 +859,30 @@ impl<'a> VersionData<'a> {
     pub const fn with_advisory_exemptions(mut self, exemptions: &'a OperatorExemptions) -> Self {
         self.advisory_exemptions = Some(exemptions);
         self
+    }
+
+    /// The suppression configured for `key`, or none when no rule is attached. Resolves the
+    /// set per call: only the single hovered or hinted dependency asks, so no cache is kept.
+    #[must_use]
+    pub fn package_suppression(
+        &self,
+        formatter: &dyn EcosystemFormatter,
+        key: &PackageKey,
+    ) -> PackageSuppression {
+        self.suppression
+            .map(|set| set.resolve(formatter))
+            .unwrap_or_default()
+            .for_package(key.normalized())
+    }
+
+    /// The kinds [`Self::package_suppression`] hides for `key`.
+    #[must_use]
+    pub fn suppressed_kinds_for(
+        &self,
+        formatter: &dyn EcosystemFormatter,
+        key: &PackageKey,
+    ) -> SuppressedKinds {
+        self.package_suppression(formatter, key).kinds()
     }
 
     /// Attaches background-pre-fetched typosquat signals. See [`Self::typosquat_prefetch`].

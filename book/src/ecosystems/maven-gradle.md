@@ -58,7 +58,15 @@ guava = { module = "com.google.guava:guava", version.ref = "guava" }
 `.properties`, `settings.gradle(.kts)`, or version-catalog sub-parser — but all of them resolve
 coordinates through the *same* Maven Central registry client Maven uses (see the top of this
 page), so hover/completion/diagnostics behavior described for Maven below applies to Gradle too
-unless a section says otherwise. Gradle has no lock file either.
+unless a section says otherwise.
+
+Gradle's dependency locking (`gradle.lockfile`) supplies the in-use version, which is what
+outdated/up-to-date diagnostics compare against. The lock file is read from the manifest's own
+directory (a `gradle/libs.versions.toml` catalog also checks one level up, the project root),
+and a lock file in an ancestor directory is never used for a build script. Known limitation:
+`buildscript { dependencies { classpath(...) } }` dependencies get no in-use version
+(`buildscript-gradle.lockfile` and the legacy `gradle/dependency-locks/` layout are not read);
+if the same coordinate is locked in `gradle.lockfile`, that version is shown.
 
 ## Non-Registry Dependency Sources (Maven)
 

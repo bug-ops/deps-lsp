@@ -1,7 +1,8 @@
-//! Poetry/uv lock file parsing.
+//! Poetry/uv/PDM/pipenv lock file parsing.
 //!
-//! Parses `poetry.lock` and `uv.lock` files to extract resolved dependency
-//! versions. Both formats use TOML with `[[package]]` sections.
+//! Parses `poetry.lock`, `uv.lock`, `pdm.lock` and `Pipfile.lock` files to extract resolved
+//! dependency versions. The first three are TOML with `[[package]]` sections; `Pipfile.lock`
+//! is JSON with `default` and `develop` maps.
 //!
 //! # Lock File Formats
 //!
@@ -43,22 +44,72 @@ use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
     locate_lockfile_for_manifest, read_and_parse_lockfile,
 };
+use deps_core::parser::parse_json_checked;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use toml_span::value::Table;
 use url::Url;
 
+/// A PyPI lock file format, in locator precedence order.
+///
+/// The single source of truth for both [`PypiLockParser::locate_lockfile`] and
+/// `Ecosystem::lockfile_filenames`, so the locator and the file watcher cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PypiLockFormat {
+    Poetry,
+    Uv,
+    Pdm,
+    Pipfile,
+}
+
+impl PypiLockFormat {
+    /// Formats in the order [`PypiLockParser::locate_lockfile`] tries them within one directory.
+    pub(crate) const PRECEDENCE: [Self; 4] = [Self::Poetry, Self::Uv, Self::Pdm, Self::Pipfile];
+
+    /// File names of [`Self::PRECEDENCE`], in the same order.
+    pub(crate) const FILE_NAMES: [&'static str; 4] = [
+        Self::Poetry.file_name(),
+        Self::Uv.file_name(),
+        Self::Pdm.file_name(),
+        Self::Pipfile.file_name(),
+    ];
+
+    pub(crate) const fn file_name(self) -> &'static str {
+        match self {
+            Self::Poetry => "poetry.lock",
+            Self::Uv => "uv.lock",
+            Self::Pdm => "pdm.lock",
+            Self::Pipfile => "Pipfile.lock",
+        }
+    }
+
+    fn of_path(path: &Path) -> Option<Self> {
+        let name = path.file_name()?.to_str()?;
+        Self::PRECEDENCE
+            .into_iter()
+            .find(|format| format.file_name() == name)
+    }
+
+    fn parser(self) -> fn(String) -> Result<ResolvedPackages> {
+        match self {
+            Self::Poetry | Self::Uv => parse_pypi_lock,
+            Self::Pdm => parse_pdm_lock,
+            Self::Pipfile => parse_pipfile_lock,
+        }
+    }
+}
+
 /// PyPI lock file parser.
 ///
-/// Implements lock file parsing for Python package managers (Poetry, uv).
-/// Supports both `poetry.lock` and `uv.lock` formats.
+/// Implements lock file parsing for Python package managers (Poetry, uv, PDM, pipenv).
+/// Supports `poetry.lock`, `uv.lock`, `pdm.lock` and `Pipfile.lock`.
 ///
 /// # Lock File Location
 ///
-/// The parser searches for lock files in the following order:
-/// 1. `poetry.lock` in the same directory as `pyproject.toml`
-/// 2. `uv.lock` in the same directory as `pyproject.toml`
-///
-/// Poetry takes priority because it's more established.
+/// When several formats coexist in one directory the first of this order wins:
+/// `poetry.lock`, `uv.lock`, `pdm.lock`, `Pipfile.lock`. All names are checked in a directory
+/// before moving to its parent.
 ///
 /// # Examples
 ///
@@ -80,14 +131,9 @@ use url::Url;
 /// ```
 pub struct PypiLockParser;
 
-impl PypiLockParser {
-    /// Lock file names for PyPI ecosystem (poetry.lock, uv.lock).
-    const LOCKFILE_NAMES: &'static [&'static str] = &["poetry.lock", "uv.lock"];
-}
-
 impl LockFileProvider for PypiLockParser {
     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
-        locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
+        locate_lockfile_for_manifest(manifest_uri, &PypiLockFormat::FILE_NAMES)
     }
 
     fn parse_lockfile<'a>(
@@ -98,8 +144,12 @@ impl LockFileProvider for PypiLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing lock file: {}", lockfile_path.display());
 
-            let packages =
-                read_and_parse_lockfile(lockfile_path, "lock file", parse_pypi_lock).await?;
+            // An unrecognised file name keeps the historical Poetry/uv TOML behaviour.
+            let parse = PypiLockFormat::of_path(lockfile_path).map_or(
+                parse_pypi_lock as fn(String) -> Result<ResolvedPackages>,
+                PypiLockFormat::parser,
+            );
+            let packages = read_and_parse_lockfile(lockfile_path, "lock file", parse).await?;
 
             tracing::info!(
                 "Parsed lock file: {} packages from {}",
@@ -176,6 +226,204 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
 #[doc(hidden)]
 pub fn fuzz_parse_pypi_lock(content: String) {
     let _ = parse_pypi_lock(content);
+}
+
+const DEFAULT_INDEX_URL: &str = "https://pypi.org/simple";
+
+fn pypi_registry_source() -> ResolvedSource {
+    ResolvedSource::Registry {
+        url: DEFAULT_INDEX_URL.to_string(),
+        checksum: String::new(),
+    }
+}
+
+/// Supported `pdm.lock` `[metadata] lock_version` major.
+const PDM_LOCK_MAJOR: &str = "4";
+
+/// Supported `Pipfile.lock` `_meta.pipfile-spec`.
+const PIPFILE_SPEC: u64 = 6;
+
+/// Parses `pdm.lock` content into resolved packages.
+///
+/// Requires `[metadata] lock_version` with major version 4; every `[[package]]` with a
+/// `name` and `version` is recorded, across all groups.
+fn parse_pdm_lock(content: String) -> Result<ResolvedPackages> {
+    const FILE_TYPE: &str = "pdm.lock";
+    let doc = deps_core::parse_toml_checked(&content)
+        .map_err(|e| DepsError::parse_error(FILE_TYPE, &e))?;
+    let root = doc.as_table();
+
+    let lock_version = root
+        .and_then(|t| t.get("metadata"))
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("lock_version"))
+        .and_then(|v| v.as_str());
+    match lock_version {
+        Some(version) if version.split('.').next() == Some(PDM_LOCK_MAJOR) => {}
+        Some(version) => {
+            return Err(DepsError::parse_error(
+                FILE_TYPE,
+                &format!(
+                    "unsupported lock_version `{}` (supported: {PDM_LOCK_MAJOR}.x)",
+                    crate::parser::truncate_for_log(version)
+                ),
+            ));
+        }
+        None => {
+            return Err(DepsError::parse_error(
+                FILE_TYPE,
+                &"missing [metadata] lock_version",
+            ));
+        }
+    }
+
+    let mut packages = ResolvedPackages::new();
+    let Some(entries) = root
+        .and_then(|t| t.get("package"))
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(packages);
+    };
+
+    for table in entries.iter().filter_map(|item| item.as_table()) {
+        let (Some(name), Some(version)) = (
+            table.get("name").and_then(|v| v.as_str()),
+            table.get("version").and_then(|v| v.as_str()),
+        ) else {
+            tracing::debug!("pdm.lock package entry without name or version skipped");
+            continue;
+        };
+        packages.insert(ResolvedPackage::new(
+            crate::name::normalize(name),
+            version.to_string(),
+            parse_pdm_source(table),
+        ));
+    }
+    Ok(packages)
+}
+
+fn parse_pdm_source(table: &Table<'_>) -> ResolvedSource {
+    let str_of = |key: &str| table.get(key).and_then(|v| v.as_str());
+    if let Some(url) = str_of("git") {
+        let rev = str_of("revision")
+            .or_else(|| str_of("ref"))
+            .unwrap_or_default();
+        return ResolvedSource::Git {
+            url: url.to_string(),
+            rev: rev.to_string(),
+        };
+    }
+    // No URL-source variant exists; a direct wheel/sdist URL must still not claim the registry.
+    if let Some(path) = str_of("path").or_else(|| str_of("url")) {
+        return ResolvedSource::Path {
+            path: path.to_string(),
+        };
+    }
+    pypi_registry_source()
+}
+
+#[derive(Deserialize)]
+struct PipfileLockDoc {
+    #[serde(rename = "_meta")]
+    meta: Option<PipfileMeta>,
+    #[serde(default)]
+    default: BTreeMap<String, PipfileEntry>,
+    #[serde(default)]
+    develop: BTreeMap<String, PipfileEntry>,
+}
+
+#[derive(Deserialize)]
+struct PipfileMeta {
+    #[serde(rename = "pipfile-spec")]
+    spec: Option<u64>,
+}
+
+/// Lenient so that one malformed entry is skipped instead of failing the whole file.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PipfileEntry {
+    Pinned { version: PipfileVersion },
+    Other(serde::de::IgnoredAny),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PipfileVersion {
+    Text(String),
+    Other(serde::de::IgnoredAny),
+}
+
+impl PipfileEntry {
+    /// The version of an exact `==x.y.z` pin; `===` (arbitrary equality), ranges, non-string
+    /// versions and VCS/path entries yield `None`.
+    fn exact_pin(&self) -> Option<&str> {
+        match self {
+            Self::Pinned {
+                version: PipfileVersion::Text(text),
+            } => text.strip_prefix("==").filter(|v| !v.starts_with('=')),
+            Self::Pinned {
+                version: PipfileVersion::Other(_),
+            }
+            | Self::Other(_) => None,
+        }
+    }
+}
+
+/// Parses `Pipfile.lock` content into resolved packages.
+///
+/// Requires `_meta.pipfile-spec` 6. Reads `default` and `develop`; only exact `==x.y.z` pins
+/// are recorded (VCS, path, editable and range entries carry no installed version).
+fn parse_pipfile_lock(content: String) -> Result<ResolvedPackages> {
+    const FILE_TYPE: &str = "Pipfile.lock";
+    let doc: PipfileLockDoc = parse_json_checked(content.as_bytes())
+        .map_err(|e| DepsError::parse_error_of_kind(FILE_TYPE, e.kind(), &e))?;
+
+    match doc.meta.and_then(|m| m.spec) {
+        Some(PIPFILE_SPEC) => {}
+        Some(other) => {
+            return Err(DepsError::parse_error(
+                FILE_TYPE,
+                &format!("unsupported pipfile-spec {other} (supported: {PIPFILE_SPEC})"),
+            ));
+        }
+        None => {
+            return Err(DepsError::parse_error(
+                FILE_TYPE,
+                &"missing _meta.pipfile-spec",
+            ));
+        }
+    }
+
+    let mut packages = ResolvedPackages::new();
+    for (name, entry) in doc.default.into_iter().chain(doc.develop) {
+        let Some(version) = entry.exact_pin() else {
+            tracing::debug!(
+                "Pipfile.lock entry '{}' has no exact pin, skipped",
+                crate::parser::truncate_for_log(&name)
+            );
+            continue;
+        };
+        packages.insert(ResolvedPackage::new(
+            crate::name::normalize(&name),
+            version.to_string(),
+            pypi_registry_source(),
+        ));
+    }
+    Ok(packages)
+}
+
+/// Fuzz-only entry point for [`parse_pdm_lock`]; see [`fuzz_parse_pypi_lock`].
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_pdm_lock(content: String) {
+    let _ = parse_pdm_lock(content);
+}
+
+/// Fuzz-only entry point for [`parse_pipfile_lock`]; see [`fuzz_parse_pypi_lock`].
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_pipfile_lock(content: String) {
+    let _ = parse_pipfile_lock(content);
 }
 
 /// Parses source information from package table.
@@ -320,6 +568,21 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+
+    #[test]
+    fn pipfile_arbitrary_equality_pin_is_skipped() {
+        let content = r#"{"_meta": {"pipfile-spec": 6}, "default": {"a": {"version": "===1.0"}, "b": {"version": "==1.0"}}}"#;
+        let packages = parse_pipfile_lock(content.to_string()).unwrap();
+        assert!(packages.get("a").is_none());
+        assert_eq!(packages.version("b"), Some("1.0"));
+    }
+
+    #[test]
+    fn pdm_direct_url_entry_is_not_registry() {
+        let content = "[metadata]\nlock_version = \"4.5.0\"\n\n[[package]]\nname = \"w\"\nversion = \"1.0\"\nurl = \"https://example.com/w-1.0.whl\"\n";
+        let packages = parse_pdm_lock(content.to_string()).unwrap();
+        assert!(!packages.get("w").unwrap().source.is_registry());
+    }
 
     #[tokio::test]
     async fn test_parse_lockfile_rejects_excessive_nesting() {

@@ -7,25 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **deps-core, deps-lsp, deps-cli**: operator-controlled advisory exemptions from the user config file (`<config dir>/deps-lsp/advisory-exemptions.toml`) or `deps-cli check --advisory-exemptions <PATH>`, shown as an `advisory-exempted` notice; repository config cannot exempt an advisory and confirmed malware is never exemptible (#2029)
-- **deps-precommit, deps-github-actions**: new `pre-commit` ecosystem for `.pre-commit-config.yaml` and `.pre-commit-config.yml` `repo`/`rev` pins, with `rev:` SHA pinning (`# frozen:` comments) and mutable-rev diagnostics (#2029)
-
-### Changed
-- **deps-core, deps-engine**: tag pins and update candidates are scanned against all release tags on the same commit, and a floating pin with no own full release is now scanned instead of skipped (#2029)
-
-### Documentation
-- **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)
-- **specs**: add spec 102 recording that pub and SwiftPM have no native release-age gate (#2029)
-
 ### Breaking
 - **deps-core**: new variants on exhaustive public enums: `EcosystemId::PreCommit`, `DiagnosticKind::AdvisoryExempted`, `GitTagsPlatform::PreCommit`, `PinSubject::PreCommitHook` (#2029)
 - **deps-core**: new public fields `ShaPinComment::style` and `VersionData::advisory_exemptions`; `read_sha_pin_tail` takes the accepted comment styles (#2029)
 - **deps-core**: new public `PrimaryRole` enum, `ScanTarget::with_stand_in_primary` and `InUseVersions::primary_role` mark a scan target whose primary is a stand-in sibling tag (#2029)
 - **deps-cli**: new public fields `CheckArgs::advisory_exemptions` and `CheckContext::advisory_exemptions` (#2029)
 - **behavior**: a floating tag pin with no full release of its own (`@v4` on a commit also tagged `v5.0.0`) is now scanned instead of skipped; `--fail-on vulnerable` can newly fail (see spec 103) (#2029)
+- **deps-core, ecosystem crates**: `ProbeDependency::route_probes` has no default, so every implementation states its routes (#2023, #2033)
+
+### Added
+- **deps-core, deps-lsp, deps-cli**: operator-controlled advisory exemptions from the user config file (`<config dir>/deps-lsp/advisory-exemptions.toml`) or `deps-cli check --advisory-exemptions <PATH>`, shown as an `advisory-exempted` notice; repository config cannot exempt an advisory and confirmed malware is never exemptible (#2029)
+- **deps-precommit, deps-github-actions**: new `pre-commit` ecosystem for `.pre-commit-config.yaml` and `.pre-commit-config.yml` `repo`/`rev` pins, with `rev:` SHA pinning (`# frozen:` comments) and mutable-rev diagnostics (#2029)
+- **deps-pypi**: in-use versions from `pdm.lock` and `Pipfile.lock` (#1926, #2033)
+- **deps-gradle**: in-use versions from `gradle.lockfile` (#1925, #2033)
+- **deps-deno**: in-use versions from `deno.lock` schemas 3, 4 and 5 (#1924, #2033)
+- **deps-core, deps-lsp, deps-cli**: `diagnostics.suppress` also applies to hover, inlay hints, code lens counts and update-all, and `diagnostics.ignore` hides a whole package's deprecated, outdated, yanked and license diagnostics (#1967, #2033)
+
+### Changed
+- **deps-core, deps-engine**: tag pins and update candidates are scanned against all release tags on the same commit, and a floating pin with no own full release is now scanned instead of skipped (#2029)
+- **deps-lsp, deps-core**: inlay hints now carry vulnerability data, so the in-use advisory glyph renders for vulnerable packages, and it and the flagged-latest warning survive `diagnostics.ignore` (#1967, #2033)
+- **workspace**: bump `jsonschema` to 0.61 (#2019, #2033)
+
+### Documentation
+- **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)
+- **specs**: add spec 102 recording that pub and SwiftPM have no native release-age gate (#2029)
 
 ### Fixed
+- **deps-lsp**: a configuration change without a reparse now also refreshes inlay hints and code lenses (#1967, #2033)
+- **deps-lsp**: a `didChange` that started before a close and reopen of the same document no longer commits over the reopened document or replaces its tasks (#2022, #2033)
 - **workspace, deps-maven**: allow `clippy::empty_enums` for sealed marker enums and drop redundant clones in the POM parser to pass clippy 1.100 (#2027)
 
 ## [5.0.0] - 2026-11-10

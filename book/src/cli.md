@@ -352,7 +352,7 @@ typosquat diagnostic is `deps-lsp` only, and a non-default `[typosquat]` section
 
 > **Warning:** An auto-discovered `deps.toml` — found by the default lookup, not passed
 > explicitly via `--config` — has its `registries`, `network`, and
-> `diagnostics.*_enabled` sections (and cache/freshness/license_policy/supply_chain) reset
+> `diagnostics.*_enabled` and `diagnostics.suppress`/`diagnostics.ignore` (and cache/freshness/license_policy/supply_chain) reset
 > to their safe defaults before use; only the seven `*_severity` display values are kept
 > (they're cosmetic and can never suppress a `--fail-on` match). This is deliberate: the
 > repository a CI job is checking is not a trusted source for the policy that judges it. A

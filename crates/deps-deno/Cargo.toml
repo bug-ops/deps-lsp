@@ -13,6 +13,11 @@ publish = true
 workspace = true
 
 [features]
+# Exposes `lockfile::fuzz_parse_deno_lock` for the `fuzz/` cargo-fuzz workspace (spec 091
+# FR-016) — never enabled by this crate's own default feature set, so the parser entry point
+# stays out of the normal public API surface. Mirrors `deps-npm`/`deps-pypi`'s `fuzzing`.
+fuzzing = []
+
 # Gates this crate's own `tower-lsp-server` dependency and LSP-response-shaped code,
 # forwarding to `deps-core`'s and `deps-npm`'s identically-named feature (issue #1083,
 # spec 064) — `deps-npm` is a real, non-optional dependency here (DenoRegistry delegates

@@ -15,9 +15,9 @@ use tokio::sync::{RwLock, broadcast::error::RecvError};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
 
-use super::lifecycle::{CommitGuard, ParseTrigger, handle_document_change_guarded};
+use super::lifecycle::{CommitGuard, CommittedChange, ParseTrigger, commit_document_change};
 use super::resolved::RefetchPolicy;
-use super::state::ServerState;
+use super::state::{OpenEpoch, ServerState};
 use crate::config::DepsConfig;
 
 /// How long events are gathered before the open documents are re-parsed.
@@ -119,6 +119,7 @@ struct OpenDocument {
     uri: Uri,
     content: String,
     version: Option<i32>,
+    epoch: OpenEpoch,
     manifest: Option<Arc<dyn ParsedManifest>>,
 }
 
@@ -132,6 +133,7 @@ fn open_documents(state: &ServerState, ecosystem: EcosystemId) -> Vec<OpenDocume
             uri: entry.key().clone(),
             content: entry.value().content.clone(),
             version: entry.value().version,
+            epoch: entry.value().open_epoch(),
             manifest: entry.value().manifest_arc(),
         })
         .collect()
@@ -156,6 +158,7 @@ async fn reparse_due(
         uri,
         content,
         version,
+        epoch,
         manifest,
     } in open_documents(state, ecosystem)
     {
@@ -170,11 +173,11 @@ async fn reparse_due(
             tracing::debug!(?uri, "document already parsed with the announced inputs");
             continue;
         }
-        match handle_document_change_guarded(
+        match commit_document_change(
             uri.clone(),
             content,
             version,
-            CommitGuard::ExpectVersion(version),
+            CommitGuard::SameOpenAndVersion { epoch, version },
             ParseTrigger::Memo,
             // A swapped dependency has a new name and source, and the re-parse also supersedes
             // a fetch still running for this document, so everything is fetched again.
@@ -185,9 +188,9 @@ async fn reparse_due(
         )
         .await
         {
-            Ok(Some(task)) => {
+            Ok(Some(CommittedChange { task, epoch })) => {
                 reparsed = true;
-                state.spawn_background_task(uri, task).await;
+                state.register_change_task(uri, task, epoch).await;
             }
             Ok(None) => tracing::debug!(
                 "skipped stale reparse for {:?}: superseded by a concurrent edit",

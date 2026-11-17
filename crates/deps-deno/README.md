@@ -47,10 +47,12 @@ lets `DenoRegistry` route each lookup to the right registry, and it is why hover
 render the scheme as part of the package name. See the crate's module docs
 (`src/registry.rs`) for the full rationale.
 
+## Lock file
+
+`deno.lock` (schema versions 3, 4 and 5) supplies the in-use version for `jsr:` and `npm:` imports, matched by package name.
+
 ## Known limitations
 
-- No `deno.lock` support — hover/completion/diagnostics compare against the manifest
-  requirement, not a resolved version (consistent with Gradle's lockfile-free MVP)
 - The `scopes` field and `importMap` file are not parsed — only the `imports` map
 - The yanked-only-match diagnostic is disabled entirely for `npm:` specifiers (matches
   `deps-npm`'s own restriction: npm's `deprecated` flag is often applied package-wide,

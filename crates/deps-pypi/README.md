@@ -16,7 +16,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **PEP 735** — Parse `[dependency-groups]` (new standard)
 - **Poetry** — Parse `[tool.poetry.dependencies]` and dependency groups
 - **requirements.txt / constraints.txt** — Parse pip's line-oriented requirements file format (comments, continuations, per-requirement options, recognized pip options), reusing the same PEP 508 machinery as the TOML paths; also recognized under a `requirements/` directory (e.g. `requirements/base.txt`), and `-r`/`-c`/`--requirement`/`--constraint` targets are surfaced as clickable `documentLink`s
-- **Lock file parsing** — Extract resolved versions from `poetry.lock` and `uv.lock`
+- **Lock file parsing** — Extract resolved versions from `poetry.lock`, `uv.lock`, `pdm.lock` and `Pipfile.lock`
 - **PEP 508 parsing** — Handle complex dependency specifications with extras and environment markers, normalized consistently across PEP 621, PEP 735, Poetry table/string syntaxes, and requirements.txt lines, and surfaced on `PypiDependency.markers`
 - **PEP 440 versions** — Validate and compare Python version specifiers
 - **PEP 503 name normalization** — One canonical normalizer (`name::normalize`) shared by registry lookups, the formatter, and lock file parsing
