@@ -116,6 +116,7 @@ pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod name;
+mod native;
 pub mod parser;
 pub mod registry;
 mod search;

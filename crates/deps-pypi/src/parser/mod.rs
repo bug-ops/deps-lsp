@@ -751,6 +751,7 @@ impl PypiParser {
             section: PypiDependencySection::Dependencies,
             source,
             index_route: None,
+            native_cooldown: None,
         })
     }
 }

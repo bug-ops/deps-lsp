@@ -61,6 +61,10 @@ pub struct PypiDependency {
     /// How the declared index configuration routed this dependency; `None` when it stayed on
     /// plain public PyPI or is not a registry dependency.
     pub(crate) index_route: Option<PypiIndexRoute>,
+    /// The uv release-age window that applies to this dependency, resolved at parse time from
+    /// `exclude-newer`/`exclude-newer-package`; `None` when no window applies or reading it is
+    /// turned off.
+    pub(crate) native_cooldown: Option<deps_core::native_cooldown::NativeCooldown>,
 }
 
 /// How a PyPI index declaration routes a dependency away from the public index.
@@ -386,6 +390,10 @@ impl deps_core::Dependency for PypiDependency {
         &self.name
     }
 
+    fn native_cooldown(&self) -> Option<&deps_core::native_cooldown::NativeCooldown> {
+        self.native_cooldown.as_ref()
+    }
+
     fn name_range(&self) -> Range {
         self.name_range
     }
@@ -467,6 +475,7 @@ impl deps_core::lsp_helpers::ProbeDependency for PypiDependency {
             section: PypiDependencySection::Dependencies,
             source,
             index_route: None,
+            native_cooldown: None,
         }
     }
 
@@ -475,6 +484,7 @@ impl deps_core::lsp_helpers::ProbeDependency for PypiDependency {
             .into_iter()
             .map(|route| Self {
                 index_route: Some(route),
+                native_cooldown: None,
                 ..Self::probe(name.clone(), deps_core::parser::DependencySource::Registry)
             })
             .collect()
@@ -502,6 +512,7 @@ mod tests {
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
             index_route: None,
+            native_cooldown: None,
         };
 
         assert_eq!(dep.name, "flask");
@@ -525,6 +536,7 @@ mod tests {
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
             index_route: None,
+            native_cooldown: None,
         };
 
         assert_eq!(

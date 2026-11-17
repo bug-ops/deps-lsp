@@ -19,7 +19,7 @@ use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
     EcosystemId, FetchCompleteness, FetchFailure, NormalizedName, PackageKey, PackageName,
     ParseResult, PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus,
-    TypedParseResult, TyposquatSignal, VersionReq, format_relative_age, format_remaining_duration,
+    TypedParseResult, TyposquatSignal, VersionReq, format_relative_age,
 };
 
 use super::{
@@ -2982,14 +2982,14 @@ fn apply_outdated_rule<F: DependencyFormatter>(
             let message = match disposition {
                 CooldownDisposition::NativeHeld { cooldown, .. } => {
                     let remaining = native.as_ref().and_then(|gate| {
-                        gate.remaining(
+                        gate.hold(
                             package_versions.published_at_of(&package_versions.latest),
                             &package_versions.latest,
                             gate.now(),
                         )
                     });
-                    let eligible = remaining.map_or_else(String::new, |secs| {
-                        format!("; eligible in {}", format_remaining_duration(secs))
+                    let eligible = remaining.map_or_else(String::new, |hold| {
+                        format!("; {}", hold.eligibility_clause())
                     });
                     format!("{notice}: {latest} (excluded by {cooldown}{eligible})")
                 }

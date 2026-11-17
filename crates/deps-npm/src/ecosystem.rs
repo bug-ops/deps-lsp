@@ -119,7 +119,7 @@ impl NpmEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for NpmEcosystem {}
 
-const WATCHED_CONFIGS: [WatchedConfig; 2] = [
+const WATCHED_CONFIGS: [WatchedConfig; 3] = [
     WatchedConfig::new(
         "pnpm-workspace.yaml",
         WatchedConfigEffect::RewritesRequirements,
@@ -128,6 +128,13 @@ const WATCHED_CONFIGS: [WatchedConfig; 2] = [
     WatchedConfig::new(
         ".npmrc",
         WatchedConfigEffect::ChangesRouting,
+        ConfigReach::Subtree,
+    ),
+    // A Bun window that appears is covered by the demand-rise refetch; one that changes or
+    // goes away needs no refetch, the stored publish times are window-independent.
+    WatchedConfig::new(
+        "bunfig.toml",
+        WatchedConfigEffect::RewritesRequirements,
         ConfigReach::Subtree,
     ),
 ];
@@ -585,6 +592,7 @@ mod tests {
                     WatchedConfigEffect::RewritesRequirements
                 ),
                 (".npmrc", WatchedConfigEffect::ChangesRouting),
+                ("bunfig.toml", WatchedConfigEffect::RewritesRequirements),
             ]
         );
     }
@@ -953,6 +961,7 @@ mod tests {
                 },
                 source,
                 registry_entry: None,
+                native_cooldown: None,
                 package: None,
             }
         }

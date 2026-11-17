@@ -327,9 +327,9 @@ pub use parser::{
 pub use path_segment::{DotSegmentError, SafePathSegment, SegmentedPathName};
 pub use position::{Position, Range};
 pub use registry::{
-    ChainNotFound, Deprecation, Metadata, MetadataAny, Registry, RegistryAny, RemovalStatus,
-    Version, VersionAny, classify_default_registry_url, existence_wildcard_req, find_latest_stable,
-    has_default_prerelease_marker, hash_routing_key, is_existence_wildcard,
+    ChainNotFound, Deprecation, Metadata, MetadataAny, PublishTimeDemand, Registry, RegistryAny,
+    RemovalStatus, Version, VersionAny, classify_default_registry_url, existence_wildcard_req,
+    find_latest_stable, has_default_prerelease_marker, hash_routing_key, is_existence_wildcard,
     is_existence_wildcard_str, not_found_or, select_latest_for_existence,
 };
 pub use registry_endpoint::{CachedEndpoint, EgressTier, EndpointFingerprint, RegistryEndpoint};

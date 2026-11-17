@@ -4023,12 +4023,14 @@ mod tests {
     #[test]
     fn cooldown_disposition_native_hold_is_independent_of_freshness_and_vets_the_fallback() {
         use crate::native_cooldown::{
-            NativeCooldown, NativeCooldownSource, NativeGate, TimeSpanValue, parse_time_span,
+            NativeCooldown, NativeCooldownSource, NativeGate, NativeLimit, TimeSpanValue,
+            parse_time_span,
         };
         let TimeSpanValue::Span(span) = parse_time_span("1 hour").expect("span") else {
             panic!("a span");
         };
-        let cooldown = NativeCooldown::new(span, NativeCooldownSource::CargoGlobal);
+        let cooldown =
+            NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal);
         let now = PublishTime::from_unix_secs(100_000);
         let name = NormalizedName::for_test("pkg");
         let cached = HashMap::new();

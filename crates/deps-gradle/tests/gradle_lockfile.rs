@@ -153,11 +153,8 @@ fn locate_lockfile_absent_returns_none() {
 }
 
 #[test]
-fn lockfile_filenames_are_the_project_and_buildscript_lockfiles() {
+fn lockfile_filenames_watch_every_lockfile() {
     let eco = GradleEcosystem::new(Arc::new(HttpCache::new()));
-    assert_eq!(
-        eco.lockfile_filenames(),
-        &["gradle.lockfile", "buildscript-gradle.lockfile"]
-    );
+    assert_eq!(eco.lockfile_filenames(), &["*.lockfile"]);
     assert!(eco.lockfile_provider().is_some());
 }

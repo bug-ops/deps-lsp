@@ -1,4 +1,4 @@
-//! Fuzzes `deps_gradle::fuzz_parse_gradle_lock`, the `gradle.lockfile` line parser (#1925).
+//! Fuzzes `deps_gradle::fuzz_parse_gradle_lock`, the `gradle.lockfile` line parsers, unified and legacy grammars (#1925, #2039).
 //!
 //! Property under test: never panics for any byte input.
 

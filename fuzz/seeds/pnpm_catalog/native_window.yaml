@@ -1,0 +1,6 @@
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - lodash
+  - "@babel/*"
+catalog:
+  react: ^18.2.0

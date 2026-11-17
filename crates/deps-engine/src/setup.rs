@@ -646,7 +646,8 @@ pub fn register_ecosystems(
             Arc::clone(&policy),
             Arc::clone(&npm_config_cache),
             Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
-        );
+        )
+        .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown));
         let deno_context =
             deps_deno::parser::DenoParseContext::new(Arc::clone(&policy), npm_config_cache);
         let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
@@ -677,7 +678,8 @@ pub fn register_ecosystems(
             Arc::clone(&policy),
             Arc::new(deps_npm::config::NpmConfigCache::new()),
             Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
-        );
+        )
+        .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown));
         registry.register(Arc::new(NpmEcosystem::with_context(
             Arc::new(NpmRegistry::new(Arc::clone(&cache))),
             npm_context,
@@ -708,10 +710,13 @@ pub fn register_ecosystems(
     // macro's default `RegistryAccessPolicy` would never see a live config update.
     #[cfg(feature = "pypi")]
     {
-        registry.register(Arc::new(PypiEcosystem::with_policy(
-            Arc::new(PypiRegistry::new(Arc::clone(&cache))),
-            Arc::clone(&policy),
-        )));
+        registry.register(Arc::new(
+            PypiEcosystem::with_policy(
+                Arc::new(PypiRegistry::new(Arc::clone(&cache))),
+                Arc::clone(&policy),
+            )
+            .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown)),
+        ));
         workspace_registry_ecosystems.push(deps_core::EcosystemId::Pypi);
     }
 

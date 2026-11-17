@@ -210,6 +210,98 @@ async fn test_workspace_transport_stops_redirect_to_private_literal() {
     );
 }
 
+// Spec 099 (#2041): the transport-only workspace fetch (npm publish times of a
+// workspace-declared registry) re-classifies every hop against the live policy, like the
+// entry-cached workspace path, and never stores the body.
+#[tokio::test]
+async fn test_transport_only_workspace_stops_loopback_redirect_baseline_follows() {
+    let mut server_a = mockito::Server::new_async().await;
+    let mut server_b = mockito::Server::new_async().await;
+    let target_url = format!("{}/api/target", server_b.url());
+
+    let _redirect = server_a
+        .mock("GET", "/api/source")
+        .with_status(302)
+        .with_header("location", &target_url)
+        .create_async()
+        .await;
+    let _target = server_b
+        .mock("GET", "/api/target")
+        .with_status(200)
+        .with_body("redirected data")
+        .create_async()
+        .await;
+    let source_url = format!("{}/api/source", server_a.url());
+
+    let baseline: Bytes = HttpCache::new()
+        .get_transport_only_with_headers(&source_url, &[])
+        .await
+        .unwrap();
+    assert_eq!(baseline.as_ref(), b"redirected data");
+
+    let policy = Arc::new(RegistryAccessPolicy::new(
+        WorkspaceRegistryAccess::PublicOnly,
+    ));
+    let workspace_cache = HttpCache::with_policy(policy);
+    let result = workspace_cache
+        .get_transport_only_workspace_with_headers(&source_url, &[])
+        .await;
+    assert_matches!(
+        result,
+        Err(DepsError::HttpStatus { status: 302, .. }),
+        "expected the workspace transport to stop the loopback hop, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_transport_only_workspace_stops_redirect_to_private_literal() {
+    let mut server = mockito::Server::new_async().await;
+    let _redirect = server
+        .mock("GET", "/api/source")
+        .with_status(302)
+        .with_header("location", "https://10.0.0.1/x")
+        .create_async()
+        .await;
+
+    let policy = Arc::new(RegistryAccessPolicy::new(
+        WorkspaceRegistryAccess::PublicOnly,
+    ));
+    let cache = HttpCache::with_policy(policy);
+    let result = cache
+        .get_transport_only_workspace_with_headers(&format!("{}/api/source", server.url()), &[])
+        .await;
+
+    assert_matches!(
+        result,
+        Err(DepsError::HttpStatus { status: 302, .. }),
+        "expected the redirect to 10.0.0.1 to be stopped, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_transport_only_workspace_returns_the_body_without_caching_it() {
+    let mut server = mockito::Server::new_async().await;
+    let _ok = server
+        .mock("GET", "/api/data")
+        .match_header("accept", "application/json")
+        .with_status(200)
+        .with_body("full packument")
+        .create_async()
+        .await;
+
+    let cache = HttpCache::new();
+    let body: Bytes = cache
+        .get_transport_only_workspace_with_headers(
+            &format!("{}/api/data", server.url()),
+            &[RequestHeader::Accept("application/json")],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(body.as_ref(), b"full packument");
+    assert!(cache.is_empty(), "the body must never enter the entry map");
+}
+
 // Unlike the https->http downgrade case, cross-origin redirect blocking IS reachable
 // through mockito: two separate `mockito::Server` instances bind to distinct ports,
 // and a distinct port is a distinct origin (scheme+host+port), so a 302 from one to

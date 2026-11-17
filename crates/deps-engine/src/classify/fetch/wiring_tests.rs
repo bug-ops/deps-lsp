@@ -25,6 +25,7 @@ async fn the_background_fetch_tags_each_package_request_with_its_endpoint() {
             &HashMap::new(),
             None,
             FreshnessSettings::Disabled,
+            deps_core::PublishTimeDemand::NotRequired,
             FetchTimeout::constant::<60>(),
             FetchConcurrency::constant::<4>(),
             &SelectionContext::none(),

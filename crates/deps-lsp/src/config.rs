@@ -492,9 +492,13 @@ impl ReparseScope {
     }
 }
 
-/// The only ecosystem `freshness.honor_native_cooldown` affects: Cargo resolves its publish-age
-/// window at parse time.
-const NATIVE_COOLDOWN_ECOSYSTEMS: &[deps_core::EcosystemId] = &[deps_core::EcosystemId::Cargo];
+/// The ecosystems `freshness.honor_native_cooldown` affects: Cargo, npm and PyPI (uv) resolve
+/// their publish-age window at parse time.
+const NATIVE_COOLDOWN_ECOSYSTEMS: &[deps_core::EcosystemId] = &[
+    deps_core::EcosystemId::Cargo,
+    deps_core::EcosystemId::Npm,
+    deps_core::EcosystemId::Pypi,
+];
 
 /// The only ecosystem `registries.nuget_user_profile_sources` affects.
 const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[deps_core::EcosystemId] =
@@ -1578,7 +1582,7 @@ mod tests {
         }
 
         #[test]
-        fn test_native_cooldown_change_scopes_to_cargo_only() {
+        fn test_native_cooldown_change_scopes_to_cargo_npm_and_pypi_only() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
             new.policy.freshness.honor_native_cooldown =
@@ -1591,6 +1595,8 @@ mod tests {
                 ReparseScope::Ecosystems(NATIVE_COOLDOWN_ECOSYSTEMS.to_vec())
             );
             assert!(scope.matches(EcosystemId::Cargo, &any_uri()));
+            assert!(scope.matches(EcosystemId::Npm, &any_uri()));
+            assert!(scope.matches(EcosystemId::Pypi, &any_uri()));
             assert!(!scope.matches(EcosystemId::NuGet, &any_uri()));
         }
 

@@ -162,6 +162,7 @@ fn parse_pnpm_workspace(content: &str, path: &Path) -> PnpmWorkspaceConfig {
 #[doc(hidden)]
 pub fn fuzz_parse_pnpm_workspace(content: &str) {
     let _ = parse_pnpm_workspace(content, Path::new("/pnpm-workspace.yaml"));
+    let _ = crate::native::parse_pnpm(Path::new("/pnpm-workspace.yaml"), content);
 }
 
 /// Per-path memoization of `pnpm-workspace.yaml` parses, invalidated by mtime.
@@ -682,6 +683,7 @@ mod tests {
             },
             source: deps_core::parser::DependencySource::Registry,
             registry_entry: None,
+            native_cooldown: None,
             package: None,
         }
     }

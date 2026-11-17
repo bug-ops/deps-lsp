@@ -544,7 +544,7 @@ struct ConfigNotices {
 }
 
 impl Backend {
-    #[cfg(all(test, feature = "npm"))]
+    #[cfg(all(test, any(feature = "npm", feature = "gradle")))]
     pub(crate) const fn state(&self) -> &Arc<ServerState> {
         &self.state
     }
@@ -990,7 +990,10 @@ impl Backend {
         ecosystem: deps_core::EcosystemId,
         ecosystem_impl: &Arc<dyn deps_core::Ecosystem>,
     ) -> Vec<(Uri, LockfileLoad)> {
-        let Some(lock_dir) = lockfile_path.parent() else {
+        let Some(lock_dir) = ecosystem_impl.lockfile_provider().map_or_else(
+            || lockfile_path.parent(),
+            |p| p.lock_set_root(lockfile_path),
+        ) else {
             return Vec::new();
         };
         let affected: Vec<(Uri, url::Url)> = self
@@ -6976,5 +6979,140 @@ let package = Package(
             message.contains(&deps_core::net_policy::RedactedUrl::new(raw).into_inner()),
             "expected the redacted form to still be present: {message}"
         );
+    }
+}
+
+/// #2039 / spec 092 FR-003: an open Gradle manifest follows the legacy
+/// `gradle/dependency-locks/<configuration>.lockfile` set through `workspace/didChangeWatchedFiles`.
+#[cfg(all(test, feature = "gradle"))]
+mod gradle_legacy_watch_tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
+
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    use tower_lsp_server::LanguageServer;
+    use tower_lsp_server::ls_types::{
+        DidChangeWatchedFilesParams, DidOpenTextDocumentParams, FileChangeType, FileEvent,
+        TextDocumentItem, Uri,
+    };
+
+    use super::Backend;
+
+    const MANIFEST: &str = "dependencies {\n    implementation(\"org.slf4j:slf4j-api:2.0.0\")\n}\n";
+    const SLF4J: &str = "org.slf4j:slf4j-api";
+    const LOGBACK: &str = "ch.qos.logback:logback-classic";
+
+    fn write_lock(locks: &Path, name: &str, content: &str) -> PathBuf {
+        std::fs::create_dir_all(locks).unwrap();
+        let path = locks.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Pushes `path`'s mtime forward so a change within one timestamp tick is still detected.
+    fn bump_mtime(path: &Path, seconds: u64) {
+        // Windows needs write-attributes access and backup semantics to open a file or a directory.
+        #[cfg(windows)]
+        let handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .access_mode(0x100)
+                .custom_flags(0x0200_0000)
+                .open(path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let handle = std::fs::File::open(path).unwrap();
+        handle
+            .set_modified(SystemTime::now() + Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    fn resolved(backend: &Backend, uri: &Uri, name: &str) -> Option<String> {
+        let doc = backend.state().get_document(uri)?;
+        doc.signals
+            .resolved_versions
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, version)| version.as_str().to_owned())
+    }
+
+    async fn resolved_until(backend: &Backend, uri: &Uri, name: &str, expected: Option<&str>) {
+        let mut last = None;
+        for _ in 0..100 {
+            last = resolved(backend, uri, name);
+            if last.as_deref() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {name} = {expected:?}; last: {last:?}");
+    }
+
+    async fn notify(backend: &Backend, path: &Path, typ: FileChangeType) {
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Uri::from_file_path(path).unwrap(),
+                    typ,
+                }],
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_lock_set_follows_edit_create_and_delete_of_an_open_manifest() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        // A canonical Windows path is verbatim (`\\?\C:\...`), which `Uri::from_file_path` cannot round-trip.
+        let root = if cfg!(windows) {
+            dir.path().to_path_buf()
+        } else {
+            dir.path().canonicalize().unwrap()
+        };
+        let locks = root.join("gradle/dependency-locks");
+        let compile = write_lock(
+            &locks,
+            "compileClasspath.lockfile",
+            "org.slf4j:slf4j-api:2.0.9\n",
+        );
+        let manifest = root.join("build.gradle.kts");
+        std::fs::write(&manifest, MANIFEST).unwrap();
+        let uri = Uri::from_file_path(&manifest).unwrap();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "kotlin".to_string(),
+                    version: 1,
+                    text: MANIFEST.to_string(),
+                },
+            })
+            .await;
+        resolved_until(backend, &uri, SLF4J, Some("2.0.9")).await;
+
+        std::fs::write(&compile, "org.slf4j:slf4j-api:2.0.10\n").unwrap();
+        bump_mtime(&compile, 3600);
+        notify(backend, &compile, FileChangeType::CHANGED).await;
+        resolved_until(backend, &uri, SLF4J, Some("2.0.10")).await;
+
+        let runtime = write_lock(
+            &locks,
+            "runtimeClasspath.lockfile",
+            "ch.qos.logback:logback-classic:1.4.11\n",
+        );
+        bump_mtime(&locks, 7200);
+        notify(backend, &runtime, FileChangeType::CREATED).await;
+        resolved_until(backend, &uri, LOGBACK, Some("1.4.11")).await;
+
+        std::fs::remove_file(&runtime).unwrap();
+        bump_mtime(&locks, 10_800);
+        notify(backend, &runtime, FileChangeType::DELETED).await;
+        resolved_until(backend, &uri, LOGBACK, None).await;
+        assert_eq!(resolved(backend, &uri, SLF4J).as_deref(), Some("2.0.10"));
     }
 }

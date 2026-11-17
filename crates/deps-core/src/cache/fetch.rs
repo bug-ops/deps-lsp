@@ -961,6 +961,41 @@ impl HttpCache {
             .await
     }
 
+    /// Same as [`Self::get_transport_only_with_headers`], but through the workspace-gated
+    /// transport: every redirect hop is re-classified against the live
+    /// [`crate::net_policy::RegistryAccessPolicy`], and the body is never entry-cached.
+    ///
+    /// For a fetch whose registry was declared by the repository itself (a workspace-declared
+    /// `.npmrc` registry) and whose payload is too large to hold in the shared cache budget.
+    ///
+    /// # Security
+    ///
+    /// `extra_headers` are re-sent on a cross-origin redirect hop, as in
+    /// [`Self::get_cached_workspace_with_headers`]. **This method must never carry a
+    /// credential.**
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_transport_only_with_headers`].
+    pub async fn get_transport_only_workspace_with_headers(
+        &self,
+        url: &str,
+        extra_headers: &[RequestHeader],
+    ) -> Result<Bytes> {
+        #[expect(
+            clippy::expect_used,
+            reason = "poisoned only if another thread already panicked holding the lock — \
+                      propagate via panic, matching RwLock's poisoning contract"
+        )]
+        let transport = self
+            .workspace
+            .read()
+            .expect("workspace transport lock poisoned")
+            .clone();
+        self.transport_only_via(url, extra_headers, BodyLimit::DEFAULT, &transport)
+            .await
+    }
+
     /// Same as [`Self::get_transport_only_with_headers_limited`], but additionally
     /// stops any redirect hop that does not match `trusted_origin` via
     /// [`crate::net_policy::is_trusted_prefix`]

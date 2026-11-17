@@ -267,6 +267,11 @@ pub(crate) async fn open_document_task(
               handle_document_open, so a config struct here would only relocate, not \
               reduce, the parameter list"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear open sequence (probe, load locks, fetch, commit, publish); the \
+              demand argument added two lines to the single fetch call"
+)]
 #[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
 async fn run_document_open_background_task(
     uri: Uri,
@@ -386,6 +391,7 @@ async fn run_document_open_background_task(
             in_use,
             selection_context,
             collided_names,
+            demand,
             ..
         },
         declared,
@@ -438,6 +444,7 @@ async fn run_document_open_background_task(
         &in_use,
         progress_sender,
         diagnostics_snapshot.freshness,
+        demand,
         diagnostics_snapshot.fetch_timeout,
         diagnostics_snapshot.max_concurrent_fetches,
         &selection_context,
@@ -844,23 +851,44 @@ struct PreFetchReparse {
 /// completion/code-actions (which read the freshly committed parse result's context
 /// immediately) would disagree with diagnostics/inlay-hints (which stay on `cached_versions`
 /// from before the edit) until the next unrelated refetch.
+///
+/// The same flag is raised when the document's publish-time demand rises from
+/// [`deps_core::PublishTimeDemand::NotRequired`] to `NativeWindow` (a native release-age window
+/// appeared through a watched file, an edited `pnpm-workspace.yaml` buffer or the
+/// `freshness.honor_native_cooldown` toggle): the cached versions carry no publish times, so
+/// every dependency must be fetched again for the window to judge them.
 async fn parse_and_diff_manifest(
     uri: &Uri,
     content: &str,
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
 ) -> (ParseOutcome, DependencyDiff, bool) {
-    let (old_deps, old_selection_context): (
+    let (old_deps, old_selection_context, old_demand): (
         HashMap<NormalizedName, Vec<Option<VersionReq>>>,
         deps_core::SelectionContext,
+        deps_core::PublishTimeDemand,
     ) = state.get_document(uri).map_or_else(
-        || (HashMap::new(), deps_core::SelectionContext::none()),
+        || {
+            (
+                HashMap::new(),
+                deps_core::SelectionContext::none(),
+                deps_core::PublishTimeDemand::NotRequired,
+            )
+        },
         |doc| match doc.parse_result() {
             Some(pr) => (
                 dependency_version_map(pr, ecosystem.formatter()),
                 pr.selection_context(),
+                doc.manifest()
+                    .map_or(deps_core::PublishTimeDemand::NotRequired, |manifest| {
+                        deps_core::PublishTimeDemand::for_document(manifest)
+                    }),
             ),
-            None => (HashMap::new(), deps_core::SelectionContext::none()),
+            None => (
+                HashMap::new(),
+                deps_core::SelectionContext::none(),
+                deps_core::PublishTimeDemand::NotRequired,
+            ),
         },
     );
 
@@ -897,7 +925,16 @@ async fn parse_and_diff_manifest(
         .map_or_else(deps_core::SelectionContext::none, |pr| {
             pr.selection_context()
         });
-    let selection_context_changed = old_selection_context != new_selection_context;
+    let new_demand = parse_result
+        .as_deref()
+        .ok()
+        .map_or(deps_core::PublishTimeDemand::NotRequired, |pr| {
+            deps_core::PublishTimeDemand::for_document(pr)
+        });
+    let demand_rose = old_demand == deps_core::PublishTimeDemand::NotRequired
+        && new_demand == deps_core::PublishTimeDemand::NativeWindow
+        && ecosystem.registry().honors_publish_time_demand();
+    let selection_context_changed = old_selection_context != new_selection_context || demand_rose;
 
     let diff = DependencyDiff::compute(&old_deps, &new_deps);
     tracing::debug!(

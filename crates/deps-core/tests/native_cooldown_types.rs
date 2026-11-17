@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use deps_core::native_cooldown::{
-    NativeCooldown, NativeCooldownSource, NativeWindow, TimeSpanError, TimeSpanValue,
+    NativeCooldown, NativeCooldownSource, NativeLimit, NativeWindow, TimeSpanError, TimeSpanValue,
     parse_time_span,
 };
 use deps_core::{ConcreteVersion, PackageVersions, PublishTime};
@@ -26,9 +26,11 @@ const MAX_SECS: u64 = 10 * 365 * DAY;
 fn window_of(raw: &str) -> Option<NativeWindow> {
     match parse_time_span(raw).unwrap_or_else(|e| panic!("{raw:?} must parse, got {e:?}")) {
         TimeSpanValue::Disabled => None,
-        TimeSpanValue::Span(span) => {
-            Some(NativeCooldown::new(span, NativeCooldownSource::CargoGlobal).window())
-        }
+        TimeSpanValue::Span(span) => Some(
+            NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal)
+                .age_window()
+                .expect("a span limit has an age window"),
+        ),
     }
 }
 
@@ -124,7 +126,8 @@ fn native_cooldown_display_names_the_setting_and_keeps_the_configured_text() {
     let TimeSpanValue::Span(span) = parse_time_span("7 days").expect("parses") else {
         panic!("7 days is a span");
     };
-    let cooldown = NativeCooldown::new(span, NativeCooldownSource::CargoGlobal);
+    let cooldown =
+        NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal);
     assert_eq!(
         cooldown.to_string(),
         "cargo registry.global-min-publish-age = 7 days"
@@ -136,7 +139,8 @@ fn native_cooldown_display_of_clamped_window_keeps_configured_text() {
     let TimeSpanValue::Span(span) = parse_time_span("40000 days").expect("parses") else {
         panic!("40000 days is a span");
     };
-    let cooldown = NativeCooldown::new(span, NativeCooldownSource::CargoGlobal);
+    let cooldown =
+        NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal);
     assert_eq!(
         cooldown.to_string(),
         "cargo registry.global-min-publish-age = 40000 days"
@@ -150,6 +154,12 @@ fn native_cooldown_source_is_matched_exhaustively_without_wildcard() {
         match source {
             NativeCooldownSource::CargoGlobal => "global",
             NativeCooldownSource::CargoRegistry { .. } => "registry",
+            NativeCooldownSource::NpmMinReleaseAge => "npm-min-release-age",
+            NativeCooldownSource::NpmBefore => "npm-before",
+            NativeCooldownSource::PnpmMinimumReleaseAge => "pnpm",
+            NativeCooldownSource::BunMinimumReleaseAge => "bun",
+            NativeCooldownSource::UvExcludeNewer => "uv",
+            NativeCooldownSource::UvExcludeNewerPackage { .. } => "uv-package",
         }
     }
     assert_eq!(label(&NativeCooldownSource::CargoGlobal), "global");

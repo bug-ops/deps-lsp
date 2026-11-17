@@ -515,7 +515,8 @@ fn native_cooldown_window_label_window_matches_configured_span() {
         parse_cargo_toml_with_context(manifest, &uri, &ctx(NativeCooldownMode::Honor)).unwrap();
     let window = Dependency::native_cooldown(&result.dependencies[0])
         .expect("window")
-        .window();
+        .age_window()
+        .expect("age window");
     assert!(window.contains(7 * 86_400 - 1));
     assert!(!window.contains(7 * 86_400));
 }

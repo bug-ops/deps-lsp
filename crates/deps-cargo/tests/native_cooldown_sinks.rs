@@ -18,7 +18,7 @@ use deps_cargo::config::ConfigFileCache;
 use deps_cargo::parser::CargoParseContext;
 use deps_core::edit::{UnplannableReason, UpdateCandidate};
 use deps_core::lsp_helpers::{DiagnosticSeverities, LockCandidates};
-use deps_core::native_cooldown::NativeGate;
+use deps_core::native_cooldown::{NativeGate, NativeHold};
 use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use deps_core::policy_config::NativeCooldownMode;
 use deps_core::{
@@ -214,8 +214,11 @@ async fn native_gate_excludes_within_window_and_releases_exactly_at_min_age() {
             !gate.excludes(p, &v, t(published + 7 * DAY)),
             "exactly min age is eligible"
         );
-        assert_eq!(gate.remaining(p, &v, t(published + 7 * DAY - 10)), Some(10));
-        assert_eq!(gate.remaining(p, &v, t(published + 7 * DAY)), None);
+        assert_eq!(
+            gate.hold(p, &v, t(published + 7 * DAY - 10)),
+            Some(NativeHold::For(10))
+        );
+        assert_eq!(gate.hold(p, &v, t(published + 7 * DAY)), None);
         assert!(
             !gate.excludes(None, &v, t(published)),
             "no publish time is eligible"

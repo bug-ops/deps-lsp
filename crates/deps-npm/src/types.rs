@@ -352,6 +352,8 @@ pub struct NpmDependency {
     pub source: deps_core::parser::DependencySource,
     /// The `.npmrc` entry that produced [`Self::source`]; `None` when no entry applied.
     pub(crate) registry_entry: Option<NpmRegistryEntry>,
+    /// The package manager's own release-age hold on this dependency (spec 099).
+    pub(crate) native_cooldown: Option<deps_core::native_cooldown::NativeCooldown>,
     /// The real registry package name from an
     /// [`npm:` alias value](https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies)
     /// (`"my-react": "npm:react@^18.0.0"`), when present. `None` for an ordinary, non-aliased
@@ -461,6 +463,10 @@ impl deps_core::Dependency for NpmDependency {
 
     fn source(&self) -> deps_core::parser::DependencySource {
         self.source.clone()
+    }
+
+    fn native_cooldown(&self) -> Option<&deps_core::native_cooldown::NativeCooldown> {
+        self.native_cooldown.as_ref()
     }
 }
 
@@ -786,6 +792,7 @@ impl deps_core::lsp_helpers::ProbeDependency for NpmDependency {
             },
             source,
             registry_entry: None,
+            native_cooldown: None,
             package: None,
         }
     }
@@ -821,6 +828,7 @@ mod tests {
             },
             source: deps_core::parser::DependencySource::Registry,
             registry_entry: None,
+            native_cooldown: None,
             package: None,
         };
 

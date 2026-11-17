@@ -721,6 +721,7 @@ mod tests {
                 section: crate::types::PypiDependencySection::Dependencies,
                 source: crate::types::PypiDependencySource::Registry,
                 index_route: None,
+                native_cooldown: None,
             }
         }
 
@@ -846,6 +847,7 @@ mod tests {
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
             index_route: None,
+            native_cooldown: None,
         };
 
         for (manifest, osv) in [
@@ -910,6 +912,7 @@ mod tests {
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
             index_route,
+            native_cooldown: None,
         };
 
         let formatter = PypiFormatter;

@@ -6,6 +6,35 @@ use dashmap::mapref::entry::Entry;
 use std::hash::Hash;
 use std::pin::Pin;
 
+/// Whether a version fetch must return publish times for a native release-age window.
+///
+/// [`NotRequired`](Self::NotRequired) keeps each registry's existing request shape;
+/// [`NativeWindow`](Self::NativeWindow) asks for dated versions even when freshness is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishTimeDemand {
+    /// No native window applies; fetch exactly what is fetched today.
+    NotRequired,
+    /// A native window applies; publish times are needed.
+    NativeWindow,
+}
+
+impl PublishTimeDemand {
+    /// The demand of a whole document: [`NativeWindow`](Self::NativeWindow) iff at least one of
+    /// its dependencies carries a native window.
+    #[must_use]
+    pub fn for_document(document: &dyn crate::ParsedManifest) -> Self {
+        let mut native = false;
+        document.for_each_formatted_dependency(&mut |bound| {
+            native |= bound.dependency().native_cooldown().is_some();
+        });
+        if native {
+            Self::NativeWindow
+        } else {
+            Self::NotRequired
+        }
+    }
+}
+
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Declares one `*Any` supertrait: `as_any` under `test`/`test-util`, an empty blanket
@@ -255,6 +284,44 @@ pub trait Registry: Send + Sync + RegistryAny {
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
         let _ = source;
         self.get_versions_with(name, freshness)
+    }
+
+    /// Whether this registry returns publish times only when asked through
+    /// [`get_versions_from_with_demand`](Self::get_versions_from_with_demand) with
+    /// [`PublishTimeDemand::NativeWindow`].
+    ///
+    /// A document whose demand rises is refetched in full only for such a registry: every other
+    /// one already returns the times its window judges, so a refetch would only add requests.
+    ///
+    /// Pairing: return `true` only if [`get_versions_from_with_demand`](Self::get_versions_from_with_demand)
+    /// fetches times it would not fetch otherwise. Returning `true` without that override makes
+    /// every demand rise refetch for nothing; overriding it without returning `true` leaves
+    /// cached versions undated when a window appears.
+    ///
+    /// Default: `false`.
+    fn honors_publish_time_demand(&self) -> bool {
+        false
+    }
+
+    /// Like [`get_versions_from`](Self::get_versions_from), additionally carrying whether the
+    /// caller needs publish times for a native release-age window.
+    ///
+    /// With [`PublishTimeDemand::NotRequired`] this is identical to
+    /// [`get_versions_from`](Self::get_versions_from). An override may only add `published_at`
+    /// values and must not change the set, order or content of the returned versions.
+    ///
+    /// Default: ignores `demand` and forwards to [`get_versions_from`](Self::get_versions_from),
+    /// which is correct for every registry that already returns publish times regardless of
+    /// freshness settings.
+    fn get_versions_from_with_demand<'a>(
+        &'a self,
+        name: &'a PackageName,
+        source: &'a DependencySource,
+        freshness: crate::freshness::FreshnessSettings,
+        demand: PublishTimeDemand,
+    ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+        let _ = demand;
+        self.get_versions_from(name, source, freshness)
     }
 
     /// Finds the latest version matching a version requirement.

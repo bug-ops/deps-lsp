@@ -14,7 +14,7 @@ use deps_core::net_policy::RegistryTrust;
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
     DepsError, EcosystemId, EgressTier, HOVER_RECENT_VERSIONS, HttpCache, PublishTime,
-    RegistryEndpoint, RequestHeader, Result, SafePathSegment, SegmentedPathName,
+    PublishTimeDemand, RegistryEndpoint, RequestHeader, Result, SafePathSegment, SegmentedPathName,
     not_found_or as core_not_found_or,
     parser::DependencySource,
     registry::{KeyShape, register_capped_with_occupied},
@@ -220,17 +220,6 @@ struct CachedTimes {
     fetched_at: Instant,
     times: Arc<HashMap<String, PublishTime>>,
     top_seen: Box<[String]>,
-}
-
-/// Full packument response, narrowed to the one field [`NpmRegistry::fetch_publish_times`]
-/// needs. `time`'s values are untyped: most are RFC 3339 timestamp strings, but a
-/// fully-unpublished package's `time.unpublished` entry is an object
-/// (`{"time": ..., "versions": [...]}`), so typing this `HashMap<String, String>` would fail
-/// deserialization of the whole document for that package.
-#[derive(Deserialize)]
-struct PackageTimes {
-    #[serde(default)]
-    time: HashMap<String, serde_json::Value>,
 }
 
 /// Client for interacting with the npm registry.
@@ -443,13 +432,8 @@ impl NpmRegistry {
     /// inline logic to give this crate a true inherent `get_versions_with`, matching the
     /// canonical shape every other ecosystem uses — #834 critic S1/S2).
     ///
-    /// A2: an alternate (`WorkspaceDeclared`-tier) registry always skips the full-packument
-    /// publish-times fetch, regardless of `freshness.is_enabled()` — `HttpCache` has no
-    /// workspace-gated `get_transport_only_*` variant, and routing an alternate's multi-MB
-    /// full packument through the ungated transport would reopen the redirect-hop hole
-    /// FR-008's routing closes, for a cosmetic relative-age suffix. `Self::publish_times`
-    /// already degrades to an empty map on any failure, so private-registry dependencies
-    /// simply keep that same shape — version data itself is unaffected.
+    /// A declared (alternate) registry never gets the cosmetic freshness fetch: only a native
+    /// release-age window asks for its publish times, see [`Self::get_versions_with_demand`].
     ///
     /// # Errors
     ///
@@ -459,8 +443,28 @@ impl NpmRegistry {
         name: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<NpmVersion>> {
+        self.get_versions_with_demand(name, freshness, PublishTimeDemand::NotRequired)
+            .await
+    }
+
+    /// Same as [`Self::get_versions_with`], and additionally fetches publish times, on any
+    /// tier, when `demand` is [`PublishTimeDemand::NativeWindow`] even if freshness is off.
+    ///
+    /// The set, order and content of the versions are the same either way; only
+    /// `published_at` is added.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`].
+    pub async fn get_versions_with_demand(
+        &self,
+        name: &str,
+        freshness: deps_core::FreshnessSettings,
+        demand: PublishTimeDemand,
+    ) -> Result<Vec<NpmVersion>> {
         let mut versions = self.get_versions(name).await?;
-        if freshness.is_enabled() && !self.tier.is_declared() {
+        let freshness_wants_times = freshness.is_enabled() && !self.tier.is_declared();
+        if freshness_wants_times || demand == PublishTimeDemand::NativeWindow {
             let all_versions: Vec<String> =
                 versions.iter().map(|v| v.version.to_string()).collect();
             let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
@@ -538,9 +542,21 @@ impl NpmRegistry {
             return HashMap::new();
         };
         let url = versions_url(&self.registry_base, segments);
-        let fetch = self
-            .cache
-            .get_transport_only_with_headers(&url, &[RequestHeader::Accept("application/json")]);
+        let headers = [RequestHeader::Accept("application/json")];
+        let fetch = async {
+            match self.tier {
+                NpmRegistryTier::Public | NpmRegistryTier::Declared(RegistryTrust::Trusted) => {
+                    self.cache
+                        .get_transport_only_with_headers(&url, &headers)
+                        .await
+                }
+                NpmRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
+                    self.cache
+                        .get_transport_only_workspace_with_headers(&url, &headers)
+                        .await
+                }
+            }
+        };
         let body = match tokio::time::timeout(PUBLISH_TIMES_FETCH_TIMEOUT, fetch).await {
             Ok(Ok(body)) => body,
             Ok(Err(e)) => {
@@ -795,32 +811,185 @@ fn publish_times_stale(cached: &CachedTimes, now: Instant, current_top8: &[Strin
 /// retained map to the package's actual published-version count regardless of how many keys
 /// the source `time` object carries — see [`NpmRegistry::fetch_publish_times`]).
 ///
-/// `known_versions` is looked up via a `HashSet` built once up front rather than
-/// `Vec::contains`: callers now pass a package's full version list (some npm packages carry
-/// several thousand versions), and a per-entry linear scan over that list inside the `time`
-/// object's filter would be O(n²).
+/// The document is streamed: every field other than `time`, and every `time` entry of an
+/// unknown version, is skipped without being materialized, so a registry-controlled multi-MB
+/// packument costs one pass and the retained map, not a parsed copy of the whole document.
+/// `time` values that are not strings (a fully-unpublished package's `time.unpublished`
+/// object) are skipped too. `known_versions` is looked up via a `HashSet` built once up
+/// front: some npm packages carry several thousand versions.
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::Json`] if `data` is not valid JSON matching [`PackageTimes`]'s shape,
-/// or a [`deps_core::ParseFailureKind::NestingTooDeep`] parse error if it nests deeper than
-/// [`deps_core::MAX_JSON_NESTING_DEPTH`].
+/// Returns [`DepsError::Json`] if `data` is not a JSON object whose `time` field (when
+/// present) is an object, or a [`deps_core::ParseFailureKind::NestingTooDeep`] parse error if
+/// it nests deeper than [`deps_core::MAX_JSON_NESTING_DEPTH`].
 fn parse_package_times(
     data: &[u8],
     known_versions: &[String],
 ) -> Result<HashMap<String, PublishTime>> {
-    let parsed: PackageTimes = deps_core::parse_json_checked(data)?;
+    use deps_core::parser::CheckedJsonError;
+    use serde::de::DeserializeSeed;
+
+    if let Err(depth) =
+        deps_core::parser::check_json_nesting_depth(data, deps_core::MAX_JSON_NESTING_DEPTH)
+    {
+        return Err(CheckedJsonError::NestingTooDeep { depth }.into());
+    }
     let known: std::collections::HashSet<&str> =
         known_versions.iter().map(String::as_str).collect();
-    Ok(parsed
-        .time
+    let mut deserializer = serde_json::Deserializer::from_slice(data);
+    let times = streaming::PackumentSeed { known: &known }
+        .deserialize(&mut deserializer)
+        .map_err(CheckedJsonError::Syntax)?;
+    deserializer.end().map_err(CheckedJsonError::Syntax)?;
+    Ok(times)
+}
+
+/// Visitors for [`parse_package_times`]: serde seeds that keep only the entries asked for.
+mod streaming {
+    use std::borrow::Cow;
+    use std::collections::{HashMap, HashSet};
+    use std::fmt;
+
+    use deps_core::PublishTime;
+    use serde::de::{
+        self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor,
+    };
+
+    /// The packument root: yields the filtered `time` map, ignoring every other field.
+    pub(super) struct PackumentSeed<'a> {
+        pub(super) known: &'a HashSet<&'a str>,
+    }
+
+    impl<'de> DeserializeSeed<'de> for PackumentSeed<'_> {
+        type Value = HashMap<String, PublishTime>;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for PackumentSeed<'_> {
+        type Value = HashMap<String, PublishTime>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a packument object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut times = HashMap::new();
+            while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                if key == "time" {
+                    times = map.next_value_seed(TimeSeed { known: self.known })?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(times)
+        }
+    }
+
+    struct TimeSeed<'a> {
+        known: &'a HashSet<&'a str>,
+    }
+
+    impl<'de> DeserializeSeed<'de> for TimeSeed<'_> {
+        type Value = HashMap<String, PublishTime>;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for TimeSeed<'_> {
+        type Value = HashMap<String, PublishTime>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a `time` object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut times = HashMap::new();
+            while let Some(version) = map.next_key::<Cow<'de, str>>()? {
+                if self.known.contains(version.as_ref()) {
+                    if let Stamp(Some(published)) = map.next_value()? {
+                        times.insert(version.into_owned(), published);
+                    }
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(times)
+        }
+    }
+
+    /// One `time` value: a timestamp when it is an RFC 3339 string, otherwise nothing; any
+    /// other shape is consumed without being stored.
+    struct Stamp(Option<PublishTime>);
+
+    impl<'de> de::Deserialize<'de> for Stamp {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(StampVisitor)
+        }
+    }
+
+    struct StampVisitor;
+
+    impl<'de> Visitor<'de> for StampVisitor {
+        type Value = Stamp;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a `time` value")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Stamp, E> {
+            Ok(Stamp(PublishTime::parse_rfc3339(value)))
+        }
+
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Stamp, E> {
+            Ok(Stamp(None))
+        }
+
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Stamp, E> {
+            Ok(Stamp(None))
+        }
+
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Stamp, E> {
+            Ok(Stamp(None))
+        }
+
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Stamp, E> {
+            Ok(Stamp(None))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Stamp, E> {
+            Ok(Stamp(None))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Stamp, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(Stamp(None))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Stamp, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(Stamp(None))
+        }
+    }
+}
+
+/// Boxes `versions` for the trait-object API; the set and order are unchanged.
+fn boxed_versions(versions: Vec<NpmVersion>) -> Vec<Box<dyn deps_core::Version>> {
+    versions
         .into_iter()
-        .filter(|(version, _)| known.contains(version.as_str()))
-        .filter_map(|(version, value)| {
-            let published = PublishTime::parse_rfc3339(value.as_str()?)?;
-            Some((version, published))
-        })
-        .collect())
+        .map(|version| Box::new(version) as Box<dyn deps_core::Version>)
+        .collect()
 }
 
 /// Attaches `published_at` to each version whose string matches an entry in `times`.
@@ -871,16 +1040,38 @@ impl deps_core::Registry for NpmRegistry {
         source: &'a DependencySource,
         freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        self.get_versions_from_with_demand(name, source, freshness, PublishTimeDemand::NotRequired)
+    }
+
+    fn honors_publish_time_demand(&self) -> bool {
+        true
+    }
+
+    /// Same routing as `get_versions_from`, asking the routed registry for publish
+    /// times when `demand` is `PublishTimeDemand::NativeWindow`.
+    fn get_versions_from_with_demand<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        freshness: deps_core::FreshnessSettings,
+        demand: PublishTimeDemand,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            match self.route(source) {
+            let alternate;
+            let routed: &Self = match self.route(source) {
                 NpmRoute::Alternate(client) => {
-                    deps_core::Registry::get_versions_with(client.as_ref(), name, freshness).await
+                    alternate = client;
+                    &alternate
                 }
-                NpmRoute::Public => {
-                    deps_core::Registry::get_versions_with(self, name, freshness).await
+                NpmRoute::Public => self,
+                NpmRoute::Unregistered => {
+                    return Err(deps_core::registry::alternate_not_registered(name));
                 }
-                NpmRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
-            }
+            };
+            routed
+                .get_versions_with_demand(name.as_str(), freshness, demand)
+                .await
+                .map(boxed_versions)
         })
     }
 
@@ -2131,6 +2322,38 @@ mod tests {
         assert!(!times.contains_key("1.0.0"));
     }
 
+    /// Security L3: a hostile packument's bulk (other fields, unknown `time` keys, nested
+    /// values of unusual shape) is skipped, and only the asked-for entries are retained.
+    #[test]
+    fn test_parse_package_times_streams_past_a_hostile_document() {
+        let mut json = String::from(r#"{"readme": ""#);
+        json.push_str(&"x".repeat(200_000));
+        json.push_str(r#"","versions": {"#);
+        for i in 0..5_000 {
+            json.push_str(&format!(r#""0.0.{i}": {{"dist": {{"files": [1,2,3]}}}},"#));
+        }
+        json.push_str(r#""9.9.9": {}}, "time": {"#);
+        for i in 0..50_000 {
+            json.push_str(&format!(r#""0.1.{i}": "2020-01-01T00:00:00Z","#));
+        }
+        json.push_str(
+            r#""1.0.0": "2020-06-15T12:00:00Z", "2.0.0": {"a": [1, {"b": null}]}, "3.0.0": 7}}"#,
+        );
+        let known = vec![
+            "1.0.0".to_string(),
+            "2.0.0".to_string(),
+            "3.0.0".to_string(),
+        ];
+        let times = parse_package_times(json.as_bytes(), &known).unwrap();
+        assert_eq!(times.len(), 1);
+        assert!(times.contains_key("1.0.0"));
+    }
+
+    #[test]
+    fn test_parse_package_times_rejects_a_non_object_time_field() {
+        assert!(parse_package_times(br#"{"time": []}"#, &[]).is_err());
+    }
+
     #[test]
     fn test_parse_package_times_object_valued_unpublished_does_not_error() {
         // Live-verified (Finding E): a fully-unpublished package's `time.unpublished` is an
@@ -2761,6 +2984,67 @@ mod tests {
              entries, proving the alternate fetch used the workspace-tier key namespace"
         );
         alt_mock.assert_async().await;
+    }
+
+    /// Spec 099 D2 (impl-critic S1): under native demand the publish-times fetch of a declared
+    /// registry follows its tier. A workspace-declared registry goes through the gated
+    /// transport, so a redirect hop to another host is refused and the versions stay undated; a
+    /// trusted one uses the baseline transport, follows the same redirect and dates them.
+    #[tokio::test]
+    async fn test_declared_registry_publish_times_follow_the_tier_transport() {
+        use deps_core::{FreshnessSettings, PublishTimeDemand};
+
+        async fn dated(trusted: bool) -> bool {
+            let mut target = mockito::Server::new_async().await;
+            let _times = target
+                .mock("GET", "/widget")
+                .with_status(200)
+                .with_body(r#"{"time": {"1.0.0": "2020-01-01T00:00:00Z"}}"#)
+                .create_async()
+                .await;
+            let mut alternate = mockito::Server::new_async().await;
+            let _abbreviated = alternate
+                .mock("GET", "/widget")
+                .match_header("accept", ABBREVIATED_ACCEPT)
+                .with_status(200)
+                .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+                .create_async()
+                .await;
+            let _redirect = alternate
+                .mock("GET", "/widget")
+                .match_header("accept", "application/json")
+                .with_status(302)
+                .with_header("location", &format!("{}/widget", target.url()))
+                .create_async()
+                .await;
+
+            let index = if trusted {
+                trusted_index(&alternate.url())
+            } else {
+                alternate_index(&alternate.url())
+            };
+            let registry = NpmRegistry::with_base(Arc::new(HttpCache::new()), &index);
+            let versions = registry
+                .get_versions_with_demand(
+                    "widget",
+                    FreshnessSettings::Disabled,
+                    PublishTimeDemand::NativeWindow,
+                )
+                .await
+                .unwrap();
+            versions
+                .iter()
+                .all(|version| version.published_at.is_some())
+        }
+
+        assert!(
+            dated(true).await,
+            "a trusted registry follows the redirect and dates its versions"
+        );
+        assert!(
+            !dated(false).await,
+            "a workspace-declared registry must not follow the redirect hop"
+        );
     }
 
     /// N-S1: an `AlternateRegistry` source whose index was never registered must return
