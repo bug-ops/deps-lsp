@@ -17,9 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: `handle_document_open` returns `Result<bool>` and registers its fetch task itself; `false` means a close or a newer open won the parse (#2036, #2040)
 - **deps-core, deps-gradle, deps-pypi**: new public `LockScope`, `Dependency::lock_scope`, `LockFileProvider::companion_lockfiles`, `VersionData::is_resolved_for`, `LockCandidates::has_scope`, `GradleDependency::lock_scope` and `PypiDependencySection::{PipfilePackages, PipfileDevPackages}` variants (#2034, #2035, #2040)
 - **behavior**: deps-cli and the Action now discover `Pipfile`, so pipenv repositories can newly fail `--fail-on` (#2035, #2040)
-- **deps-core, deps-cli**: `cooldown_disposition` takes a `NativeGate` argument, `CooldownDisposition::NativeHeld`, `UnplannableReason::WithinNativeCooldown`, `SkipReason::WithinNativeCooldown`, `PlannedUpdateItem::native_hold` and `PolicyConfigDiff::native_cooldown_changed` are new (#TBD)
-- **deps-core**: new public fields `PackageVersions::publish_times`, `VersionData::now` and `FreshnessConfig::honor_native_cooldown` (#TBD)
-- **deps-cargo**: `.cargo/config.toml` is now a watched config, so editing it re-parses and re-fetches open Cargo manifests (#TBD)
+- **deps-core, deps-cli**: `cooldown_disposition` takes a `NativeGate` argument, `CooldownDisposition::NativeHeld`, `UnplannableReason::WithinNativeCooldown`, `SkipReason::WithinNativeCooldown`, `PlannedUpdateItem::native_hold` and `PolicyConfigDiff::native_cooldown_changed` are new (#2043)
+- **deps-core**: new public fields `PackageVersions::publish_times`, `VersionData::now` and `FreshnessConfig::honor_native_cooldown` (#2043)
+- **deps-cargo**: `.cargo/config.toml` is now a watched config, so editing it re-parses and re-fetches open Cargo manifests (#2043)
 
 ### Added
 - **deps-pypi**: `Pipfile` is a PyPI manifest (`[packages]`, `[dev-packages]`, primary `[[source]]` and per-package `index`) (#2035, #2040)
@@ -31,10 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle**: in-use versions from `gradle.lockfile` (#1925, #2033)
 - **deps-deno**: in-use versions from `deno.lock` schemas 3, 4 and 5 (#1924, #2033)
 - **deps-core, deps-lsp, deps-cli**: `diagnostics.suppress` also applies to hover, inlay hints, code lens counts and update-all, and `diagnostics.ignore` hides a whole package's deprecated, outdated, yanked and license diagnostics (#1967, #2033)
-- **deps-cargo, deps-core, deps-engine, deps-lsp, deps-cli**: Cargo's `min-publish-age` window (`registry.global-min-publish-age`, `registries.<name>.min-publish-age`, `resolver.incompatible-publish-age`) from the repository's `.cargo/config.toml` is honored explain-only: a held `latest` is named in diagnostics, hover, `deps-cli check` and `update`, and is never proposed (#TBD)
-- **deps-lsp, deps-cli**: `freshness.honor_native_cooldown` (default `true`) turns the native window off (#TBD)
-- **deps-core**: new `native_cooldown` module, `Dependency::native_cooldown`, `UserHome::is` (now public), `PackageVersions::published_at_of`, `VersionData::with_now` and `format_duration_bucket` (#TBD)
-- **deps-engine**: `EcosystemRuntime::native_cooldown` live toggle (#TBD)
+- **deps-cargo, deps-core, deps-engine, deps-lsp, deps-cli**: Cargo's `min-publish-age` window (`registry.global-min-publish-age`, `registries.<name>.min-publish-age`, `resolver.incompatible-publish-age`) from the repository's `.cargo/config.toml` is honored explain-only: a held `latest` is named in diagnostics, hover, `deps-cli check` and `update`, and is never proposed (#2043)
+- **deps-lsp, deps-cli**: `freshness.honor_native_cooldown` (default `true`) turns the native window off (#2043)
+- **deps-core**: new `native_cooldown` module, `Dependency::native_cooldown`, `UserHome::is` (now public), `PackageVersions::published_at_of`, `VersionData::with_now` and `format_duration_bucket` (#2043)
+- **deps-engine**: `EcosystemRuntime::native_cooldown` live toggle (#2043)
 
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
@@ -46,8 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 - **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)
 - **specs**: add spec 102 recording that pub and SwiftPM have no native release-age gate (#2029)
-- **book**: document the Cargo publish-age window, its limits and `freshness.honor_native_cooldown` (#TBD)
-- **specs**: spec 099 Phase 1 shipped explain-only; steering past a held version is deferred to Phase 2 (#TBD)
+- **book**: document the Cargo publish-age window, its limits and `freshness.honor_native_cooldown` (#2043)
+- **specs**: spec 099 Phase 1 shipped explain-only; steering past a held version is deferred to Phase 2 (#2043)
 
 ### Fixed
 - **deps-lsp**: a `didClose` during the first parse of a `didOpen` no longer brings the closed document back, and a cold-start load no longer replaces an open still parsing (#2036, #2040)
