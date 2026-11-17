@@ -14,8 +14,8 @@ use deps_cli::cli::{Cli, Command, OutputFormat, UpdateArgs, UpdateOutputFormat};
 use deps_cli::config::{self, CliConfig};
 use deps_cli::exit::{ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, CoverageGate, FailOnPolicy, check_manifest};
+use deps_cli::update;
 use deps_cli::update::ignore::IgnoreRules;
-use deps_cli::update::{self, UpdatePlan};
 use deps_cli::{format, walk};
 use deps_core::net_policy::{EnvSource, ProcessEnv, RegistryEnvironment};
 use deps_core::osv::OsvClient;
@@ -538,16 +538,19 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
         .then(|| cli_config.update.ignore.clone());
 
     match runtime.block_on(run_update(args, policy, ignore_config)) {
-        Ok(plan) => {
+        Ok(run) => {
+            if let deps_cli::update::regen::LockfileOutcome::Unsupported { reason, .. } =
+                &run.lockfile
+            {
+                eprintln!("deps-cli: warning: lockfile not regenerated: {reason}");
+            }
             let rendered = match args.format {
                 UpdateOutputFormat::Table => {
-                    format::table::render_update(&plan, format::DryRun::from_flag(args.dry_run))
+                    format::table::render_update(&run, format::DryRun::from_flag(args.dry_run))
                 }
                 UpdateOutputFormat::Json => {
-                    match format::json::render_update(
-                        &plan,
-                        format::DryRun::from_flag(args.dry_run),
-                    ) {
+                    match format::json::render_update(&run, format::DryRun::from_flag(args.dry_run))
+                    {
                         Ok(json) => json,
                         Err(error) => {
                             eprintln!("deps-cli: failed to render JSON report: {error}");
@@ -557,7 +560,7 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
                 }
             };
             print!("{rendered}");
-            ExitCode::from(u8::try_from(deps_cli::exit::update_exit_code(&plan)).unwrap_or(2))
+            ExitCode::from(u8::try_from(deps_cli::exit::update_exit_code(&run)).unwrap_or(2))
         }
         Err(message) => {
             eprintln!("deps-cli: error: {message}");
@@ -576,7 +579,7 @@ async fn run_update(
     args: &UpdateArgs,
     policy: PolicyConfig,
     ignore_config: Option<Vec<deps_cli::config::IgnoreRule>>,
-) -> Result<UpdatePlan, String> {
+) -> Result<deps_cli::update::UpdateRun, String> {
     let handles = build_runtime_handles(&policy, &ProcessEnv);
     let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
 
@@ -776,7 +779,19 @@ async fn run_update(
     )
     .map_err(|error| error.to_string())?;
 
-    Ok(plan)
+    let gate = deps_cli::update::regen::RegenerationGate::new(
+        args.lockfile,
+        format::DryRun::from_flag(args.dry_run),
+        ctx.policy.network.mode(),
+    );
+    let target = deps_cli::update::regen::ManifestTarget {
+        ecosystem: &manifest.ecosystem,
+        manifest_path: &manifest.path,
+        display_path: &manifest.display_path,
+        uri: &analysis.uri,
+    };
+    let lockfile = deps_cli::update::regen::regenerate_lockfile(&plan, &target, gate).await;
+    Ok(deps_cli::update::UpdateRun { plan, lockfile })
 }
 
 #[cfg(test)]

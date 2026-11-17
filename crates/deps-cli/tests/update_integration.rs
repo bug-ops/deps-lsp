@@ -33,6 +33,15 @@ use deps_core::position::{Position, Range};
 #[cfg(unix)]
 use std::assert_matches;
 
+fn nothing_applied_run(plan: UpdatePlan) -> deps_cli::update::UpdateRun {
+    deps_cli::update::UpdateRun {
+        plan,
+        lockfile: deps_cli::update::regen::LockfileOutcome::NotApplicable(
+            deps_cli::update::regen::NotApplicableReason::NothingApplied,
+        ),
+    }
+}
+
 fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_deps-cli")
 }
@@ -385,7 +394,8 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
         latest: "3.5.0",
         ignore_name,
     });
-    deps_cli::format::json::render_update(&plan, DryRun::Yes).expect("render the plan as JSON")
+    deps_cli::format::json::render_update(&nothing_applied_run(plan), DryRun::Yes)
+        .expect("render the plan as JSON")
 }
 
 /// One manifest, its registry's latest version and an optional ignore rule, planned in process.
@@ -580,7 +590,7 @@ fn test_update_bare_cargo_requirement_satisfied_by_latest_never_becomes_a_no_op_
             "{constraint} vs {latest}: {plan:?}"
         );
         assert_eq!(
-            deps_cli::exit::update_exit_code(&plan),
+            deps_cli::exit::update_exit_code(&nothing_applied_run(plan.clone())),
             deps_cli::exit::EXIT_CLEAN,
             "{constraint} vs {latest}: {plan:?}"
         );
@@ -689,4 +699,60 @@ async fn test_update_current_column_matches_between_catalog_entry_and_package_js
         current(&catalog).split_whitespace().collect::<Vec<_>>(),
         current(&package).split_whitespace().collect::<Vec<_>>(),
     );
+}
+
+// --- #1116: `--lockfile` surface (network-free via --offline) ---
+
+fn update_json(extra: &[&str]) -> (Option<i32>, serde_json::Value) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .expect("write fixture manifest");
+    let output = std::process::Command::new(exe())
+        .args(["update", "--offline", "--format", "json"])
+        .args(extra)
+        .arg(dir.path().join("Cargo.toml"))
+        .output()
+        .expect("run the real deps-cli binary");
+    let json = serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+    (output.status.code(), json)
+}
+
+/// Default `--lockfile skip`: an empty plan reports `not-applicable/nothing-applied`, exits clean.
+#[test]
+fn test_update_default_lockfile_mode_empty_plan_is_not_applicable() {
+    let (code, json) = update_json(&[]);
+    assert_eq!(code, Some(0), "{json}");
+    assert_eq!(
+        json["lockfile"],
+        serde_json::json!({"status": "not-applicable", "reason": "nothing-applied"})
+    );
+}
+
+#[test]
+fn test_update_lockfile_regenerate_offline_empty_plan_is_not_applicable() {
+    let (code, json) = update_json(&["--lockfile", "regenerate"]);
+    assert_eq!(code, Some(0), "{json}");
+    assert_eq!(
+        json["lockfile"],
+        serde_json::json!({"status": "not-applicable", "reason": "nothing-applied"})
+    );
+}
+
+#[test]
+fn test_update_lockfile_skip_is_accepted_explicitly() {
+    let (code, json) = update_json(&["--lockfile", "skip"]);
+    assert_eq!(code, Some(0), "{json}");
+    assert_eq!(json["lockfile"]["status"], "not-applicable");
+}
+
+#[test]
+fn test_update_lockfile_unknown_mode_is_a_usage_error() {
+    let output = std::process::Command::new(exe())
+        .args(["update", "--offline", "--lockfile", "bogus", "Cargo.toml"])
+        .output()
+        .expect("run the real deps-cli binary");
+    assert_eq!(output.status.code(), Some(2));
 }

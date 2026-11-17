@@ -360,7 +360,13 @@ async fn update_skips_held_latest_as_within_native_cooldown_with_the_same_note_a
         "{}",
         skipped[0].reason()
     );
-    assert_eq!(update_exit_code(&plan), 0);
+    let run = deps_cli::update::UpdateRun {
+        plan: plan.clone(),
+        lockfile: deps_cli::update::regen::LockfileOutcome::NotApplicable(
+            deps_cli::update::regen::NotApplicableReason::NothingApplied,
+        ),
+    };
+    assert_eq!(update_exit_code(&run), 0);
 
     let check = fx.check_messages().await;
     assert!(

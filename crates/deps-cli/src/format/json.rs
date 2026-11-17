@@ -8,6 +8,10 @@
 
 use super::DryRun;
 use crate::report::{Category, CheckReport};
+use crate::update::regen::{
+    LockfileOutcome, NotApplicableReason, NpmClient, PinResolution, Program, RegenerationError,
+    SkipCause, UnsupportedReason,
+};
 use deps_core::EcosystemId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -275,6 +279,8 @@ pub struct UpdateReportDocument {
     pub dry_run: bool,
     /// One entry per candidate dependency the planner considered.
     pub items: Vec<UpdateItemDocument>,
+    /// The outcome of the lockfile step; always present (additive, no schema bump).
+    pub lockfile: LockfileDocument,
 }
 
 /// One `update` plan item's JSON shape.
@@ -324,28 +330,359 @@ pub enum CooldownFallbackDocument {
     },
 }
 
-/// Builds the versioned [`UpdateReportDocument`] for `plan`.
+/// The tool that regenerated a lockfile, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolToken {
+    /// `cargo`.
+    Cargo,
+    /// `go`.
+    Go,
+    /// `npm`.
+    Npm,
+    /// `pnpm`.
+    Pnpm,
+}
+
+impl From<Program> for ToolToken {
+    fn from(program: Program) -> Self {
+        match program {
+            Program::Cargo => Self::Cargo,
+            Program::Go => Self::Go,
+            Program::Npm => Self::Npm,
+            Program::Pnpm => Self::Pnpm,
+        }
+    }
+}
+
+/// Whether a regenerated lockfile holds exactly the target or a newer version.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatchToken {
+    /// The lockfile holds exactly the target.
+    Exact,
+    /// The lockfile holds a newer version that still satisfies the edited requirement.
+    Newer,
+}
+
+/// One verified pin in a regenerated lockfile.
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
+pub struct LockfilePinDocument {
+    /// The package name.
+    pub name: String,
+    /// The version the plan applied.
+    pub target: String,
+    /// The version the regenerated lockfile holds.
+    pub resolved: String,
+    /// How `resolved` compares with `target`.
+    #[serde(rename = "match")]
+    pub matched: MatchToken,
+}
+
+/// Why regeneration was skipped, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkipToken {
+    /// `--lockfile regenerate` was not passed.
+    NotEnabled,
+    /// `--dry-run`.
+    DryRun,
+    /// Offline mode.
+    Offline,
+}
+
+/// Why there was nothing to regenerate, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotApplicableToken {
+    /// The plan applied no edit.
+    NothingApplied,
+    /// The ecosystem has no lockfile format.
+    NoLockfileFormat,
+    /// No lockfile exists for the manifest.
+    NoLockfilePresent,
+}
+
+/// Why regeneration is unsupported, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnsupportedToken {
+    /// The ecosystem's regeneration is not implemented yet.
+    EcosystemDeferred,
+    /// The JavaScript client is not supported yet.
+    NpmClientDeferred,
+    /// The manifest may be a workspace member (ancestor lockfile or workspace, or the workspace
+    /// directory set via the environment).
+    WorkspaceMemberLockfile,
+    /// The located lockfile is not the one the tool would update.
+    LockfileOwnershipMismatch,
+    /// The Go module vendors its dependencies.
+    GoVendored,
+    /// A Go workspace is active.
+    GoWorkspace,
+    /// A cooldown-fallback target cannot be pinned by range resolution.
+    CooldownFallbackTarget,
+    /// The lockfile is a symlink or not a regular file.
+    LockfileSymlink,
+}
+
+/// The kind of a failed regeneration, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureKind {
+    /// The tool is not installed.
+    ToolchainMissing,
+    /// The tool could not be started.
+    Spawn,
+    /// The shared time budget ran out.
+    TimedOut,
+    /// The tool exited unsuccessfully.
+    ToolFailed,
+    /// A probe printed unexpected output.
+    UnexpectedProbeOutput,
+    /// A package name or version was unsafe to pass on a command line.
+    UnsafeArgument,
+    /// The lockfile's name matches no known client.
+    UnrecognizedLockfile,
+    /// The edited manifest could not be re-parsed.
+    ManifestReparseFailed,
+    /// The regenerated lockfile could not be read.
+    LockfileUnreadable,
+    /// The regenerated lockfile does not hold the applied target.
+    VersionMismatch,
+}
+
+impl From<&RegenerationError> for FailureKind {
+    fn from(error: &RegenerationError) -> Self {
+        match error {
+            RegenerationError::ToolchainMissing { .. } => Self::ToolchainMissing,
+            RegenerationError::Spawn { .. } => Self::Spawn,
+            RegenerationError::TimedOut { .. } => Self::TimedOut,
+            RegenerationError::ToolFailed { .. } => Self::ToolFailed,
+            RegenerationError::UnexpectedProbeOutput { .. } => Self::UnexpectedProbeOutput,
+            RegenerationError::UnsafeArgument { .. } => Self::UnsafeArgument,
+            RegenerationError::UnrecognizedLockfile { .. } => Self::UnrecognizedLockfile,
+            RegenerationError::ManifestReparseFailed { .. } => Self::ManifestReparseFailed,
+            RegenerationError::LockfileUnreadable { .. } => Self::LockfileUnreadable,
+            RegenerationError::VersionMismatch { .. } => Self::VersionMismatch,
+        }
+    }
+}
+
+/// The JavaScript client an `unsupported` report refers to, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientToken {
+    /// npm.
+    Npm,
+    /// pnpm.
+    Pnpm,
+    /// Yarn.
+    Yarn,
+    /// Bun.
+    Bun,
+}
+
+impl From<NpmClient> for ClientToken {
+    fn from(client: NpmClient) -> Self {
+        match client {
+            NpmClient::Npm => Self::Npm,
+            NpmClient::Pnpm => Self::Pnpm,
+            NpmClient::Yarn => Self::Yarn,
+            NpmClient::Bun => Self::Bun,
+        }
+    }
+}
+
+/// What an `unsupported` reason refers to; both shapes are a bare string on the wire.
+///
+/// The token sets overlap on `"npm"`, so an untagged `"npm"` deserializes as
+/// [`Self::Ecosystem`] first. This is harmless: only `yarn` and `bun`
+/// ([`Self::Client`]) are ever emitted, and neither is an ecosystem id.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum UnsupportedDetail {
+    /// The ecosystem whose regeneration is deferred.
+    Ecosystem(EcosystemToken),
+    /// The client whose regeneration is deferred.
+    Client(ClientToken),
+}
+
+/// The lockfile step of an `update` run, tagged by `status`.
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum LockfileDocument {
+    /// The lockfile was regenerated and every pin verified.
+    Regenerated {
+        /// The lockfile's display path.
+        path: String,
+        /// The tool that updated it.
+        tool: ToolToken,
+        /// One entry per applied pin.
+        pins: Vec<LockfilePinDocument>,
+    },
+    /// Regeneration was gated off.
+    Skipped {
+        /// The gate that closed.
+        reason: SkipToken,
+    },
+    /// There was nothing to regenerate.
+    NotApplicable {
+        /// Why.
+        reason: NotApplicableToken,
+    },
+    /// Regeneration is unsupported for this manifest.
+    Unsupported {
+        /// Why.
+        reason: UnsupportedToken,
+        /// The lockfile found, if any.
+        path: Option<String>,
+        /// The ecosystem or client the reason refers to, when it names one.
+        detail: Option<UnsupportedDetail>,
+    },
+    /// Regeneration started and failed.
+    Failed {
+        /// The failure kind.
+        kind: FailureKind,
+        /// The sanitized error message.
+        message: String,
+        /// The package of a `version-mismatch`, else `null`.
+        package: Option<String>,
+        /// The expected version of a `version-mismatch`, else `null`.
+        expected: Option<String>,
+        /// The lockfile's version of a `version-mismatch`, else `null`.
+        found: Option<String>,
+    },
+}
+
+impl From<&LockfileOutcome> for LockfileDocument {
+    fn from(outcome: &LockfileOutcome) -> Self {
+        let clean = crate::sanitize::sanitize_message_for_display;
+        match outcome {
+            LockfileOutcome::Regenerated {
+                lockfile,
+                tool,
+                pins,
+            } => Self::Regenerated {
+                path: clean(&lockfile.to_string()),
+                tool: (*tool).into(),
+                pins: pins
+                    .iter()
+                    .map(|pin| {
+                        let (resolved, matched) = match &pin.resolution {
+                            PinResolution::Exact => (&pin.target, MatchToken::Exact),
+                            PinResolution::Newer(version) => (version, MatchToken::Newer),
+                        };
+                        LockfilePinDocument {
+                            name: clean(pin.package.as_str()),
+                            target: clean(pin.target.as_str()),
+                            resolved: clean(resolved.as_str()),
+                            matched,
+                        }
+                    })
+                    .collect(),
+            },
+            LockfileOutcome::Skipped(cause) => Self::Skipped {
+                reason: match cause {
+                    SkipCause::NotEnabled => SkipToken::NotEnabled,
+                    SkipCause::DryRun => SkipToken::DryRun,
+                    SkipCause::Offline => SkipToken::Offline,
+                },
+            },
+            LockfileOutcome::NotApplicable(reason) => Self::NotApplicable {
+                reason: match reason {
+                    NotApplicableReason::NothingApplied => NotApplicableToken::NothingApplied,
+                    NotApplicableReason::NoLockfileFormat => NotApplicableToken::NoLockfileFormat,
+                    NotApplicableReason::NoLockfilePresent => NotApplicableToken::NoLockfilePresent,
+                },
+            },
+            LockfileOutcome::Unsupported { lockfile, reason } => {
+                let (token, detail) = match reason {
+                    UnsupportedReason::EcosystemDeferred(id) => (
+                        UnsupportedToken::EcosystemDeferred,
+                        Some(UnsupportedDetail::Ecosystem(EcosystemToken(*id))),
+                    ),
+                    UnsupportedReason::NpmClientDeferred(client) => (
+                        UnsupportedToken::NpmClientDeferred,
+                        Some(UnsupportedDetail::Client(ClientToken::from(*client))),
+                    ),
+                    UnsupportedReason::WorkspaceMemberLockfile => {
+                        (UnsupportedToken::WorkspaceMemberLockfile, None)
+                    }
+                    UnsupportedReason::LockfileOwnershipMismatch => {
+                        (UnsupportedToken::LockfileOwnershipMismatch, None)
+                    }
+                    UnsupportedReason::GoVendored => (UnsupportedToken::GoVendored, None),
+                    UnsupportedReason::GoWorkspace => (UnsupportedToken::GoWorkspace, None),
+                    UnsupportedReason::CooldownFallbackTarget => {
+                        (UnsupportedToken::CooldownFallbackTarget, None)
+                    }
+                    UnsupportedReason::LockfileSymlink => (UnsupportedToken::LockfileSymlink, None),
+                };
+                Self::Unsupported {
+                    reason: token,
+                    path: lockfile.as_ref().map(|path| clean(&path.to_string())),
+                    detail,
+                }
+            }
+            LockfileOutcome::Failed(error) => {
+                let (package, expected, found) = match error {
+                    RegenerationError::VersionMismatch {
+                        package,
+                        expected,
+                        found,
+                    } => (
+                        Some(clean(package.as_str())),
+                        Some(clean(expected.as_str())),
+                        found.as_ref().map(|version| clean(version.as_str())),
+                    ),
+                    RegenerationError::ToolchainMissing { .. }
+                    | RegenerationError::Spawn { .. }
+                    | RegenerationError::TimedOut { .. }
+                    | RegenerationError::ToolFailed { .. }
+                    | RegenerationError::UnexpectedProbeOutput { .. }
+                    | RegenerationError::UnsafeArgument { .. }
+                    | RegenerationError::UnrecognizedLockfile { .. }
+                    | RegenerationError::ManifestReparseFailed { .. }
+                    | RegenerationError::LockfileUnreadable { .. } => (None, None, None),
+                };
+                Self::Failed {
+                    kind: error.into(),
+                    message: clean(&error.to_string()),
+                    package,
+                    expected,
+                    found,
+                }
+            }
+        }
+    }
+}
+
+/// Builds the versioned [`UpdateReportDocument`] for `run`.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_cli::format::DryRun;
 /// use deps_cli::format::json::{UPDATE_SCHEMA_VERSION, update_to_document};
-/// use deps_cli::update::UpdatePlan;
+/// use deps_cli::update::regen::{LockfileOutcome, NotApplicableReason};
+/// use deps_cli::update::{UpdatePlan, UpdateRun};
 ///
-/// let document = update_to_document(&UpdatePlan::default(), DryRun::No);
+/// let run = UpdateRun {
+///     plan: UpdatePlan::default(),
+///     lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
+/// };
+/// let document = update_to_document(&run, DryRun::No);
 /// assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
 /// assert!(!document.dry_run);
 /// assert!(document.items.is_empty());
 /// ```
 #[must_use]
-pub fn update_to_document(
-    plan: &crate::update::UpdatePlan,
-    dry_run: DryRun,
-) -> UpdateReportDocument {
+pub fn update_to_document(run: &crate::update::UpdateRun, dry_run: DryRun) -> UpdateReportDocument {
     // Security-S3: `target`/`reason`/`cooldown_fallback` carry unvalidated `ConcreteVersion`
     // text, sanitized here like `name`/`current` and `format::table::render_update`.
-    let items = plan
+    let items = run
+        .plan
         .items
         .iter()
         .map(|item| UpdateItemDocument {
@@ -385,25 +722,35 @@ pub fn update_to_document(
         schema_version: UPDATE_SCHEMA_VERSION,
         dry_run: dry_run == DryRun::Yes,
         items,
+        lockfile: LockfileDocument::from(&run.lockfile),
     }
 }
 
-/// Renders `plan` as a pretty-printed JSON string.
+/// Renders `run` as a pretty-printed JSON string.
 ///
 /// # Errors
 ///
 /// Returns an error only if [`UpdateReportDocument`]'s `Serialize` impl fails, which does not
 /// happen for the plain-data shape this module builds.
 pub fn render_update(
-    plan: &crate::update::UpdatePlan,
+    run: &crate::update::UpdateRun,
     dry_run: DryRun,
 ) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(&update_to_document(plan, dry_run))
+    serde_json::to_string_pretty(&update_to_document(run, dry_run))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_of(plan: &crate::update::UpdatePlan) -> crate::update::UpdateRun {
+        crate::update::UpdateRun {
+            plan: plan.clone(),
+            lockfile: crate::update::regen::LockfileOutcome::NotApplicable(
+                crate::update::regen::NotApplicableReason::NothingApplied,
+            ),
+        }
+    }
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
     use deps_core::diagnostic::{DiagnosticKind, Severity};
@@ -621,7 +968,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(applied_outcome())],
         };
-        let document = update_to_document(&plan, DryRun::Yes);
+        let document = update_to_document(&run_of(&plan), DryRun::Yes);
         assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
         assert!(document.dry_run);
         assert_eq!(document.items.len(), 1);
@@ -654,7 +1001,7 @@ mod tests {
         let item = update_item(applied_outcome())
             .with_osv_sibling_match(Some(SiblingMatchNote::new(&Messages, &tags)));
         let plan = crate::update::UpdatePlan { items: vec![item] };
-        let document = update_to_document(&plan, DryRun::No);
+        let document = update_to_document(&run_of(&plan), DryRun::No);
         assert_eq!(document.items[0].matched_tags, ["v4.9.0", "v4.9.1"]);
         assert!(
             document.items[0]
@@ -664,12 +1011,12 @@ mod tests {
             document.items[0].reason
         );
 
-        let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
+        let rendered = render_update(&run_of(&plan), DryRun::No).expect("render must succeed");
         assert!(rendered.contains("matched_tags"));
         let plain = render_update(
-            &crate::update::UpdatePlan {
+            &run_of(&crate::update::UpdatePlan {
                 items: vec![update_item(applied_outcome())],
-            },
+            }),
             DryRun::No,
         )
         .expect("render must succeed");
@@ -681,10 +1028,10 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(applied_outcome())],
         };
-        let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
+        let rendered = render_update(&run_of(&plan), DryRun::No).expect("render must succeed");
         let parsed: UpdateReportDocument =
             serde_json::from_str(&rendered).expect("must round-trip");
-        assert_eq!(parsed, update_to_document(&plan, DryRun::No));
+        assert_eq!(parsed, update_to_document(&run_of(&plan), DryRun::No));
     }
 
     /// #1629: `None` (empty/no target) maps to `null` on the wire (`UPDATE_SCHEMA_VERSION`
@@ -698,10 +1045,10 @@ mod tests {
             target: None,
         });
         let plan = crate::update::UpdatePlan { items: vec![item] };
-        let document = update_to_document(&plan, DryRun::No);
+        let document = update_to_document(&run_of(&plan), DryRun::No);
         assert_eq!(document.items[0].target, None);
 
-        let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
+        let rendered = render_update(&run_of(&plan), DryRun::No).expect("render must succeed");
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("must parse");
         let target = value["items"][0]
             .as_object()
@@ -735,7 +1082,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![item, applied_instead_of_item],
         };
-        let document = update_to_document(&plan, DryRun::No);
+        let document = update_to_document(&run_of(&plan), DryRun::No);
         let doc_item = &document.items[0];
         let target = doc_item.target.as_deref().expect("target must be Some");
         assert!(!target.contains('\x1B'));

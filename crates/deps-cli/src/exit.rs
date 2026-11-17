@@ -1,7 +1,8 @@
 //! Exit-code mapping (FR-011, FR-012): 0 clean, 1 policy violation, 2 execution error.
 
 use crate::report::{CheckReport, FailOnPolicy, OsvCoverage};
-use crate::update::{Outcome, SkipReason, UpdatePlan};
+use crate::update::regen::LockfileOutcome;
+use crate::update::{Outcome, SkipReason, UpdateRun};
 use deps_core::policy_config::OsvChecks;
 
 /// The process exited cleanly: no finding matched the `--fail-on` policy.
@@ -124,7 +125,8 @@ pub fn exit_code(
 /// [`Outcome::RequiresLockfileUpdate`], or [`Outcome::Unfixable`] — these represent something
 /// the run *wanted* to fix but could not, unlike an operator-requested exclusion. `2`
 /// (execution error — parse/write/TOCTOU/symlink/offline-gate failures) is set by the caller
-/// before this function is ever reached, never by this function itself (FR-022 — a non-zero
+/// before this function is ever reached; this function itself returns `2` only for a failed
+/// lockfile regeneration (#1116), which still prints the plan report (FR-022 — a non-zero
 /// exit here never implies the working tree is unmodified: a mixed run can exit `1` with real
 /// edits already on disk).
 ///
@@ -139,13 +141,21 @@ pub fn exit_code(
 ///
 /// ```
 /// use deps_cli::exit::{EXIT_CLEAN, EXIT_POLICY_VIOLATION, update_exit_code};
-/// use deps_cli::update::UpdatePlan;
+/// use deps_cli::update::regen::{LockfileOutcome, NotApplicableReason};
+/// use deps_cli::update::{UpdatePlan, UpdateRun};
 ///
-/// assert_eq!(update_exit_code(&UpdatePlan::default()), EXIT_CLEAN);
+/// let run = UpdateRun {
+///     plan: UpdatePlan::default(),
+///     lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
+/// };
+/// assert_eq!(update_exit_code(&run), EXIT_CLEAN);
 /// ```
 #[must_use]
-pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
-    let has_unresolved_item = plan.items.iter().any(|item| {
+pub fn update_exit_code(run: &UpdateRun) -> i32 {
+    if matches!(run.lockfile, LockfileOutcome::Failed(_)) {
+        return EXIT_EXECUTION_ERROR;
+    }
+    let has_unresolved_item = run.plan.items.iter().any(|item| {
         !matches!(
             item.outcome,
             Outcome::Applied { .. }
@@ -542,7 +552,15 @@ mod tests {
 
     // --- update_exit_code (spec 068, S3) ---
 
-    use crate::update::{PlannedUpdateItem, UnfixableReason};
+    use crate::update::regen::NotApplicableReason;
+    use crate::update::{PlannedUpdateItem, UnfixableReason, UpdatePlan};
+
+    fn run_of(plan: &UpdatePlan) -> UpdateRun {
+        UpdateRun {
+            plan: plan.clone(),
+            lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
+        }
+    }
     use deps_core::edit::{ManifestEdit, UnplannableReason};
 
     fn update_item(outcome: Outcome) -> PlannedUpdateItem {
@@ -573,7 +591,10 @@ mod tests {
 
     #[test]
     fn test_update_exit_code_empty_plan_is_clean() {
-        assert_eq!(update_exit_code(&UpdatePlan::default()), EXIT_CLEAN);
+        assert_eq!(
+            update_exit_code(&run_of(&UpdatePlan::default())),
+            EXIT_CLEAN
+        );
     }
 
     #[test]
@@ -581,7 +602,7 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![update_item(applied()), update_item(applied())],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_CLEAN);
     }
 
     /// US-004: an ignore-rule skip alone must not fail the run.
@@ -596,7 +617,7 @@ mod tests {
                 }),
             ],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_CLEAN);
     }
 
     /// US-002: a `--package` exclusion alone must not fail the run.
@@ -611,7 +632,7 @@ mod tests {
                 }),
             ],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_CLEAN);
     }
 
     #[test]
@@ -622,7 +643,7 @@ mod tests {
                 target: None,
             })],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_POLICY_VIOLATION);
     }
 
     #[test]
@@ -632,7 +653,7 @@ mod tests {
                 target: deps_core::ConcreteVersion::from("1.2.0"),
             })],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_POLICY_VIOLATION);
     }
 
     #[test]
@@ -642,7 +663,7 @@ mod tests {
                 UnfixableReason::FetchFailedOrAbsent,
             ))],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_POLICY_VIOLATION);
     }
 
     /// Issue #1525: an automatic freshness-cooldown pause is a policy-driven exclusion, not a
@@ -658,7 +679,7 @@ mod tests {
                 }),
             ],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_CLEAN);
     }
 
     /// Spec 075 fix-cycle (code review): a genuinely overlapping edit dropped by
@@ -678,7 +699,7 @@ mod tests {
                 }),
             ],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_CLEAN);
     }
 
     #[test]
@@ -696,6 +717,6 @@ mod tests {
                 }),
             ],
         };
-        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+        assert_eq!(update_exit_code(&run_of(&plan)), EXIT_CLEAN);
     }
 }

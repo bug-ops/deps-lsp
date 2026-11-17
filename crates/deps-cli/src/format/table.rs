@@ -2,6 +2,7 @@
 
 use super::{DryRun, severity_str};
 use crate::report::CheckReport;
+use crate::update::regen::{LockfileOutcome, NotApplicableReason, PinResolution, SkipCause};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -80,25 +81,29 @@ pub fn render(report: &CheckReport) -> String {
 /// ```
 /// use deps_cli::format::DryRun;
 /// use deps_cli::format::table::render_update;
-/// use deps_cli::update::UpdatePlan;
+/// use deps_cli::update::regen::{LockfileOutcome, NotApplicableReason};
+/// use deps_cli::update::{UpdatePlan, UpdateRun};
 ///
+/// let run = UpdateRun {
+///     plan: UpdatePlan::default(),
+///     lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
+/// };
+/// assert_eq!(render_update(&run, DryRun::No), "No eligible updates.\n");
 /// assert_eq!(
-///     render_update(&UpdatePlan::default(), DryRun::No),
-///     "No eligible updates.\n"
-/// );
-/// assert_eq!(
-///     render_update(&UpdatePlan::default(), DryRun::Yes),
+///     render_update(&run, DryRun::Yes),
 ///     "(dry run — no changes written)\nNo eligible updates.\n"
 /// );
 /// ```
 #[must_use]
-pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: DryRun) -> String {
+pub fn render_update(run: &crate::update::UpdateRun, dry_run: DryRun) -> String {
+    let plan = &run.plan;
     let mut out = String::new();
     if dry_run == DryRun::Yes {
         let _ = writeln!(out, "(dry run — no changes written)");
     }
     if plan.items.is_empty() {
         out.push_str("No eligible updates.\n");
+        write_lockfile_lines(&mut out, &run.lockfile);
         return out;
     }
 
@@ -119,12 +124,71 @@ pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: DryRun) -> Strin
             crate::sanitize::sanitize_message_for_display(&item.reason()),
         );
     }
+    write_lockfile_lines(&mut out, &run.lockfile);
     out
+}
+
+/// Appends the lockfile step's line (plus one indented line per verified pin); silent for the
+/// default no-op outcomes (`NothingApplied`, `NotEnabled`) so a default run's table is unchanged.
+fn write_lockfile_lines(out: &mut String, outcome: &LockfileOutcome) {
+    let clean = crate::sanitize::sanitize_message_for_display;
+    match outcome {
+        LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied)
+        | LockfileOutcome::Skipped(SkipCause::NotEnabled) => {}
+        LockfileOutcome::Regenerated {
+            lockfile,
+            tool,
+            pins,
+        } => {
+            let _ = writeln!(
+                out,
+                "lockfile: regenerated {} via {tool}",
+                clean(&lockfile.to_string())
+            );
+            for pin in pins {
+                let resolved = match &pin.resolution {
+                    PinResolution::Exact => format!("{} (exact)", pin.target),
+                    PinResolution::Newer(version) => format!("{version} (newer)"),
+                };
+                let _ = writeln!(
+                    out,
+                    "  {} {} -> {}",
+                    clean(pin.package.as_str()),
+                    clean(pin.target.as_str()),
+                    clean(&resolved),
+                );
+            }
+        }
+        LockfileOutcome::Skipped(cause) => {
+            let _ = writeln!(out, "lockfile: skipped — {cause}");
+        }
+        LockfileOutcome::NotApplicable(reason) => {
+            let _ = writeln!(out, "lockfile: not applicable — {reason}");
+        }
+        LockfileOutcome::Unsupported { lockfile, reason } => {
+            let path = lockfile
+                .as_ref()
+                .map_or_else(String::new, |path| format!(" {}", clean(&path.to_string())));
+            let _ = writeln!(out, "lockfile: unsupported{path} — {reason}");
+        }
+        LockfileOutcome::Failed(error) => {
+            let _ = writeln!(out, "lockfile: failed — {}", clean(&error.to_string()));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_of(plan: &crate::update::UpdatePlan) -> crate::update::UpdateRun {
+        crate::update::UpdateRun {
+            plan: plan.clone(),
+            lockfile: crate::update::regen::LockfileOutcome::NotApplicable(
+                crate::update::regen::NotApplicableReason::NothingApplied,
+            ),
+        }
+    }
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
     use deps_core::diagnostic::Severity;
@@ -255,7 +319,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(applied_outcome())],
         };
-        let table = render_update(&plan, DryRun::No);
+        let table = render_update(&run_of(&plan), DryRun::No);
         assert!(table.contains("serde"));
         assert!(table.contains("1.0.0"));
         assert!(table.contains("1.2.0"));
@@ -268,7 +332,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(applied_outcome())],
         };
-        let table = render_update(&plan, DryRun::Yes);
+        let table = render_update(&run_of(&plan), DryRun::Yes);
         assert!(table.starts_with("(dry run"));
     }
 
@@ -278,7 +342,7 @@ mod tests {
     /// is emitted unconditionally regardless of item count).
     #[test]
     fn test_render_update_empty_plan_still_includes_dry_run_note() {
-        let table = render_update(&crate::update::UpdatePlan::default(), DryRun::Yes);
+        let table = render_update(&run_of(&crate::update::UpdatePlan::default()), DryRun::Yes);
         assert!(table.starts_with("(dry run"));
         assert!(table.contains("No eligible updates."));
     }
@@ -291,7 +355,7 @@ mod tests {
             target: None,
         });
         let plan = crate::update::UpdatePlan { items: vec![item] };
-        let table = render_update(&plan, DryRun::No);
+        let table = render_update(&run_of(&plan), DryRun::No);
         assert!(table.contains(" -> - "), "got: {table}");
     }
 
@@ -317,7 +381,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![item, applied_instead_of_item],
         };
-        let table = render_update(&plan, DryRun::No);
+        let table = render_update(&run_of(&plan), DryRun::No);
         assert!(!table.contains('\x1B'), "got: {table}");
         assert!(table.contains("1.2.0"), "got: {table}");
         assert!(table.contains("1.1.0"), "got: {table}");
