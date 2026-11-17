@@ -43,6 +43,14 @@ fn home() -> tempfile::TempDir {
     tempfile::tempdir().expect("temp home")
 }
 
+/// The filesystem root of the volume holding `dir` (`/` on Unix, `C:\` on Windows).
+fn filesystem_root_of(dir: &Path) -> PathBuf {
+    dir.ancestors()
+        .last()
+        .expect("a path has at least one ancestor")
+        .to_path_buf()
+}
+
 /// (a) The direnv / devcontainer layout: an absolute `XDG_CONFIG_HOME` inside the workspace.
 #[test]
 fn under_config_dir_absolute_xdg_inside_workspace_is_inside_workspace() {
@@ -69,7 +77,7 @@ fn under_config_dir_filesystem_root_workspace_is_ignored() {
 
     let lookup = ExemptionFile::under_config_dir(
         operator_path(&config),
-        &roots(h.path(), [PathBuf::from("/")]),
+        &roots(h.path(), [filesystem_root_of(h.path())]),
     );
 
     assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");
@@ -143,7 +151,7 @@ fn under_config_dir_without_home_still_drops_filesystem_root() {
 
     let lookup = ExemptionFile::under_config_dir(
         operator_path(&config),
-        &WorkspaceRoots::new([PathBuf::from("/")], None),
+        &WorkspaceRoots::new([filesystem_root_of(h.path())], None),
     );
 
     assert_matches!(lookup, UserConfigLookup::Located(_), "{lookup:?}");

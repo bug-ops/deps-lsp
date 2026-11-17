@@ -9,9 +9,9 @@ use std::assert_matches;
 use std::path::{Path, PathBuf};
 
 use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
-use deps_core::lsp_helpers::exemption::{
-    ExemptionFile, OperatorExemptions, UserConfigLookup, WorkspaceRoots,
-};
+#[cfg(unix)]
+use deps_core::lsp_helpers::exemption::OperatorExemptions;
+use deps_core::lsp_helpers::exemption::{ExemptionFile, UserConfigLookup, WorkspaceRoots};
 use deps_core::net_policy::MapEnv;
 
 const BODY: &str = "[[advisory]]\nid = \"GHSA-aaaa-bbbb-cccc\"\nreason = \"accepted risk\"\n";
