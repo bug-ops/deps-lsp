@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::lsp_helpers::{ResolvedCandidatesMap, ResolvedVersionsMap, VersionData};
 use crate::{ConcreteVersion, CooldownWindow, Dependency, NormalizedName, PackageKey, PublishTime};
@@ -90,6 +91,15 @@ pub struct NativeTimeSpan {
 }
 
 impl NativeTimeSpan {
+    /// Builds a span from a configured count and unit.
+    ///
+    /// # Errors
+    ///
+    /// [`TimeSpanError::Overflow`] when the span does not fit in `u64` seconds.
+    pub fn from_count(_count: u64, _unit: TimeUnit) -> Result<TimeSpanValue, TimeSpanError> {
+        todo!("native release-age gate: NativeTimeSpan::from_count")
+    }
+
     /// The span length in seconds (unclamped).
     const fn as_secs(self) -> u64 {
         self.secs
@@ -164,17 +174,89 @@ pub fn parse_time_span(raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
     Ok(TimeSpanValue::Span(NativeTimeSpan { count, unit, secs }))
 }
 
+/// Parses uv's `exclude-newer` span grammar (friendly units and ISO 8601 durations).
+///
+/// # Errors
+///
+/// [`TimeSpanError::Malformed`] outside the grammar; [`TimeSpanError::Overflow`] when the span
+/// exceeds `u64` seconds.
+pub fn parse_uv_span(_raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
+    todo!("native release-age gate: parse_uv_span")
+}
+
+/// An absolute instant before which releases are eligible, as configured (`npm before`,
+/// uv `exclude-newer` timestamps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeCutoff(PublishTime);
+
+impl NativeCutoff {
+    /// Parses an RFC 3339 timestamp.
+    #[must_use]
+    pub fn parse_rfc3339(_raw: &str) -> Option<Self> {
+        todo!("native release-age gate: NativeCutoff::parse_rfc3339")
+    }
+
+    /// Parses npm's `before` value: an RFC 3339 timestamp or a date-only value at midnight UTC.
+    #[must_use]
+    pub fn parse_npm_date(_raw: &str) -> Option<Self> {
+        todo!("native release-age gate: NativeCutoff::parse_npm_date")
+    }
+}
+
+impl fmt::Display for NativeCutoff {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!("native release-age gate: NativeCutoff Display")
+    }
+}
+
+/// What a native setting restricts: a relative age or an absolute cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLimit {
+    /// Releases younger than the span are held.
+    MinAge(NativeTimeSpan),
+    /// Releases published after the cutoff are held, indefinitely.
+    PublishedAfter(NativeCutoff),
+}
+
+/// How long a version stays held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeHold {
+    /// Eligible again after this many seconds.
+    For(u64),
+    /// Never becomes eligible under the configured cutoff.
+    Indefinite,
+}
+
+/// A PyPI package name restricted to characters safe to quote in a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PypiPackageLabel(String);
+
+impl PypiPackageLabel {
+    /// Wraps `name`, or `None` when it is empty or has a character outside PEP 508 names.
+    #[must_use]
+    pub fn new(_name: &str) -> Option<Self> {
+        todo!("native release-age gate: PypiPackageLabel::new")
+    }
+
+    /// The label text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A non-zero publish-age window, clamped to ten years.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::native_cooldown::{
-///     NativeCooldown, NativeCooldownSource, TimeSpanValue, parse_time_span,
+///     NativeCooldown, NativeCooldownSource, NativeLimit, TimeSpanValue, parse_time_span,
 /// };
 ///
 /// let Ok(TimeSpanValue::Span(span)) = parse_time_span("7 days") else { unreachable!() };
-/// let window = NativeCooldown::new(span, NativeCooldownSource::CargoGlobal).window();
+/// let window = NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal)
+///     .window();
 /// assert!(window.contains(3600));
 /// assert!(!window.contains(7 * 86_400));
 /// ```
@@ -251,6 +333,21 @@ pub enum NativeCooldownSource {
         /// The registry the key belongs to.
         alias: RegistryAlias,
     },
+    /// npm `min-release-age` in `.npmrc`.
+    NpmMinReleaseAge,
+    /// npm `before` in `.npmrc`.
+    NpmBefore,
+    /// pnpm `minimumReleaseAge` in `pnpm-workspace.yaml`.
+    PnpmMinimumReleaseAge,
+    /// Bun `minimumReleaseAge` in `bunfig.toml`.
+    BunMinimumReleaseAge,
+    /// uv `exclude-newer`.
+    UvExcludeNewer,
+    /// uv `exclude-newer-package` for one package.
+    UvExcludeNewerPackage {
+        /// The package the override belongs to.
+        package: PypiPackageLabel,
+    },
 }
 
 /// A native window together with the setting it came from.
@@ -259,30 +356,53 @@ pub enum NativeCooldownSource {
 ///
 /// ```
 /// use deps_core::native_cooldown::{
-///     NativeCooldown, NativeCooldownSource, TimeSpanValue, parse_time_span,
+///     NativeCooldown, NativeCooldownSource, NativeLimit, TimeSpanValue, parse_time_span,
 /// };
 ///
 /// let Ok(TimeSpanValue::Span(span)) = parse_time_span("7 days") else { unreachable!() };
-/// let cooldown = NativeCooldown::new(span, NativeCooldownSource::CargoGlobal);
+/// let cooldown = NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal);
 /// assert_eq!(cooldown.to_string(), "cargo registry.global-min-publish-age = 7 days");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCooldown {
-    span: NativeTimeSpan,
+    limit: NativeLimit,
     source: NativeCooldownSource,
 }
 
 impl NativeCooldown {
-    /// Builds a cooldown from a span and its source.
+    /// Builds a cooldown from a limit and its source.
     #[must_use]
-    pub const fn new(span: NativeTimeSpan, source: NativeCooldownSource) -> Self {
-        Self { span, source }
+    pub const fn new(limit: NativeLimit, source: NativeCooldownSource) -> Self {
+        Self { limit, source }
+    }
+
+    /// The configured limit.
+    #[must_use]
+    pub const fn limit(&self) -> &NativeLimit {
+        &self.limit
+    }
+
+    /// Whether `version`, published at `published_at`, is held at `now`, and for how long.
+    ///
+    /// Lock membership is not consulted; callers apply it on top.
+    #[must_use]
+    pub fn hold(
+        &self,
+        _published_at: Option<PublishTime>,
+        _version: &ConcreteVersion,
+        _now: PublishTime,
+    ) -> Option<NativeHold> {
+        todo!("native release-age gate: NativeCooldown::hold")
     }
 
     /// The configured span, as the user wrote it.
+    // TODO(review): removed when the Cargo surfaces move to `hold`; panics for a cutoff limit.
     #[must_use]
-    pub const fn span(&self) -> NativeTimeSpan {
-        self.span
+    pub fn span(&self) -> NativeTimeSpan {
+        match self.limit {
+            NativeLimit::MinAge(span) => span,
+            NativeLimit::PublishedAfter(_) => todo!("native release-age gate: span of a cutoff"),
+        }
     }
 
     /// The configuration key this window came from.
@@ -294,7 +414,7 @@ impl NativeCooldown {
     /// The window this cooldown enforces.
     #[must_use]
     pub fn window(&self) -> NativeWindow {
-        NativeWindow::new(self.span)
+        NativeWindow::new(self.span())
     }
 }
 
@@ -302,14 +422,22 @@ impl fmt::Display for NativeCooldown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.source {
             NativeCooldownSource::CargoGlobal => {
-                write!(f, "cargo registry.global-min-publish-age = {}", self.span)
+                write!(f, "cargo registry.global-min-publish-age = {}", self.span())
             }
             NativeCooldownSource::CargoRegistry { alias } => write!(
                 f,
                 "cargo registries.{}.min-publish-age = {}",
                 alias.as_str(),
-                self.span
+                self.span()
             ),
+            NativeCooldownSource::NpmMinReleaseAge
+            | NativeCooldownSource::NpmBefore
+            | NativeCooldownSource::PnpmMinimumReleaseAge
+            | NativeCooldownSource::BunMinimumReleaseAge
+            | NativeCooldownSource::UvExcludeNewer
+            | NativeCooldownSource::UvExcludeNewerPackage { .. } => {
+                todo!("native release-age gate: Display for the npm-family and uv sources")
+            }
         }
     }
 }
@@ -437,4 +565,86 @@ pub fn native_cooldowns_by_name(
     seen.into_iter()
         .filter_map(|(name, cooldown)| Some((name, cooldown?)))
         .collect()
+}
+
+/// Package-manager dialect an exemption list is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExemptionSyntax {
+    /// npm `min-release-age-exclude` (minimatch `*` within one path segment).
+    Npm,
+    /// pnpm `minimumReleaseAgeExclude`.
+    Pnpm,
+    /// Bun `minimumReleaseAgeExcludes`.
+    Bun,
+    /// uv `exclude-newer-package` names.
+    Uv,
+}
+
+/// Which versions of a package an exemption list releases from the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exemption {
+    /// The package is not exempt.
+    None,
+    /// Every version of the package is exempt.
+    AllVersions,
+    /// Only the listed versions are exempt.
+    Versions(Vec<String>),
+}
+
+/// Why an exemption list was rejected as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ExemptionError {
+    /// An entry uses syntax this reader does not support.
+    #[error("unsupported exemption entry")]
+    Unsupported,
+    /// The list or one of its entries exceeds the size caps.
+    #[error("exemption list too large")]
+    TooLarge,
+}
+
+/// A parsed per-package exemption list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExemptionList {
+    entries: Vec<String>,
+}
+
+impl ExemptionList {
+    /// What the list exempts for the package `name`.
+    #[must_use]
+    pub fn lookup(&self, _name: &str) -> Exemption {
+        todo!("native release-age gate: ExemptionList::lookup")
+    }
+}
+
+/// Parses `entries` in the given dialect.
+///
+/// # Errors
+///
+/// [`ExemptionError`] when any entry is unsupported or a size cap is exceeded; the whole list is
+/// rejected so a partially understood list never exempts more than the user wrote.
+pub fn parse_exemptions(
+    _entries: &[&str],
+    _syntax: ExemptionSyntax,
+) -> Result<ExemptionList, ExemptionError> {
+    todo!("native release-age gate: parse_exemptions")
+}
+
+/// The directories whose repository-level config applies to one manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryScope {
+    dirs: Vec<PathBuf>,
+}
+
+impl RepositoryScope {
+    /// Scope from `manifest_dir` up to `root` inclusive, never including `home`.
+    #[must_use]
+    pub fn new(_manifest_dir: &Path, _root: &Path, _home: Option<&Path>) -> Self {
+        todo!("native release-age gate: RepositoryScope::new")
+    }
+
+    /// The config directories, closest to the manifest first.
+    #[must_use]
+    pub fn config_dirs(&self) -> Vec<PathBuf> {
+        self.dirs.clone()
+    }
 }

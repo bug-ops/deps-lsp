@@ -1076,6 +1076,14 @@ fn push_native_hold_hover_section(
             markdown.push_text(alias.as_str(), FieldKind::Name);
             markdown.push_static(".min-publish-age = ");
         }
+        NativeCooldownSource::NpmMinReleaseAge
+        | NativeCooldownSource::NpmBefore
+        | NativeCooldownSource::PnpmMinimumReleaseAge
+        | NativeCooldownSource::BunMinimumReleaseAge
+        | NativeCooldownSource::UvExcludeNewer
+        | NativeCooldownSource::UvExcludeNewerPackage { .. } => {
+            todo!("native release-age gate: hover wording for the npm-family and uv sources")
+        }
     }
     markdown.push_text(&hold.cooldown.span().to_string(), FieldKind::Prose);
     markdown.push_static("; eligible in ");

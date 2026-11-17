@@ -1361,6 +1361,14 @@ pub trait LockFileProvider: Send + Sync {
         Vec::new()
     }
 
+    /// The directory that identifies the lock set `lockfile` belongs to, used to find the set
+    /// again when `lockfile` itself is created, edited or deleted.
+    ///
+    /// Default: the lock file's parent directory.
+    fn lock_set_root<'p>(&self, lockfile: &'p Path) -> Option<&'p Path> {
+        lockfile.parent()
+    }
+
     /// Extra packages to resolve alongside what [`Self::parse_lockfile`] returned, derived at
     /// load time from state outside the lock file.
     ///

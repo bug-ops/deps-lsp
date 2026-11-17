@@ -49,8 +49,8 @@ use deps_core::config_trust::{
     EnvPath, OperatorEnvName, OperatorEnvValue, OperatorEnvVar, OperatorPath,
 };
 use deps_core::native_cooldown::{
-    NativeCooldown, NativeCooldownSource, NativeTimeSpan, RegistryAlias, TimeSpanValue,
-    parse_time_span,
+    NativeCooldown, NativeCooldownSource, NativeLimit, NativeTimeSpan, RegistryAlias,
+    TimeSpanValue, parse_time_span,
 };
 use deps_core::net_policy::{
     BlockedHost, DeclaredRegistry, EnvSource, IndexUrlError, OperatorRegistries, ProcessEnv,
@@ -966,16 +966,17 @@ pub(crate) fn resolve_native_cooldown(
     {
         return match value {
             RawNativeValue::Window(span) => Some(NativeCooldown::new(
-                span,
+                NativeLimit::MinAge(span),
                 NativeCooldownSource::CargoRegistry { alias },
             )),
             RawNativeValue::Disabled | RawNativeValue::Invalid => None,
         };
     }
     match first_valid(&|file| file.global)? {
-        RawNativeValue::Window(span) => {
-            Some(NativeCooldown::new(span, NativeCooldownSource::CargoGlobal))
-        }
+        RawNativeValue::Window(span) => Some(NativeCooldown::new(
+            NativeLimit::MinAge(span),
+            NativeCooldownSource::CargoGlobal,
+        )),
         RawNativeValue::Disabled | RawNativeValue::Invalid => None,
     }
 }

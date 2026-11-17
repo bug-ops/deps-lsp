@@ -584,6 +584,12 @@ impl NpmParseContext {
             workspace_cache,
         }
     }
+
+    /// Sets whether npm-family native release-age settings are honored, ignored or off.
+    #[must_use]
+    pub fn with_native_cooldown(self, _mode: deps_core::policy_config::NativeCooldownMode) -> Self {
+        todo!("native release-age gate: NpmParseContext::with_native_cooldown")
+    }
 }
 
 /// Resolves `manifest_dir`'s `.npmrc` hierarchy (project tier, ancestor-walked, plus the

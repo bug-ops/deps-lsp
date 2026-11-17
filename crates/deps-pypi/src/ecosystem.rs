@@ -93,6 +93,17 @@ impl PypiEcosystem {
         )
     }
 
+    /// Shares the live native release-age mode (uv `exclude-newer`) with this ecosystem.
+    #[must_use]
+    pub fn with_native_cooldown_toggle(
+        self,
+        _toggle: Arc<
+            deps_core::policy_config::AtomicToggle<deps_core::policy_config::NativeCooldownMode>,
+        >,
+    ) -> Self {
+        todo!("native release-age gate: PypiEcosystem::with_native_cooldown_toggle")
+    }
+
     /// Creates a new PyPI ecosystem around an existing [`PypiRegistry`] instance, sharing
     /// `policy`'s live reachability setting — the production constructor, used by
     /// `deps_engine::setup::register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
