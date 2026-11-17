@@ -29,6 +29,10 @@ pub(super) enum SearchPath {
     /// Fake tools live in this directory: executables are resolved there only, and the child's
     /// `PATH` is this directory followed by the inherited one so scripts keep coreutils.
     #[cfg(all(test, unix))]
+    #[cfg_attr(
+        not(all(feature = "cargo", feature = "npm", feature = "go")),
+        allow(dead_code)
+    )]
     Override(OsString),
 }
 

@@ -12,6 +12,11 @@
 //! Real `go`/`npm`/`pnpm` runs against live registries belong to the live-tester.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::too_many_lines)]
+// Helpers serve the feature-gated cargo/npm/go tests; a partial feature build leaves them unused.
+#![cfg_attr(
+    not(all(feature = "cargo", feature = "npm", feature = "go")),
+    allow(dead_code)
+)]
 
 use std::assert_matches;
 use std::path::{Path, PathBuf};
@@ -772,7 +777,10 @@ mod cargo_real {
         let LockfileOutcome::Regenerated { lockfile, .. } = &outcome else {
             panic!("{outcome:?}");
         };
-        assert_eq!(lockfile.to_string(), "../Cargo.lock");
+        assert_eq!(
+            lockfile.to_string(),
+            Path::new("..").join("Cargo.lock").display().to_string()
+        );
         assert!(lock_has(&project.read("Cargo.lock"), "stuba", "1.0.1"));
         assert!(!project.path("m/Cargo.lock").exists());
     }

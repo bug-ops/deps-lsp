@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-cli**: `update_exit_code`, `format::json::{update_to_document, render_update}` and `format::table::render_update` take `&UpdateRun`; the update JSON report gains a `lockfile` object (#1116, #2050)
+- **deps-cli**: `update_exit_code`, `format::json::{update_to_document, render_update}` and `format::table::render_update` take `&UpdateRun`; `UpdateArgs` and `UpdateReportDocument` gain a public `lockfile` field (#1116, #2050)
 - **deps-core**: new variants on exhaustive public enums: `EcosystemId::PreCommit`, `DiagnosticKind::AdvisoryExempted`, `GitTagsPlatform::PreCommit`, `PinSubject::PreCommitHook` (#2029)
 - **deps-core**: new public fields `ShaPinComment::style` and `VersionData::advisory_exemptions`; `read_sha_pin_tail` takes the accepted comment styles (#2029)
 - **deps-core**: new public `PrimaryRole` enum, `ScanTarget::with_stand_in_primary` and `InUseVersions::primary_role` mark a scan target whose primary is a stand-in sibling tag (#2029)
