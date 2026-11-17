@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-engine**: tag pins and update candidates are scanned against all release tags on the same commit, and a floating pin with no own full release is now scanned instead of skipped (#2029)
 - **deps-lsp, deps-core**: inlay hints now carry vulnerability data, so the in-use advisory glyph renders for vulnerable packages, and it and the flagged-latest warning survive `diagnostics.ignore` (#1967, #2033)
 - **workspace**: bump `jsonschema` to 0.61 (#2019, #2033)
+- **deps**: refresh `Cargo.lock` and bump SHA-pinned `taiki-e/install-action` to v2.90.5 (#2045)
 
 ### Documentation
 - **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)
