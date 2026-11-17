@@ -61,7 +61,6 @@ urlencoding.workspace = true
 criterion = { workspace = true, features = ["html_reports"] }
 deps-cargo = { path = ".", features = ["test-util"] }
 deps-core = { workspace = true, features = ["test-util"] }
-insta = { workspace = true, features = ["json"] }
 mockito.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -103,7 +103,6 @@ deps-core = { workspace = true, features = ["test-util"] }
 # The `github-actions` feature re-exports `deps_engine::setup::GithubActionsFormatter`, the real
 # tag-index-backed formatter used by `update::security`'s #1779 end-to-end tests.
 deps-engine = { workspace = true, features = ["test-util", "cargo", "github-actions"] }
-dashmap.workspace = true
 # `tests/cross_major_siblings.rs` drives the real GitHub Actions fetch pipeline against a mock
 # GitHub API (`GithubActionsEcosystem::for_test`); dev-only.
 deps-github-actions = { workspace = true, features = ["test-util"] }
