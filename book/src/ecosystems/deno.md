@@ -8,7 +8,7 @@ different registries in the same `imports` map.
 | | |
 |---|---|
 | Manifest file | `deno.json` or `deno.jsonc` |
-| Lock file (in-use version) | not yet supported — `deno.lock` parsing is a documented gap; no `LockFileProvider` is registered for this ecosystem |
+| Lock file (in-use version) | `deno.lock` (schema versions 3, 4 and 5), located next to the manifest or in an ancestor directory |
 | Registry | `jsr:` specifiers resolve against JSR (`jsr.io`/`api.jsr.io`); `npm:` specifiers resolve against the same npm registry client `deps-npm` uses |
 | Version syntax | node-semver ranges, same as npm |
 
@@ -25,6 +25,20 @@ A dependency's scheme prefix (`jsr:` or `npm:`) determines which registry client
 hover, completion, and diagnostics — both schemes get the identical LSP experience version
 data otherwise gets (outdated/unsatisfiable diagnostics, inlay hints, code actions), just
 sourced from different upstream registries.
+
+## Lock Files
+
+`deno.lock` supplies the in-use version for both `jsr:` and `npm:` imports, so hover, inlay hints and
+OSV matching use the version Deno resolved instead of the manifest range. `deno.json` and `deno.jsonc`
+read the same file. The lock is searched in the manifest's directory and then its ancestors (the same
+depth as npm), so a nested `deno.json` without its own `deno.lock` picks up the parent's.
+
+- Entries are matched by package name, not by the exact manifest specifier: the Deno CLI normalizes the
+  keys of the lock's `specifiers` map (`^1.0.0` becomes `1`, an unversioned request becomes `*`, requests
+  that resolve identically merge), and subpaths such as `jsr:@std/path@^1/posix` are not part of the key.
+- npm peer-dependency suffixes (`18.3.1_react@18.3.1`) are stripped to the plain version.
+- The `remote` and `workspace` sections are ignored; a lock with only `remote` entries resolves nothing.
+- A lock whose `version` is missing or is not `"3"`, `"4"` or `"5"` is rejected rather than misread.
 
 ## Non-Registry Dependency Sources
 

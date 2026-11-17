@@ -164,8 +164,8 @@ pub use sha_comment::{
     sha_pin_rewrite_with_default_style,
 };
 pub use suppression::{
-    PackagePattern, PatternError, ResolvedSuppression, RuleError, SuppressedKinds, SuppressionKind,
-    SuppressionRule, SuppressionSet,
+    PackagePattern, PackageSuppression, PatternError, ResolvedSuppression, RuleError,
+    SuppressedKinds, SuppressionKind, SuppressionRule, SuppressionSet,
 };
 #[cfg(feature = "lsp-responses")]
 pub use unknown_ref::build_unknown_ref_fix_action;

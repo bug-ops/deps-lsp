@@ -4,7 +4,7 @@
 //! to the appropriate ecosystem implementation.
 
 use crate::config::{DepsConfig, InlayHintsConfig};
-use crate::document::{ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
 use deps_core::EcosystemConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -38,12 +38,16 @@ pub async fn handle_inlay_hints(
     }
 
     // Snapshot config before the document lookup (Copy value, no lock held across the call)
-    let (loading_config, network, osv_checks) = {
+    let (loading_config, network, osv_checks, vulnerability_visibility, suppression) = {
         let full_config = full_config.read().await;
         (
             full_config.loading_indicator.clone(),
             full_config.policy.network.mode(),
             full_config.policy.osv_checks(),
+            PrefetchVisibility::from_enabled(
+                full_config.policy.diagnostics.vulnerabilities_enabled,
+            ),
+            full_config.policy.diagnostics.effective_suppression(),
         )
     };
 
@@ -59,6 +63,7 @@ pub async fn handle_inlay_hints(
             .signals
             .snapshot()
             .with_resolved_version_candidates()
+            .with_vulnerabilities(vulnerability_visibility)
             .with_latest_status(osv_checks)
             .with_outcomes()
             .finish();
@@ -95,12 +100,17 @@ pub async fn handle_inlay_hints(
             snapshot
                 .version_data()
                 .with_ecosystem(ecosystem_id)
-                .with_network(network),
+                .with_network(network)
+                .with_suppression(&suppression),
             loading_state,
             &ecosystem_config,
         )
         .await
 }
+
+#[cfg(test)]
+#[path = "inlay_hints_ignore_tests.rs"]
+mod ignore_tests;
 
 #[cfg(test)]
 mod tests {

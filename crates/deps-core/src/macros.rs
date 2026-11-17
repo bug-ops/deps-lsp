@@ -756,6 +756,10 @@ macro_rules! impl_unprobed_dependency {
                     " is a test double that is never probed"
                 ))
             }
+
+            fn route_probes(_name: $crate::PackageName) -> ::std::vec::Vec<Self> {
+                ::std::vec::Vec::new()
+            }
         }
     };
 }

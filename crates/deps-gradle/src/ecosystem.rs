@@ -190,7 +190,11 @@ impl EcosystemBase for GradleEcosystem {
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
-        &[]
+        &[crate::lockfile::LOCKFILE_NAME]
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(Arc::new(crate::lockfile::GradleLockParser))
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
@@ -362,7 +366,6 @@ mod tests {
     }
 
     // #758: exact-value `Ecosystem` conformance, replacing the individual hand-written tests.
-    // `no_lockfile_support: true;` (#782 gap 2) covers Gradle having no lock file format.
     deps_core::ecosystem_conformance! {
         mod gradle_ecosystem_conformance;
         build: GradleEcosystem::new(make_cache());
@@ -376,7 +379,7 @@ mod tests {
             "settings.gradle.kts",
             "settings.gradle",
         ];
-        no_lockfile_support: true;
+        lockfile_filenames: &["gradle.lockfile"];
         // #1212: closes the follow-up noted in the previous `no_non_registry_fixture` reason —
         // Gradle 6+'s `content { includeGroup(...) }` restriction is a real static per-group
         // binding (see `parser::parse_repository_content_restrictions`), unlike the general

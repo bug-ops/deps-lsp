@@ -190,6 +190,10 @@ impl deps_core::lsp_helpers::ProbeDependency for DartDependency {
             name_range_is_synthetic: false,
         }
     }
+
+    fn route_probes(_name: deps_core::PackageName) -> Vec<Self> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

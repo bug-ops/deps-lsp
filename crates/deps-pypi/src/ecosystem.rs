@@ -176,7 +176,7 @@ impl EcosystemBase for PypiEcosystem {
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
-        &["poetry.lock", "uv.lock"]
+        &crate::lockfile::PypiLockFormat::FILE_NAMES
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
@@ -694,7 +694,7 @@ mod tests {
         id: "pypi";
         display_name: "PyPI (Python)";
         manifest_filenames: &["pyproject.toml"];
-        lockfile_filenames: &["poetry.lock", "uv.lock"];
+        lockfile_filenames: &["poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock"];
         non_registry_fixture: "requirements.txt" => "mylib @ https://example.com/mylib.tar.gz\n";
     }
 

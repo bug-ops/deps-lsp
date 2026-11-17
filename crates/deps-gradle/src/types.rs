@@ -66,6 +66,10 @@ impl deps_core::lsp_helpers::ProbeDependency for GradleDependency {
             source,
         }
     }
+
+    fn route_probes(_name: deps_core::PackageName) -> Vec<Self> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

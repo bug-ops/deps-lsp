@@ -15,7 +15,9 @@ use super::osv_scan::{
 };
 use super::probes::spawn_background_probes;
 use super::resolved::RefetchPolicy;
-use super::state::{DocumentState, ParseFailure, RefetchEscalation, ServerState, spawn_supervised};
+use super::state::{
+    DocumentState, OpenEpoch, ParseFailure, RefetchEscalation, ServerState, spawn_supervised,
+};
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
@@ -120,6 +122,8 @@ pub async fn handle_document_open(
 
     check_content_size(&content, &uri)?;
 
+    let reservation = state.reserve_open(&uri);
+
     tracing::info!(
         "Opening {:?} with ecosystem: {}",
         uri,
@@ -145,7 +149,7 @@ pub async fn handle_document_open(
     };
     doc_state.set_version(version);
 
-    state.update_document(uri.clone(), doc_state);
+    state.insert_opened(reservation, doc_state);
 
     // Read before any OSV request is built, so disabling the feature (or being offline)
     // suppresses the network call itself (FR-011; issue #1517 critique S3 — an explicit
@@ -699,9 +703,9 @@ async fn apply_pre_fetch_reparse(
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
 ) -> Option<PreFetchReparse> {
-    let (parsed, version) = state
+    let (parsed, version, epoch) = state
         .get_document(uri)
-        .and_then(|doc| Some((doc.manifest_arc()?, doc.version)))?;
+        .and_then(|doc| Some((doc.manifest_arc()?, doc.version, doc.open_epoch())))?;
     let decision = pre_fetch_decision(parsed.as_ref(), state.network_mode()).await;
     let report = match decision {
         PreFetchDecision::Skipped => return None,
@@ -734,7 +738,7 @@ async fn apply_pre_fetch_reparse(
         state,
         CommitOptions {
             diff: &diff,
-            guard: CommitGuard::ExpectVersion(version),
+            guard: CommitGuard::SameOpenAndVersion { epoch, version },
         },
     )
     .then_some(PreFetchReparse { needs_osv_rescan })
@@ -837,10 +841,39 @@ pub(crate) enum CommitGuard {
     /// Commit while the document is still tracked — a real edit's own version is authoritative,
     /// so no version check applies, but an edit whose document was closed meanwhile must not
     /// resurrect it.
+    #[cfg(test)]
+    #[allow(dead_code, reason = "constructed only by feature-gated test modules")]
     IfTracked,
     /// Commit only if the document is still tracked and its *current* version in `state` still
     /// equals this value; otherwise skip the commit entirely (impl-critic S1).
+    #[cfg(test)]
+    #[allow(dead_code, reason = "constructed only by feature-gated test modules")]
     ExpectVersion(Option<i32>),
+    /// Commit only if the document is still the same open as `epoch`.
+    SameOpen(OpenEpoch),
+    /// Commit only if the document is still the same open and at `version`.
+    SameOpenAndVersion {
+        /// Open the reparse started under.
+        epoch: OpenEpoch,
+        /// Version the reparse started at.
+        version: Option<i32>,
+    },
+}
+
+impl CommitGuard {
+    /// Whether a commit may overwrite `current`, the entry it would replace.
+    fn admits(self, current: &DocumentState) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::IfTracked => true,
+            #[cfg(test)]
+            Self::ExpectVersion(version) => current.version == version,
+            Self::SameOpen(epoch) => current.open_epoch() == epoch,
+            Self::SameOpenAndVersion { epoch, version } => {
+                current.open_epoch() == epoch && current.version == version
+            }
+        }
+    }
 }
 
 /// Bundles [`commit_parsed_document`]'s two commit-behavior parameters — kept as one struct
@@ -854,7 +887,7 @@ struct CommitOptions<'a> {
 /// placeholder when parsing failed), carries over cache entries the previous state already
 /// held, prunes/invalidates entries `options.diff` says are now stale, and commits the result
 /// into `state` — unless the document is no longer tracked, or `options.guard` is
-/// [`CommitGuard::ExpectVersion`] and the document's *current* version in `state` no longer
+/// [`CommitGuard::SameOpenAndVersion`] and the document's *current* version in `state` no longer
 /// matches, in which case the commit is skipped entirely and `false` is returned. Both checks
 /// run inside the one `documents` entry the commit then writes through, so a `did_close` cannot
 /// slip in between the check and the write (#2009).
@@ -865,8 +898,8 @@ struct CommitOptions<'a> {
 /// re-parse ran. Without this check, a `did_change` notification landing while that reparse
 /// is in flight gets silently reverted: this function would otherwise commit unconditionally,
 /// overwriting the newer edit with the older, watched-config-triggered content (impl-critic
-/// S1). [`handle_document_change`] passes [`CommitGuard::IfTracked`] — a real edit's own
-/// version is authoritative, so only a closed document skips the commit.
+/// S1). [`handle_document_change`] passes [`CommitGuard::SameOpen`] — a real edit's own
+/// version is authoritative, so only a closed or reopened document skips the commit.
 fn commit_parsed_document(
     uri: &Uri,
     ecosystem: &dyn Ecosystem,
@@ -876,6 +909,30 @@ fn commit_parsed_document(
     state: &ServerState,
     options: CommitOptions<'_>,
 ) -> bool {
+    commit_parsed_document_in_open(
+        uri,
+        ecosystem,
+        content,
+        parse_result,
+        version,
+        state,
+        options,
+    )
+    .is_some()
+}
+
+/// [`commit_parsed_document`], returning the [`OpenEpoch`] of the entry it replaced so the
+/// caller can register follow-up work against exactly that open (#2022). Read inside the same
+/// `documents` entry the commit writes through, so no reopen can slip in between.
+fn commit_parsed_document_in_open(
+    uri: &Uri,
+    ecosystem: &dyn Ecosystem,
+    content: String,
+    parse_result: ParseOutcome,
+    version: Option<i32>,
+    state: &ServerState,
+    options: CommitOptions<'_>,
+) -> Option<OpenEpoch> {
     let diff = options.diff;
 
     let mut doc_state = match parse_result {
@@ -900,19 +957,18 @@ fn commit_parsed_document(
             ?uri,
             "skipping reparse commit: document is no longer tracked"
         );
-        return false;
+        return None;
     };
-    if let CommitGuard::ExpectVersion(expected) = options.guard
-        && old_doc.get().version != expected
-    {
+    if !options.guard.admits(old_doc.get()) {
         tracing::debug!(
             ?uri,
-            ?expected,
-            current = ?old_doc.get().version,
-            "skipping stale reparse commit: document version changed since this reparse started"
+            guard = ?options.guard,
+            current_version = ?old_doc.get().version,
+            "skipping stale reparse commit: document version or open changed since it started"
         );
-        return false;
+        return None;
     }
+    doc_state.inherit_open_epoch(old_doc.get());
     preserve_cache(&mut doc_state, old_doc.get());
 
     // Prune stale cache entries for packages no longer declared under any spelling.
@@ -942,10 +998,10 @@ fn commit_parsed_document(
         .invalidate(&diff.version_changed);
 
     // Issue #1424 (impl-critic round 2, S2): a manifest edit that changes a dependency's
-    // version requirement is this document's *only* resolved-version-move signal for
-    // Gradle/Deno (no `LockFileProvider`, so `document::diff::reload_resolved_versions`'s
-    // lock-file-driven eviction never runs for them) and can also race a Dart/Swift
-    // lock-file-driven eviction for the same dependency. Same tier-3-only gate and rationale
+    // version requirement is this document's *only* resolved-version-move signal while it has
+    // no lock file (none written yet, or an ecosystem without a `LockFileProvider`, so
+    // `document::diff::reload_resolved_versions`'s lock-file-driven eviction never runs) and
+    // can also race a lock-file-driven eviction for the same dependency. Same tier-3-only gate and rationale
     // as `document::diff::reload_resolved_versions`'s own license eviction.
     if ecosystem.license_source().requires_dedicated_fetch() {
         for changed_dep in &diff.version_changed {
@@ -955,8 +1011,9 @@ fn commit_parsed_document(
 
     // Writes through the same entry acquired above — see its comment for why this must not be
     // a fresh `state.update_document` lookup.
+    let epoch = doc_state.open_epoch();
     old_doc.insert(doc_state);
-    true
+    Some(epoch)
 }
 
 /// Generic document change handler using ecosystem registry.
@@ -983,11 +1040,48 @@ pub async fn handle_document_change(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<JoinHandle<()>>> {
-    handle_document_change_guarded(
+    Ok(
+        handle_document_change_for_open(uri, content, version, state, client, config)
+            .await?
+            .map(|change| change.task),
+    )
+}
+
+/// A committed change: the background task it spawned and the open it was committed against.
+pub(crate) struct CommittedChange {
+    /// The debounced fetch/diagnostics task, not yet registered.
+    pub(crate) task: JoinHandle<()>,
+    /// The open the commit replaced; register `task` with
+    /// [`ServerState::register_change_task`] using it (#2022).
+    pub(crate) epoch: OpenEpoch,
+}
+
+/// [`handle_document_change`], also reporting the open the change committed against so the
+/// caller can register the task only for that open.
+///
+/// # Errors
+///
+/// Same as [`handle_document_change`].
+pub(crate) async fn handle_document_change_for_open(
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Result<Option<CommittedChange>> {
+    // Read before the parse, so a close and reopen that land while it runs make the commit skip
+    // instead of overwriting the new open (#2022). A document that is not open still has its
+    // change validated (unsupported URI, oversized) before being dropped.
+    let Some(epoch) = state.capture_open_epoch(&uri) else {
+        resolve_change_ecosystem(&uri, &content, &state)?;
+        return Ok(None);
+    };
+    commit_document_change(
         uri,
         content,
         version,
-        CommitGuard::IfTracked,
+        CommitGuard::SameOpen(epoch),
         ParseTrigger::Content,
         RefetchPolicy::Diff,
         state,
@@ -997,8 +1091,33 @@ pub async fn handle_document_change(
     .await
 }
 
+/// [`commit_document_change`] without the epoch, for tests that spawn the task themselves.
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors `commit_document_change`'s parameter list"
+)]
+#[allow(dead_code, reason = "called only by feature-gated test modules")]
+pub(crate) async fn handle_document_change_guarded(
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+    guard: CommitGuard,
+    trigger: ParseTrigger,
+    refetch: RefetchPolicy,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Result<Option<JoinHandle<()>>> {
+    Ok(commit_document_change(
+        uri, content, version, guard, trigger, refetch, state, client, config,
+    )
+    .await?
+    .map(|change| change.task))
+}
+
 /// Like [`handle_document_change`], but skips committing the reparse — and spawning its
-/// diagnostics-refresh background task — if `guard` is [`CommitGuard::ExpectVersion`] and the
+/// diagnostics-refresh background task — if `guard` is [`CommitGuard::SameOpenAndVersion`] and the
 /// document's version in `state` no longer matches by the time this reparse finishes; see
 /// [`commit_parsed_document`]'s doc for why.
 ///
@@ -1013,8 +1132,8 @@ pub async fn handle_document_change(
 /// all", not as "install a no-op task".
 ///
 /// `None` also covers a document closed before the commit, for every guard: the commit never
-/// creates an untracked document. [`handle_document_change`] passes [`CommitGuard::IfTracked`],
-/// so it observes `None` only for that case.
+/// creates an untracked document. [`handle_document_change`] passes [`CommitGuard::SameOpen`],
+/// so it observes `None` only for a close or reopen.
 #[allow(
     clippy::too_many_arguments,
     reason = "issue #592 added `refetch: RefetchPolicy` alongside the pre-existing `guard: \
@@ -1026,7 +1145,7 @@ pub async fn handle_document_change(
     skip_all,
     fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
 )]
-pub(crate) async fn handle_document_change_guarded(
+pub(crate) async fn commit_document_change(
     uri: Uri,
     content: String,
     version: Option<i32>,
@@ -1036,27 +1155,9 @@ pub(crate) async fn handle_document_change_guarded(
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
-) -> Result<Option<JoinHandle<()>>> {
-    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
-    // same as "no ecosystem handles this URI".
-    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
-        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
-        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-            "{uri:?}"
-        )));
-    };
-    let ecosystem = match state.ecosystem_registry.for_uri(&domain_uri) {
-        Some(e) => e,
-        None => {
-            tracing::debug!("No ecosystem handler for {:?}", uri);
-            return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-                "{uri:?}"
-            )));
-        }
-    };
+) -> Result<Option<CommittedChange>> {
+    let ecosystem = resolve_change_ecosystem(&uri, &content, &state)?;
     tracing::Span::current().record("ecosystem", ecosystem.id());
-
-    check_content_size(&content, &uri)?;
 
     let (parse_result, diff, selection_context_changed) =
         parse_and_diff_manifest(&uri, &content, &state, &ecosystem).await;
@@ -1080,7 +1181,7 @@ pub(crate) async fn handle_document_change_guarded(
         refetch
     };
 
-    let committed = commit_parsed_document(
+    let committed = commit_parsed_document_in_open(
         &uri,
         ecosystem.as_ref(),
         content,
@@ -1092,9 +1193,9 @@ pub(crate) async fn handle_document_change_guarded(
     // A close that raced the recording above already removed the document and cleared the
     // entry before it existed; without this the entry would outlive the document.
     state.drop_refetch_escalation_if_untracked(&uri);
-    if !committed {
+    let Some(epoch) = committed else {
         return Ok(None);
-    }
+    };
 
     // Read before any OSV request is built (FR-011; issue #1517 critique S3 — see the
     // open-path's identical read for why offline is folded in here too).
@@ -1138,7 +1239,37 @@ pub(crate) async fn handle_document_change_guarded(
         .instrument(span),
     );
 
-    Ok(Some(task))
+    Ok(Some(CommittedChange { task, epoch }))
+}
+
+/// The ecosystem that handles a change to `uri`, after rejecting a URI no ecosystem handles and
+/// content over the size cap.
+///
+/// # Errors
+///
+/// [`deps_core::error::DepsError::UnsupportedEcosystem`] when no ecosystem handles `uri`; an I/O
+/// error of kind `FileTooLarge` when `content` exceeds the cap.
+fn resolve_change_ecosystem(
+    uri: &Uri,
+    content: &str,
+    state: &ServerState,
+) -> Result<Arc<dyn Ecosystem>> {
+    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
+    // same as "no ecosystem handles this URI".
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
+            "{uri:?}"
+        )));
+    };
+    let Some(ecosystem) = state.ecosystem_registry.for_uri(&domain_uri) else {
+        tracing::debug!("No ecosystem handler for {:?}", uri);
+        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
+            "{uri:?}"
+        )));
+    };
+    check_content_size(content, uri)?;
+    Ok(ecosystem)
 }
 
 /// The packages `doc` still needs a registry outcome for: under [`RefetchPolicy::Diff`] those
@@ -1433,7 +1564,7 @@ async fn run_document_change_task(
         })
         .unwrap_or_default();
 
-    // `handle_document_change_guarded` already validated this exact `uri` converts
+    // `commit_document_change` already validated this exact `uri` converts
     // successfully before spawning this task, so `None` here is unreachable in
     // practice — handled defensively rather than unwrapped.
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
@@ -1669,8 +1800,8 @@ async fn reload_lockfile_for_change(
     // alongside empty maps (a parse failure — e.g. a lock file caught mid-rewrite by the
     // package manager racing this same debounced edit), so `lockfile_reload_ok` is `true`
     // whenever the reload was a genuine success — including to zero packages, which
-    // covers Gradle/Deno's permanent no-`LockFileProvider` state and Dart/Swift before
-    // their first resolve (R1: a manifest edit on those ecosystems must still reach
+    // covers an ecosystem without a `LockFileProvider` and any ecosystem before its first
+    // resolve (R1: a manifest edit on those ecosystems must still reach
     // `change_task_triggers` via `diff_needs_rescan`, not be skipped because there
     // was never any lock data to diff) — or `resolved_versions` is non-empty (which
     // itself implies success). Gating on `lockfile_reload_ok` alone therefore both fires
@@ -2188,6 +2319,14 @@ pub async fn ensure_document_loaded(
 mod rekey_signals_tests;
 
 #[cfg(all(test, feature = "npm"))]
+#[path = "lifecycle_open_epoch_tests.rs"]
+mod open_epoch_tests;
+
+#[cfg(all(test, feature = "npm"))]
+#[path = "lifecycle_open_window_tests.rs"]
+mod open_window_tests;
+
+#[cfg(all(test, feature = "npm"))]
 #[path = "lifecycle_refresh_tests.rs"]
 mod refresh_tests;
 
@@ -2350,7 +2489,7 @@ mod tests {
     /// impl-critic S1 (#1433): a `minimum-stability`-only edit changes no dependency
     /// name/version, so `DependencyDiff` alone reports nothing to fetch — proves
     /// `parse_and_diff_manifest`'s own `selection_context_changed` signal catches this case
-    /// regardless, which `handle_document_change_guarded` escalates to
+    /// regardless, which `commit_document_change` escalates to
     /// `RefetchPolicy::AllDependencies` on (see that function's own comment at the call site).
     #[cfg(feature = "composer")]
     #[tokio::test]
@@ -2431,8 +2570,8 @@ mod tests {
     }
 
     /// Issue #1407 R1 regression case (a)/(c): a pure manifest edit
-    /// (`diff_needs_rescan == true`) with no lock file resolved at all (Gradle/Deno's
-    /// permanent state, or Dart/Swift before their first resolve) must still trigger
+    /// (`diff_needs_rescan == true`) with no lock file resolved at all (an ecosystem without a
+    /// provider, or any ecosystem before its first resolve) must still trigger
     /// the license refresh — before this fix, the trigger was computed only inside
     /// the `!resolved_versions.is_empty()` guard, so it silently stayed `false`
     /// forever for these ecosystems.
@@ -2462,9 +2601,9 @@ mod tests {
     /// Issue #1407 R1, critic M1: call-site regression guard, exercised through the real
     /// `handle_document_open`/`handle_document_change` pipeline rather than
     /// `change_task_triggers` in isolation — protects the *placement* of the trigger
-    /// computation inside `run_document_change_task`, not just its formula. Gradle has
-    /// no `LockFileProvider` (`load_resolved_versions` always returns empty maps for
-    /// it), so before this fix the trigger — nested inside the
+    /// computation inside `run_document_change_task`, not just its formula. A Gradle document
+    /// without a `gradle.lockfile` resolves nothing (`load_resolved_versions` returns empty
+    /// maps), so before this fix the trigger — nested inside the
     /// `!resolved_versions.is_empty()` guard — could never fire for a Gradle manifest
     /// edit; a future refactor that reintroduced that nesting would keep
     /// `change_task_triggers`'s own unit tests green while silently regressing this.
@@ -2559,7 +2698,7 @@ mod tests {
             "a manifest edit adding a dependency to a lockless Gradle document, with \
              vulnerabilities disabled, must still bump resolved_versions_generation for \
              its license refresh (issue #1407 R1) — even though the OSV rescan itself \
-             stays off and Gradle has no lock file to resolve from"
+             stays off and the Gradle document has no lock file to resolve from"
         );
     }
 

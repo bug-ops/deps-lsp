@@ -47,6 +47,17 @@ pub enum SuppressionKind {
     License,
 }
 
+impl SuppressionKind {
+    /// Every variant, the single source of [`SuppressedKinds::ALL`]; the `every_kind_is_listed`
+    /// test fails to compile when a variant is added without extending this list.
+    const EVERY: [Self; 4] = [
+        Self::Deprecated,
+        Self::Outdated,
+        Self::Yanked,
+        Self::License,
+    ];
+}
+
 /// A set of [`SuppressionKind`]s.
 ///
 /// # Examples
@@ -68,6 +79,16 @@ impl SuppressedKinds {
             SuppressionKind::Outdated => 2,
             SuppressionKind::Yanked => 4,
             SuppressionKind::License => 8,
+        }
+    }
+
+    /// Every suppressible kind: what a whole-package ignore hides.
+    pub const ALL: Self = Self::of(&SuppressionKind::EVERY);
+
+    const fn of(kinds: &[SuppressionKind]) -> Self {
+        match kinds {
+            [first, rest @ ..] => Self::of(rest).with(*first),
+            [] => Self(0),
         }
     }
 
@@ -93,6 +114,19 @@ impl SuppressedKinds {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// `dv` without the unmaintained (Informational) advisories when `deprecated` is in the set,
+    /// borrowed unchanged otherwise. The one definition of FR-008 for diagnostics and hover.
+    pub(crate) fn visible_advisories(
+        self,
+        dv: &DependencyVulnerabilities,
+    ) -> std::borrow::Cow<'_, DependencyVulnerabilities> {
+        if self.contains(SuppressionKind::Deprecated) {
+            std::borrow::Cow::Owned(dv.without_informational())
+        } else {
+            std::borrow::Cow::Borrowed(dv)
+        }
     }
 
     /// Whether a diagnostic of `kind` for a package with this suppression set must be dropped.
@@ -313,19 +347,31 @@ impl TryFrom<RawRule> for SuppressionRule {
 #[serde(transparent)]
 pub struct SuppressionSet {
     rules: Vec<SuppressionRule>,
+    #[serde(skip)]
+    ignored: Vec<PackagePattern>,
 }
 
 impl SuppressionSet {
     /// Builds a set from already-validated rules.
     #[must_use]
     pub const fn new(rules: Vec<SuppressionRule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            ignored: Vec::new(),
+        }
     }
 
-    /// Whether no rule is configured.
+    /// This set plus whole-package ignore patterns (`diagnostics.ignore`).
+    #[must_use]
+    pub fn with_ignored(mut self, ignored: Vec<PackagePattern>) -> Self {
+        self.ignored = ignored;
+        self
+    }
+
+    /// Whether neither a rule nor an ignore pattern is configured.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.rules.is_empty() && self.ignored.is_empty()
     }
 
     /// Normalizes every pattern through `formatter` once, for repeated per-dependency lookups.
@@ -337,7 +383,38 @@ impl SuppressionSet {
                 .iter()
                 .map(|rule| (rule.package.resolve(formatter), rule.kinds))
                 .collect(),
+            ignored: self
+                .ignored
+                .iter()
+                .map(|pattern| pattern.resolve(formatter))
+                .collect(),
         }
+    }
+}
+
+/// The suppression that applies to one package: a kind subset or the whole package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageSuppression {
+    /// Only these kinds are hidden.
+    Kinds(SuppressedKinds),
+    /// Every suppressible kind is hidden (`diagnostics.ignore`).
+    Ignored,
+}
+
+impl PackageSuppression {
+    /// The suppressible kinds this suppression hides; `Ignored` hides all of them.
+    #[must_use]
+    pub const fn kinds(self) -> SuppressedKinds {
+        match self {
+            Self::Kinds(kinds) => kinds,
+            Self::Ignored => SuppressedKinds::ALL,
+        }
+    }
+
+    /// Whether the package's `Outdated` diagnostics and hints are hidden.
+    #[must_use]
+    pub const fn hides_outdated(self) -> bool {
+        self.kinds().contains(SuppressionKind::Outdated)
     }
 }
 
@@ -345,9 +422,20 @@ impl SuppressionSet {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSuppression {
     rules: Vec<(ResolvedPattern, SuppressedKinds)>,
+    ignored: Vec<ResolvedPattern>,
 }
 
 impl ResolvedSuppression {
+    /// The suppression for `name`, with a whole-package ignore taking precedence.
+    #[must_use]
+    pub fn for_package(&self, name: &NormalizedName) -> PackageSuppression {
+        if self.ignored.iter().any(|pattern| pattern.matches(name)) {
+            PackageSuppression::Ignored
+        } else {
+            PackageSuppression::Kinds(self.kinds_for(name))
+        }
+    }
+
     /// The union of the kinds of every rule matching `name`.
     #[must_use]
     pub fn kinds_for(&self, name: &NormalizedName) -> SuppressedKinds {
@@ -374,6 +462,22 @@ mod tests {
     fn kinds(set: &SuppressionSet, name: &str) -> SuppressedKinds {
         set.resolve(&FORMATTER)
             .kinds_for(&NormalizedName::for_test(name))
+    }
+
+    #[test]
+    fn every_kind_is_listed() {
+        let listed = |kind: SuppressionKind| match kind {
+            SuppressionKind::Deprecated
+            | SuppressionKind::Outdated
+            | SuppressionKind::Yanked
+            | SuppressionKind::License => SuppressionKind::EVERY.contains(&kind),
+        };
+        assert!(SuppressionKind::EVERY.into_iter().all(listed));
+        assert!(
+            SuppressionKind::EVERY
+                .into_iter()
+                .all(|k| SuppressedKinds::ALL.contains(k))
+        );
     }
 
     #[test]

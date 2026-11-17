@@ -7,8 +7,8 @@ use crate::{ConcreteVersion, Dependency, EcosystemConfig, PackageKey, TypedParse
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
     DependencyFormatter, DependencyGate, EcosystemFormatter, LatestVerdict, LookupMiss,
-    RequirementStatus, SiblingMatchNote, VersionData, in_use_version, latest_verdict,
-    resolve_scan_outcome, sanitize_and_truncate_for_diagnostic,
+    PackageSuppression, RequirementStatus, SiblingMatchNote, VersionData, in_use_version,
+    latest_verdict, resolve_scan_outcome, sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -152,6 +152,10 @@ where
         config,
         formatter,
         vuln_keys: super::hover::vuln_keys_for(parse_result, &versions, formatter),
+        suppression: versions
+            .suppression
+            .map(|set| set.resolve(formatter))
+            .unwrap_or_default(),
     };
     let mut hints = Vec::with_capacity(deps.len());
     hints.extend(deps.iter().filter_map(|dep| inlay_hint_for(dep, &ctx)));
@@ -165,6 +169,7 @@ struct HintContext<'a, F> {
     config: &'a EcosystemConfig,
     formatter: &'a F,
     vuln_keys: Option<crate::osv::VulnKeys>,
+    suppression: super::ResolvedSuppression,
 }
 
 /// A hint at `position` carrying `label` and an optional plain-text `tooltip`.
@@ -232,9 +237,25 @@ fn inlay_hint_for<F: DependencyFormatter>(
     dep: &F::Dep,
     ctx: &HintContext<'_, F>,
 ) -> Option<InlayHint> {
-    let mut hint = base_hint_for(dep, ctx)?;
     let key = PackageKey::new(dep.name(), ctx.formatter);
-    match in_use_advisory_state(dep, &key, ctx) {
+    let suppression = ctx.suppression.for_package(key.normalized());
+    let advisory_state = in_use_advisory_state(dep, &key, ctx);
+    // A flagged latest is not a suppressible kind (#1526): suppression only drops the plain
+    // version label, never an OSV warning.
+    let flagged_latest = latest_is_flagged(dep, &key, ctx);
+    if suppression == PackageSuppression::Ignored
+        && !flagged_latest
+        && matches!(advisory_state, InUseAdvisoryState::Clean)
+    {
+        return None;
+    }
+    let outdated = if suppression.hides_outdated() && !flagged_latest {
+        OutdatedRendering::AsUpToDate
+    } else {
+        OutdatedRendering::AsOutdated
+    };
+    let mut hint = base_hint_for(dep, ctx, outdated)?;
+    match advisory_state {
         InUseAdvisoryState::Clean => {}
         InUseAdvisoryState::Primary(ids) => flag_advisory(
             &mut hint,
@@ -249,6 +270,35 @@ fn inlay_hint_for<F: DependencyFormatter>(
         ),
     }
     Some(hint)
+}
+
+/// Whether OSV flags the cached latest version of `dep`.
+fn latest_is_flagged<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    ctx: &HintContext<'_, F>,
+) -> bool {
+    let Some(latest) = ctx.versions.cached_for(key).map(|v| &v.latest) else {
+        return false;
+    };
+    matches!(
+        latest_verdict(
+            ctx.versions.latest_status,
+            dep,
+            ctx.vuln_keys.as_ref(),
+            key,
+            latest.as_str(),
+            ctx.formatter,
+        ),
+        LatestVerdict::Flagged { .. }
+    )
+}
+
+/// How an outdated dependency's hint is rendered once user suppression is applied.
+#[derive(Clone, Copy)]
+enum OutdatedRendering {
+    AsOutdated,
+    AsUpToDate,
 }
 
 fn flag_advisory(hint: &mut InlayHint, detail: String) {
@@ -271,6 +321,7 @@ fn flag_advisory(hint: &mut InlayHint, detail: String) {
 fn base_hint_for<F: DependencyFormatter>(
     dep: &F::Dep,
     ctx: &HintContext<'_, F>,
+    outdated: OutdatedRendering,
 ) -> Option<InlayHint> {
     let HintContext {
         versions,
@@ -355,6 +406,15 @@ fn base_hint_for<F: DependencyFormatter>(
             // parser couldn't resolve to any string) — nothing was verified.
             None => RequirementStatus::Unresolved,
         }
+    };
+
+    let status = match status {
+        RequirementStatus::Outdated if matches!(outdated, OutdatedRendering::AsUpToDate) => {
+            RequirementStatus::UpToDate
+        }
+        RequirementStatus::Outdated
+        | RequirementStatus::UpToDate
+        | RequirementStatus::Unresolved => status,
     };
 
     let (label_text, flagged_tooltip) =

@@ -923,12 +923,13 @@ pub async fn check_manifest(
     };
 
     let severities = ctx.policy.diagnostics.to_severities();
+    let suppression = ctx.policy.diagnostics.effective_suppression();
     let diagnostics = analysis
         .parse_result
         .generate_diagnostics(
             analysis
                 .version_data()
-                .with_suppression(&ctx.policy.diagnostics.suppress)
+                .with_suppression(&suppression)
                 .with_advisory_exemptions(&ctx.advisory_exemptions),
             &analysis.uri,
             ctx.policy.freshness.to_freshness(),

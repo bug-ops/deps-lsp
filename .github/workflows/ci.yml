@@ -1031,6 +1031,14 @@ jobs:
         shell: bash
         run: cargo nextest run --workspace --all-features -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only --profile ci --retries 0
 
+      - name: Run probe_dependency_compile_fail (ignored for local speed, explicit in CI)
+        # Same rationale and flags as the `redacting_debug_compile_fail` step above: the trybuild
+        # test is `#[ignore]`d in-crate for local speed, so it is run explicitly here to keep
+        # gating every PR.
+        if: '!cancelled()'
+        shell: bash
+        run: cargo nextest run --workspace --all-features -E 'test(probe_dependency_compile_fail)' --run-ignored ignored-only --profile ci --retries 0
+
       - name: Run doctests
         run: cargo test --workspace --doc --all-features
 
@@ -1397,6 +1405,7 @@ jobs:
           - redact_declaration_key
           - bundler_lockfile
           - go_lockfile
+          - gradle_lockfile
           - toml_lockfiles
           - json_lockfiles
           - deps_cli_config

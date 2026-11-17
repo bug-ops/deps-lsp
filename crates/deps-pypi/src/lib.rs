@@ -132,7 +132,7 @@ pub use lockfile::PypiLockParser;
 // `deps-gradle`'s `fuzz_parse_pom_licenses`.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
-pub use lockfile::fuzz_parse_pypi_lock;
+pub use lockfile::{fuzz_parse_pdm_lock, fuzz_parse_pipfile_lock, fuzz_parse_pypi_lock};
 pub use parser::PypiParser;
 pub use registry::{PypiRegistry, package_url};
 pub use types::{

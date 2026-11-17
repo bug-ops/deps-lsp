@@ -307,8 +307,8 @@ fn disable_unsupported_keychain(registries: &mut RegistriesConfig, path: &Path) 
 /// [`crate::report::FailOnPolicy::matches`] checks a finding's `Category`, never its
 /// severity, so no severity value can suppress or weaken a `--fail-on` match. Everything else
 /// reverts to its default: `policy.diagnostics.{mutable_ref_pin,vulnerabilities}_enabled`
-/// (the two direct "disable the check" levers), `policy.diagnostics.suppress` (hides findings;
-/// #1927), `policy.cache.*` (a low `fetch_timeout_secs`
+/// (the two direct "disable the check" levers), `policy.diagnostics.{suppress,ignore}` (hide findings;
+/// #1927, #1967), `policy.cache.*` (a low `fetch_timeout_secs`
 /// can induce spurious fetch failures that mask a real finding as an unresolved lookup
 /// instead), `policy.freshness.*` and `policy.license_policy.{allow,deny}` (both change what
 /// counts as a violation), `policy.supply_chain.enabled` (moot for `deps-cli` today —
@@ -376,7 +376,7 @@ fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> 
         if policy.diagnostics.mutable_ref_pin_enabled != default.diagnostics.mutable_ref_pin_enabled
             || policy.diagnostics.vulnerabilities_enabled
                 != default.diagnostics.vulnerabilities_enabled
-            || !policy.diagnostics.suppress.is_empty()
+            || !policy.diagnostics.effective_suppression().is_empty()
         {
             sections.push("diagnostics");
         }

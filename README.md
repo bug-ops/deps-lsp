@@ -45,7 +45,8 @@ extensions to install and keep in sync.
   other lock entries that satisfy the range are scanned too and shown as "also locked at".
 - **Unverified-registry signal** — dependencies resolved through a non-public mirror are marked as
   not checked for vulnerabilities instead of silently reported clean; `diagnostics.suppress`
-  silences chosen diagnostics for named packages or globs.
+  silences chosen diagnostics, and `diagnostics.ignore` all of a package's outdated, deprecated, yanked
+  and license findings, for named packages or globs.
 - **One-click fixes** — Code actions to bump a version, resolve an unsatisfiable range, or patch a
   known vulnerability; a code lens batch-updates every outdated dependency in the file at once.
 - **Fast** — Parallel registry fetching and aggressive caching keep hover and inlay hints

@@ -4,9 +4,9 @@ use crate::document::republish::{self, RepublishLifecycle};
 use crate::document::tag_refresh::{TagRefreshLifecycle, TagRefreshSubscriptions};
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
-    change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
-    reload_resolved_versions, rescan_after_resolved_version_change, run_license_prefetch,
-    spawn_supervised, trigger_gossip_prefetch_for_open_documents,
+    change_task_triggers, handle_document_change_for_open, handle_document_open,
+    refresh_with_timeout, reload_resolved_versions, rescan_after_resolved_version_change,
+    run_license_prefetch, spawn_supervised, trigger_gossip_prefetch_for_open_documents,
     trigger_license_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
     trigger_typosquat_prefetch_for_open_documents,
 };
@@ -674,7 +674,7 @@ impl Backend {
         content: String,
         version: i32,
     ) {
-        match handle_document_change(
+        match handle_document_change_for_open(
             uri.clone(),
             content,
             Some(version),
@@ -684,18 +684,13 @@ impl Backend {
         )
         .await
         {
-            Ok(Some(task)) => {
-                let task_id = task.id();
-                self.state.spawn_background_task(uri.clone(), task).await;
-                // A close that ran between the commit and this registration already cancelled
-                // its task; the one just registered would outlive the document. The task cannot
-                // publish for it either way: `claim_publish` fails on an untracked document.
-                // Id-matched, so a task a reopen installed meanwhile is left alone.
-                if !self.state.documents.contains_key(&uri) {
-                    self.state
-                        .cancel_background_task_if_current(&uri, task_id)
-                        .await;
-                }
+            Ok(Some(change)) => {
+                // Registered only if the document is still the open the change committed
+                // against: a close or reopen that raced it must neither keep nor cancel this
+                // task's replacement (#2022).
+                self.state
+                    .register_change_task(uri, change.task, change.epoch)
+                    .await;
             }
             Ok(None) => {
                 tracing::warn!(
@@ -1624,6 +1619,9 @@ impl LanguageServer for Backend {
                 } else {
                     self.state.request_republish();
                 }
+                // Suppression and the other render-time settings also change inlay hints and
+                // the update lens, which the client would otherwise only re-request on its own.
+                self.state.spawn_refresh_requests(&self.client);
             }
         }
     }
@@ -1996,6 +1994,13 @@ impl Backend {
     // it anyway. Verified false positive.
     #[allow(clippy::await_holding_invalid_type)]
     async fn execute_update_all_outdated(&self, uri: Uri) {
+        let suppression = self
+            .config
+            .read()
+            .await
+            .policy
+            .diagnostics
+            .effective_suppression();
         let Some(doc) = self.state.get_document(&uri) else {
             self.warn_update_all_outdated_not_ready().await;
             return;
@@ -2019,7 +2024,8 @@ impl Backend {
             deps_core::VersionData::new(
                 &doc.signals.cached_versions,
                 &doc.signals.resolved_versions,
-            ),
+            )
+            .with_suppression(&suppression),
         );
         let version = doc.version;
         drop(doc);
@@ -5042,6 +5048,45 @@ let package = Package(
                     .await
                     .is_err()
             );
+        }
+
+        /// A render-time-only config change (here `diagnostics.ignore`) must make the client
+        /// re-request inlay hints, which now depend on package suppression.
+        #[tokio::test]
+        async fn test_did_change_configuration_without_reparse_refreshes_inlay_hints() {
+            use futures::StreamExt as _;
+            use tower::Service as _;
+
+            let (mut service, mut socket) =
+                tower_lsp_server::LspService::build(Backend::new).finish();
+            let init = tower_lsp_server::jsonrpc::Request::build("initialize")
+                .id(1_i64)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            assert!(service.call(init).await.unwrap().is_some_and(|r| r.is_ok()));
+            let backend = service.inner();
+            backend.state.set_inlay_hint_refresh_supported(true);
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "diagnostics": { "ignore": ["serde"] } }),
+                })
+                .await;
+
+            let methods = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut methods = Vec::new();
+                while let Some(message) = socket.next().await {
+                    methods.push(message.method().to_owned());
+                    if message.method() == "workspace/inlayHint/refresh" {
+                        break;
+                    }
+                }
+                methods
+            })
+            .await
+            .expect("no inlay hint refresh request within the timeout");
+            let request = methods.last().map(String::as_str);
+            assert_eq!(request, Some("workspace/inlayHint/refresh"), "{methods:?}");
         }
 
         #[tokio::test]

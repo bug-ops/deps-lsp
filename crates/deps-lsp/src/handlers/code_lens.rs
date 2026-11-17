@@ -47,12 +47,13 @@ pub async fn handle_code_lens(
         return vec![];
     }
 
-    let (network, severities, osv_checks) = {
+    let (network, severities, osv_checks, suppression) = {
         let config = config.read().await;
         (
             config.policy.network.mode(),
             config.policy.diagnostics.to_severities(),
             config.policy.osv_checks(),
+            config.policy.diagnostics.effective_suppression(),
         )
     };
     let vulnerability_visibility =
@@ -104,7 +105,8 @@ pub async fn handle_code_lens(
     let versions = snapshot
         .version_data()
         .with_network(network)
-        .with_ecosystem(ecosystem_id);
+        .with_ecosystem(ecosystem_id)
+        .with_suppression(&suppression);
     let mut lenses = manifest
         .generate_code_lenses(&content, versions, &domain_uri, COMMAND_ID)
         .await;

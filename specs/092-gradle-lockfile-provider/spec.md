@@ -11,7 +11,7 @@ tags:
   - cross-ecosystem
   - priority/p4
 created: 2026-11-08
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -143,9 +143,9 @@ THEN output is identical to before this feature
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the file watcher THE SYSTEM SHALL return `gradle.lockfile` and `buildscript-gradle.lockfile` so edits to either trigger a re-resolve | must |
+| FR-001 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the file watcher THE SYSTEM SHALL return `gradle.lockfile` only so edits to it trigger a re-resolve | must |
 | FR-002 | WHEN a Gradle manifest is opened THE SYSTEM SHALL locate the lock file by searching the manifest's own project directory first, using the shared `deps-core` locate helper and ancestor-depth bound, and SHALL NOT use a lock file from a different module's directory when the manifest's own directory has one | must |
-| FR-003 | WHEN a project directory has no `gradle.lockfile` THE SYSTEM SHALL fall back to the legacy `gradle/dependency-locks/*.lockfile` per-configuration files in that project directory and merge their entries | should |
+| FR-003 | (removed) The legacy `gradle/dependency-locks/*.lockfile` layout is not supported; see Known limitations | - |
 | FR-004 | WHEN parsing a lock file line of the form `group:artifact:version=config1,config2` THE SYSTEM SHALL produce one resolved package keyed by the Maven coordinate `group:artifact` with the given version | must |
 | FR-005 | WHEN a line is blank or begins with `#` THE SYSTEM SHALL skip it | must |
 | FR-006 | WHEN a line is `empty=` (optionally followed by configuration names) THE SYSTEM SHALL treat it as a marker of locked-but-empty configurations and contribute no packages | must |
@@ -186,18 +186,18 @@ No new public cross-crate types are required; resolved data reuses
 | Scenario | Expected Behavior |
 |----------|-------------------|
 | Lock file absent | No resolution; behaviour unchanged (US-005) |
-| `gradle.lockfile` and legacy `dependency-locks/` both present | `gradle.lockfile` wins; legacy files ignored for that directory (FR-003) |
-| `gradle.lockfile` and `buildscript-gradle.lockfile` both present | [NEEDS CLARIFICATION: merge both (buildscript classpath coordinates can overlap with app coordinates) or resolve only `gradle.lockfile` for application manifests and `buildscript-gradle.lockfile` for `buildSrc`/plugin entries?] |
-| Multi-module: module has no lock file but root has one | [NEEDS CLARIFICATION: Gradle locks per project, so a root lock file does not describe a submodule; should ancestor fallback be disabled for Gradle to avoid showing root versions for a module?] |
+| `gradle.lockfile` and legacy `dependency-locks/` both present | Legacy files are never read; only `gradle.lockfile` is used |
+| `gradle.lockfile` and `buildscript-gradle.lockfile` both present | Only `gradle.lockfile` is read; `buildscript-gradle.lockfile` is ignored (see Known limitations) |
+| Multi-module: module has no lock file but root has one | Build scripts search the manifest's own directory only; no ancestor fallback, no in-use version |
 | Lock file contains only `empty=` | Empty `ResolvedPackages`, not an error |
 | Malformed line | Line skipped, debug log, rest of file parsed (FR-007) |
 | Empty file or comment-only file | Empty `ResolvedPackages` |
 | Windows line endings (`\r\n`) | Parsed identically to `\n` |
-| Coordinate with classifier or extension segments | [NEEDS CLARIFICATION: Gradle lock lines are three-part; confirm no four-part forms occur and decide skip vs strip] |
+| Coordinate with classifier or extension segments | Lines that are not exactly three segments are skipped |
 | Same coordinate, different versions across configurations | All distinct versions recorded (FR-008) |
 | File over size cap, symlink, or non-regular file | Rejected by the shared capped-read helper, same as other ecosystems |
 | Non-UTF-8 content | Treated as unreadable via the shared helper's error path; no panic |
-| Manifest is `settings.gradle(.kts)` or `libs.versions.toml` | [NEEDS CLARIFICATION: which manifest kinds should resolve a lock file, and does a version catalog consult the lock file of the project that consumes it?] |
+| Manifest is `settings.gradle(.kts)` or `libs.versions.toml` | `settings.gradle(.kts)` uses its own directory; a version catalog uses its own directory, plus the project root only when it sits in a directory named `gradle` |
 
 ## 7. Success Criteria
 
@@ -229,13 +229,12 @@ No new public cross-crate types are required; resolved data reuses
 
 ## 9. Open Questions
 
-> [!question] Open items
-> - [NEEDS CLARIFICATION: `gradle.lockfile` vs `buildscript-gradle.lockfile` precedence or merge, see section 6]
-> - [NEEDS CLARIFICATION: ancestor-directory fallback for submodules without their own lock file, see section 6]
-> - [NEEDS CLARIFICATION: classifier or four-part coordinate handling]
-> - [NEEDS CLARIFICATION: manifest kinds eligible for lock resolution (`settings.gradle*`, `libs.versions.toml`)]
-> - [NEEDS CLARIFICATION: how Gradle package keys are represented today (`NormalizedName` vs Maven `group:artifact` string) and whether version-catalog aliases need a mapping step before lookup; confirm against `crates/deps-gradle/src/parser/` during planning]
-> - [NEEDS CLARIFICATION: custom lock file locations (`lockFile` property set in build logic) are undiscoverable without evaluating the build; confirm they stay unsupported]
+All items resolved: the provider reads `gradle.lockfile` only, from the manifest's own directory (a catalog in `<project>/gradle/` also the project root). Custom `lockFile` locations stay unsupported because they need build evaluation.
+
+## Known limitations
+
+- `classpath(...)` buildscript dependencies are parsed but have no lock source: `buildscript-gradle.lockfile` is not read, so they show no in-use version, or the application-configuration version when the same coordinate is locked in `gradle.lockfile`.
+- The legacy `gradle/dependency-locks/<config>.lockfile` layout is not supported.
 
 ## 10. See Also
 

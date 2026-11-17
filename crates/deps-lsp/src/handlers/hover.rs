@@ -34,6 +34,7 @@ pub async fn handle_hover(
         gossip_checks,
         osv_checks,
         vulnerability_visibility,
+        suppression,
     ) = {
         let config = config.read().await;
         (
@@ -43,6 +44,7 @@ pub async fn handle_hover(
             config.policy.gossip_checks(),
             config.policy.osv_checks(),
             PrefetchVisibility::from_enabled(config.policy.diagnostics.vulnerabilities_enabled),
+            config.policy.diagnostics.effective_suppression(),
         )
     };
 
@@ -83,7 +85,8 @@ pub async fn handle_hover(
         .with_ecosystem(ecosystem_id)
         .with_network(network)
         .with_interactive_fetch_gate(&state.interactive_fetch)
-        .with_license_source(ecosystem.license_source());
+        .with_license_source(ecosystem.license_source())
+        .with_suppression(&suppression);
     // The only call site that sets `VersionData::trust` (see lsp_helpers::hover docs) —
     // makes the supply-chain trust signal hover-only by construction (FR-010).
     if supply_chain_enabled {

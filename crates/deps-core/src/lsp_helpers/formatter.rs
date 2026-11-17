@@ -2800,6 +2800,10 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
 ///             source,
 ///         }
 ///     }
+///
+///     fn route_probes(_name: PackageName) -> Vec<Self> {
+///         Vec::new()
+///     }
 /// }
 ///
 /// let dep = PlainDependency::probe(PackageName::new("serde"), DependencySource::Registry);
@@ -2813,13 +2817,11 @@ pub trait ProbeDependency: Dependency + Sized {
     /// dependency type can carry, so a cross-ecosystem guard can reach the opt-ins that no
     /// [`DependencySource`](crate::parser::DependencySource) expresses (#1999).
     ///
-    /// Default: no routes. An implementor whose type carries a route field returns one probe per
-    /// route variant. Deliberately not feature-gated: a gated method would be gated per crate,
-    /// and a crate built without its own `test-util` would silently fall back to this default.
-    fn route_probes(name: PackageName) -> Vec<Self> {
-        let _ = name;
-        Vec::new()
-    }
+    /// Required, with no default: an implementor whose type carries a route field returns one
+    /// probe per route variant, and one without a route field returns an empty `Vec` explicitly.
+    /// Deliberately not feature-gated: a gated method would be gated per crate, and a crate
+    /// built without its own `test-util` would silently skip the guard.
+    fn route_probes(name: PackageName) -> Vec<Self>;
 }
 
 /// The dependency-taking half of an ecosystem's formatter, typed to the one dependency kind

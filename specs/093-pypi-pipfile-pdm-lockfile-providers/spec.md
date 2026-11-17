@@ -11,7 +11,7 @@ tags:
   - cross-ecosystem
   - enhancement
 created: 2026-11-08
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[052-pnpm-lockfile-provider/spec|pnpm-lock.yaml Lock File Provider]]"
@@ -185,7 +185,7 @@ No new public result types; reuses `deps_core::lockfile::{ResolvedPackage, Resol
 | Lock file in an ancestor directory, none adjacent | Found via the existing ancestor search depth |
 | `Pipfile.lock` entry `"version": "==2.31.0"` | Stored as `2.31.0` |
 | `Pipfile.lock` entry with no `version` (git/path/editable) | Not given a fabricated version (FR-005) |
-| `Pipfile.lock` entry `version` not starting with `==` | [NEEDS CLARIFICATION: pipenv always writes `==`; decide whether to store verbatim or skip and log] |
+| `Pipfile.lock` entry `version` not starting with `==` | Skipped with a debug log; only exact `==` pins are recorded (resolved: Q-A) |
 | Same name in `default` and `develop` with different versions | Both recorded (FR-008) |
 | Name with mixed case, `_`, or `.` (`Django_Rest.Framework`) | Normalised per PEP 503 (FR-006) |
 | Empty file, or missing `[[package]]` / `default` / `develop` | Empty `ResolvedPackages`, not a parse error (mirrors Poetry/uv behaviour) |
@@ -228,11 +228,12 @@ No new public result types; reuses `deps_core::lockfile::{ResolvedPackage, Resol
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: Add a `Pipfile` manifest type? Without it, `Pipfile.lock` only benefits pipenv projects that also keep `pyproject.toml` or `requirements*.txt`. If yes, it should be its own spec; if no, should `Pipfile.lock` support still ship given its limited reach, or be deferred behind `pdm.lock`?]
-- [NEEDS CLARIFICATION: Final precedence when several lock files coexist. Proposed `uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`; but the current order is `poetry.lock` then `uv.lock`, and changing it alters behaviour for repos holding both. Alternative: keep `poetry.lock`, `uv.lock` first and append `pdm.lock`, `Pipfile.lock`. Should precedence ever follow the manifest (e.g. `[tool.pdm]` / `[tool.poetry]` tables in `pyproject.toml`) instead of a fixed order?]
-- [NEEDS CLARIFICATION: Supported `lock_version` range for `pdm.lock` (2.x in current PDM) and the `_meta.pipfile-spec` value(s) for `Pipfile.lock`; verify against current PDM and pipenv releases before planning.]
-- [NEEDS CLARIFICATION: Should lock-file `develop` / non-default PDM `groups` entries be distinguished from runtime ones, or all treated as candidates (current proposal: all candidates, FR-008)?]
-- [NEEDS CLARIFICATION: Ship as one PR or two (`pdm.lock` first, as it needs no manifest work)?]
+- Resolved: no `Pipfile` manifest type in this feature; `Pipfile.lock` ships anyway and is tracked as a follow-up spec/issue ("pypi: recognise Pipfile as a manifest").
+- Resolved: precedence is fixed, existing order kept and new formats appended: `poetry.lock`, `uv.lock`, `pdm.lock`, `Pipfile.lock`; never manifest-driven. The single constant (`PypiLockFormat::FILE_NAMES`) lives in `deps-pypi`, its only consumer, not `deps-core` (deviation from FR-002).
+- Resolved: `pdm.lock` requires `[metadata] lock_version` major 4; `Pipfile.lock` requires `_meta.pipfile-spec` 6. Missing or other values are `DepsError::ParseError`.
+- Resolved: all PDM groups and both `default`/`develop` entries are candidates (FR-008).
+- Resolved: one PR for both formats.
+- Resolved (FR-004): `Pipfile.lock` is parsed with `deps_core::parser::parse_json_checked` (same depth guard) rather than `json_ast`; entries without an exact `==` pin (git/path/editable/range) are skipped (FR-005).
 
 ## 10. See Also
 

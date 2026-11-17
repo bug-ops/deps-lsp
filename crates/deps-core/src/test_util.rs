@@ -1094,6 +1094,10 @@ impl crate::lsp_helpers::ProbeDependency for StubDependency {
     fn probe(name: crate::PackageName, source: crate::parser::DependencySource) -> Self {
         Self { name, source }
     }
+
+    fn route_probes(_name: crate::PackageName) -> Vec<Self> {
+        Vec::new()
+    }
 }
 
 impl crate::Dependency for StubDependency {

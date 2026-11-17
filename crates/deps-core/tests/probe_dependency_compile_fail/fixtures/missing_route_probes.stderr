@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `route_probes`
+  --> tests/probe_dependency_compile_fail/fixtures/missing_route_probes.rs:22:1
+   |
+22 | impl ProbeDependency for PlainDependency {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `route_probes` in implementation
+   |
+   = help: implement the missing item: `fn route_probes(_: deps_core::PackageName) -> Vec<Self> { todo!() }`
