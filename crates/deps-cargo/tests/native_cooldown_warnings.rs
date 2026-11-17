@@ -96,10 +96,17 @@ fn malformed_keys_produce_one_warning_per_file_naming_path_count_and_first_five_
     let lines = warn_lines(&output);
     assert_eq!(lines.len(), 1, "one warning across three parses: {output}");
     let line = lines[0].as_str();
-    assert!(
-        line.contains(Path::new(&config_path).to_str().unwrap()),
-        "{line}"
-    );
+    // Compare path components, not the full canonical string: Windows canonicalize() yields a
+    // verbatim `\\?\` form while the logged path is the plain one.
+    let temp_dir_name = config_path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap();
+    assert!(line.contains(temp_dir_name), "{line}");
+    assert!(line.contains(".cargo"), "{line}");
+    assert!(line.contains("config.toml"), "{line}");
     assert!(line.contains("count=8"), "{line}");
     let named = (0..8)
         .filter(|i| line.contains(&format!("registries.r{i}.min-publish-age")))
