@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-cli**: `update_exit_code`, `format::json::{update_to_document, render_update}` and `format::table::render_update` take `&UpdateRun`; the update JSON report gains a `lockfile` object (#1116)
+- **deps-cli**: `update_exit_code`, `format::json::{update_to_document, render_update}` and `format::table::render_update` take `&UpdateRun`; the update JSON report gains a `lockfile` object (#1116, #2050)
 - **deps-core**: new variants on exhaustive public enums: `EcosystemId::PreCommit`, `DiagnosticKind::AdvisoryExempted`, `GitTagsPlatform::PreCommit`, `PinSubject::PreCommitHook` (#2029)
 - **deps-core**: new public fields `ShaPinComment::style` and `VersionData::advisory_exemptions`; `read_sha_pin_tail` takes the accepted comment styles (#2029)
 - **deps-core**: new public `PrimaryRole` enum, `ScanTarget::with_stand_in_primary` and `InUseVersions::primary_role` mark a scan target whose primary is a stand-in sibling tag (#2029)
@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo**: `.cargo/config.toml` is now a watched config, so editing it re-parses and re-fetches open Cargo manifests (#2043)
 
 ### Added
-- **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116)
+- **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
 - **deps-pypi**: `Pipfile` is a PyPI manifest (`[packages]`, `[dev-packages]`, primary `[[source]]` and per-package `index`) (#2035, #2040)
 - **deps-gradle, deps-core**: in-use versions for `classpath(...)` dependencies from `buildscript-gradle.lockfile`, kept apart from application dependencies (#2034, #2040)
 - **github-action**: `advisory-exemptions` input forwarded to `deps-cli check --advisory-exemptions` (#2032, #2040)
