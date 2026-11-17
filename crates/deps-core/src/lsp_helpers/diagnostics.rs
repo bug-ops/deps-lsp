@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
-use super::exemption::OperatorExemptions;
+use super::exemption::ExemptionCheck;
 use crate::deps_dev::DepsDevScope;
 use crate::diagnostic::{
     CodeDescription, Diagnostic, DiagnosticKind, RelatedInformation, Severity,
@@ -1880,9 +1880,7 @@ fn apply_vulnerability_rule<'a, F: DependencyFormatter>(
         dv,
         ctx.formatter,
         ctx.suppressed,
-        ctx.versions
-            .advisory_exemptions
-            .map(|exemptions| (exemptions, ctx.now)),
+        ExemptionCheck::new(ctx.versions.advisory_exemptions, ctx.now),
     );
     Some(dv)
 }
@@ -2411,7 +2409,7 @@ fn apply_unknown_package_rule<F: DependencyFormatter>(
     ctx: &RuleContext<'_, F>,
 ) {
     let dep = ctx.dep;
-    let in_lockfile = ctx.versions.is_resolved(ctx.key);
+    let in_lockfile = ctx.versions.is_resolved_for(ctx.dep, ctx.key);
 
     let can_resolve_source = ctx.formatter.can_resolve_source(&dep.source());
     let fetch_failure: Option<&FetchFailure> = can_resolve_source
@@ -2764,6 +2762,32 @@ fn push_flagged_latest_admitted_by_requirement<F: DependencyFormatter>(
     }
 }
 
+/// Whether the in-use version of `dep` resolves to exactly `expected`; `false` without an
+/// `ecosystem` to resolve it against. Shared by the R7 dedup and the inlay-hint flagged-latest
+/// check, so both agree on what "the in-use version is the latest" means.
+pub(super) fn in_use_version_is<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    versions: &VersionData<'_>,
+    formatter: &F,
+    expected: &str,
+) -> bool {
+    let Some(ecosystem) = versions.ecosystem else {
+        return false;
+    };
+    super::resolve_in_use_version(
+        dep,
+        key,
+        versions.resolved_map(),
+        versions.candidates_map(),
+        formatter,
+        ecosystem,
+    )
+    .as_ref()
+    .map(ConcreteVersion::as_str)
+        == Some(expected)
+}
+
 /// Issue #1532: whether R2 (`apply_vulnerability_rule`) already covered this exact finding at
 /// least as severely as this rule's own `would_be_severity` — the in-use version *is* the
 /// flagged `latest` a declared requirement admits, and `vulnerable_in_use` (R2's own resolved
@@ -2793,18 +2817,7 @@ fn flagged_latest_duplicates_vulnerability_finding<F: DependencyFormatter>(
     let Some(dv) = vulnerable_in_use else {
         return false;
     };
-    let Some(ecosystem) = ctx.versions.ecosystem else {
-        return false;
-    };
-    let in_use_version = super::resolve_in_use_version(
-        ctx.dep,
-        ctx.key,
-        ctx.versions.resolved_map(),
-        ctx.versions.candidates_map(),
-        ctx.formatter,
-        ecosystem,
-    );
-    if in_use_version.as_ref().map(ConcreteVersion::as_str) != Some(latest) {
+    if !in_use_version_is(ctx.dep, ctx.key, &ctx.versions, ctx.formatter, latest) {
         return false;
     }
     let Some(worst_advisory) = dv.advisories_for_display().items().first().map(Arc::clone) else {
@@ -3202,20 +3215,12 @@ fn push_vulnerability_diagnostics(
     dv: &crate::osv::DependencyVulnerabilities,
     formatter: &dyn EcosystemFormatter,
     suppressed: SuppressedKinds,
-    exemptions: Option<(&OperatorExemptions, PublishTime)>,
+    exemptions: Option<ExemptionCheck<'_>>,
 ) {
     let range: Range = version_anchor_range(dep);
 
     let visible = suppressed.visible_advisories(dv);
-    let unexempted;
-    let mut exempted_ids = Vec::new();
-    let dv = match exemptions {
-        Some((exemptions, now)) if !exemptions.is_empty() => {
-            (unexempted, exempted_ids) = visible.without_exempted(exemptions, now);
-            &unexempted
-        }
-        _ => &*visible,
-    };
+    let (dv, exempted_ids) = ExemptionCheck::apply(exemptions, &visible);
     let display_advisories = dv.advisories_for_display();
     for advisory in display_advisories.items() {
         let code_description = advisory
@@ -10283,19 +10288,7 @@ mod tests {
     }
 
     fn exemptions_for(ids: &[&str]) -> super::super::exemption::OperatorExemptions {
-        let body = ids
-            .iter()
-            .map(|id| format!("[[advisory]]\nid = \"{id}\"\nreason = \"accepted\"\n"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("advisory-exemptions.toml");
-        std::fs::write(&path, body).unwrap();
-        super::super::exemption::OperatorExemptions::load(
-            &super::super::exemption::ExemptionFile::for_test(path),
-        )
-        .unwrap()
-        .unwrap()
+        super::super::exemption::test_exemptions(ids)
     }
 
     fn diagnostics_with_exemptions(

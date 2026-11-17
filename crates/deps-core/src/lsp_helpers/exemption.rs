@@ -14,6 +14,7 @@
 //! needs_deserialize::<OperatorExemptions>();
 //! ```
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +23,7 @@ use time::{Date, Month, OffsetDateTime};
 
 use crate::PublishTime;
 use crate::config_trust::OperatorPath;
-use crate::osv::{Advisory, OsvId};
+use crate::osv::{Advisory, DependencyVulnerabilities, OsvId};
 use crate::parser::{TomlDeserializeError, deserialize_toml_checked};
 
 /// Size cap for an exemption file, in bytes.
@@ -245,7 +246,8 @@ impl ExemptionFile {
         })
     }
 
-    /// Like [`Self::user_config_default`] with an explicit config directory, for tests.
+    /// Like [`Self::user_config_default`] with an explicit config directory, for callers that
+    /// resolve it themselves (the server's startup wiring, tests).
     ///
     /// A missing file is [`UserConfigLookup::Absent`] before any containment check. Any other
     /// failure to resolve the path fails closed: the result is a [`UserConfigLookup::Located`]
@@ -411,6 +413,75 @@ impl OperatorExemptions {
     }
 }
 
+/// An [`OperatorExemptions`] set bound to the instant it is evaluated at, present only when it
+/// can hide something.
+///
+/// Every surface that renders OSV advisories (diagnostics, inlay hints, the vulnerability quick
+/// fix, hover) builds one with [`Self::new`] and funnels the advisories through
+/// [`Self::apply`], so they all agree on which advisories are exempted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExemptionCheck<'a> {
+    exemptions: &'a OperatorExemptions,
+    now: PublishTime,
+}
+
+impl<'a> ExemptionCheck<'a> {
+    /// `None` when `exemptions` is absent or empty, so callers skip the work entirely.
+    pub(crate) fn new(
+        exemptions: Option<&'a OperatorExemptions>,
+        now: PublishTime,
+    ) -> Option<Self> {
+        exemptions
+            .filter(|exemptions| !exemptions.is_empty())
+            .map(|exemptions| Self { exemptions, now })
+    }
+
+    /// Whether `advisory` is exempted at this check's instant.
+    pub(crate) fn exempts(&self, advisory: &Advisory) -> bool {
+        self.exemptions.exempts(advisory, self.now)
+    }
+
+    /// `dv` without the exempted advisories, plus the removed ids (sorted).
+    ///
+    /// Borrowed with an empty id list when `check` is `None`. Otherwise totals follow
+    /// `DependencyVulnerabilities::without_exempted`: unfetched overflow stays counted.
+    pub(crate) fn apply(
+        check: Option<Self>,
+        dv: &DependencyVulnerabilities,
+    ) -> (Cow<'_, DependencyVulnerabilities>, Vec<OsvId>) {
+        match check {
+            Some(check) => {
+                let (kept, ids) = dv.without_exempted(check.exemptions, check.now);
+                (Cow::Owned(kept), ids)
+            }
+            None => (Cow::Borrowed(dv), Vec::new()),
+        }
+    }
+}
+
+/// Exemptions without an expiry for each of `ids`, for tests of the surfaces that apply them.
+#[cfg(test)]
+pub(crate) fn test_exemptions(ids: &[&str]) -> OperatorExemptions {
+    test_exemptions_expiring(ids, None)
+}
+
+/// Like [`test_exemptions`], every entry optionally expiring on `expires` (`YYYY-MM-DD`).
+#[cfg(test)]
+pub(crate) fn test_exemptions_expiring(ids: &[&str], expires: Option<&str>) -> OperatorExemptions {
+    let expires = expires.map_or_else(String::new, |date| format!("expires = \"{date}\"\n"));
+    let body = ids
+        .iter()
+        .map(|id| format!("[[advisory]]\nid = \"{id}\"\nreason = \"accepted\"\n{expires}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join(FILE_NAME);
+    std::fs::write(&path, body).expect("write");
+    OperatorExemptions::load(&ExemptionFile::for_test(path))
+        .expect("valid")
+        .expect("present")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +501,16 @@ mod tests {
         OperatorExemptions::load(&ExemptionFile::for_test(path))
             .expect("valid")
             .expect("present")
+    }
+
+    #[test]
+    fn exemption_check_ignores_an_expired_entry() {
+        let live = test_exemptions_expiring(&["GHSA-1"], Some("2999-01-01"));
+        let expired = test_exemptions_expiring(&["GHSA-1"], Some("2000-01-01"));
+        let a = advisory("GHSA-1", &[], VulnSeverity::High);
+        let now = PublishTime::now();
+        assert!(ExemptionCheck::new(Some(&live), now).is_some_and(|c| c.exempts(&a)));
+        assert!(ExemptionCheck::new(Some(&expired), now).is_some_and(|c| !c.exempts(&a)));
     }
 
     #[test]

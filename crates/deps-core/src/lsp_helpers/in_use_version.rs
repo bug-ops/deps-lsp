@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use crate::lockfile::compare_parsed_versions;
 use crate::lsp_helpers::{
-    BoundedVersionReq, CandidateSet, DependencyFormatter, EcosystemFormatter, OwnerPreference,
-    PinResolution, ResolvedCandidatesMap, ResolvedPin,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, EcosystemFormatter, LockCandidates,
+    OwnerPreference, PinResolution, ResolvedCandidatesMap, ResolvedPin,
 };
 use crate::osv::{AlternativeCoverage, MAX_LOCK_ALTERNATIVES, SiblingCoverage};
-use crate::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey};
+use crate::{ConcreteVersion, Dependency, EcosystemId, LockScope, NormalizedName, PackageKey};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
 /// deciding whether it denotes a single concrete version.
@@ -606,7 +606,31 @@ fn keep_smallest(entries: &mut Vec<Entry<'_, '_>>, n: usize) {
 /// and requirement, so a hit allocates nothing for the key.
 #[derive(Debug, Default)]
 pub struct LockSelectionMemo {
-    by_name: HashMap<NormalizedName, RequirementMemo>,
+    by_name: HashMap<NormalizedName, ScopedMemo>,
+}
+
+/// One name's memo per [`LockScope`]: a Project and a build-script dependency of the same name
+/// select from different lock entries, so their outcomes must not be shared.
+#[derive(Debug, Default)]
+struct ScopedMemo {
+    project: RequirementMemo,
+    build_script: RequirementMemo,
+}
+
+impl ScopedMemo {
+    const fn for_scope(&mut self, scope: LockScope) -> &mut RequirementMemo {
+        match scope {
+            LockScope::Project => &mut self.project,
+            LockScope::BuildScript => &mut self.build_script,
+        }
+    }
+
+    const fn scope(&self, scope: LockScope) -> &RequirementMemo {
+        match scope {
+            LockScope::Project => &self.project,
+            LockScope::BuildScript => &self.build_script,
+        }
+    }
 }
 
 /// One name's memoized outcomes: for a bare occurrence, and per declared requirement.
@@ -694,22 +718,34 @@ fn pick<'a>(
     let collapsed = resolved_versions.get(key.normalized());
     let Some(lock) = resolved_version_candidates
         .and_then(|candidates| candidates.get(key.normalized()))
-        .filter(|candidates| candidates.len() > 1)
+        .filter(|candidates| candidates.needs_selection())
     else {
-        return Some(Picked {
-            primary: collapsed?,
-            candidates: None,
-        });
+        return match dep.lock_scope() {
+            LockScope::Project => Some(Picked {
+                primary: collapsed?,
+                candidates: None,
+            }),
+            LockScope::BuildScript => None,
+        };
     };
+    // A scoped lock set: the collapsed value is Project-only, so it never answers for another
+    // scope, and the selection is restricted to the dependency's own scope.
+    let restricted = lock.has_non_project();
     let entries = lock.versions();
     let list = lock.cached_list(formatter);
-    let (primary, possible) = match dep.version_requirement() {
+    let (primary, mut possible) = match dep.version_requirement() {
         Some(req) => (
             None,
             satisfying_mask(entries, req, formatter, list.set.as_deref()),
         ),
+        None if restricted => (None, vec![true; entries.len()]),
         None => (collapsed, vec![true; entries.len()]),
     };
+    if restricted {
+        for (possible, in_scope) in possible.iter_mut().zip(lock.scope_mask(dep.lock_scope())) {
+            *possible &= in_scope;
+        }
+    }
     let candidates = Candidates {
         entries,
         parsed: Arc::clone(&list.parsed),
@@ -762,17 +798,18 @@ fn select_occurrence(
     };
     let multiple_candidates = resolved_version_candidates
         .and_then(|candidates| candidates.get(key.normalized()))
-        .is_some_and(|candidates| candidates.len() > 1);
+        .is_some_and(LockCandidates::needs_selection);
     let Some(memo) =
         memo.filter(|_| multiple_candidates && scope == AlternativeScope::WithAlternatives)
     else {
         return select();
     };
     let requirement = dep.version_requirement();
+    let lock_scope = dep.lock_scope();
     if let Some(outcome) = memo
         .by_name
         .get(key.normalized())
-        .and_then(|memoized| memoized.get(requirement))
+        .and_then(|memoized| memoized.scope(lock_scope).get(requirement))
     {
         return outcome.selection();
     }
@@ -780,6 +817,7 @@ fn select_occurrence(
     memo.by_name
         .entry(key.normalized().clone())
         .or_default()
+        .for_scope(lock_scope)
         .insert(requirement, Outcome::of(selection.clone()));
     selection
 }
@@ -2807,7 +2845,7 @@ mod tests {
         }
 
         assert_matches!(
-            memo.by_name[&name].by_requirement[&VersionReq::new(">=9.0.0")],
+            memo.by_name[&name].project.by_requirement[&VersionReq::new(">=9.0.0")],
             Outcome::NoMatch
         );
     }
@@ -2867,8 +2905,8 @@ mod tests {
 
         assert_eq!(memo.by_name.len(), 1, "one memo per name");
         let memoized = &memo.by_name[&NormalizedName::for_test("pkg")];
-        assert_eq!(memoized.by_requirement.len(), REQUIREMENTS);
-        for outcome in memoized.by_requirement.values() {
+        assert_eq!(memoized.project.by_requirement.len(), REQUIREMENTS);
+        for outcome in memoized.project.by_requirement.values() {
             let Outcome::Selected(selection) = outcome else {
                 panic!("every requirement selects a primary");
             };
@@ -3364,6 +3402,183 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    mod scoped_lock {
+        use super::*;
+        use crate::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
+        use crate::lsp_helpers::test_support::{MOCK_FORMATTER, MockDep};
+        use crate::{LockScope, VersionReq};
+
+        struct ScopedDep {
+            inner: MockDep,
+            scope: LockScope,
+        }
+
+        impl Dependency for ScopedDep {
+            fn name(&self) -> &PackageName {
+                self.inner.name()
+            }
+            fn name_range(&self) -> Range {
+                self.inner.name_range()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.inner.version_requirement()
+            }
+            fn version_range(&self) -> Option<Range> {
+                self.inner.version_range()
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                self.inner.source()
+            }
+            fn lock_scope(&self) -> LockScope {
+                self.scope
+            }
+        }
+
+        fn dep(scope: LockScope, requirement: &str) -> ScopedDep {
+            ScopedDep {
+                inner: MockDep {
+                    name: PackageName::new("com.acme:lib"),
+                    version_req: VersionReq::new(requirement),
+                    version_range: Range::default(),
+                    name_range: Range::default(),
+                },
+                scope,
+            }
+        }
+
+        fn locked(entries: &[(&str, LockScope)]) -> ResolvedPackages {
+            let mut packages = ResolvedPackages::new();
+            for (version, scope) in entries {
+                packages.insert(
+                    ResolvedPackage::new(
+                        "com.acme:lib".into(),
+                        (*version).into(),
+                        ResolvedSource::Registry {
+                            url: String::new(),
+                            checksum: String::new(),
+                        },
+                    )
+                    .with_lock_scope(*scope),
+                );
+            }
+            packages
+        }
+
+        fn pick_version(
+            packages: &ResolvedPackages,
+            dep: &ScopedDep,
+            with_candidates: bool,
+        ) -> Option<String> {
+            let (versions, candidates) = packages.split_normalized(&MOCK_FORMATTER);
+            let key = crate::test_util::package_key("com.acme:lib");
+            select_occurrence(
+                dep,
+                &key,
+                &versions,
+                with_candidates.then_some(&candidates),
+                &MOCK_FORMATTER,
+                AlternativeScope::PrimaryOnly,
+                None,
+            )
+            .map(|selection| selection.primary.as_str().to_owned())
+        }
+
+        #[test]
+        fn same_version_in_both_scopes_reaches_each_dependency() {
+            let packages = locked(&[
+                ("1.0.0", LockScope::Project),
+                ("1.0.0", LockScope::BuildScript),
+            ]);
+            for scope in [LockScope::Project, LockScope::BuildScript] {
+                assert_eq!(
+                    pick_version(&packages, &dep(scope, "1.0.0"), true).as_deref(),
+                    Some("1.0.0")
+                );
+            }
+        }
+
+        #[test]
+        fn different_versions_per_scope_each_get_their_own() {
+            let packages = locked(&[
+                ("2.0.0", LockScope::Project),
+                ("1.0.0", LockScope::BuildScript),
+            ]);
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::Project, "2.0.0"), true).as_deref(),
+                Some("2.0.0")
+            );
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::BuildScript, "1.0.0"), true).as_deref(),
+                Some("1.0.0")
+            );
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::Project, "1.0.0"), true),
+                None
+            );
+        }
+
+        #[test]
+        fn buildscript_only_name_never_reaches_a_project_dependency() {
+            let packages = locked(&[("1.0.0", LockScope::BuildScript)]);
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::Project, "1.0.0"), true),
+                None
+            );
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::BuildScript, "1.0.0"), true).as_deref(),
+                Some("1.0.0")
+            );
+            let (versions, candidates) = packages.split_normalized(&MOCK_FORMATTER);
+            let key = crate::test_util::package_key("com.acme:lib");
+            let cached = HashMap::new();
+            let data = crate::VersionData::new(&cached, &versions)
+                .with_resolved_version_candidates(&candidates);
+            assert!(!data.is_resolved_for(&dep(LockScope::Project, "1.0.0"), &key));
+            assert!(data.is_resolved_for(&dep(LockScope::BuildScript, "1.0.0"), &key));
+        }
+
+        #[test]
+        fn without_candidates_a_buildscript_dependency_gets_nothing() {
+            let packages = locked(&[
+                ("2.0.0", LockScope::Project),
+                ("1.0.0", LockScope::BuildScript),
+            ]);
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::BuildScript, "1.0.0"), false),
+                None
+            );
+            assert_eq!(
+                pick_version(&packages, &dep(LockScope::Project, "2.0.0"), false).as_deref(),
+                Some("2.0.0")
+            );
+        }
+
+        #[test]
+        fn memo_keeps_scopes_apart() {
+            let packages = locked(&[
+                ("2.0.0", LockScope::Project),
+                ("1.0.0", LockScope::BuildScript),
+            ]);
+            let (versions, candidates) = packages.split_normalized(&MOCK_FORMATTER);
+            let key = crate::test_util::package_key("com.acme:lib");
+            let mut memo = LockSelectionMemo::default();
+            let mut primary = |scope| {
+                select_occurrence(
+                    &dep(scope, "2.0.0"),
+                    &key,
+                    &versions,
+                    Some(&candidates),
+                    &MOCK_FORMATTER,
+                    AlternativeScope::WithAlternatives,
+                    Some(&mut memo),
+                )
+                .map(|selection| selection.primary.as_str().to_owned())
+            };
+            assert_eq!(primary(LockScope::Project).as_deref(), Some("2.0.0"));
+            assert_eq!(primary(LockScope::BuildScript), None);
         }
     }
 }

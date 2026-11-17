@@ -38,7 +38,9 @@ repository-controlled `deps.toml`, editor workspace setting or file inside an op
 cannot grant one. Exempted advisories are not emitted as vulnerability diagnostics; instead each
 affected dependency gets one `INFORMATION` diagnostic with code `advisory-exempted` naming the count
 and up to five ids. A `MAL-` (confirmed malware) advisory is never exempted. Records OSV reported
-but that were not fetched (beyond the fetch cap) stay in the "+N more" count. See
+but that were not fetched (beyond the fetch cap) stay in the "+N more" count. Inlay hints and the
+vulnerability quick fix apply the same exemptions; hover keeps the full list and marks exempted
+advisories. See
 [Configuration](../configuration.md#exempting-an-advisory-operator-file) and the
 [CLI page](../cli.md#exempting-advisories).
 

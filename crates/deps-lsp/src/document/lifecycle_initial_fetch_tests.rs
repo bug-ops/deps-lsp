@@ -8,7 +8,7 @@
     reason = "test code; clippy's allow-*-in-tests does not see this `cfg(all(test, ..))` module"
 )]
 
-use super::{handle_document_change, handle_document_open};
+use super::{handle_document_change, open_document_task};
 use crate::config::DepsConfig;
 #[cfg(feature = "npm")]
 use crate::document::osv_scan::osv_scan_plan_is_stale;
@@ -154,7 +154,7 @@ fn fixture(spec: FixtureSpec<'_>) -> Fixture {
 
 impl Fixture {
     async fn open(&self) -> tokio::task::JoinHandle<()> {
-        handle_document_open(
+        open_document_task(
             self.uri.clone(),
             self.content.clone(),
             Some(1),

@@ -32,6 +32,17 @@ inputs:
       variable of the step.
     required: false
     default: ''
+  advisory-exemptions:
+    description: >-
+      Path to an operator advisory-exemptions TOML file, forwarded as
+      deps-cli check --advisory-exemptions. Must point outside the scanned
+      checkout and be controlled by the workflow operator: under
+      pull_request_target or fork PRs a path inside the checkout is
+      attacker-controlled and lets the scanned repository exempt its own
+      vulnerable dependencies (spec 101, section 3). Requires the next
+      release of the action image.
+    required: false
+    default: ''
 outputs:
   sarif-file:
     description: >-
@@ -61,3 +72,4 @@ runs:
     DEPS_CLI_FAIL_ON: ${{ inputs.fail-on }}
     DEPS_CLI_COOLDOWN: ${{ inputs.cooldown }}
     DEPS_CLI_CONFIG: ${{ inputs.config }}
+    DEPS_CLI_ADVISORY_EXEMPTIONS: ${{ inputs.advisory-exemptions }}

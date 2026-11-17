@@ -20,11 +20,12 @@ use super::{
 use crate::ecosystem::Dependency;
 use crate::error::FetchFailure;
 use crate::licenses::LicensePolicy;
+use crate::lockfile::LockScopes;
 use crate::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
 use crate::parser::DependencySource;
 use crate::{
-    ConcreteVersion, DepsDevClient, EcosystemId, LicenseSource, NormalizedName, PackageKey,
-    PackageVersions, TyposquatSignal,
+    ConcreteVersion, DepsDevClient, EcosystemId, LicenseSource, LockScope, NormalizedName,
+    PackageKey, PackageVersions, TyposquatSignal,
 };
 
 /// Registry data per package, keyed by the ecosystem-normalized name.
@@ -63,6 +64,9 @@ pub type ResolvedVersionsMap = HashMap<NormalizedName, ConcreteVersion>;
 pub struct LockCandidates {
     versions: Vec<ConcreteVersion>,
     preference: OwnerPreference,
+    /// Per version, the lock scopes whose entries resolved to it; `None` when every entry is
+    /// [`LockScope::Project`] (every lock format but Gradle's).
+    scopes: Option<Box<[LockScopes]>>,
     /// The parse of `versions`, filled by the first selection and then shared by every later one
     /// for the life of this value (#2011). It belongs to the one formatter that fills it:
     /// production builds a single formatter per document, so the first fill is the only one;
@@ -72,7 +76,9 @@ pub struct LockCandidates {
 
 impl PartialEq for LockCandidates {
     fn eq(&self, other: &Self) -> bool {
-        self.versions == other.versions && self.preference == other.preference
+        self.versions == other.versions
+            && self.preference == other.preference
+            && self.scopes == other.scopes
     }
 }
 
@@ -84,6 +90,7 @@ impl std::fmt::Debug for LockCandidates {
         f.debug_struct("LockCandidates")
             .field("versions", &self.versions)
             .field("preference", &self.preference)
+            .field("scopes", &self.scopes)
             .finish_non_exhaustive()
     }
 }
@@ -133,8 +140,43 @@ impl LockCandidates {
         Self {
             versions,
             preference,
+            scopes: None,
             cache: OnceLock::new(),
         }
+    }
+
+    /// Attaches per-version scopes; `scopes` must be as long as the versions.
+    pub(crate) fn with_scopes(mut self, scopes: Box<[LockScopes]>) -> Self {
+        self.scopes = Some(scopes);
+        self
+    }
+
+    /// Whether any retained version was resolved in a scope other than
+    /// [`LockScope::Project`].
+    pub(crate) fn has_non_project(&self) -> bool {
+        self.scopes
+            .as_deref()
+            .is_some_and(|scopes| scopes.iter().any(|s| s.has_non_project()))
+    }
+
+    /// Whether choosing among the versions is needed: several are retained, or some belong to a
+    /// non-Project scope (so even a single one must not be handed to a Project dependency).
+    pub(crate) fn needs_selection(&self) -> bool {
+        self.versions.len() > 1 || self.has_non_project()
+    }
+
+    /// Per version, whether `scope`'s lock file resolved it.
+    pub(crate) fn scope_mask(&self, scope: LockScope) -> Vec<bool> {
+        match self.scopes.as_deref() {
+            Some(scopes) => scopes.iter().map(|s| s.contains(scope)).collect(),
+            None => vec![scope == LockScope::Project; self.versions.len()],
+        }
+    }
+
+    /// Whether `scope`'s lock file resolved at least one retained version.
+    #[must_use]
+    pub fn has_scope(&self, scope: LockScope) -> bool {
+        self.scope_mask(scope).contains(&true)
     }
 
     /// The versions' parse, built with `formatter` on first use; see the `cache` field.
@@ -405,8 +447,9 @@ pub struct VersionData<'a> {
     /// [`generate_diagnostics_from_cache`] after each dependency's rules run. `None` means no
     /// rule is configured.
     pub suppression: Option<&'a SuppressionSet>,
-    /// Operator-supplied advisory exemptions (#1964), read only by the vulnerability
-    /// diagnostics rule. `None` and an empty set behave identically: nothing is hidden.
+    /// Operator-supplied advisory exemptions (#1964), applied by the vulnerability
+    /// diagnostics rule, inlay hints and the vulnerability quick fix; hover marks exempted
+    /// advisories. `None` and an empty set behave identically: nothing is hidden.
     pub advisory_exemptions: Option<&'a OperatorExemptions>,
 }
 
@@ -525,10 +568,25 @@ impl<'a> VersionData<'a> {
         Some(miss)
     }
 
-    /// Whether the lock file resolved `key`.
+    /// Whether the lock file resolved `key` in the [`crate::LockScope::Project`] scope.
+    ///
+    /// Scope-blind to the dependency: a name locked only in another scope reads as unresolved.
+    /// Use [`Self::is_resolved_for`] when the dependency may live in another scope.
     #[must_use]
     pub fn is_resolved(&self, key: &PackageKey) -> bool {
         self.resolved_for(key).is_some()
+    }
+
+    /// Whether the lock file resolved `key` in `dep`'s own [`crate::LockScope`].
+    #[must_use]
+    pub fn is_resolved_for(&self, dep: &dyn Dependency, key: &PackageKey) -> bool {
+        match dep.lock_scope() {
+            crate::LockScope::Project => self.is_resolved(key),
+            scope @ crate::LockScope::BuildScript => self
+                .resolved_version_candidates
+                .and_then(|candidates| candidates.get(key.normalized()))
+                .is_some_and(|candidates| candidates.has_scope(scope)),
+        }
     }
 
     /// Every lock-file-resolved version retained for `key` (see

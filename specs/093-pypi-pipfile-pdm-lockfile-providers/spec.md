@@ -51,13 +51,11 @@ was filed for the PyPI formats. This spec is that follow-up.
 > - **`pdm.lock`** pairs with `pyproject.toml` (PDM uses PEP 621 metadata),
 >   which the PyPI ecosystem already parses. Adding the lock provider is
 >   sufficient for end-to-end value.
-> - **`Pipfile.lock`** pairs with `Pipfile`. Verified 2026-11-08: the PyPI
->   ecosystem registers no `Pipfile` manifest (`PypiManifestKind` has only
->   `PyProject` and `Requirements`; no `Pipfile` match exists in
->   `crates/deps-pypi`). A pipenv project that has only a `Pipfile` and
->   `Pipfile.lock` gets no deps-lsp features at all, so a `Pipfile.lock`
->   provider alone helps only pipenv projects that also keep a
->   `pyproject.toml` or `requirements*.txt`. See FR-010 and Open Questions.
+> - **`Pipfile.lock`** pairs with `Pipfile`. When this spec shipped (2026-11-08)
+>   the PyPI ecosystem registered no `Pipfile` manifest, so the provider only
+>   helped pipenv projects that also kept a `pyproject.toml` or
+>   `requirements*.txt`. The `Pipfile` manifest type has since shipped (#2035);
+>   see FR-010.
 
 ### Goal
 
@@ -69,7 +67,7 @@ and `uv.lock`, with no user-visible difference between lock formats.
 ### Out of Scope
 
 - `Pipfile` as a manifest type (parsing `[packages]`/`[dev-packages]`,
-  hover/completion/diagnostics on it) - separate decision, see FR-010 and §9.
+  hover/completion/diagnostics on it) - shipped separately in #2035, see FR-010.
 - Other lock formats from issue #709 (`yarn.lock`, `bun.lock`, `deno.lock`,
   `gradle.lockfile`) - separate follow-ups.
 - `pip-tools` outputs, `pylock.toml` (PEP 751), and Hatch/Rye lock files.
@@ -151,7 +149,7 @@ THEN results are identical to before this feature
 | FR-007 | WHEN a `pdm.lock` or `Pipfile.lock` declares a format version this feature does not understand (`pdm.lock` `lock_version` outside the supported range; `Pipfile.lock` `_meta.pipfile-spec` other than the known value) THE SYSTEM SHALL return `DepsError::ParseError` naming the unsupported version rather than silently misparsing. The supported ranges are an Open Question | should |
 | FR-008 | WHEN the same package name appears more than once in a lock file (PDM per-group or per-marker duplicates; `default` and `develop` both pinning the same name) THE SYSTEM SHALL record every distinct version via `ResolvedPackages::insert` using the existing multi-version-per-name behaviour, with no importer or group correlation performed | must |
 | FR-009 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the LSP file watcher THE SYSTEM SHALL include `pdm.lock` and `Pipfile.lock` so edits to either file trigger a re-resolve, using the same FR-002 constant so the watcher list and locator list cannot drift | must |
-| FR-010 | WHEN a directory contains `Pipfile` and `Pipfile.lock` but no other PyPI manifest THE SYSTEM SHALL behave as it does today (no features on `Pipfile`) unless the §9 decision to add a `Pipfile` manifest type is taken, in which case that work is specified separately | should |
+| FR-010 | WHEN the manifest is a `Pipfile` THE SYSTEM SHALL parse `[packages]` and `[dev-packages]` as PyPI dependencies (shipped in #2035) and locate only `Pipfile.lock` for it, never `poetry.lock`, `uv.lock` or `pdm.lock` | should |
 | FR-011 | WHEN a lock file is read THE SYSTEM SHALL read it through the capped read path (`deps_core::fs_probe::read_to_string_capped`, via the existing `read_and_parse_lockfile` helper) and run the parse closure on the `spawn_blocking` pool, with no new unbounded or blocking I/O | must |
 | FR-012 | WHEN a located lock file is requested repeatedly THE SYSTEM SHALL rely on `LockFileCache::get_or_parse`'s existing mtime-keyed caching with no provider-side override | should |
 
@@ -193,7 +191,7 @@ No new public result types; reuses `deps_core::lockfile::{ResolvedPackage, Resol
 | Over-deep nesting | Reported as the shared nesting-too-deep error, same as other parsers |
 | File larger than the size cap, symlink, or non-regular file | Rejected by the capped read path, same as other lock files |
 | Unsupported `lock_version` / `pipfile-spec` | `DepsError::ParseError` naming the version (FR-007) |
-| `Pipfile.lock` present but no recognised manifest | No features, as today (FR-010) |
+| `Pipfile` manifest with only a `poetry.lock`/`uv.lock`/`pdm.lock` beside it | No in-use versions (FR-010) |
 
 ## 7. Success Criteria
 
@@ -218,7 +216,7 @@ No new public result types; reuses `deps_core::lockfile::{ResolvedPackage, Resol
 - Changing `deps_core::lockfile` shared trait or helper signatures to host the FR-002 precedence
 - Reordering the existing `poetry.lock` / `uv.lock` precedence
 - Adding any new third-party dependency
-- Adding a `Pipfile` manifest type (§9)
+- Adding a `Pipfile` manifest type (shipped in #2035)
 
 ### Never
 - Change Poetry or uv resolution behaviour

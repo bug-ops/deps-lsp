@@ -26,7 +26,7 @@ pub async fn handle_document_link(
     let uri = &params.text_document.uri;
 
     if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
-        tracing::warn!("Could not load document for document link: {:?}", uri);
+        state.log_document_unavailable(uri, "document link");
         return vec![];
     }
 

@@ -5,6 +5,7 @@ args=(check --format sarif)
 [ -n "${DEPS_CLI_FAIL_ON:-}" ] && args+=(--fail-on "$DEPS_CLI_FAIL_ON")
 [ -n "${DEPS_CLI_COOLDOWN:-}" ] && args+=(--cooldown "$DEPS_CLI_COOLDOWN")
 [ -n "${DEPS_CLI_CONFIG:-}" ] && args+=(--config "$DEPS_CLI_CONFIG")
+[ -n "${DEPS_CLI_ADVISORY_EXEMPTIONS:-}" ] && args+=(--advisory-exemptions "$DEPS_CLI_ADVISORY_EXEMPTIONS")
 if [ -n "${DEPS_CLI_PATHS:-}" ]; then
 	read -r -a paths_array <<<"$DEPS_CLI_PATHS"
 	args+=("${paths_array[@]}")

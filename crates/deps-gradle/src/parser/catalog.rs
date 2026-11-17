@@ -95,6 +95,7 @@ fn parse_library_entry(
         version_range,
         configuration: String::new(),
         source: deps_core::parser::DependencySource::Registry,
+        lock_scope: deps_core::LockScope::Project,
     })
 }
 

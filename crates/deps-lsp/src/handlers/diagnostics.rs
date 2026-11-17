@@ -438,7 +438,7 @@ pub async fn handle_diagnostics(
     full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
-        tracing::warn!("Could not load document for diagnostics: {:?}", uri);
+        state.log_document_unavailable(uri, "diagnostics");
         return vec![];
     }
 

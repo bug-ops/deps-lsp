@@ -5,9 +5,11 @@ use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, Wo
 use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
 use crate::{
-    ConcreteVersion, Dependency, PackageKey, Registry, TypedParseResult, Version, VersionReq,
+    ConcreteVersion, Dependency, PackageKey, PublishTime, Registry, TypedParseResult, Version,
+    VersionReq,
 };
 
+use super::exemption::ExemptionCheck;
 use super::{
     BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DependencyFormatter, EcosystemFormatter,
     FetchContext, InteractiveFetch, InteractiveFetchRequest, LatestVerdict, LineOffsetTable,
@@ -214,6 +216,19 @@ where
     // function of `dv`/`latest` alone, so calling it again here is not a second decision.
     let fix = dv.recommended_fix(latest)?;
 
+    // The edit above stays the full-set fix phase B verified; operator exemptions only decide
+    // whether an advisory it resolves is still worth announcing. ASSUMPTION: no caller supplies
+    // the clock here, so expiry is evaluated at request time.
+    let (unexempted_view, exempted_ids) = ExemptionCheck::apply(
+        ExemptionCheck::new(versions.advisory_exemptions, PublishTime::now()),
+        dv,
+    );
+    let surviving_ids: Vec<&crate::osv::OsvId> = fix
+        .advisory_ids
+        .iter()
+        .filter(|id| !exempted_ids.contains(id))
+        .collect();
+
     // #1422 follow-up: `fix.advisory_ids` is computed over the full `MAX_ADVISORY_RECORDS`-capped
     // fetch set, but only `dv.advisories_for_display()`'s ids are ever published as `Diagnostic`s
     // (`push_vulnerability_diagnostics`). Restrict the ids handed to `bind_diagnostics` via
@@ -224,15 +239,15 @@ where
     // `bind_diagnostics` treats this as "no binding to attempt" instead of "matched nothing";
     // the action is still returned, just not diagnostic-bound (title/edit are unaffected — they
     // report the true fix regardless of what's displayed).
-    let display_advisories = dv.advisories_for_display();
+    let display_advisories = unexempted_view.advisories_for_display();
     let displayed_ids: HashSet<&str> = display_advisories
         .items()
         .iter()
         .map(|a| a.id().as_str())
         .collect();
-    let diagnostic_codes: Vec<&crate::osv::OsvId> = fix
-        .advisory_ids
+    let diagnostic_codes: Vec<&crate::osv::OsvId> = surviving_ids
         .iter()
+        .copied()
         .filter(|id| displayed_ids.contains(id.as_str()))
         .collect();
 
@@ -240,13 +255,13 @@ where
     // the declared requirement — rewriting the manifest alone would then not
     // clear the diagnostic until the lockfile is regenerated. Say so in the
     // title rather than silently overclaiming.
-    let lockfile_hit = versions.is_resolved(&key);
+    let lockfile_hit = versions.is_resolved_for(dep, &key);
 
     // Names only the first (worst-severity, per `recommended_fix`'s sort)
     // advisory id and summarizes the rest — `recommended_fix` can return an
     // unbounded number of ids (up to `MAX_ADVISORY_RECORDS`), and a title
     // listing every one of them would overflow an editor's code-action menu.
-    let (first_id, rest_ids) = fix.advisory_ids.split_first()?;
+    let (first_id, rest_ids) = surviving_ids.split_first()?;
     let fixes = if rest_ids.is_empty() {
         first_id.to_string()
     } else {
@@ -1220,6 +1235,89 @@ mod tests {
                 "diagnostic_codes": ["A2", "A1"],
                 "diagnostic_range": version_range,
             }))
+        );
+    }
+
+    /// #2030: an exempted advisory is dropped from the quick fix's title and diagnostic codes,
+    /// the edit stays the full-set fix, and the action disappears once every claimed advisory
+    /// is exempted.
+    #[tokio::test]
+    async fn test_generate_code_actions_vulnerability_fix_applies_operator_exemptions() {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+        };
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let advisory = |id: &str, severity, fixed| {
+            std::sync::Arc::new(
+                Advisory::new(id.to_string(), "2023-01-01T00:00:00Z".to_string(), severity)
+                    .expect("valid osv id")
+                    .with_fixed_versions(vec![OsvVersion::new(fixed)]),
+            )
+        };
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
+                advisories: Capped::new(
+                    vec![
+                        advisory("A1", VulnSeverity::High, "1.1.0"),
+                        advisory("A2", VulnSeverity::Critical, "1.2.0"),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: ConcreteVersion::new("1.2.0"),
+                },
+            }),
+        );
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let fix_with_set = async |exemptions: &super::super::exemption::OperatorExemptions| {
+            let versions = VersionData::new(&cached, &resolved)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_advisory_exemptions(exemptions);
+            generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &MOCK_FORMATTER,
+            )
+            .await
+        };
+        let fix_with = async |exempted: &[&str]| {
+            fix_with_set(&super::super::exemption::test_exemptions(exempted)).await
+        };
+
+        let partial = fix_with(&["A2"]).await;
+        assert_eq!(
+            quickfix_titles(&partial),
+            vec!["Update to 1.2.0 (fixes A1)"]
+        );
+        assert_eq!(
+            partial[0].data,
+            Some(serde_json::json!({
+                "diagnostic_codes": ["A1"],
+                "diagnostic_range": version_range,
+            }))
+        );
+
+        assert!(quickfix_titles(&fix_with(&["A1", "A2"]).await).is_empty());
+
+        let expired =
+            super::super::exemption::test_exemptions_expiring(&["A1", "A2"], Some("2000-01-01"));
+        assert_eq!(
+            quickfix_titles(&fix_with_set(&expired).await),
+            vec!["Update to 1.2.0 (fixes A2 +1 more)"]
         );
     }
 

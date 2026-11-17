@@ -25,7 +25,7 @@ pub async fn handle_code_actions(
     let position = params.range.start;
 
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
-        tracing::warn!("Could not load document for code actions: {:?}", uri);
+        state.log_document_unavailable(uri, "code actions");
         return vec![];
     }
 
@@ -68,11 +68,13 @@ pub async fn handle_code_actions(
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
     };
+    let advisory_exemptions = state.advisory_exemptions();
     let version_data = snapshot
         .version_data()
         .with_ecosystem(ecosystem_id)
         .with_network(network)
-        .with_interactive_fetch_gate(&state.interactive_fetch);
+        .with_interactive_fetch_gate(&state.interactive_fetch)
+        .with_advisory_exemptions(&advisory_exemptions);
     let mut actions = manifest
         .generate_code_actions(position, &domain_uri, version_data, &content)
         .await;

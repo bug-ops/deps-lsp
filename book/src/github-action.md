@@ -58,6 +58,7 @@ action, which GitHub Actions only runs on Linux.
 | `fail-on` | Comma-separated categories that make `deps-cli` exit `1` — `outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `sha-comment-mismatch` and `unknown-ref` (both require the next release of the action image), `license`, `deprecated`, `other` | `vulnerable,yanked,unsatisfiable` |
 | `cooldown` | Overrides `freshness.cooldown_secs` for this run only (e.g. `3d`) | unset |
 | `config` | Path to a **fully-trusted** `deps.toml` — see the warning below | unset (falls back to `deps-cli`'s own hardened auto-discovery) |
+| `advisory-exemptions` | Path to an operator advisory-exemptions TOML file (`deps-cli check --advisory-exemptions`); requires the next release of the action image — see warning below | unset (no exemptions) |
 
 > **Warning:** `deps-cli` treats an explicit `--config` path (which `config` here maps to) as
 > fully trusted — unlike an auto-discovered `deps.toml`, whose `registries`/`network`/
@@ -67,6 +68,14 @@ action, which GitHub Actions only runs on Linux.
 > re-establishes that full trust, so only point it at a file outside the scanned checkout and
 > under your own control — never at a path inside the repository you are scanning, especially
 > in a `pull_request_target` workflow scanning a fork.
+
+> **Warning:** `advisory-exemptions` must point at a file outside the scanned checkout and
+> under your own control. Under `pull_request_target` and other fork-PR workflows a path inside
+> the checkout is attacker-controlled, so the scanned repository could exempt its own vulnerable
+> dependencies. Only `GITHUB_WORKSPACE` and `/github/home` are visible inside the action's
+> container: check the scanned repository out with `path:` and keep the file elsewhere in the
+> workspace, for example a trusted checkout of a separate repository. The input requires the
+> next release of the action image.
 
 ## Outputs
 
@@ -89,6 +98,7 @@ translates into the equivalent `deps-cli check` flag:
 | `fail-on` | `DEPS_CLI_FAIL_ON` | `--fail-on` |
 | `cooldown` | `DEPS_CLI_COOLDOWN` | `--cooldown` |
 | `config` | `DEPS_CLI_CONFIG` | `--config` |
+| `advisory-exemptions` | `DEPS_CLI_ADVISORY_EXEMPTIONS` | `--advisory-exemptions` |
 
 The entrypoint always runs `deps-cli check --format sarif`, redirecting the output to
 `deps-lsp-results.sarif` in the scanned checkout. That output path is removed before every

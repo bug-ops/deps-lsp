@@ -17,21 +17,66 @@ use url::Url;
 /// (spec FR-002/003/005/006/007/013) — built once from the TOML tree's `[[tool.poetry.source]]`
 /// and `[tool.uv.index]`/`[tool.uv.sources]` tables (see [`PypiParser::parse_content_with_policy`]),
 /// then threaded through every dependency-parsing function below.
-struct IndexContext<'a> {
+pub(super) struct IndexContext<'a> {
+    /// Which TOML-table key spelling this manifest uses for dependency tables.
+    pub(super) dialect: TableDialect,
     /// The primary/extras/named-source router (FR-005's chain rules).
-    config: &'a PypiIndexConfig,
+    pub(super) config: &'a PypiIndexConfig,
     /// `[tool.uv.sources] <dep> = { index = "<name>" }` bindings, keyed by dependency name
     /// (FR-013) — the uv analogue of Poetry's per-dependency `source = "<name>"` key.
-    uv_named_by_dep: &'a HashMap<String, String>,
+    pub(super) uv_named_by_dep: &'a HashMap<String, String>,
     /// Accumulates a [`BlockedRegistryOccurrence`] (#925) for every dependency
     /// [`Self::resolve`] routes through an entry blocked by the current
     /// `registries.workspace_registries` policy — a `RefCell` because `resolve` is called from
     /// several independent `parse_*` helpers (PEP 621/735, Poetry, build-system requires) that
     /// each only see their own local `Vec<PypiDependency>`, not one shared result accumulator.
-    blocked_registries: RefCell<Vec<BlockedRegistryOccurrence>>,
+    pub(super) blocked_registries: RefCell<Vec<BlockedRegistryOccurrence>>,
     /// [`Self::blocked_registries`]'s counterpart for every rejection reason *other* than a
     /// policy-blocked host (#1438).
-    rejected_registries: RefCell<Vec<RejectedRegistryOccurrence>>,
+    pub(super) rejected_registries: RefCell<Vec<RejectedRegistryOccurrence>>,
+}
+
+/// The key spellings that differ between Poetry's and pipenv's dependency tables, which
+/// otherwise share one entry shape (a version string or an inline table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TableDialect {
+    /// `pyproject.toml` `[tool.poetry.*dependencies]`.
+    Poetry,
+    /// `Pipfile` `[packages]` / `[dev-packages]`.
+    Pipfile,
+}
+
+impl TableDialect {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Poetry => "Poetry",
+            Self::Pipfile => "Pipfile",
+        }
+    }
+
+    /// Key naming the `[[source]]` entry a dependency is pinned to.
+    const fn named_source_key(self) -> &'static str {
+        match self {
+            Self::Poetry => "source",
+            Self::Pipfile => "index",
+        }
+    }
+
+    /// Key holding the git revision.
+    const fn git_ref_key(self) -> &'static str {
+        match self {
+            Self::Poetry => "rev",
+            Self::Pipfile => "ref",
+        }
+    }
+
+    /// Key holding a direct archive URL.
+    const fn url_key(self) -> &'static str {
+        match self {
+            Self::Poetry => "url",
+            Self::Pipfile => "file",
+        }
+    }
 }
 
 impl IndexContext<'_> {
@@ -98,14 +143,7 @@ impl PypiParser {
         uri: &Url,
         policy: &RegistryAccessPolicy,
     ) -> Result<ParseResult> {
-        // toml_span::Error::Display echoes raw key/table names (see PypiError::reason_for_log's
-        // doc) — redacted here (#1228 M5).
-        let doc = deps_core::parse_toml_checked(content).map_err(|e| {
-            crate::error::PypiError::TomlParseError {
-                message: super::truncate_for_log(&e.to_string()).into_owned(),
-                kind: e.kind(),
-            }
-        })?;
+        let doc = parse_toml_document(content)?;
 
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
@@ -146,6 +184,7 @@ impl PypiParser {
             }
         }
         let ctx = IndexContext {
+            dialect: TableDialect::Poetry,
             config: &config,
             uv_named_by_dep: &uv_named_by_dep,
             blocked_registries: RefCell::new(Vec::new()),
@@ -455,51 +494,19 @@ impl PypiParser {
         ctx: &IndexContext<'_>,
         budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
-        let Some(deps_val) = poetry.get("dependencies") else {
+        let Some(deps_table) = poetry.get("dependencies").and_then(Value::as_table) else {
             return Vec::new();
         };
 
-        let Some(deps_table) = deps_val.as_table() else {
-            return Vec::new();
-        };
-
-        let mut dependencies = Vec::new();
-
-        for (name_key, value) in deps_table {
-            let name = &name_key.name;
-            // Skip Python version constraint
-            if name == "python" {
-                continue;
-            }
-            if !budget.allow() {
-                continue;
-            }
-
-            let position = span_start(content, line_table, name_key.span);
-
-            match self.parse_poetry_dependency(
-                name,
-                value,
-                Some(position),
-                content,
-                line_table,
-                ctx,
-            ) {
-                Ok(mut dep) => {
-                    dep.section = PypiDependencySection::PoetryDependencies;
-                    dependencies.push(dep);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse Poetry dependency '{}': {}",
-                        super::truncate_for_log(name),
-                        e.reason_for_log()
-                    );
-                }
-            }
-        }
-
-        dependencies
+        // The `python` key is the interpreter constraint, not a package.
+        self.parse_dependency_table(
+            deps_table.iter().filter(|(key, _)| key.name != "python"),
+            &PypiDependencySection::PoetryDependencies,
+            content,
+            line_table,
+            ctx,
+            budget,
+        )
     }
 
     /// Parse Poetry `[tool.poetry.group.*.dependencies]` tables.
@@ -514,59 +521,74 @@ impl PypiParser {
         ctx: &IndexContext<'_>,
         budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
-        let Some(group_val) = poetry.get("group") else {
-            return Vec::new();
-        };
-
-        let Some(groups_table) = group_val.as_table() else {
+        let Some(groups_table) = poetry.get("group").and_then(Value::as_table) else {
             return Vec::new();
         };
 
         let mut dependencies = Vec::new();
-
         for (group_name_key, group_val) in groups_table {
-            let group_name = &group_name_key.name;
-            if let Some(group_table) = group_val.as_table()
-                && let Some(deps_val) = group_table.get("dependencies")
-                && let Some(deps_table) = deps_val.as_table()
-            {
-                for (name_key, value) in deps_table {
-                    if !budget.allow() {
-                        continue;
-                    }
-                    let name = &name_key.name;
-                    let position = span_start(content, line_table, name_key.span);
-
-                    match self.parse_poetry_dependency(
-                        name,
-                        value,
-                        Some(position),
-                        content,
-                        line_table,
-                        ctx,
-                    ) {
-                        Ok(mut dep) => {
-                            dep.section = PypiDependencySection::PoetryGroup {
-                                group: group_name.to_string(),
-                            };
-                            dependencies.push(dep);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse Poetry dependency '{}': {}",
-                                super::truncate_for_log(name),
-                                e.reason_for_log()
-                            );
-                        }
-                    }
-                }
-            }
+            let Some(deps_table) = group_val
+                .as_table()
+                .and_then(|group| group.get("dependencies"))
+                .and_then(Value::as_table)
+            else {
+                continue;
+            };
+            dependencies.extend(self.parse_dependency_table(
+                deps_table,
+                &PypiDependencySection::PoetryGroup {
+                    group: group_name_key.name.to_string(),
+                },
+                content,
+                line_table,
+                ctx,
+                budget,
+            ));
         }
-
         dependencies
     }
 
-    /// Parse a Poetry dependency (can be string or table).
+    /// Parses every entry of one TOML dependency table into dependencies tagged `section`.
+    ///
+    /// Shared by Poetry's dependency/group tables and Pipfile's `[packages]`/`[dev-packages]`;
+    /// `ctx.dialect` selects the key spellings. A malformed entry is logged and skipped.
+    pub(super) fn parse_dependency_table<'t>(
+        &self,
+        entries: impl IntoIterator<Item = (&'t toml_span::value::Key<'t>, &'t Value<'t>)>,
+        section: &PypiDependencySection,
+        content: &str,
+        line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
+    ) -> Vec<PypiDependency> {
+        let mut dependencies = Vec::new();
+        for (name_key, value) in entries {
+            if !budget.allow() {
+                continue;
+            }
+            let name = &name_key.name;
+            let position = span_start(content, line_table, name_key.span);
+
+            match self.parse_table_dependency(name, value, Some(position), content, line_table, ctx)
+            {
+                Ok(mut dep) => {
+                    dep.section = section.clone();
+                    dependencies.push(dep);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse {} dependency '{}': {}",
+                        ctx.dialect.label(),
+                        super::truncate_for_log(name),
+                        e.reason_for_log()
+                    );
+                }
+            }
+        }
+        dependencies
+    }
+
+    /// Parse a Poetry or Pipfile dependency (can be string or table).
     ///
     /// Examples:
     /// - String: `requests = "^2.28.0"`
@@ -575,7 +597,7 @@ impl PypiParser {
     // `value_span` offsets come from toml-span (always char boundaries); the `find(';')`
     // index is ASCII, so both slice bounds are always char boundaries.
     #[allow(clippy::string_slice)]
-    fn parse_poetry_dependency(
+    fn parse_table_dependency(
         &self,
         name: &str,
         value: &Value<'_>,
@@ -695,7 +717,10 @@ impl PypiParser {
                         .and_then(|g| g.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    rev: table.get("rev").and_then(|r| r.as_str()).map(String::from),
+                    rev: table
+                        .get(ctx.dialect.git_ref_key())
+                        .and_then(|r| r.as_str())
+                        .map(String::from),
                 };
                 (git, None)
             } else if table.contains_key("path") {
@@ -707,10 +732,10 @@ impl PypiParser {
                         .to_string(),
                 };
                 (path, None)
-            } else if table.contains_key("url") {
+            } else if table.contains_key(ctx.dialect.url_key()) {
                 let url = PypiDependencySource::Url {
                     url: table
-                        .get("url")
+                        .get(ctx.dialect.url_key())
                         .and_then(|u| u.as_str())
                         .unwrap_or("")
                         .to_string(),
@@ -720,7 +745,9 @@ impl PypiParser {
                 // FR-007: a `source = "<name>"` key routes to that named Poetry source;
                 // absent, the dependency routes through the primary/extras chain like any
                 // other plain dependency.
-                let source_name = table.get("source").and_then(|s| s.as_str());
+                let source_name = table
+                    .get(ctx.dialect.named_source_key())
+                    .and_then(|s| s.as_str());
                 if let Some(classification) = ctx.config.blocked_class_for(source_name) {
                     ctx.blocked_registries
                         .borrow_mut()
@@ -750,10 +777,22 @@ impl PypiParser {
 
         // `name` redacted here — `UnsupportedFormat`'s message is shown verbatim (#1228).
         Err(crate::error::PypiError::unsupported_format(format!(
-            "Unsupported Poetry dependency format for '{}'",
+            "Unsupported {} dependency format for '{}'",
+            ctx.dialect.label(),
             super::truncate_for_log(name)
         )))
     }
+}
+
+/// Parses `content` as TOML under the shared nesting-depth guard.
+///
+/// `toml_span::Error::Display` echoes raw key/table names (see `PypiError::reason_for_log`'s
+/// doc), so the message is redacted here (#1228 M5).
+pub(super) fn parse_toml_document(content: &str) -> Result<Value<'_>> {
+    deps_core::parse_toml_checked(content).map_err(|e| crate::error::PypiError::TomlParseError {
+        message: super::truncate_for_log(&e.to_string()).into_owned(),
+        kind: e.kind(),
+    })
 }
 
 /// Get a nested table value by key from a toml-span Table.
@@ -2718,7 +2757,7 @@ requests = "^2.28.0"
     /// through a different code path than the string-form dependency tested by
     /// `test_poetry_primary_source_blocked_by_policy_populates_blocked_registries` above (this
     /// one calls `ctx.config.blocked_class_for(source_name)` directly in the table-format
-    /// branch of `PypiParser::parse_poetry_dependency`, not through `IndexContext::resolve`) —
+    /// branch of `PypiParser::parse_table_dependency`, not through `IndexContext::resolve`) —
     /// a named source blocked by policy must populate `blocked_registries` here too, not just
     /// for the string-form/primary-chain path.
     #[test]

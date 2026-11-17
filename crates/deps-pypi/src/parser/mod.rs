@@ -21,6 +21,7 @@ use pep508_rs::{MarkerTree, Requirement, VersionOrUrl};
 use std::str::FromStr;
 use url::Url;
 
+pub mod pipfile;
 pub mod pyproject;
 pub mod requirements;
 

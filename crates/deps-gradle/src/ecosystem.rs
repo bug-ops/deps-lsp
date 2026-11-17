@@ -190,7 +190,10 @@ impl EcosystemBase for GradleEcosystem {
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
-        &[crate::lockfile::LOCKFILE_NAME]
+        &[
+            crate::lockfile::LOCKFILE_NAME,
+            crate::lockfile::BUILDSCRIPT_LOCKFILE_NAME,
+        ]
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
@@ -379,7 +382,7 @@ mod tests {
             "settings.gradle.kts",
             "settings.gradle",
         ];
-        lockfile_filenames: &["gradle.lockfile"];
+        lockfile_filenames: &["gradle.lockfile", "buildscript-gradle.lockfile"];
         // #1212: closes the follow-up noted in the previous `no_non_registry_fixture` reason —
         // Gradle 6+'s `content { includeGroup(...) }` restriction is a real static per-group
         // binding (see `parser::parse_repository_content_restrictions`), unlike the general

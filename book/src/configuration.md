@@ -134,8 +134,10 @@ expires = "2027-03-31"          # optional, inclusive, UTC; an expired entry is 
 - A file located inside an open workspace folder is refused with a warning, because a repository
   can point `XDG_CONFIG_HOME` at itself. Opening your config directory as a workspace therefore
   disables exemptions.
-- There is no `deps.toml` or editor-settings key for this. Hover, inlay hints and code actions
-  still show the raw advisories.
+- There is no `deps.toml` or editor-settings key for this.
+- Inlay hints and the vulnerability quick fix follow the diagnostics: an exempted advisory raises
+  no warning hint and no fix suggestion. Hover still lists every advisory for audit and marks the
+  exempted ones with `exempted by operator config`.
 
 `deps-cli check --advisory-exemptions <PATH>` takes the same file format; see the
 [CLI page](cli.md#exempting-advisories).

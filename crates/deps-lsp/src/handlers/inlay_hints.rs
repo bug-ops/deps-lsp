@@ -33,7 +33,7 @@ pub async fn handle_inlay_hints(
     let uri = &params.text_document.uri;
 
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
-        tracing::warn!("Could not load document for inlay hints: {:?}", uri);
+        state.log_document_unavailable(uri, "inlay hints");
         return vec![];
     }
 
@@ -95,13 +95,15 @@ pub async fn handle_inlay_hints(
     // Issue #1517: `with_ecosystem` is needed for `generate_inlay_hints`'s own OSV
     // latest-verdict lookup to disambiguate duplicate dependency names, mirroring every
     // other renderer's identical `vuln_keys` derivation.
+    let advisory_exemptions = state.advisory_exemptions();
     manifest
         .generate_inlay_hints(
             snapshot
                 .version_data()
                 .with_ecosystem(ecosystem_id)
                 .with_network(network)
-                .with_suppression(&suppression),
+                .with_suppression(&suppression)
+                .with_advisory_exemptions(&advisory_exemptions),
             loading_state,
             &ecosystem_config,
         )

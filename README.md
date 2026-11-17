@@ -59,7 +59,7 @@ extensions to install and keep in sync.
 | Rust | Cargo | `Cargo.toml` |
 | JavaScript | npm | `package.json`, `pnpm-workspace.yaml` (catalog entries, `overrides:`) |
 | JavaScript/TypeScript | Deno (JSR/npm) | `deno.json`, `deno.jsonc` |
-| Python | PyPI | `pyproject.toml`, `requirements.txt`, `constraints.txt` |
+| Python | PyPI | `pyproject.toml`, `Pipfile`, `requirements.txt`, `constraints.txt` |
 | Go | Go Modules | `go.mod` |
 | Ruby | Bundler | `Gemfile` |
 | Dart | Pub | `pubspec.yaml` |

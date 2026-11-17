@@ -218,6 +218,33 @@ else
 fi
 assert_stderr_contains "$ERR" "removing pre-existing" "case 10: the removal of the stale file is logged as a warning"
 
+# --- Case 11: advisory-exemptions is forwarded as one --advisory-exemptions argument (#2032);
+# unset leaves the argv free of the flag. ---
+new_case
+write_stub "printf '%s\\n' \"\$@\" >\"$WORK/argv\"
+$(valid_sarif_stub)
+exit 0"
+DEPS_CLI_ADVISORY_EXEMPTIONS="$WORK/with space/ex.toml" run_entrypoint
+ec=$?
+assert_exit_zero "$ec" "case 11: run with advisory-exemptions succeeds"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qxF -- "--advisory-exemptions" "$WORK/argv" && grep -qxF -- "$WORK/with space/ex.toml" "$WORK/argv"; then
+	pass "case 11: path is forwarded as a single argument after --advisory-exemptions"
+else
+	fail "case 11: expected --advisory-exemptions and its unsplit value in argv, got: $(cat "$WORK/argv")"
+fi
+new_case
+write_stub "printf '%s\\n' \"\$@\" >\"$WORK/argv\"
+$(valid_sarif_stub)
+exit 0"
+run_entrypoint
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qF -- "--advisory-exemptions" "$WORK/argv"; then
+	fail "case 11: flag present although the input is empty"
+else
+	pass "case 11: flag absent when the input is empty"
+fi
+
 echo
 echo "$TESTS_RUN tests run, $((TESTS_RUN - TESTS_FAILED)) passed, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]

@@ -287,8 +287,9 @@ pub use licenses::{
     evaluate as evaluate_license_policy, resolve_license_entries,
 };
 pub use lockfile::{
-    EntryOwner, EntryPlacement, ImporterPath, ImporterPathError, LockFileProvider, ResolvedPackage,
-    ResolvedPackages, ResolvedSource, read_and_parse_lockfile, read_lockfile_content,
+    EntryOwner, EntryPlacement, ImporterPath, ImporterPathError, LockFileProvider, LockScope,
+    ResolvedPackage, ResolvedPackages, ResolvedSource, read_and_parse_lockfile,
+    read_lockfile_content,
 };
 pub use lsp_helpers::{
     BoundDependency, CachedVersionsMap, DependencyFormatter, DependencyGate, DependencyOutcome,

@@ -143,7 +143,7 @@ THEN output is identical to before this feature
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the file watcher THE SYSTEM SHALL return `gradle.lockfile` only so edits to it trigger a re-resolve | must |
+| FR-001 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the file watcher THE SYSTEM SHALL return `gradle.lockfile` and `buildscript-gradle.lockfile` so edits to either trigger a re-resolve | must |
 | FR-002 | WHEN a Gradle manifest is opened THE SYSTEM SHALL locate the lock file by searching the manifest's own project directory first, using the shared `deps-core` locate helper and ancestor-depth bound, and SHALL NOT use a lock file from a different module's directory when the manifest's own directory has one | must |
 | FR-003 | (removed) The legacy `gradle/dependency-locks/*.lockfile` layout is not supported; see Known limitations | - |
 | FR-004 | WHEN parsing a lock file line of the form `group:artifact:version=config1,config2` THE SYSTEM SHALL produce one resolved package keyed by the Maven coordinate `group:artifact` with the given version | must |
@@ -187,7 +187,12 @@ No new public cross-crate types are required; resolved data reuses
 |----------|-------------------|
 | Lock file absent | No resolution; behaviour unchanged (US-005) |
 | `gradle.lockfile` and legacy `dependency-locks/` both present | Legacy files are never read; only `gradle.lockfile` is used |
-| `gradle.lockfile` and `buildscript-gradle.lockfile` both present | Only `gradle.lockfile` is read; `buildscript-gradle.lockfile` is ignored (see Known limitations) |
+| `gradle.lockfile` and `buildscript-gradle.lockfile` both present | Both are read as one lock set; entries carry a `LockScope` (`Project` / `BuildScript`) and a dependency resolves only from entries of its own scope (a dependency inside `buildscript { }` is `BuildScript`, tagged at parse time from the block position) |
+| Only `buildscript-gradle.lockfile` present | It is located as the fallback; classpath dependencies resolve, project dependencies get no in-use version (the collapsed map holds `Project` entries only) |
+| Same coordinate locked in both files | Each dependency gets its own file's version, including when the versions are equal |
+| Callers that attach no candidates map (update-all, pin-all) | A `buildscript` dependency gets no in-use version (fail-closed), never the application version |
+| Cache | The located file and its companion are stat'ed before the parse; a companion appearing, vanishing or changing invalidates the entry, and the watcher refreshes documents whose companion changed |
+| Cold open before the registry fetch | M9: the instant lock-file seeding reads the collapsed (Project) map only, so classpath dependencies show no lock-file version until the first registry fetch completes |
 | Multi-module: module has no lock file but root has one | Build scripts search the manifest's own directory only; no ancestor fallback, no in-use version |
 | Lock file contains only `empty=` | Empty `ResolvedPackages`, not an error |
 | Malformed line | Line skipped, debug log, rest of file parsed (FR-007) |
@@ -233,7 +238,6 @@ All items resolved: the provider reads `gradle.lockfile` only, from the manifest
 
 ## Known limitations
 
-- `classpath(...)` buildscript dependencies are parsed but have no lock source: `buildscript-gradle.lockfile` is not read, so they show no in-use version, or the application-configuration version when the same coordinate is locked in `gradle.lockfile`.
 - The legacy `gradle/dependency-locks/<config>.lockfile` layout is not supported.
 
 ## 10. See Also

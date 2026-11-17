@@ -2,9 +2,12 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, Inlay
 
 use crate::error::FetchFailure;
 use crate::osv::{MatchOrigin, ScanOutcome};
-use crate::{ConcreteVersion, Dependency, EcosystemConfig, PackageKey, TypedParseResult};
+use crate::{
+    ConcreteVersion, Dependency, EcosystemConfig, PackageKey, PublishTime, TypedParseResult,
+};
 
-use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
+use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail, in_use_version_is};
+use super::exemption::ExemptionCheck;
 use super::{
     DependencyFormatter, DependencyGate, EcosystemFormatter, LatestVerdict, LookupMiss,
     PackageSuppression, RequirementStatus, SiblingMatchNote, VersionData, in_use_version,
@@ -156,6 +159,9 @@ where
             .suppression
             .map(|set| set.resolve(formatter))
             .unwrap_or_default(),
+        // ASSUMPTION: no caller supplies the clock to this entry point, so exemption expiry is
+        // evaluated at request time; one instant is shared by every hint of the call.
+        exemptions: ExemptionCheck::new(versions.advisory_exemptions, PublishTime::now()),
     };
     let mut hints = Vec::with_capacity(deps.len());
     hints.extend(deps.iter().filter_map(|dep| inlay_hint_for(dep, &ctx)));
@@ -170,6 +176,70 @@ struct HintContext<'a, F> {
     formatter: &'a F,
     vuln_keys: Option<crate::osv::VulnKeys>,
     suppression: super::ResolvedSuppression,
+    exemptions: Option<ExemptionCheck<'a>>,
+}
+
+impl<F: DependencyFormatter> HintContext<'_, F> {
+    /// [`latest_verdict`] minus the advisories the operator exempted, when the in-use version
+    /// *is* that latest (mirrors the diagnostics R7 dedup): the ids shown are the unexempted
+    /// ones, and a verdict whose every id is exempted is not flagged at all.
+    ///
+    /// The verdict and the in-use scan come from separate OSV fetches and can disagree, so only
+    /// ids the in-use scan itself exempted count, and a malicious verdict is never touched.
+    fn latest_verdict_for(&self, dep: &F::Dep, key: &PackageKey, latest: &str) -> LatestVerdict {
+        let verdict = latest_verdict(
+            self.versions.latest_status,
+            dep,
+            self.vuln_keys.as_ref(),
+            key,
+            latest,
+            self.formatter,
+        );
+        let LatestVerdict::Flagged {
+            advisory_ids,
+            malicious: false,
+            via_sibling_tags,
+        } = verdict
+        else {
+            return verdict;
+        };
+        let exempted = self.in_use_exempted_ids(dep, key);
+        if exempted.is_empty()
+            || !in_use_version_is(dep, key, &self.versions, self.formatter, latest)
+        {
+            return LatestVerdict::Flagged {
+                advisory_ids,
+                malicious: false,
+                via_sibling_tags,
+            };
+        }
+        let remaining: Vec<_> = advisory_ids
+            .iter()
+            .filter(|id| !exempted.contains(id))
+            .cloned()
+            .collect();
+        if remaining.is_empty() && !advisory_ids.is_empty() {
+            LatestVerdict::NotApplicable
+        } else {
+            LatestVerdict::Flagged {
+                advisory_ids: remaining,
+                malicious: false,
+                via_sibling_tags,
+            }
+        }
+    }
+
+    /// The ids of the in-use advisories the operator exempted; empty without exemptions.
+    fn in_use_exempted_ids(&self, dep: &F::Dep, key: &PackageKey) -> Vec<crate::osv::OsvId> {
+        let Some(ScanOutcome::Vulnerable(dv)) = self
+            .versions
+            .vulnerabilities
+            .and_then(|m| resolve_scan_outcome(m, dep, self.vuln_keys.as_ref(), key))
+        else {
+            return Vec::new();
+        };
+        ExemptionCheck::apply(self.exemptions, dv).1
+    }
 }
 
 /// A hint at `position` carrying `label` and an optional plain-text `tooltip`.
@@ -194,6 +264,8 @@ fn type_hint(
 enum InUseAdvisoryState {
     /// No advisory, or the scan did not complete; the hint is unchanged.
     Clean,
+    /// Advisories exist but the operator exempted every fetched one; renders like `Clean`.
+    FullyExempted,
     /// An advisory matches the shown version itself, or the list is a lower bound so an
     /// alternative-only claim cannot be made. Carries the advisory ids shown by the diagnostic.
     Primary(Vec<crate::osv::OsvId>),
@@ -214,6 +286,10 @@ fn in_use_advisory_state<F: DependencyFormatter>(
     else {
         return InUseAdvisoryState::Clean;
     };
+    let (dv, _) = ExemptionCheck::apply(ctx.exemptions, dv);
+    if ctx.exemptions.is_some() && dv.advisories.total() == 0 {
+        return InUseAdvisoryState::FullyExempted;
+    }
     match dv.sibling_only_tags() {
         Some(tags) if tags.origin() == MatchOrigin::LockEntry => {
             InUseAdvisoryState::LockAlternativeOnly(tags)
@@ -245,7 +321,10 @@ fn inlay_hint_for<F: DependencyFormatter>(
     let flagged_latest = latest_is_flagged(dep, &key, ctx);
     if suppression == PackageSuppression::Ignored
         && !flagged_latest
-        && matches!(advisory_state, InUseAdvisoryState::Clean)
+        && matches!(
+            advisory_state,
+            InUseAdvisoryState::Clean | InUseAdvisoryState::FullyExempted
+        )
     {
         return None;
     }
@@ -256,7 +335,7 @@ fn inlay_hint_for<F: DependencyFormatter>(
     };
     let mut hint = base_hint_for(dep, ctx, outdated)?;
     match advisory_state {
-        InUseAdvisoryState::Clean => {}
+        InUseAdvisoryState::Clean | InUseAdvisoryState::FullyExempted => {}
         InUseAdvisoryState::Primary(ids) => flag_advisory(
             &mut hint,
             format!("Flagged by OSV.dev{}", flagged_detail(&ids, None)),
@@ -282,14 +361,7 @@ fn latest_is_flagged<F: DependencyFormatter>(
         return false;
     };
     matches!(
-        latest_verdict(
-            ctx.versions.latest_status,
-            dep,
-            ctx.vuln_keys.as_ref(),
-            key,
-            latest.as_str(),
-            ctx.formatter,
-        ),
+        ctx.latest_verdict_for(dep, key, latest.as_str()),
         LatestVerdict::Flagged { .. }
     )
 }
@@ -525,11 +597,7 @@ fn hint_label<F: DependencyFormatter>(
     ctx: &HintContext<'_, F>,
 ) -> Option<(String, Option<String>)> {
     let HintContext {
-        versions,
-        config,
-        formatter,
-        vuln_keys,
-        ..
+        config, formatter, ..
     } = ctx;
     match status {
         RequirementStatus::UpToDate => {
@@ -542,14 +610,7 @@ fn hint_label<F: DependencyFormatter>(
             // shows a plain checkmark for a range that already admits an OSV-flagged
             // version. Deliberately gated on `Flagged` only (not `Unverified`) — see
             // `diagnostics.rs`'s `push_flagged_latest_admitted_by_requirement` for why.
-            let verdict = latest_verdict(
-                versions.latest_status,
-                dep,
-                vuln_keys.as_ref(),
-                key,
-                latest.as_str(),
-                *formatter,
-            );
+            let verdict = ctx.latest_verdict_for(dep, key, latest.as_str());
             if let LatestVerdict::Flagged {
                 advisory_ids,
                 malicious,
@@ -586,14 +647,7 @@ fn hint_label<F: DependencyFormatter>(
             // Issue #1517: an OSV-flagged/malicious latest must never render with the same
             // plain "needs update" icon as an ordinary outdated version — that icon alone
             // reads as a routine, safe-to-click upgrade nudge on this always-visible surface.
-            let verdict = latest_verdict(
-                versions.latest_status,
-                dep,
-                vuln_keys.as_ref(),
-                key,
-                latest.as_str(),
-                *formatter,
-            );
+            let verdict = ctx.latest_verdict_for(dep, key, latest.as_str());
             if let LatestVerdict::Flagged {
                 advisory_ids,
                 malicious,
@@ -2647,5 +2701,276 @@ mod tests {
             }
             _ => panic!("Expected string label"),
         }
+    }
+
+    /// #2030: operator exemptions apply to the inlay hint like they do to diagnostics: a fully
+    /// exempted dependency keeps its check mark, a partly exempted one names only what remains.
+    #[test]
+    fn test_inlay_hint_applies_operator_advisory_exemptions() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, VulnSeverity, VulnerabilityMap,
+        };
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.0.8"),
+        );
+        let resolved_versions = HashMap::new();
+        let mut vulns = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                vec![
+                    sample_advisory("GHSA-aaaa-bbbb-cccc", VulnSeverity::High),
+                    sample_advisory("GHSA-dddd-eeee-ffff", VulnSeverity::High),
+                ],
+                2,
+            ))),
+        );
+        let hint_with = |exempted: &[&str]| {
+            let exemptions = super::super::exemption::test_exemptions(exempted);
+            generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_vulnerabilities(&vulns)
+                    .with_advisory_exemptions(&exemptions),
+                crate::LoadingState::Loaded,
+                &config,
+                &MOCK_FORMATTER,
+            )
+            .remove(0)
+        };
+
+        let partial = hint_with(&["GHSA-aaaa-bbbb-cccc"]);
+        assert_matches!(&partial.label, InlayHintLabel::String(t) if t.starts_with("⚠ "));
+        assert_matches!(
+            &partial.tooltip,
+            Some(InlayHintTooltip::String(t))
+                if t.contains("GHSA-dddd-eeee-ffff") && !t.contains("GHSA-aaaa-bbbb-cccc")
+        );
+
+        let full = hint_with(&["GHSA-aaaa-bbbb-cccc", "GHSA-dddd-eeee-ffff"]);
+        assert_matches!(&full.label, InlayHintLabel::String(t) if !t.starts_with('⚠'));
+        assert!(full.tooltip.is_none(), "got: {:?}", full.tooltip);
+    }
+
+    /// The label and tooltip of the single hint for a dependency resolved to `resolved` whose
+    /// cached latest `1.0.8` is flagged, with `in_use_ids` advisories on the in-use version and
+    /// `exemptions` applied.
+    fn exempted_flagged_latest_hint(
+        resolved: &str,
+        in_use_ids: &[&str],
+        latest: (&[&str], crate::osv::VulnSeverity),
+        exemptions: &super::super::exemption::OperatorExemptions,
+    ) -> (String, Option<String>) {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnerabilityMap,
+        };
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let (latest_ids, latest_severity) = latest;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "widget".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            NormalizedName::for_test("widget"),
+            PackageVersions::latest_only("1.0.8"),
+        );
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(NormalizedName::for_test("widget"), resolved.into());
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("widget"),
+            UpgradeStatus::CandidateVulnerable {
+                version: ConcreteVersion::new("1.0.8"),
+                advisory_ids: Capped::new(
+                    latest_ids
+                        .iter()
+                        .map(|id| crate::test_util::osv_id(id))
+                        .collect(),
+                    latest_ids.len(),
+                ),
+                worst_severity: Some(latest_severity),
+                via_sibling_tags: None,
+            },
+        );
+        let mut vulns = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("widget"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                in_use_ids
+                    .iter()
+                    .map(|id| sample_advisory(id, crate::osv::VulnSeverity::High))
+                    .collect(),
+                in_use_ids.len(),
+            ))),
+        );
+        let hint = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_vulnerabilities(&vulns)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_advisory_exemptions(exemptions),
+            crate::LoadingState::Loaded,
+            &config,
+            &MOCK_FORMATTER,
+        )
+        .remove(0);
+        let InlayHintLabel::String(label) = hint.label else {
+            panic!("expected a string label");
+        };
+        let tooltip = match hint.tooltip {
+            Some(InlayHintTooltip::String(t)) => Some(t),
+            _ => None,
+        };
+        (label, tooltip)
+    }
+
+    /// #2030 (flagged-latest): the in-use version is the flagged latest and every advisory on
+    /// it is exempted, so the hint stays plain.
+    #[test]
+    fn test_inlay_hint_exempted_in_use_latest_is_not_flagged() {
+        let exemptions = super::super::exemption::test_exemptions(&["GHSA-aaaa"]);
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.8",
+            &["GHSA-aaaa"],
+            (&["GHSA-aaaa"], crate::osv::VulnSeverity::High),
+            &exemptions,
+        );
+        assert!(label.starts_with('✅'), "got: {label}");
+        assert!(tooltip.is_none(), "got: {tooltip:?}");
+    }
+
+    /// Negative: an exemption does not apply to an unexempted in-use advisory.
+    #[test]
+    fn test_inlay_hint_partly_exempted_in_use_latest_stays_flagged() {
+        let exemptions = super::super::exemption::test_exemptions(&["GHSA-aaaa"]);
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.8",
+            &["GHSA-aaaa", "GHSA-bbbb"],
+            (&["GHSA-bbbb"], crate::osv::VulnSeverity::High),
+            &exemptions,
+        );
+        assert!(label.starts_with('⚠'), "got: {label}");
+        let tooltip = tooltip.expect("tooltip");
+        assert!(tooltip.contains("GHSA-bbbb"), "got: {tooltip}");
+        assert!(!tooltip.contains("GHSA-aaaa"), "got: {tooltip}");
+    }
+
+    /// The flagged-latest tooltip names only unexempted ids, even when the latest record also
+    /// carries an exempted one.
+    #[test]
+    fn test_inlay_hint_flagged_latest_tooltip_omits_exempted_ids() {
+        let exemptions = super::super::exemption::test_exemptions(&["GHSA-aaaa"]);
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.8",
+            &["GHSA-aaaa", "GHSA-bbbb"],
+            (&["GHSA-aaaa", "GHSA-bbbb"], crate::osv::VulnSeverity::High),
+            &exemptions,
+        );
+        assert!(label.starts_with('⚠'), "got: {label}");
+        let tooltip = tooltip.expect("tooltip");
+        assert!(tooltip.contains("GHSA-bbbb"), "got: {tooltip}");
+        assert!(!tooltip.contains("GHSA-aaaa"), "got: {tooltip}");
+    }
+
+    /// Negative: when the in-use version is not the latest, the flagged latest is still flagged
+    /// even though every in-use advisory is exempted.
+    #[test]
+    fn test_inlay_hint_exempted_in_use_older_than_flagged_latest_still_flags_latest() {
+        let exemptions = super::super::exemption::test_exemptions(&["GHSA-aaaa"]);
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.4",
+            &["GHSA-aaaa"],
+            (&["GHSA-latest"], crate::osv::VulnSeverity::High),
+            &exemptions,
+        );
+        assert!(
+            label.starts_with('⚠') && label.contains("1.0.8"),
+            "got: {label}"
+        );
+        assert!(tooltip.is_some_and(|t| t.contains("GHSA-latest")));
+    }
+
+    /// An expired exemption no longer hides anything.
+    #[test]
+    fn test_inlay_hint_expired_exemption_does_not_suppress() {
+        let exemptions =
+            super::super::exemption::test_exemptions_expiring(&["GHSA-aaaa"], Some("2000-01-01"));
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.8",
+            &["GHSA-aaaa"],
+            (&["GHSA-aaaa"], crate::osv::VulnSeverity::High),
+            &exemptions,
+        );
+        assert!(label.starts_with('⚠'), "got: {label}");
+        assert!(tooltip.is_some_and(|t| t.contains("GHSA-aaaa")));
+    }
+
+    /// The latest verdict and the in-use scan are separate OSV fetches: a malicious latest
+    /// record is never suppressed, even when it names an exempted id.
+    #[test]
+    fn test_inlay_hint_malicious_latest_stays_flagged_despite_exempted_in_use() {
+        let exemptions = super::super::exemption::test_exemptions(&["GHSA-aaaa"]);
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.8",
+            &["GHSA-aaaa"],
+            (&["GHSA-aaaa"], crate::osv::VulnSeverity::Malicious),
+            &exemptions,
+        );
+        assert!(label.starts_with(['⚠', '🚫']), "got: {label}");
+        assert!(tooltip.is_some(), "a flagged latest carries a tooltip");
+    }
+
+    /// A latest record naming an id outside the exempted set stays flagged.
+    #[test]
+    fn test_inlay_hint_latest_with_unexempted_id_stays_flagged() {
+        let exemptions = super::super::exemption::test_exemptions(&["GHSA-aaaa"]);
+        let (label, tooltip) = exempted_flagged_latest_hint(
+            "1.0.8",
+            &["GHSA-aaaa"],
+            (&["GHSA-aaaa", "GHSA-zzzz"], crate::osv::VulnSeverity::High),
+            &exemptions,
+        );
+        assert!(label.starts_with('⚠'), "got: {label}");
+        assert!(tooltip.is_some_and(|t| t.contains("GHSA-zzzz")));
     }
 }

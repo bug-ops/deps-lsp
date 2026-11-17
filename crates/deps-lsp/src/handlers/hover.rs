@@ -22,7 +22,7 @@ pub async fn handle_hover(
     let position = params.text_document_position_params.position;
 
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
-        tracing::warn!("Could not load document for hover: {:?}", uri);
+        state.log_document_unavailable(uri, "hover");
         return None;
     }
 
@@ -80,13 +80,15 @@ pub async fn handle_hover(
 
     tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
+    let advisory_exemptions = state.advisory_exemptions();
     let mut versions = snapshot
         .version_data()
         .with_ecosystem(ecosystem_id)
         .with_network(network)
         .with_interactive_fetch_gate(&state.interactive_fetch)
         .with_license_source(ecosystem.license_source())
-        .with_suppression(&suppression);
+        .with_suppression(&suppression)
+        .with_advisory_exemptions(&advisory_exemptions);
     // The only call site that sets `VersionData::trust` (see lsp_helpers::hover docs) —
     // makes the supply-chain trust signal hover-only by construction (FR-010).
     if supply_chain_enabled {
