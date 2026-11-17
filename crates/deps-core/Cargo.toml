@@ -92,7 +92,7 @@ insta.workspace = true
 mockito.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 trybuild.workspace = true
 
 [[bench]]
