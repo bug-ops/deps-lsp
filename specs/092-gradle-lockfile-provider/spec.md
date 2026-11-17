@@ -143,9 +143,9 @@ THEN output is identical to before this feature
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the file watcher THE SYSTEM SHALL return `gradle.lockfile` and `buildscript-gradle.lockfile` so edits to either trigger a re-resolve | must |
+| FR-001 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the file watcher THE SYSTEM SHALL return the glob `*.lockfile` so edits to `gradle.lockfile`, `buildscript-gradle.lockfile` or any legacy per-configuration file trigger a re-resolve | must |
 | FR-002 | WHEN a Gradle manifest is opened THE SYSTEM SHALL locate the lock file by searching the manifest's own project directory first, using the shared `deps-core` locate helper and ancestor-depth bound, and SHALL NOT use a lock file from a different module's directory when the manifest's own directory has one | must |
-| FR-003 | (removed) The legacy `gradle/dependency-locks/*.lockfile` layout is not supported; see Known limitations | - |
+| FR-003 | WHEN neither `gradle.lockfile` nor `buildscript-gradle.lockfile` exists next to the manifest THE SYSTEM SHALL read the legacy `<project>/gradle/dependency-locks/*.lockfile` set (every file except `settings-*`, `buildscript-*` files in the build-script scope, entries deduplicated per scope, at most 16384 directory entries examined and 1024 eligible files considered by name, 128 companion files and `MAX_LOCKFILE_BYTES` read in total) and SHALL refresh open manifests when a file is created, edited or deleted | must |
 | FR-004 | WHEN parsing a lock file line of the form `group:artifact:version=config1,config2` THE SYSTEM SHALL produce one resolved package keyed by the Maven coordinate `group:artifact` with the given version | must |
 | FR-005 | WHEN a line is blank or begins with `#` THE SYSTEM SHALL skip it | must |
 | FR-006 | WHEN a line is `empty=` (optionally followed by configuration names) THE SYSTEM SHALL treat it as a marker of locked-but-empty configurations and contribute no packages | must |
@@ -234,11 +234,11 @@ No new public cross-crate types are required; resolved data reuses
 
 ## 9. Open Questions
 
-All items resolved: the provider reads `gradle.lockfile` only, from the manifest's own directory (a catalog in `<project>/gradle/` also the project root). Custom `lockFile` locations stay unsupported because they need build evaluation.
+All items resolved: the provider reads `gradle.lockfile` and `buildscript-gradle.lockfile`, or, when neither exists, the legacy `gradle/dependency-locks/` set, from the manifest's own directory (a catalog in `<project>/gradle/` also the project root). Custom `lockFile` locations stay unsupported because they need build evaluation.
 
 ## Known limitations
 
-- The legacy `gradle/dependency-locks/<config>.lockfile` layout is not supported.
+- A `gradle/dependency-locks/` directory with more than 16384 entries is only partly scanned, so the located file is not guaranteed name-first there.
 
 ## 10. See Also
 

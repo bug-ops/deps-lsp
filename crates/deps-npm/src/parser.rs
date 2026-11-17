@@ -186,6 +186,7 @@ pub fn parse_package_json_with_context(
         let workspace_config = crate::catalog::load(manifest_dir.as_deref(), &ctx.workspace_cache);
         crate::catalog::apply(&mut dependencies, workspace_config.as_deref());
     }
+    crate::native::apply_to_manifest(&mut dependencies, uri, manifest_dir.as_deref(), ctx);
 
     Ok(NpmParseResult {
         dependencies,
@@ -308,6 +309,7 @@ fn parse_dependency_section(
             // manifest with none (NFR-005) and for this function's own unit tests.
             source: deps_core::parser::DependencySource::Registry,
             registry_entry: None,
+            native_cooldown: None,
             package,
         });
     }
@@ -1519,6 +1521,7 @@ mod tests {
             )),
             config_cache: std::sync::Arc::new(crate::config::NpmConfigCache::new()),
             workspace_cache: std::sync::Arc::new(crate::catalog::PnpmWorkspaceCache::new()),
+            ..crate::config::NpmParseContext::default()
         }
     }
 

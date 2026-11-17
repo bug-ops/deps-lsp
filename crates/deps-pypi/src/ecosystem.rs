@@ -14,9 +14,16 @@ use url::Url;
 use deps_core::ParsedView;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
+use deps_core::{
+    ConfigReach, EcosystemBase, Registry, Result, TypedEcosystem, WatchedConfig,
+    WatchedConfigEffect,
+};
+
+use deps_core::parser::DependencySource;
+use deps_core::policy_config::{AtomicToggle, NativeCooldownMode};
 
 use crate::formatter::PypiFormatter;
+use crate::native::UvConfigCache;
 use crate::parser::PypiParser;
 use crate::registry::PypiRegistry;
 
@@ -80,6 +87,10 @@ pub struct PypiEcosystem {
     /// with `ServerState`, mirroring `deps_npm::ecosystem::NpmEcosystem`'s identical `context`
     /// field.
     policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
+    /// Whether uv's native `exclude-newer` windows are read; shared live with the server's
+    /// configuration so a toggle applies to the next parse.
+    native_cooldown: Arc<AtomicToggle<NativeCooldownMode>>,
+    uv_config: UvConfigCache,
 }
 
 impl PypiEcosystem {
@@ -96,12 +107,11 @@ impl PypiEcosystem {
     /// Shares the live native release-age mode (uv `exclude-newer`) with this ecosystem.
     #[must_use]
     pub fn with_native_cooldown_toggle(
-        self,
-        _toggle: Arc<
-            deps_core::policy_config::AtomicToggle<deps_core::policy_config::NativeCooldownMode>,
-        >,
+        mut self,
+        toggle: Arc<AtomicToggle<NativeCooldownMode>>,
     ) -> Self {
-        todo!("native release-age gate: PypiEcosystem::with_native_cooldown_toggle")
+        self.native_cooldown = toggle;
+        self
     }
 
     /// Creates a new PyPI ecosystem around an existing [`PypiRegistry`] instance, sharing
@@ -119,6 +129,40 @@ impl PypiEcosystem {
             parser: PypiParser::new(),
             formatter: PypiFormatter,
             policy,
+            native_cooldown: Arc::new(AtomicToggle::new(NativeCooldownMode::default())),
+            uv_config: UvConfigCache::default(),
+        }
+    }
+
+    /// Attaches uv's `exclude-newer`/`exclude-newer-package` window to every registry
+    /// dependency of a `pyproject.toml` (spec 099); a no-op while native windows are ignored.
+    fn apply_uv_native_cooldown(
+        &self,
+        result: &mut crate::parser::ParseResult,
+        content: &str,
+        uri: &Url,
+    ) {
+        if self.native_cooldown.get() == NativeCooldownMode::Ignore {
+            return;
+        }
+        let Some(manifest_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        else {
+            return;
+        };
+        let config = self.uv_config.resolve(&manifest_dir, content);
+        for dependency in &mut result.dependencies {
+            // uv applies `exclude-newer` to every index, so a dependency routed to a private
+            // index is gated like a public one; direct URL, git and path sources are not.
+            if matches!(
+                dependency.source,
+                DependencySource::Registry
+                    | DependencySource::CustomRegistry { .. }
+                    | DependencySource::AlternateRegistry { .. }
+            ) {
+                dependency.native_cooldown =
+                    config.cooldown_for(&crate::name::normalize(dependency.name.as_str()));
+            }
         }
     }
 
@@ -164,6 +208,14 @@ impl PypiEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for PypiEcosystem {}
 
+/// `uv.toml` carries uv's release-age window, resolved at parse time and invisible to a
+/// requirement diff; publish times are already fetched, so a diff-driven reparse is enough.
+const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
+    "uv.toml",
+    WatchedConfigEffect::RewritesRequirements,
+    ConfigReach::Subtree,
+)];
+
 impl EcosystemBase for PypiEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Pypi
@@ -192,6 +244,10 @@ impl EcosystemBase for PypiEcosystem {
 
     fn lockfile_filenames(&self) -> &[&'static str] {
         &crate::lockfile::PypiLockFormat::FILE_NAMES
+    }
+
+    fn watched_configs(&self) -> &[WatchedConfig] {
+        &WATCHED_CONFIGS
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
@@ -272,7 +328,7 @@ impl TypedEcosystem for PypiEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<crate::parser::ParseResult>> {
         Box::pin(async move {
             let kind = PypiManifestKind::from_uri(uri);
-            let result = match kind {
+            let mut result = match kind {
                 PypiManifestKind::PyProject => {
                     self.parser
                         .parse_content_with_policy(content, uri, &self.policy)
@@ -311,6 +367,9 @@ impl TypedEcosystem for PypiEcosystem {
             // (`ResolvedChain::named_source`), so no separate call is needed here.
             for chain in &result.resolved_chains {
                 PypiRegistry::register_alternate(&self.registry, chain);
+            }
+            if matches!(kind, PypiManifestKind::PyProject) {
+                self.apply_uv_native_cooldown(&mut result, content, uri);
             }
             Ok(result)
         })
@@ -1829,6 +1888,8 @@ dependencies = []
                 parser: PypiParser::new(),
                 formatter: PypiFormatter,
                 policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                native_cooldown: Arc::new(AtomicToggle::new(NativeCooldownMode::default())),
+                uv_config: UvConfigCache::default(),
             }
         }
 
@@ -2121,6 +2182,7 @@ dependencies = []
                     section: crate::types::PypiDependencySection::Requirements,
                     source,
                     index_route: None,
+                    native_cooldown: None,
                 }],
                 workspace_root: None,
                 uri: deps_core::test_util::test_uri("/test/requirements.txt"),

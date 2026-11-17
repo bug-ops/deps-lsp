@@ -522,10 +522,10 @@ fn native_hold_of(
         .cached_versions
         .get(key.normalized())
         .and_then(|versions| versions.published_at_of(target));
-    let eligible_in_secs = gate.remaining(published_at, target, gate.now())?;
+    let hold = gate.hold(published_at, target, gate.now())?;
     Some(super::NativeHoldNote {
         cooldown: gate.cooldown().clone(),
-        eligible_in_secs,
+        hold,
     })
 }
 

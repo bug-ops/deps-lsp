@@ -493,6 +493,7 @@ pub async fn analyze_manifest(
         &prep.in_use,
         None,
         ctx.policy.freshness.to_freshness(),
+        prep.demand,
         ctx.policy.cache.fetch_timeout,
         ctx.policy.cache.max_concurrent_fetches,
         &prep.selection_context,

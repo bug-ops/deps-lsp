@@ -684,6 +684,7 @@ impl PypiParser {
                 section: PypiDependencySection::PoetryDependencies,
                 source,
                 index_route,
+                native_cooldown: None,
             });
         }
 
@@ -772,6 +773,7 @@ impl PypiParser {
                 section: PypiDependencySection::PoetryDependencies,
                 source,
                 index_route,
+                native_cooldown: None,
             });
         }
 

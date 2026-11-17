@@ -173,7 +173,7 @@ Terminology: **native window** is the duration derived from the project's own pa
 | NFR-001 | Security (untrusted repository) | Native config is repository-controlled input. A hostile config may only lengthen or shorten the delay of a non-security recommendation; it SHALL NOT suppress any diagnostic, alter any edit target to an unlisted version, or cause network access. See #1964 and the `vulnerability` suppression rule of [[094-lsp-per-package-diagnostic-suppression/spec|094]]. |
 | NFR-002 | Security (bounded reads) | Every native config read SHALL go through `deps-core::fs_probe::read_to_string_capped` and the existing ancestor search bound `MAX_CONFIG_ANCESTOR_DEPTH`; unbounded or TOCTOU-prone reads are not permitted. Ancestor files SHALL be cached through `mtime_cache`. |
 | NFR-003 | Security (resource) | A window value SHALL be clamped to a documented maximum so an absurd value (for example a 10^12 day count) cannot overflow duration arithmetic; overflow SHALL fall back per FR-014. |
-| NFR-004 | Network | The feature SHALL add no registry, deps.dev or OSV request. It consumes publish times already fetched for the existing freshness signal. Where a registry response lacks a publish time, the window does not apply (FR-005). |
+| NFR-004 | Network | The feature SHALL add no deps.dev or OSV request. For Cargo and PyPI it consumes publish times already returned with the version list. For npm, pnpm and Bun, WHEN a native window applies THE SYSTEM SHALL fetch the full package document (the one the freshness signal already fetches; same cache, timeout and size limits), including for `.npmrc`-declared registries through the workspace-gated transport, even with freshness disabled (user-approved exception, #2041). With no native config the request count is unchanged. Where a registry response lacks a publish time, the window does not apply (FR-005). |
 | NFR-005 | Performance | Hover and completion SHALL remain non-blocking; native windows are resolved at document load or reparse and cached, not on the request path. |
 | NFR-006 | Type safety | The native window, its source and the opt-out SHALL be dedicated types (a duration newtype, an enum of sources that is exhaustive and without a catch-all `_` arm), not raw `u64` seconds or `String` labels. |
 | NFR-007 | Consistency | The same scenario SHALL give the same hover, diagnostic and action behavior across Cargo, npm/pnpm and uv, differing only in the source label. |
@@ -218,7 +218,7 @@ Terminology: **native window** is the duration derived from the project's own pa
 | SC-002 | Per-ecosystem live checks (Cargo, npm, pnpm, uv) where the proposed version matches what the real tool resolves | 100% of verified fixtures |
 | SC-003 | Projects with no native config produce unchanged output | 0 snapshot diffs |
 | SC-004 | Vulnerability diagnostics emitted with a hostile native window set | identical to the no-config run |
-| SC-005 | Added network requests per document load | 0 |
+| SC-005 | Added network requests per document load | 0 with no native config; with an npm-family window, one full-document request per package, bounded by the freshness cache |
 | SC-006 | Duplicate window-parsing or duration-normalization code across ecosystem crates | 0 (single `deps-core` implementation) |
 
 ## 8. Agent Boundaries
@@ -275,6 +275,26 @@ Resolved open questions and the shape that shipped:
 - **Item 7 (surface and environment):** boolean opt-out `freshness.honor_native_cooldown` (default `true`). Only repository-level `.cargo/config.toml` files from the manifest directory up to the workspace root are read (the manifest directory alone without a workspace root); `~/.cargo/config.toml`, `$CARGO_HOME/config.toml` and `CARGO_*` environment variables are never read.
 - **Narrowed FR-002 / US-001:** explain-only. A held `latest` is never proposed and nothing older is proposed in its place; a version in `Cargo.lock` stays eligible.
 - **Read-time gate:** per-version publish times (`PackageVersions::publish_times`) are stored window-independently; the gate runs at read time against the lock maps and one instant (`VersionData::now`), so a `Cargo.lock` change or a release published after the fetch is judged correctly without a refetch.
+
+### Phase 2 resolution (npm, pnpm, Bun, #2041)
+
+- **Reading:** only the project root's own file is read, chosen by the lock file (`package-lock.json`/`npm-shrinkwrap.json` npm, `pnpm-lock.yaml` pnpm, `bun.lock`/`bun.lockb` Bun, `yarn.lock` none); without a lock file `pnpm-workspace.yaml` then `bunfig.toml` select the manager, else npm. The root is the lock file's directory, else the manifest's directory; `~`, member-level files and environment variables are not read.
+- **Settings and units:** npm `min-release-age` (whole days) and `before` (RFC 3339 or date-only, midnight UTC; wins in the same file; a malformed `before` falls back to `min-release-age`); pnpm `minimumReleaseAge` (minutes, no assumed default, off with `minimumReleaseAgeStrict: false`); Bun `[install] minimumReleaseAge` (seconds). Fractional, negative, zero and non-numeric values are ignored with a warning.
+- **Exemptions:** names, `name@version` (pnpm and Bun also `||`-separated versions) and `*`; npm's `*` never crosses `/`. An unsupported entry or a list above 1024 entries or 512 bytes per entry rejects the whole list.
+- **Open pnpm workspace file:** its catalog entries are gated from the buffer, never from disk; `catalog:` dependencies are gated by real name; `overrides` entries are not gated.
+- **Cutoff semantics:** a `before` cutoff holds every release published after it, indefinitely (`NativeHold::Indefinite`).
+- **Refetch:** publish times are fetched on native demand (`PublishTimeDemand::NativeWindow`); a document whose demand rises (window added through a watched file, an edited buffer, or the opt-out turned off) is refetched in full.
+- **Not implemented (F-Y1):** Yarn `npmMinimalAgeGate` (`.yarnrc.yml`) is not honored.
+
+### Phase 3 resolution (uv, #2042)
+
+- **Settings:** `exclude-newer` is a span (`<n> <unit>` with seconds/minutes/hours/days/weeks, or ISO `PnW`/`PnD`/`PTnH`/`PTnM`/`PTnS`) or an RFC 3339 cutoff; calendar units, date-only values and multi-term spans are malformed and ignored with one warning per file. `exclude-newer-package` (PEP 503 normalized names; `false` or `0` turns the window off for that package) wins over the global value.
+- **Item 6 (absolute timestamp):** a cutoff holds every release uploaded after it indefinitely (`NativeHold::Indefinite`), unlike a rolling span.
+- **Precedence:** only the nearest directory holding `uv.toml` or a `pyproject.toml` with `[tool.uv]` is read; `uv.toml` wins over `[tool.uv]` there; nothing is merged with a farther directory; within that file `exclude-newer-package` beats `exclude-newer`; an invalid value counts as absent.
+- **Workspaces:** the nearest ancestor with `[tool.uv.workspace]` whose `members` globs match the project and whose `exclude` globs do not is the root, and a member reads only the root (its own `[tool.uv]` is ignored); otherwise the project's own nearest file applies. Home and `UV_*` variables are never read.
+- **Scope:** `pyproject.toml` documents only; `requirements.txt`, Pipfile, direct URL, git and path dependencies get no window. Index-level `exclude-newer` is not read (F2).
+- **Accuracy:** a hold is judged per version by its newest upload time, so deps-lsp may report a hold uv would not apply to an individual file (M3).
+- **Wording:** `uv exclude-newer = <span|cutoff>` and `uv exclude-newer-package.<name> = <span|cutoff>`.
 
 **F1 (Phase 2 follow-up):** steering a recommended fix past a held version (`steer_past_deprecated`) is not implemented, because Cargo never reports `AdvisoryDeprecated`. When another ecosystem needs it, the native steer filter must be applied identically in deps-engine `resolve_fix_target` and every `FixTargetContext` site, or the fix-target verifier and the action desync and a hostile window could hide a fix.
 

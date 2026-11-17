@@ -51,8 +51,8 @@ use super::{EcosystemFormatter, VersionData};
 use crate::freshness::FreshnessSettings;
 use crate::single_flight::Slot;
 use crate::{
-    Dependency, DependencySource, FetchFailure, NetworkMode, PackageKey, PackageName, Registry,
-    RegistryEndpoint, Version,
+    Dependency, DependencySource, FetchFailure, NetworkMode, PackageKey, PackageName,
+    PublishTimeDemand, Registry, RegistryEndpoint, Version,
 };
 
 /// A version list shared between the requests of one flight.
@@ -185,6 +185,7 @@ pub struct InteractiveFetchRequest<'a> {
     key: PackageKey,
     source: DependencySource,
     context: FetchContext,
+    demand: PublishTimeDemand,
 }
 
 impl<'a> InteractiveFetchRequest<'a> {
@@ -208,13 +209,21 @@ impl<'a> InteractiveFetchRequest<'a> {
         formatter: &dyn EcosystemFormatter,
         context: FetchContext,
     ) -> Self {
-        Self::from_key(
-            versions,
-            manifest,
-            PackageKey::new(dep.name(), formatter),
-            dep.source(),
-            context,
-        )
+        let demand = if dep.native_cooldown().is_some() {
+            PublishTimeDemand::NativeWindow
+        } else {
+            PublishTimeDemand::NotRequired
+        };
+        Self {
+            demand,
+            ..Self::from_key(
+                versions,
+                manifest,
+                PackageKey::new(dep.name(), formatter),
+                dep.source(),
+                context,
+            )
+        }
     }
 
     /// A request from parts a fixture chose, for tests that have no dependency to derive them
@@ -244,6 +253,7 @@ impl<'a> InteractiveFetchRequest<'a> {
             key,
             source,
             context,
+            demand: PublishTimeDemand::NotRequired,
         }
     }
 
@@ -605,14 +615,26 @@ pub async fn await_interactive_versions<R: Registry + ?Sized>(
 ) -> InteractiveFetch<SharedVersions> {
     let fetch = async {
         registry
-            .get_versions_from(request.package(), &request.source, freshness)
+            .get_versions_from_with_demand(
+                request.package(),
+                &request.source,
+                freshness,
+                request.demand,
+            )
             .await
             .map(SharedVersions::from)
     };
     let Some((gate, lookup)) = request.gated(registry, LookupKind::VersionList) else {
         return plain_bounded_await(fetch, &request, LookupKind::VersionList).await;
     };
-    flight::await_shared(gate, lookup, fetch, &request, ListShape::of(freshness)).await
+    flight::await_shared(
+        gate,
+        lookup,
+        fetch,
+        &request,
+        ListShape::of(freshness, request.demand),
+    )
+    .await
 }
 
 async fn plain_bounded_await<T, E: InteractiveFetchError>(

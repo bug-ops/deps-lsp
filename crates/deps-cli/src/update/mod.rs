@@ -202,8 +202,8 @@ pub struct PlannedUpdateItem {
 pub struct NativeHoldNote {
     /// The configured window that excludes `latest`.
     pub cooldown: deps_core::native_cooldown::NativeCooldown,
-    /// Seconds until `latest` becomes eligible.
-    pub eligible_in_secs: u64,
+    /// How long `latest` stays held.
+    pub hold: deps_core::native_cooldown::NativeHold,
 }
 
 /// Why [`PlannedUpdateItem::cooldown_fallback`] is set (spec 075 FR-013) — mirrors
@@ -606,9 +606,9 @@ impl PlannedUpdateItem {
                     reason.push_str(&format!(" (inside {})", hold.cooldown));
                 }
                 _ => reason.push_str(&format!(
-                    " (excluded by {}; eligible in {})",
+                    " (excluded by {}; {})",
                     hold.cooldown,
-                    deps_core::format_remaining_duration(hold.eligible_in_secs)
+                    hold.hold.eligibility_clause()
                 )),
             }
         }
@@ -1305,14 +1305,14 @@ fn resolve_occurrence(
     });
     let native_hold_note = match (&disposition, &native_gate, package_versions) {
         (CooldownDisposition::NativeHeld { cooldown, .. }, Some(gate), Some(versions)) => gate
-            .remaining(
+            .hold(
                 versions.published_at_of(&versions.latest),
                 &versions.latest,
                 gate.now(),
             )
-            .map(|eligible_in_secs| NativeHoldNote {
+            .map(|hold| NativeHoldNote {
                 cooldown: (*cooldown).clone(),
-                eligible_in_secs,
+                hold,
             }),
         _ => None,
     };

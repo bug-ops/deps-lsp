@@ -1029,7 +1029,7 @@ struct VersionMetadata {
     /// itself treats a release as yanked once any file under it is, since
     /// new uploads to an already-yanked version are rejected).
     yanked: bool,
-    /// Earliest `upload-time` across the version's release files (a version
+    /// Latest `upload-time` across the version's release files (a version
     /// can ship multiple files/wheels uploaded at different times). `None`
     /// if no file reports one.
     published_at: Option<deps_core::PublishTime>,

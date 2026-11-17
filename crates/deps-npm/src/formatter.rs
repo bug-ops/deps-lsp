@@ -1609,6 +1609,7 @@ mod tests {
                 },
                 source: deps_core::parser::DependencySource::Registry,
                 registry_entry: None,
+                native_cooldown: None,
                 package: None,
             };
             assert!(
@@ -1825,6 +1826,7 @@ mod tests {
             },
             source: deps_core::parser::DependencySource::Registry,
             registry_entry: None,
+            native_cooldown: None,
             package: None,
         };
         let f = NpmFormatter;

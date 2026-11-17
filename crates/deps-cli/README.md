@@ -56,9 +56,13 @@ version-requirement edits to one manifest.
   refused rather than silently substituted
 - **Freshness cooldown** — `update` skips a version published within `freshness.cooldown_secs`
   (default 3 days) and targets the newest already-cooled-down, verified candidate instead
-- **Cargo publish-age window** — a `latest` held back by `min-publish-age` in the repository's
-  `.cargo/config.toml` is explained by `check` and skipped (exit 0) by `update`, never written;
+- **Package-manager release-age window** — a `latest` held back by Cargo's `min-publish-age`
+  (`.cargo/config.toml`), npm's `min-release-age`/`before` (root `.npmrc`), pnpm's
+  `minimumReleaseAge` (`pnpm-workspace.yaml`) or Bun's `minimumReleaseAge` (`bunfig.toml`) is
+  explained by `check` and skipped (exit 0) by `update`, never written;
   `[freshness] honor_native_cooldown = false` ignores it
+- **uv release-age window** — a `latest` held back by `exclude-newer` / `exclude-newer-package` in the
+  repository's `uv.toml` or `[tool.uv]` is skipped (`within-native-cooldown`, exit 0), never written
 - **Safe rewrites** — an unresolved version placeholder (`${VAR}`, `$(VAR)`, `%VAR%`,
   `self.version`, string interpolation) is never overwritten by a rewrite
 - **Offline mode** — `--offline` serves only already-cached registry data, useful for

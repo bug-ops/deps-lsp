@@ -22,8 +22,16 @@ impl PublishTimeDemand {
     /// The demand of a whole document: [`NativeWindow`](Self::NativeWindow) iff at least one of
     /// its dependencies carries a native window.
     #[must_use]
-    pub fn for_document(_document: &dyn crate::ParsedManifest) -> Self {
-        todo!("native release-age gate: PublishTimeDemand::for_document")
+    pub fn for_document(document: &dyn crate::ParsedManifest) -> Self {
+        let mut native = false;
+        document.for_each_formatted_dependency(&mut |bound| {
+            native |= bound.dependency().native_cooldown().is_some();
+        });
+        if native {
+            Self::NativeWindow
+        } else {
+            Self::NotRequired
+        }
     }
 }
 
@@ -276,6 +284,23 @@ pub trait Registry: Send + Sync + RegistryAny {
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
         let _ = source;
         self.get_versions_with(name, freshness)
+    }
+
+    /// Whether this registry returns publish times only when asked through
+    /// [`get_versions_from_with_demand`](Self::get_versions_from_with_demand) with
+    /// [`PublishTimeDemand::NativeWindow`].
+    ///
+    /// A document whose demand rises is refetched in full only for such a registry: every other
+    /// one already returns the times its window judges, so a refetch would only add requests.
+    ///
+    /// Pairing: return `true` only if [`get_versions_from_with_demand`](Self::get_versions_from_with_demand)
+    /// fetches times it would not fetch otherwise. Returning `true` without that override makes
+    /// every demand rise refetch for nothing; overriding it without returning `true` leaves
+    /// cached versions undated when a window appears.
+    ///
+    /// Default: `false`.
+    fn honors_publish_time_demand(&self) -> bool {
+        false
     }
 
     /// Like [`get_versions_from`](Self::get_versions_from), additionally carrying whether the

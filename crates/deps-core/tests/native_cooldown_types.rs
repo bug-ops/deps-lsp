@@ -28,7 +28,8 @@ fn window_of(raw: &str) -> Option<NativeWindow> {
         TimeSpanValue::Disabled => None,
         TimeSpanValue::Span(span) => Some(
             NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal)
-                .window(),
+                .age_window()
+                .expect("a span limit has an age window"),
         ),
     }
 }

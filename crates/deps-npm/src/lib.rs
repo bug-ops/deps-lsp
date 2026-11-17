@@ -17,6 +17,7 @@ pub mod ecosystem;
 /// Version formatting and comparison for npm (node-semver ranges).
 pub mod formatter;
 pub mod lockfile;
+mod native;
 pub mod parser;
 pub mod registry;
 /// Domain types for npm dependencies (parsed `package.json` entries, registry versions).

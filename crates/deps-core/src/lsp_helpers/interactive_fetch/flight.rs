@@ -19,23 +19,28 @@ use super::{
     log_skipped, now,
 };
 use crate::freshness::FreshnessSettings;
+use crate::registry::PublishTimeDemand;
 use crate::single_flight::{Claim, Follower, claim_or_follow};
 
 /// Whether a version list carries publish-time enrichment.
 ///
 /// An enriched list is a superset of a bare one for every reader that only inspects versions,
-/// so a bare request may follow an enriched flight but never the reverse.
+/// so a bare request may follow an enriched flight but never the reverse. A native-demand list
+/// neither follows nor is followed: it must carry the publish times the window judges, and
+/// sharing it with a document that has no window would leak those ages into its output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ListShape {
     Bare,
     Enriched,
+    Native,
 }
 
 impl ListShape {
-    pub(super) const fn of(freshness: FreshnessSettings) -> Self {
-        match freshness {
-            FreshnessSettings::Disabled => Self::Bare,
-            FreshnessSettings::Enabled { .. } => Self::Enriched,
+    pub(super) const fn of(freshness: FreshnessSettings, demand: PublishTimeDemand) -> Self {
+        match (demand, freshness) {
+            (PublishTimeDemand::NativeWindow, _) => Self::Native,
+            (PublishTimeDemand::NotRequired, FreshnessSettings::Disabled) => Self::Bare,
+            (PublishTimeDemand::NotRequired, FreshnessSettings::Enabled { .. }) => Self::Enriched,
         }
     }
 }

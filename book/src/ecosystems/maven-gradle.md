@@ -67,8 +67,10 @@ and a lock file in an ancestor directory is never used for a build script.
 `buildscript { dependencies { classpath(...) } }` dependencies resolve from
 `buildscript-gradle.lockfile` and every other dependency from `gradle.lockfile`, so the same
 coordinate can show a different version in each. A name locked only in the other file shows no
-in-use version. Known limitations: the legacy `gradle/dependency-locks/` layout is not read, and
-classpath dependencies show no lock-file version before the first registry fetch completes.
+in-use version. When neither file exists, the legacy `gradle/dependency-locks/<configuration>.lockfile`
+layout supplies the lock set (every file merged; `buildscript-*` files count as the build-script
+scope, `settings-*` files are skipped). Known limitation: classpath dependencies show no lock-file
+version before the first registry fetch completes.
 
 ## Non-Registry Dependency Sources (Maven)
 

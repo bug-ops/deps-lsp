@@ -1021,10 +1021,10 @@ fn push_latest_hover_section(
 }
 
 /// The package manager's own publish-age hold on the displayed latest version.
-struct NativeHold<'a> {
+struct HeldLatest<'a> {
     version: &'a str,
     cooldown: &'a crate::native_cooldown::NativeCooldown,
-    remaining_secs: u64,
+    hold: crate::native_cooldown::NativeHold,
 }
 
 /// The native hold on the displayed latest version, judged at [`VersionData::now`].
@@ -1036,15 +1036,14 @@ fn native_hold<'a>(
     key: &PackageKey,
     versions: &VersionData<'a>,
     latest_line: Option<(&'a str, Option<PublishTime>)>,
-) -> Option<NativeHold<'a>> {
+) -> Option<HeldLatest<'a>> {
     let (version, published_at) = latest_line?;
     let gate = crate::native_cooldown::NativeGate::for_dependency(dep, key, versions)?;
-    let remaining_secs =
-        gate.remaining(published_at, &ConcreteVersion::new(version), gate.now())?;
-    Some(NativeHold {
+    let hold = gate.hold(published_at, &ConcreteVersion::new(version), gate.now())?;
+    Some(HeldLatest {
         version,
         cooldown: gate.cooldown(),
-        remaining_secs,
+        hold,
     })
 }
 
@@ -1053,7 +1052,7 @@ fn native_hold<'a>(
 /// explain-only. A flagged latest keeps only its OSV callout.
 fn push_native_hold_hover_section(
     markdown: &mut HoverMarkdown,
-    hold: Option<NativeHold<'_>>,
+    hold: Option<HeldLatest<'_>>,
     latest_verdict: &LatestVerdict,
 ) {
     use crate::native_cooldown::NativeCooldownSource;
@@ -1066,7 +1065,8 @@ fn push_native_hold_hover_section(
     markdown.push_static("> ⏳ **Held back** — ");
     markdown.push_code(hold.version, FieldKind::Version);
     markdown.push_static(" is excluded by ");
-    // The alias is the only free-form part; the rest is fixed text and a digits-plus-unit span.
+    // The Cargo alias and the uv package label are the only free-form names, both restricted
+    // to a safe charset; the rest is fixed text and a digits-plus-unit span or a timestamp.
     match hold.cooldown.source() {
         NativeCooldownSource::CargoGlobal => {
             markdown.push_static("cargo registry.global-min-publish-age = ");
@@ -1076,21 +1076,30 @@ fn push_native_hold_hover_section(
             markdown.push_text(alias.as_str(), FieldKind::Name);
             markdown.push_static(".min-publish-age = ");
         }
-        NativeCooldownSource::NpmMinReleaseAge
-        | NativeCooldownSource::NpmBefore
-        | NativeCooldownSource::PnpmMinimumReleaseAge
-        | NativeCooldownSource::BunMinimumReleaseAge
-        | NativeCooldownSource::UvExcludeNewer
-        | NativeCooldownSource::UvExcludeNewerPackage { .. } => {
-            todo!("native release-age gate: hover wording for the npm-family and uv sources")
+        NativeCooldownSource::NpmMinReleaseAge => {
+            markdown.push_static("npm min-release-age = ");
+        }
+        NativeCooldownSource::NpmBefore => {
+            markdown.push_static("npm before = ");
+        }
+        NativeCooldownSource::PnpmMinimumReleaseAge => {
+            markdown.push_static("pnpm minimumReleaseAge = ");
+        }
+        NativeCooldownSource::BunMinimumReleaseAge => {
+            markdown.push_static("bun minimumReleaseAge = ");
+        }
+        NativeCooldownSource::UvExcludeNewer => {
+            markdown.push_static("uv exclude-newer = ");
+        }
+        NativeCooldownSource::UvExcludeNewerPackage { package } => {
+            markdown.push_static("uv exclude-newer-package.");
+            markdown.push_text(package.as_str(), FieldKind::Name);
+            markdown.push_static(" = ");
         }
     }
-    markdown.push_text(&hold.cooldown.span().to_string(), FieldKind::Prose);
-    markdown.push_static("; eligible in ");
-    markdown.push_text(
-        &crate::format_remaining_duration(hold.remaining_secs),
-        FieldKind::Prose,
-    );
+    markdown.push_text(&hold.cooldown.limit().to_string(), FieldKind::Prose);
+    markdown.push_static("; ");
+    markdown.push_text(&hold.hold.eligibility_clause(), FieldKind::Prose);
     markdown.push_static(".\n\n");
 }
 

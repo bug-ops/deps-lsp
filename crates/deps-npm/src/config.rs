@@ -62,6 +62,7 @@ use deps_core::net_policy::{
     RegistryUrlKind, RejectionOutcome, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
+use deps_core::policy_config::{AtomicToggle, NativeCooldownMode};
 use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
@@ -369,17 +370,38 @@ fn scope_of(name: &str) -> Option<&str> {
 struct RawNpmrc {
     registry: Option<String>,
     scoped: HashMap<String, String>,
+    /// The release-age window of this file, interpreted once per parse so a malformed value
+    /// warns once per file change rather than once per `package.json` parse (spec 099).
+    native: Option<crate::native::Settings>,
+}
+
+/// The release-age entries of one `.npmrc` file (spec 099): `min-release-age`, `before` and
+/// `min-release-age-exclude`, raw and unvalidated; [`crate::native`] interprets them.
+#[derive(Debug, Default)]
+pub(crate) struct NpmrcNative {
+    pub(crate) min_release_age: Option<String>,
+    pub(crate) before: Option<String>,
+    pub(crate) exclude: Vec<String>,
+}
+
+/// Removes one pair of matching quotes around `value`, as npm's ini reader does.
+fn unquote(value: &str) -> &str {
+    ['"', '\'']
+        .into_iter()
+        .find_map(|quote| value.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(value)
 }
 
 /// Parses one `.npmrc` file's content into its raw, unvalidated `registry`/
 /// `@scope:registry` entries.
 ///
-/// **Recognizes exactly two key shapes** — `registry` and `@<scope>:registry` — and skips
-/// every other line outright, including every auth-shaped key (`_authToken`, `_auth`,
-/// `_password`, `_authIdent`, `always-auth`, any `//<host>/:_*` scoped-credential key) and
-/// every other npm config setting. This is the structural half of FR-013/NFR-001: there is
-/// no code path in this function that can produce a value for anything but those two key
-/// shapes.
+/// **Recognizes exactly five key shapes** — `registry`, `@<scope>:registry` and the three
+/// release-age keys `min-release-age`, `before` and `min-release-age-exclude` (spec 099, read
+/// only into [`crate::native::Settings`]) — and skips every other line outright, including every
+/// auth-shaped key (`_authToken`, `_auth`, `_password`, `_authIdent`, `always-auth`, any
+/// `//<host>/:_*` scoped-credential key) and every other npm config setting. This is the
+/// structural half of FR-013/NFR-001: there is no code path in this function that can produce a
+/// value for anything but those key shapes.
 ///
 /// Grammar (FR-001): npm's own `.npmrc` INI-like format — `key=value` or `key = value` one
 /// per line, `#`/`;` as full-line comment markers, blank lines ignored. A line with no `=` is
@@ -392,6 +414,7 @@ struct RawNpmrc {
 /// valid line still applies.
 fn parse_npmrc_raw(path: &Path, content: &str) -> RawNpmrc {
     let mut out = RawNpmrc::default();
+    let mut native = NpmrcNative::default();
     for (line_number, line) in content.lines().enumerate() {
         let line_number = line_number + 1;
         let line = line.trim();
@@ -416,10 +439,17 @@ fn parse_npmrc_raw(path: &Path, content: &str) -> RawNpmrc {
             .filter(|scope| scope.starts_with('@'))
         {
             out.scoped.insert(scope.to_string(), value.to_string());
+        } else if key == "min-release-age" {
+            native.min_release_age = Some(unquote(value).to_owned());
+        } else if key == "before" {
+            native.before = Some(unquote(value).to_owned());
+        } else if key == "min-release-age-exclude" || key == "min-release-age-exclude[]" {
+            native.exclude.push(unquote(value).to_owned());
         }
         // Every other key (including every auth-shaped one) is deliberately ignored — see
         // this function's doc.
     }
+    out.native = crate::native::settings_from_npmrc(path, &native);
     out
 }
 
@@ -534,12 +564,18 @@ impl NpmConfigCache {
         self.0
             .get_or_parse(path, |content| parse_npmrc_raw(path, content))
     }
+
+    /// The release-age entries of the `.npmrc` at `path`, through the same cached parse as the
+    /// registry entries; `None` when the file cannot be read.
+    pub(crate) fn native(&self, path: &Path) -> Option<crate::native::Settings> {
+        self.get_or_parse(path).and_then(|raw| raw.native.clone())
+    }
 }
 
 /// Owned by `NpmEcosystem`, shared across every document it parses — the npm analogue of
 /// `deps_cargo::parser::CargoParseContext`.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NpmParseContext {
     /// Gates every workspace-declared [`NpmRegistryIndex`] this parse constructs.
     pub policy: Arc<RegistryAccessPolicy>,
@@ -549,6 +585,20 @@ pub struct NpmParseContext {
     /// Memoizes each distinct `pnpm-workspace.yaml` file's parsed catalogs across every parse
     /// that reads it (spec 046, NFR-001).
     pub workspace_cache: Arc<crate::catalog::PnpmWorkspaceCache>,
+    /// Whether the package manager's own release-age settings are honored; shared live with
+    /// the server configuration, like `deps_cargo::parser::CargoParseContext`'s.
+    pub(crate) native_cooldown: Arc<deps_core::policy_config::AtomicToggle<NativeCooldownMode>>,
+    /// Memoizes the release-age settings of `pnpm-workspace.yaml` and `bunfig.toml` files.
+    pub(crate) native_cache: Arc<crate::native::NativeSettingsCache>,
+    /// The user's home directory, whose config files never change what a repository holds
+    /// back.
+    pub(crate) user_home: Option<deps_core::UserHome>,
+}
+
+impl Default for NpmParseContext {
+    fn default() -> Self {
+        Self::new(Arc::default(), Arc::default(), Arc::default())
+    }
 }
 
 impl NpmParseContext {
@@ -573,7 +623,7 @@ impl NpmParseContext {
     /// assert!(Arc::strong_count(&ctx.policy) >= 1);
     /// ```
     #[must_use]
-    pub const fn new(
+    pub fn new(
         policy: Arc<RegistryAccessPolicy>,
         config_cache: Arc<NpmConfigCache>,
         workspace_cache: Arc<crate::catalog::PnpmWorkspaceCache>,
@@ -582,13 +632,37 @@ impl NpmParseContext {
             policy,
             config_cache,
             workspace_cache,
+            native_cooldown: Arc::default(),
+            native_cache: Arc::default(),
+            user_home: deps_core::UserHome::current().cloned(),
         }
     }
 
-    /// Sets whether npm-family native release-age settings are honored, ignored or off.
+    /// Test-only: treats `home` as the user home directory instead of the process's real one.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
-    pub fn with_native_cooldown(self, _mode: deps_core::policy_config::NativeCooldownMode) -> Self {
-        todo!("native release-age gate: NpmParseContext::with_native_cooldown")
+    pub fn with_user_home_for_test(mut self, home: deps_core::UserHome) -> Self {
+        self.user_home = Some(home);
+        self
+    }
+
+    /// Sets whether the npm-family release-age settings (`.npmrc`, `pnpm-workspace.yaml`,
+    /// `bunfig.toml`) are honored or ignored, with a private toggle.
+    #[must_use]
+    pub fn with_native_cooldown(mut self, mode: NativeCooldownMode) -> Self {
+        self.native_cooldown = Arc::new(AtomicToggle::new(mode));
+        self
+    }
+
+    /// Shares `toggle` with this context so a configuration change takes effect on the next
+    /// parse without rebuilding the ecosystem.
+    #[must_use]
+    pub fn with_native_cooldown_toggle(
+        mut self,
+        toggle: Arc<AtomicToggle<NativeCooldownMode>>,
+    ) -> Self {
+        self.native_cooldown = toggle;
+        self
     }
 }
 

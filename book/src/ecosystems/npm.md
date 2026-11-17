@@ -165,6 +165,38 @@ entry belonging to the `package.json` you are looking at is preferred:
 When the preferred entry does not satisfy the requirement, the highest satisfying entry is used
 instead, and every other satisfying entry stays an `also locked at` alternative.
 
+## Release-Age Windows
+
+When the project's package manager holds back young releases, a `latest` inside that window is
+explained, never written: hover and `check` name the setting and when the version becomes eligible,
+and `deps-cli update` skips it (exit 0). Nothing older is proposed in its place, and a version
+already in the lock file stays eligible. Which manager applies is decided by the lock file the
+project resolves with (`package-lock.json`, `pnpm-lock.yaml`, `bun.lock`/`bun.lockb`, `yarn.lock`);
+without one, a `pnpm-workspace.yaml` selects pnpm, a `bunfig.toml` selects Bun, otherwise npm.
+Only that manager's own file in the project root (the directory of the lock file, else the
+manifest's directory) is read; your home directory and environment variables never are.
+
+| Manager | File | Setting | Unit |
+|---------|------|---------|------|
+| npm | `.npmrc` | `min-release-age`, or `before` (an absolute cutoff that wins when both are set) | days; RFC 3339 or `YYYY-MM-DD` |
+| pnpm | `pnpm-workspace.yaml` | `minimumReleaseAge` (off when `minimumReleaseAgeStrict: false`) | minutes |
+| Bun | `bunfig.toml` | `[install] minimumReleaseAge` | seconds |
+
+Yarn is not supported. pnpm's built-in default is never assumed: only a declared value applies.
+Exemptions (`min-release-age-exclude`, `minimumReleaseAgeExclude`, `minimumReleaseAgeExcludes`)
+accept names, `name@version` and `*` wildcards (segment-scoped for npm); an entry the server cannot
+interpret exactly discards the whole list, so the window holds more rather than less. A malformed
+value (a fraction, a negative number, text) is ignored with a warning.
+
+Publish times are fetched only when a window applies: the server then reads the package's full
+document even with `freshness.enabled = false`, within the same cache, timeout and size limits as
+the freshness signal, and through the same network policy as the version list. If a registry omits
+publish times or the fetch times out, the window does not apply to that package. Because those
+versions are now dated, a deprecated security-fix target is no longer steered onto a `latest`
+that is younger than the default release cooldown (3 days), exactly as for Cargo. A project without a
+window sends exactly the requests it sent before. `freshness.honor_native_cooldown = false` ignores
+all of it.
+
 ## Non-Registry Dependency Sources
 
 A dependency declared against a git repository, a local filesystem path, or a workspace

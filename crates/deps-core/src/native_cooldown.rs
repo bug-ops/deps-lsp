@@ -11,7 +11,13 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+mod exemption;
+mod scope;
+
+pub use exemption::{Exemption, ExemptionError, ExemptionList, ExemptionSyntax, parse_exemptions};
+pub use scope::RepositoryScope;
 
 use crate::lsp_helpers::{ResolvedCandidatesMap, ResolvedVersionsMap, VersionData};
 use crate::{ConcreteVersion, CooldownWindow, Dependency, NormalizedName, PackageKey, PublishTime};
@@ -96,8 +102,14 @@ impl NativeTimeSpan {
     /// # Errors
     ///
     /// [`TimeSpanError::Overflow`] when the span does not fit in `u64` seconds.
-    pub fn from_count(_count: u64, _unit: TimeUnit) -> Result<TimeSpanValue, TimeSpanError> {
-        todo!("native release-age gate: NativeTimeSpan::from_count")
+    pub fn from_count(count: u64, unit: TimeUnit) -> Result<TimeSpanValue, TimeSpanError> {
+        if count == 0 {
+            return Ok(TimeSpanValue::Disabled);
+        }
+        let secs = count
+            .checked_mul(unit.secs())
+            .ok_or(TimeSpanError::Overflow)?;
+        Ok(TimeSpanValue::Span(Self { count, unit, secs }))
     }
 
     /// The span length in seconds (unclamped).
@@ -165,13 +177,7 @@ pub fn parse_time_span(raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
     let word = rest.strip_prefix(' ').unwrap_or(rest);
     let unit = TimeUnit::from_word(word).ok_or(TimeSpanError::Malformed)?;
     let count: u64 = digits.parse().map_err(|_| TimeSpanError::Overflow)?;
-    if count == 0 {
-        return Ok(TimeSpanValue::Disabled);
-    }
-    let secs = count
-        .checked_mul(unit.secs())
-        .ok_or(TimeSpanError::Overflow)?;
-    Ok(TimeSpanValue::Span(NativeTimeSpan { count, unit, secs }))
+    NativeTimeSpan::from_count(count, unit)
 }
 
 /// Parses uv's `exclude-newer` span grammar (friendly units and ISO 8601 durations).
@@ -180,8 +186,65 @@ pub fn parse_time_span(raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
 ///
 /// [`TimeSpanError::Malformed`] outside the grammar; [`TimeSpanError::Overflow`] when the span
 /// exceeds `u64` seconds.
-pub fn parse_uv_span(_raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
-    todo!("native release-age gate: parse_uv_span")
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::native_cooldown::{TimeSpanError, TimeSpanValue, parse_uv_span};
+///
+/// assert!(matches!(parse_uv_span("7 days"), Ok(TimeSpanValue::Span(_))));
+/// assert!(matches!(parse_uv_span("PT36H"), Ok(TimeSpanValue::Span(_))));
+/// assert_eq!(parse_uv_span("0 days"), Ok(TimeSpanValue::Disabled));
+/// assert_eq!(parse_uv_span("1 month"), Err(TimeSpanError::Malformed));
+/// ```
+pub fn parse_uv_span(raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
+    let parsed = match raw.strip_prefix(['P', 'p']) {
+        Some(iso) => parse_iso_term(iso),
+        None => split_count(raw).and_then(|(count, rest)| Some((count, friendly_unit(rest)?))),
+    };
+    let (count, unit) = parsed.ok_or(TimeSpanError::Malformed)?;
+    NativeTimeSpan::from_count(count?, unit)
+}
+
+type CountAndUnit = (Result<u64, TimeSpanError>, TimeUnit);
+
+/// Splits a leading digit run off `text`; the count is `Err(Overflow)` when it exceeds `u64`.
+fn split_count(text: &str) -> Option<(Result<u64, TimeSpanError>, &str)> {
+    let digits_len = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, rest) = text.split_at(digits_len);
+    (!digits.is_empty()).then(|| (digits.parse().map_err(|_| TimeSpanError::Overflow), rest))
+}
+
+/// A single-term ISO 8601 duration after the `P`: `<n>W`, `<n>D`, `T<n>H`, `T<n>M` or `T<n>S`.
+///
+/// Calendar units (`P1M`, `P1Y`) and combined terms (`P1DT2H`) are not matched.
+fn parse_iso_term(iso: &str) -> Option<CountAndUnit> {
+    let (time_part, body) = match iso.strip_prefix(['T', 't']) {
+        Some(body) => (true, body),
+        None => (false, iso),
+    };
+    let (count, designator) = split_count(body)?;
+    let unit = match (time_part, designator.to_ascii_uppercase().as_str()) {
+        (false, "W") => TimeUnit::Week,
+        (false, "D") => TimeUnit::Day,
+        (true, "H") => TimeUnit::Hour,
+        (true, "M") => TimeUnit::Minute,
+        (true, "S") => TimeUnit::Second,
+        _ => return None,
+    };
+    Some((count, unit))
+}
+
+fn friendly_unit(rest: &str) -> Option<TimeUnit> {
+    let word = rest.strip_prefix(' ').unwrap_or(rest).to_ascii_lowercase();
+    match word.as_str() {
+        "second" | "seconds" | "sec" | "secs" => Some(TimeUnit::Second),
+        "minute" | "minutes" | "min" | "mins" => Some(TimeUnit::Minute),
+        "hour" | "hours" | "hr" | "hrs" => Some(TimeUnit::Hour),
+        "day" | "days" => Some(TimeUnit::Day),
+        "week" | "weeks" | "wk" | "wks" => Some(TimeUnit::Week),
+        _ => None,
+    }
 }
 
 /// An absolute instant before which releases are eligible, as configured (`npm before`,
@@ -191,22 +254,77 @@ pub struct NativeCutoff(PublishTime);
 
 impl NativeCutoff {
     /// Parses an RFC 3339 timestamp.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::native_cooldown::NativeCutoff;
+    ///
+    /// let cutoff = NativeCutoff::parse_rfc3339("2026-01-01T02:00:00+02:00").unwrap();
+    /// assert_eq!(cutoff.to_string(), "2026-01-01T00:00:00Z");
+    /// assert!(NativeCutoff::parse_rfc3339("2026-01-01").is_none());
+    /// ```
     #[must_use]
-    pub fn parse_rfc3339(_raw: &str) -> Option<Self> {
-        todo!("native release-age gate: NativeCutoff::parse_rfc3339")
+    pub fn parse_rfc3339(raw: &str) -> Option<Self> {
+        PublishTime::parse_rfc3339(raw).map(Self)
     }
 
     /// Parses npm's `before` value: an RFC 3339 timestamp or a date-only value at midnight UTC.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::native_cooldown::NativeCutoff;
+    ///
+    /// let date = NativeCutoff::parse_npm_date("2026-01-01").unwrap();
+    /// assert_eq!(Some(date), NativeCutoff::parse_rfc3339("2026-01-01T00:00:00Z"));
+    /// assert!(NativeCutoff::parse_npm_date("soon").is_none());
+    /// ```
     #[must_use]
-    pub fn parse_npm_date(_raw: &str) -> Option<Self> {
-        todo!("native release-age gate: NativeCutoff::parse_npm_date")
+    pub fn parse_npm_date(raw: &str) -> Option<Self> {
+        let date_only = raw.len() == 10
+            && raw.bytes().enumerate().all(|(i, b)| {
+                if matches!(i, 4 | 7) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            });
+        if date_only {
+            PublishTime::parse_rfc3339(&format!("{raw}T00:00:00Z")).map(Self)
+        } else {
+            Self::parse_rfc3339(raw)
+        }
     }
 }
 
 impl fmt::Display for NativeCutoff {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("native release-age gate: NativeCutoff Display")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secs = self.0.as_unix_secs();
+        let (days, day_secs) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        let (year, month, day) = civil_from_days(days);
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            day_secs / 3600,
+            day_secs % 3600 / 60,
+            day_secs % 60
+        )
     }
+}
+
+/// Proleptic Gregorian date of a day count since 1970-01-01 (the `civil_from_days` algorithm).
+const fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 /// What a native setting restricts: a relative age or an absolute cutoff.
@@ -218,6 +336,15 @@ pub enum NativeLimit {
     PublishedAfter(NativeCutoff),
 }
 
+impl fmt::Display for NativeLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MinAge(span) => span.fmt(f),
+            Self::PublishedAfter(cutoff) => cutoff.fmt(f),
+        }
+    }
+}
+
 /// How long a version stays held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeHold {
@@ -227,15 +354,34 @@ pub enum NativeHold {
     Indefinite,
 }
 
+impl NativeHold {
+    /// The clause completing a hold sentence: how long until the version is eligible.
+    #[must_use]
+    pub fn eligibility_clause(self) -> String {
+        match self {
+            Self::For(secs) => format!("eligible in {}", crate::format_remaining_duration(secs)),
+            Self::Indefinite => "not eligible while the cutoff stays in place".to_owned(),
+        }
+    }
+}
+
 /// A PyPI package name restricted to characters safe to quote in a diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PypiPackageLabel(String);
 
 impl PypiPackageLabel {
+    /// Longest name accepted; PyPI names are short.
+    const MAX_LEN: usize = 128;
+
     /// Wraps `name`, or `None` when it is empty or has a character outside PEP 508 names.
     #[must_use]
-    pub fn new(_name: &str) -> Option<Self> {
-        todo!("native release-age gate: PypiPackageLabel::new")
+    pub fn new(name: &str) -> Option<Self> {
+        let valid = !name.is_empty()
+            && name.len() <= Self::MAX_LEN
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        valid.then(|| Self(name.to_owned()))
     }
 
     /// The label text.
@@ -256,7 +402,8 @@ impl PypiPackageLabel {
 ///
 /// let Ok(TimeSpanValue::Span(span)) = parse_time_span("7 days") else { unreachable!() };
 /// let window = NativeCooldown::new(NativeLimit::MinAge(span), NativeCooldownSource::CargoGlobal)
-///     .window();
+///     .age_window()
+///     .unwrap();
 /// assert!(window.contains(3600));
 /// assert!(!window.contains(7 * 86_400));
 /// ```
@@ -367,13 +514,25 @@ pub enum NativeCooldownSource {
 pub struct NativeCooldown {
     limit: NativeLimit,
     source: NativeCooldownSource,
+    exempt_versions: Arc<[ConcreteVersion]>,
 }
 
 impl NativeCooldown {
     /// Builds a cooldown from a limit and its source.
     #[must_use]
-    pub const fn new(limit: NativeLimit, source: NativeCooldownSource) -> Self {
-        Self { limit, source }
+    pub fn new(limit: NativeLimit, source: NativeCooldownSource) -> Self {
+        Self {
+            limit,
+            source,
+            exempt_versions: Arc::from([]),
+        }
+    }
+
+    /// Releases the listed exact versions from the limit (`name@version` exemptions).
+    #[must_use]
+    pub fn with_exempt_versions(mut self, versions: Arc<[ConcreteVersion]>) -> Self {
+        self.exempt_versions = versions;
+        self
     }
 
     /// The configured limit.
@@ -388,20 +547,25 @@ impl NativeCooldown {
     #[must_use]
     pub fn hold(
         &self,
-        _published_at: Option<PublishTime>,
-        _version: &ConcreteVersion,
-        _now: PublishTime,
+        published_at: Option<PublishTime>,
+        version: &ConcreteVersion,
+        now: PublishTime,
     ) -> Option<NativeHold> {
-        todo!("native release-age gate: NativeCooldown::hold")
-    }
-
-    /// The configured span, as the user wrote it.
-    // TODO(review): removed when the Cargo surfaces move to `hold`; panics for a cutoff limit.
-    #[must_use]
-    pub fn span(&self) -> NativeTimeSpan {
+        if self.exempt_versions.contains(version) {
+            return None;
+        }
+        let published_at = published_at?;
         match self.limit {
-            NativeLimit::MinAge(span) => span,
-            NativeLimit::PublishedAfter(_) => todo!("native release-age gate: span of a cutoff"),
+            NativeLimit::MinAge(span) => {
+                let window = NativeWindow::new(span);
+                let age = published_at.age_secs_from(now);
+                window
+                    .contains(age)
+                    .then(|| NativeHold::For(window.as_secs() - age))
+            }
+            NativeLimit::PublishedAfter(cutoff) => (published_at.as_unix_secs()
+                > cutoff.0.as_unix_secs())
+            .then_some(NativeHold::Indefinite),
         }
     }
 
@@ -411,32 +575,43 @@ impl NativeCooldown {
         &self.source
     }
 
-    /// The window this cooldown enforces.
+    /// The relative-age window this cooldown enforces; `None` for an absolute cutoff.
     #[must_use]
-    pub fn window(&self) -> NativeWindow {
-        NativeWindow::new(self.span())
+    pub fn age_window(&self) -> Option<NativeWindow> {
+        match self.limit {
+            NativeLimit::MinAge(span) => Some(NativeWindow::new(span)),
+            NativeLimit::PublishedAfter(_) => None,
+        }
     }
 }
 
 impl fmt::Display for NativeCooldown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let limit = &self.limit;
         match &self.source {
             NativeCooldownSource::CargoGlobal => {
-                write!(f, "cargo registry.global-min-publish-age = {}", self.span())
+                write!(f, "cargo registry.global-min-publish-age = {limit}")
             }
-            NativeCooldownSource::CargoRegistry { alias } => write!(
-                f,
-                "cargo registries.{}.min-publish-age = {}",
-                alias.as_str(),
-                self.span()
-            ),
-            NativeCooldownSource::NpmMinReleaseAge
-            | NativeCooldownSource::NpmBefore
-            | NativeCooldownSource::PnpmMinimumReleaseAge
-            | NativeCooldownSource::BunMinimumReleaseAge
-            | NativeCooldownSource::UvExcludeNewer
-            | NativeCooldownSource::UvExcludeNewerPackage { .. } => {
-                todo!("native release-age gate: Display for the npm-family and uv sources")
+            NativeCooldownSource::CargoRegistry { alias } => {
+                write!(
+                    f,
+                    "cargo registries.{}.min-publish-age = {limit}",
+                    alias.as_str()
+                )
+            }
+            NativeCooldownSource::NpmMinReleaseAge => {
+                write!(f, "npm min-release-age = {limit}")
+            }
+            NativeCooldownSource::NpmBefore => write!(f, "npm before = {limit}"),
+            NativeCooldownSource::PnpmMinimumReleaseAge => {
+                write!(f, "pnpm minimumReleaseAge = {limit}")
+            }
+            NativeCooldownSource::BunMinimumReleaseAge => {
+                write!(f, "bun minimumReleaseAge = {limit}")
+            }
+            NativeCooldownSource::UvExcludeNewer => write!(f, "uv exclude-newer = {limit}"),
+            NativeCooldownSource::UvExcludeNewerPackage { package } => {
+                write!(f, "uv exclude-newer-package.{} = {limit}", package.as_str())
             }
         }
     }
@@ -509,18 +684,19 @@ impl<'a> NativeGate<'a> {
                 .is_some_and(|candidates| candidates.versions().contains(version))
     }
 
-    /// Seconds until `version`, published at `published_at`, becomes eligible at `now`;
-    /// `None` when it is eligible (no publish time, outside the window, or locked).
+    /// How long `version`, published at `published_at`, stays held at `now`; `None` when it
+    /// is eligible (no publish time, outside the limit, or locked).
     #[must_use]
-    pub fn remaining(
+    pub fn hold(
         &self,
         published_at: Option<PublishTime>,
         version: &ConcreteVersion,
         now: PublishTime,
-    ) -> Option<u64> {
-        let age = published_at?.age_secs_from(now);
-        let window = self.cooldown.window();
-        (window.contains(age) && !self.is_locked(version)).then(|| window.as_secs() - age)
+    ) -> Option<NativeHold> {
+        if self.is_locked(version) {
+            return None;
+        }
+        self.cooldown.hold(published_at, version, now)
     }
 
     /// Whether `version`, published at `published_at`, is held back at `now`.
@@ -534,7 +710,7 @@ impl<'a> NativeGate<'a> {
         version: &ConcreteVersion,
         now: PublishTime,
     ) -> bool {
-        self.remaining(published_at, version, now).is_some()
+        self.hold(published_at, version, now).is_some()
     }
 }
 
@@ -565,86 +741,4 @@ pub fn native_cooldowns_by_name(
     seen.into_iter()
         .filter_map(|(name, cooldown)| Some((name, cooldown?)))
         .collect()
-}
-
-/// Package-manager dialect an exemption list is written in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExemptionSyntax {
-    /// npm `min-release-age-exclude` (minimatch `*` within one path segment).
-    Npm,
-    /// pnpm `minimumReleaseAgeExclude`.
-    Pnpm,
-    /// Bun `minimumReleaseAgeExcludes`.
-    Bun,
-    /// uv `exclude-newer-package` names.
-    Uv,
-}
-
-/// Which versions of a package an exemption list releases from the window.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Exemption {
-    /// The package is not exempt.
-    None,
-    /// Every version of the package is exempt.
-    AllVersions,
-    /// Only the listed versions are exempt.
-    Versions(Vec<String>),
-}
-
-/// Why an exemption list was rejected as a whole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ExemptionError {
-    /// An entry uses syntax this reader does not support.
-    #[error("unsupported exemption entry")]
-    Unsupported,
-    /// The list or one of its entries exceeds the size caps.
-    #[error("exemption list too large")]
-    TooLarge,
-}
-
-/// A parsed per-package exemption list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExemptionList {
-    entries: Vec<String>,
-}
-
-impl ExemptionList {
-    /// What the list exempts for the package `name`.
-    #[must_use]
-    pub fn lookup(&self, _name: &str) -> Exemption {
-        todo!("native release-age gate: ExemptionList::lookup")
-    }
-}
-
-/// Parses `entries` in the given dialect.
-///
-/// # Errors
-///
-/// [`ExemptionError`] when any entry is unsupported or a size cap is exceeded; the whole list is
-/// rejected so a partially understood list never exempts more than the user wrote.
-pub fn parse_exemptions(
-    _entries: &[&str],
-    _syntax: ExemptionSyntax,
-) -> Result<ExemptionList, ExemptionError> {
-    todo!("native release-age gate: parse_exemptions")
-}
-
-/// The directories whose repository-level config applies to one manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepositoryScope {
-    dirs: Vec<PathBuf>,
-}
-
-impl RepositoryScope {
-    /// Scope from `manifest_dir` up to `root` inclusive, never including `home`.
-    #[must_use]
-    pub fn new(_manifest_dir: &Path, _root: &Path, _home: Option<&Path>) -> Self {
-        todo!("native release-age gate: RepositoryScope::new")
-    }
-
-    /// The config directories, closest to the manifest first.
-    #[must_use]
-    pub fn config_dirs(&self) -> Vec<PathBuf> {
-        self.dirs.clone()
-    }
 }

@@ -848,6 +848,7 @@ pub fn parse_pnpm_workspace_manifest(
     }
 
     let registries = crate::parser::resolve_dependency_sources(&mut dependencies, uri, ctx);
+    crate::native::apply_to_workspace_buffer(&mut dependencies, uri, content, ctx);
     Ok(NpmParseResult {
         dependencies,
         uri: uri.clone(),
@@ -901,6 +902,7 @@ fn push_dependency(
         origin,
         source: deps_core::parser::DependencySource::Registry,
         registry_entry: None,
+        native_cooldown: None,
         package,
     });
 }

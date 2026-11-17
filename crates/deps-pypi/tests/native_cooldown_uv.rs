@@ -250,13 +250,31 @@ async fn uv_toml_alone_supplies_the_window() {
 }
 
 #[tokio::test]
-async fn uv_toml_without_the_key_does_not_hide_the_pyproject_value() {
+async fn uv_toml_without_the_key_still_hides_the_pyproject_value() {
+    assert_control_applies().await;
     let (_g, root) = root();
     write(&root.join("uv.toml"), "index-strategy = \"first-index\"\n");
     assert!(
         requests_window(&root, "exclude-newer = \"7 days\"")
             .await
-            .is_some()
+            .is_none(),
+        "uv ignores [tool.uv] when uv.toml exists in the same directory (no per-key merge)"
+    );
+}
+
+#[tokio::test]
+async fn nearest_config_file_without_the_key_hides_a_farther_window() {
+    let (_g, root) = root();
+    write(&root.join("uv.toml"), "exclude-newer = \"7 days\"\n");
+    let project = root.join("tools/app");
+    let content = pyproject("index-strategy = \"first-index\"");
+    write(&project.join("pyproject.toml"), &content);
+    let eco = ecosystem(NativeCooldownMode::Honor);
+    assert!(
+        cooldown_in(&eco, &project, "pyproject.toml", &content, "requests")
+            .await
+            .is_none(),
+        "only the nearest directory holding uv config is read"
     );
 }
 

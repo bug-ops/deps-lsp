@@ -36,7 +36,7 @@ use crate::config::{
 use crate::types::{
     CargoDependency, CargoDependencySection, CustomRegistryOrigin, DependencySource,
 };
-use deps_core::native_cooldown::NativeCooldown;
+use deps_core::native_cooldown::{NativeCooldown, RepositoryScope};
 use deps_core::net_policy::{
     EnvSource, ProcessEnv, RegistryAccessPolicy, RegistryRejectionClassifier,
 };
@@ -961,28 +961,16 @@ fn discover_workspace(doc_uri: &Url) -> Result<WorkspaceDiscovery> {
 /// boundary is the workspace root (inclusive), or the manifest directory alone when there is
 /// none; the user's home directory is excluded wherever it falls in that range.
 fn native_config_paths(discovery: &WorkspaceDiscovery, ctx: &CargoParseContext) -> Vec<PathBuf> {
+    let root = discovery
+        .workspace_root
+        .as_deref()
+        .unwrap_or(&discovery.manifest_dir);
+    let scope =
+        RepositoryScope::with_user_home(&discovery.manifest_dir, root, ctx.user_home.as_ref());
     discovery
         .config_paths
         .iter()
-        .filter(|config| {
-            let Some(dir) = config.parent().and_then(std::path::Path::parent) else {
-                return false;
-            };
-            let in_repository = discovery
-                .workspace_root
-                .as_deref()
-                .map_or(dir == discovery.manifest_dir, |root| dir.starts_with(root));
-            // Canonical comparison also catches a symlinked dir or a symlinked config file.
-            let is_home = ctx.user_home.as_ref().is_some_and(|home| {
-                home.is(dir)
-                    || std::fs::canonicalize(dir).is_ok_and(|real| home.is(&real))
-                    || std::fs::canonicalize(config).is_ok_and(|real| {
-                        std::fs::canonicalize(home.path().join(".cargo/config.toml"))
-                            .is_ok_and(|home_config| home_config == real)
-                    })
-            });
-            in_repository && !is_home
-        })
+        .filter(|config| scope.admits(config, std::path::Path::new(".cargo/config.toml")))
         .cloned()
         .collect()
 }

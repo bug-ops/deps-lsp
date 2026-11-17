@@ -583,19 +583,40 @@ impl Fixture {
         freshness: FreshnessSettings,
         behavior: Versions,
     ) -> InteractiveFetch<SharedVersions> {
+        self.versions_demanding(
+            context,
+            name,
+            freshness,
+            PublishTimeDemand::NotRequired,
+            behavior,
+        )
+        .await
+    }
+
+    async fn versions_demanding(
+        &self,
+        context: FetchContext,
+        name: &str,
+        freshness: FreshnessSettings,
+        demand: PublishTimeDemand,
+        behavior: Versions,
+    ) -> InteractiveFetch<SharedVersions> {
         let package = PackageName::new(name);
         let source = DependencySource::Registry;
         let outcomes = DependencyOutcomes::new();
-        let request = InteractiveFetchRequest::from_parts(
-            VersionData::new(&self.cached, &self.resolved)
-                .with_ecosystem(self.ecosystem)
-                .with_outcomes(&outcomes)
-                .with_interactive_fetch_gate(&self.gate),
-            &self.manifest,
-            crate::test_util::package_key(package.as_str()),
-            source.clone(),
-            context,
-        );
+        let request = InteractiveFetchRequest {
+            demand,
+            ..InteractiveFetchRequest::from_parts(
+                VersionData::new(&self.cached, &self.resolved)
+                    .with_ecosystem(self.ecosystem)
+                    .with_outcomes(&outcomes)
+                    .with_interactive_fetch_gate(&self.gate),
+                &self.manifest,
+                crate::test_util::package_key(package.as_str()),
+                source.clone(),
+                context,
+            )
+        };
         let (gate, lookup) = request
             .gated(&self.registry, LookupKind::VersionList)
             .unwrap();
@@ -648,7 +669,30 @@ impl Fixture {
                 }
             }
         };
-        flight::await_shared(gate, lookup, fetch, &request, ListShape::of(freshness)).await
+        flight::await_shared(
+            gate,
+            lookup,
+            fetch,
+            &request,
+            ListShape::of(freshness, request.demand),
+        )
+        .await
+    }
+
+    async fn native(
+        &self,
+        name: &str,
+        freshness: FreshnessSettings,
+        behavior: Versions,
+    ) -> InteractiveFetch<SharedVersions> {
+        self.versions_demanding(
+            FetchContext::Hover,
+            name,
+            freshness,
+            PublishTimeDemand::NativeWindow,
+            behavior,
+        )
+        .await
     }
 
     async fn enriched(&self, name: &str, behavior: Versions) -> InteractiveFetch<SharedVersions> {
@@ -707,6 +751,41 @@ async fn enriched_request_does_not_follow_a_bare_flight() {
 
     assert!(!Arc::ptr_eq(&live_list(bare), &live_list(enriched)));
     assert_eq!(fixture.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_request_neither_follows_nor_is_followed_by_a_bare_or_enriched_flight() {
+    for freshness in [FreshnessSettings::Disabled, FreshnessSettings::default()] {
+        let fixture = Fixture::new();
+        let (plain, native) = tokio::join!(
+            fixture.versions("serde", freshness, Versions::Succeed(secs(2))),
+            fixture.native("serde", freshness, Versions::Succeed(secs(2))),
+        );
+        assert!(!Arc::ptr_eq(&live_list(plain), &live_list(native)));
+        assert_eq!(fixture.calls(), 2, "{freshness:?}: plain then native");
+
+        let fixture = Fixture::new();
+        let (native, plain) = tokio::join!(
+            fixture.native("serde", freshness, Versions::Succeed(secs(2))),
+            fixture.versions("serde", freshness, Versions::Succeed(secs(2))),
+        );
+        assert!(!Arc::ptr_eq(&live_list(native), &live_list(plain)));
+        assert_eq!(fixture.calls(), 2, "{freshness:?}: native then plain");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_native_requests_share_one_fetch() {
+    let fixture = Fixture::new();
+    let succeed = Versions::Succeed(secs(2));
+
+    let (a, b) = tokio::join!(
+        fixture.native("serde", FreshnessSettings::Disabled, succeed),
+        fixture.native("serde", FreshnessSettings::Disabled, succeed),
+    );
+
+    assert!(Arc::ptr_eq(&live_list(a), &live_list(b)));
+    assert_eq!(fixture.calls(), 1);
 }
 
 #[tokio::test(start_paused = true)]

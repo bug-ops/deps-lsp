@@ -82,6 +82,16 @@ pub(crate) struct ChangeFetch {
     pub(crate) requested: DeclaredRequirements,
 }
 
+/// What a diff-scoped fetch needs from the freshly committed parse result.
+type SubsetFetchInputs = (
+    HashMap<NormalizedName, Vec<ConcreteVersion>>,
+    deps_core::SelectionContext,
+    DepSources,
+    HashSet<NormalizedName>,
+    DeclaredRequirements,
+    deps_core::PublishTimeDemand,
+);
+
 /// Fans the registry fetch out for the dependencies the caller determined are pending: marks
 /// the document loading, opens an LSP progress notification when the client supports it,
 /// resolves each dependency occurrence to a fetchable source (deduping
@@ -126,13 +136,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
     // Build the in-use-version map (§4.6), the manifest's own `SelectionContext` (#1433),
     // and the added/changed dependencies' resolved sources (spec FR-001/FR-011) from the
     // freshly-committed parse result and the resolved versions just loaded above.
-    let (in_use, selection_context, dep_sources, collided_names, requested): (
-        HashMap<NormalizedName, Vec<ConcreteVersion>>,
-        deps_core::SelectionContext,
-        DepSources,
-        HashSet<NormalizedName>,
-        DeclaredRequirements,
-    ) = match state.get_document(uri) {
+    let (in_use, selection_context, dep_sources, collided_names, requested, demand): SubsetFetchInputs = match state.get_document(uri) {
         Some(doc) => match doc.manifest() {
             Some(pr) => {
                 let mut prep = prepare_fetch(pr, resolved_versions, resolved_version_candidates);
@@ -147,6 +151,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
                     prep.dep_sources,
                     prep.collided_names,
                     requested,
+                    prep.demand,
                 )
             }
             None => (
@@ -155,6 +160,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
                 Vec::new(),
                 HashSet::new(),
                 HashMap::new(),
+                deps_core::PublishTimeDemand::NotRequired,
             ),
         },
         None => (
@@ -163,6 +169,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
             Vec::new(),
             HashSet::new(),
             HashMap::new(),
+            deps_core::PublishTimeDemand::NotRequired,
         ),
     };
 
@@ -185,6 +192,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
         &in_use,
         progress_sender,
         freshness_settings,
+        demand,
         fetch_timeout,
         max_concurrent_fetches,
         &selection_context,
@@ -430,6 +438,7 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
+            deps_core::PublishTimeDemand::NotRequired,
             FetchTimeout::constant::<5>(),
             FetchConcurrency::constant::<10>(),
             &deps_core::SelectionContext::none(),
@@ -650,6 +659,7 @@ dependencies = ["requests>=2.0.0"]
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
+                deps_core::PublishTimeDemand::NotRequired,
                 FetchTimeout::constant::<5>(),
                 FetchConcurrency::constant::<10>(),
                 &deps_core::SelectionContext::none(),

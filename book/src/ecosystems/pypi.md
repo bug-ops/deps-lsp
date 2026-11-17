@@ -174,6 +174,41 @@ whether the file declares an explicit `--index-url` primary:
   fallback, its hover heading still omits the `pypi.org` project link (the same
   suppression a genuinely private dependency gets). No data-correctness impact.
 
+## uv's Release-Age Window (`exclude-newer`)
+
+uv can ignore releases newer than a configured age or instant. deps-lsp reads the same settings
+from the repository's `uv.toml` and `[tool.uv]` tables and **explains** the hold the same way it
+does for Cargo's `min-publish-age` (hover callout, `outdated` diagnostic note, no update offered
+for the held version, `deps-cli update` skips it); it never writes an older version because of it.
+
+```toml
+# pyproject.toml ([tool.uv]) or uv.toml (top level)
+exclude-newer = "7 days"                        # relative window
+# exclude-newer = "2026-01-01T00:00:00Z"        # fixed cutoff: later files are held indefinitely
+exclude-newer-package = { requests = "2026-01-01T00:00:00Z", urllib3 = false }
+```
+
+- **Values:** a friendly span (`<integer> <unit>` with seconds, minutes, hours, days or weeks), a
+  single-term ISO 8601 duration (`P2D`, `PT48H`, `P1W`) or an RFC 3339 timestamp. Calendar units
+  (`1 month`, `P1M`), date-only values, signs, fractions and anything else are ignored with one
+  logged warning per file. `0` and, for a package, `false` turn the window off.
+- **Which file:** as in uv, only the nearest directory (the manifest's, then its parents) holding a
+  `uv.toml` or a `pyproject.toml` with a `[tool.uv]` table is read; in that directory `uv.toml`
+  wins and `[tool.uv]` is ignored. Nothing is merged with a farther directory. Inside the file a
+  package entry in `exclude-newer-package` (names compared PEP 503-normalized) beats the global
+  `exclude-newer`. An invalid value counts as absent.
+- **Workspaces:** a project that is a member of a workspace declared by a parent
+  `pyproject.toml` (`[tool.uv.workspace]` `members` globs matched, `exclude` globs not) reads that
+  root's file, and its own `[tool.uv]` is ignored, as in uv. A project outside the members keeps
+  its own nearest file.
+- **Scope and limits:** the search walks up from the manifest directory (depth-capped) and stops
+  at your home directory, so your home directory's config and anything above it, and `UV_*`
+  environment variables, are **ignored**. Only `pyproject.toml` documents get a window; `requirements.txt`, `Pipfile` and
+  direct-URL, git or path dependencies do not. Index-level `exclude-newer` under
+  `[[tool.uv.index]]` is not read. The hold is judged per version against its latest file upload
+  time, so deps-lsp may report a hold that uv does not apply to a given file.
+- Set `freshness.honor_native_cooldown` to `false` to ignore the window entirely.
+
 ## Environment Markers (PEP 508)
 
 When a Python dependency is gated by an environment marker (e.g., `numpy>=1.24; python_version>='3.9'`), the hover popup displays:
