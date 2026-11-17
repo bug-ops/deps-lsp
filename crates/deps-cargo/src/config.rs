@@ -819,7 +819,7 @@ struct NativeConfigFile {
     per_registry: HashMap<String, RawNativeValue>,
     allow_incompatible: Option<bool>,
     invalid_keys: Vec<String>,
-    warned: std::sync::Once,
+    warned: std::sync::atomic::AtomicBool,
 }
 
 impl NativeConfigFile {
@@ -884,21 +884,22 @@ impl NativeConfigFile {
         if self.invalid_keys.is_empty() {
             return;
         }
-        self.warned.call_once(|| {
-            let keys = self
-                .invalid_keys
-                .iter()
-                .take(MAX_NAMED_KEYS)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
-                path = %path.display(),
-                count = self.invalid_keys.len(),
-                %keys,
-                "ignoring malformed Cargo publish-age settings; no window applies from them"
-            );
-        });
+        if self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let keys = self
+            .invalid_keys
+            .iter()
+            .take(MAX_NAMED_KEYS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            path = %path.display(),
+            count = self.invalid_keys.len(),
+            %keys,
+            "ignoring malformed Cargo publish-age settings; no window applies from them"
+        );
     }
 }
 

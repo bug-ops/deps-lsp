@@ -8,6 +8,7 @@
 #![cfg(feature = "lsp-responses")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -262,15 +263,12 @@ async fn held_latest_is_never_planned_and_is_reported_as_within_native_cooldown(
         .manifest
         .collect_update_candidates(MANIFEST, data(&cached, &l, T0));
     assert_eq!(candidates.len(), 1);
-    assert!(
-        matches!(
-            &candidates[0],
-            UpdateCandidate::Unplannable {
-                reason: UnplannableReason::WithinNativeCooldown,
-                ..
-            }
-        ),
-        "{candidates:?}"
+    assert_matches!(
+        &candidates[0],
+        UpdateCandidate::Unplannable {
+            reason: UnplannableReason::WithinNativeCooldown,
+            ..
+        }
     );
     assert!(
         fx.manifest

@@ -9,11 +9,15 @@ use std::sync::Arc;
 
 use deps_cargo::CargoEcosystem;
 use deps_cargo::config::ConfigFileCache;
-use deps_cargo::parser::{CargoParseContext, parse_cargo_toml_with_context};
+use deps_cargo::parser::CargoParseContext;
+#[cfg(unix)]
+use deps_cargo::parser::parse_cargo_toml_with_context;
 use deps_core::native_cooldown::native_cooldowns_by_name;
 use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use deps_core::policy_config::NativeCooldownMode;
-use deps_core::{Dependency, Ecosystem, HttpCache, UserHome};
+#[cfg(unix)]
+use deps_core::{Dependency, UserHome};
+use deps_core::{Ecosystem, HttpCache};
 use url::Url;
 
 const WINDOW: &str = "[registry]\nglobal-min-publish-age = \"7 days\"\n";
