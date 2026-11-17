@@ -504,6 +504,41 @@ own rule still allows), a matching `[update].ignore` rule here skips the depende
 for this run — it is reported `skipped (ignore-rule)` with no edit written at all, never
 rewritten to some lesser version.
 
+### Regenerating the lockfile (`--lockfile regenerate`)
+
+By default `update` only edits the manifest (`--lockfile skip`). With `--lockfile regenerate`,
+after a successful write it runs the ecosystem's own tool in the manifest's directory and checks
+the fresh lockfile against every applied version:
+
+| Ecosystem | Tool run | Checked against the lockfile |
+|---|---|---|
+| Cargo | `cargo update --workspace`, then `cargo update --package=<name>@<class> --precise=<version>` per update | the lockfile holds exactly the target |
+| npm (`package-lock.json`) | `npm install --package-lock-only --ignore-scripts --no-audit --no-fund` | a locked version satisfies the edited requirement and is at least the target |
+| pnpm (`pnpm-lock.yaml`) | `pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile` | same as npm |
+| Go | `go get -- <module>@<version>` | `go.sum` holds the module's content checksum for the target |
+
+The JSON report always has a `lockfile` object tagged by `status` (`regenerated`, `skipped`,
+`not-applicable`, `unsupported`, `failed`). A failed regeneration prints the full report and
+exits `2`; the manifest edit stays on disk and no rollback is attempted. Nothing runs under
+`--dry-run` or `--offline`. Yarn, Bun and the other ecosystems report `unsupported`, as do npm and
+pnpm workspace members (including a manifest below an ancestor that declares workspaces), a
+symlinked lockfile, Go vendored modules and Go workspaces, and updates chosen by the cooldown
+fallback for npm and pnpm. A binary `bun.lockb` is not recognized as a lockfile, so a Bun project
+with only that file reports `no-lockfile-present`.
+
+**Check-then-spawn window.** Workspace, ownership and symlink checks run before the tool starts, so
+a change made to the tree in between is not noticed.
+
+**Trust model.** The tool runs with the repository's own configuration (`.cargo/config.toml`,
+`rust-toolchain.toml`, `.npmrc`, `.pnpmfile.cjs`, the `go.mod` toolchain directive) and its
+network traffic is not subject to deps-cli's registry policy. Child processes inherit the full
+environment, so tokens in it are readable by `.pnpmfile.cjs` and the like, and corepack may
+download a package manager silently. Known limits: a Cargo cooldown
+fallback below a sibling's new minimum fails the `--precise` step and leaves the lockfile at the
+newest compatible version; a grandchild process may outlive a timeout (5 minutes in total); `go
+get` may raise indirect requirements and the `go` directive in `go.mod`, and download a newer
+toolchain to satisfy it.
+
 ### Write safety and exit codes
 
 Writes are atomic: a temp file is created in the manifest's own directory
@@ -518,7 +553,7 @@ writing.
 |---|---|
 | `0` | Every selected update was applied, or nothing was eligible, or every non-applied item was a deliberate exclusion — an `[update].ignore` match, a `--package` exclusion, or a version held back by the default-mode freshness cooldown (reported as a `skipped` outcome, see above) |
 | `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span, `requires-lockfile-update`, `unfixable`, or a cooldown-fallback candidate that was itself OSV-flagged/unverified |
-| `2` | Execution error — not a single recognized manifest, a registry required to classify the manifest was unreachable, a write/read failure, a symlinked manifest path (refused before any read, not just before the write), stale content detected before write, or `--security-only` combined with `network.offline`/vulnerability scanning disabled |
+| `2` | Execution error — a failed `--lockfile regenerate` step (report still printed), not a single recognized manifest, a registry required to classify the manifest was unreachable, a write/read failure, a symlinked manifest path (refused before any read, not just before the write), stale content detected before write, or `--security-only` combined with `network.offline`/vulnerability scanning disabled |
 
 An ignore rule, a `--package` exclusion, or a freshness-cooldown pause is something the run
 deliberately chose to leave alone, not a failure — none of the three ever turn an otherwise-clean

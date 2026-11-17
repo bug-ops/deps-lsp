@@ -4,6 +4,7 @@
 //! and [`security`]'s `plan_security_updates`) produce (spec 068, #1329).
 
 pub mod ignore;
+pub mod regen;
 pub mod security;
 
 use deps_core::ConcreteVersion;
@@ -121,6 +122,15 @@ impl CurrentVersion {
 pub struct UpdatePlan {
     /// One entry per candidate dependency this planner considered.
     pub items: Vec<PlannedUpdateItem>,
+}
+
+/// A completed `update` run: the plan plus the outcome of the lockfile step that followed it.
+#[derive(Debug)]
+pub struct UpdateRun {
+    /// The per-dependency plan.
+    pub plan: UpdatePlan,
+    /// What happened to the lockfile after the manifest edit.
+    pub lockfile: regen::LockfileOutcome,
 }
 
 impl UpdatePlan {
@@ -1699,6 +1709,15 @@ pub fn apply_plan(
 
 #[cfg(test)]
 mod tests {
+    fn run_of(plan: &UpdatePlan) -> UpdateRun {
+        UpdateRun {
+            plan: plan.clone(),
+            lockfile: regen::LockfileOutcome::NotApplicable(
+                regen::NotApplicableReason::NothingApplied,
+            ),
+        }
+    }
+
     use super::*;
     use deps_core::licenses::LicensePolicy;
     use deps_core::lsp_helpers::DependencyFormatter;
@@ -2024,7 +2043,7 @@ mod tests {
             }
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN,
             "an automatic freshness-cooldown pause must not fail the run"
         );
@@ -2261,7 +2280,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION,
             "a flagged latest must never exit clean"
         );
@@ -2378,7 +2397,7 @@ mod tests {
             "an Unplannable candidate has no concrete target"
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION,
             "a flagged latest must never exit clean, even when also within cooldown"
         );
@@ -2439,7 +2458,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION,
             "an unverified latest must never exit clean, even when also within cooldown"
         );
@@ -2494,7 +2513,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN,
             "a cooldown-driven pause must exit clean even when the candidate was also unplannable"
         );
@@ -2536,7 +2555,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION,
             "an unverified latest must never exit clean"
         );
@@ -3918,7 +3937,7 @@ mod tests {
             "row 10 must name the sibling tags of the blocked fallback"
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION
         );
     }
@@ -3961,7 +3980,7 @@ mod tests {
             Some(&ConcreteVersion::from("1.1.0"))
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION
         );
     }
@@ -4018,7 +4037,7 @@ mod tests {
             "row 8 defers entirely to latest's own attribution, no fallback note"
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_POLICY_VIOLATION
         );
     }
@@ -4055,7 +4074,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN
         );
     }
@@ -4120,7 +4139,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN
         );
     }
@@ -4164,7 +4183,7 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN
         );
     }
@@ -4223,7 +4242,7 @@ mod tests {
             "the ignore-rule skip of an OSV-blocked fallback has no concrete target"
         );
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN
         );
     }
@@ -4551,7 +4570,7 @@ mod tests {
             );
         }
         assert_eq!(
-            crate::exit::update_exit_code(&plan),
+            crate::exit::update_exit_code(&run_of(&plan)),
             crate::exit::EXIT_CLEAN
         );
     }

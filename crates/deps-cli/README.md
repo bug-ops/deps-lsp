@@ -233,11 +233,14 @@ deps-cli update --dry-run --format json Cargo.toml
 
 # Honor [update].ignore rules from an explicit config, using cached registry data only
 deps-cli update --config ./ci/deps-strict.toml --offline Cargo.toml
+
+# Also regenerate and verify the lockfile with the ecosystem's own tool
+deps-cli update --lockfile regenerate Cargo.toml
 ```
 
 Flags: `--package <NAME>` (repeatable), `--security-only`, `--dry-run`, `--format
-table|json`, `--config <PATH>`, `--offline`, and `--cooldown <DURATION>` (`--cooldown` has no
-effect under `--security-only`).
+table|json`, `--config <PATH>`, `--offline`, `--lockfile skip|regenerate` (default `skip`), and
+`--cooldown <DURATION>` (`--cooldown` has no effect under `--security-only`).
 
 - **Default mode** honors the freshness cooldown (default 3 days) even with no flags: a
   version published inside the window is replaced by the newest already-cooled-down, OSV-verified
@@ -249,8 +252,14 @@ effect under `--security-only`).
   `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule.
 - **`[update].ignore`** (`{ name = "tokio", update_types = ["major"] }`) is honored only from
   an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
+- **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm` or `go` in the manifest's directory after
+  the write and verifies that the lockfile holds every applied version; the JSON report always
+  carries a `lockfile` object. It does nothing under `--dry-run` or `--offline`, never creates a
+  lockfile, and reports `unsupported` for Yarn, Bun, workspace members and the other ecosystems.
+  The tool runs with the repository's own configuration and your full environment.
 - **Exit codes**: `0` all selected updates applied or deliberately skipped, `1` at least one
-  wanted fix could not be applied, `2` execution error. A non-zero exit does not imply the
+  wanted fix could not be applied, `2` execution error (including a failed lockfile
+  regeneration). A non-zero exit does not imply the
   manifest is unmodified; inspect each item's `outcome` in `--format json`.
 
 See the [`update` usage](https://bug-ops.github.io/deps-lsp/cli.html#update-usage) mdBook

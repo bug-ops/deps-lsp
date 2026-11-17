@@ -248,6 +248,11 @@ pub struct UpdateArgs {
     /// (FR-014).
     #[arg(long, value_parser = parse_cooldown)]
     pub cooldown: Option<u64>,
+
+    /// Whether to regenerate the lockfile with the ecosystem's own tool after the manifest
+    /// edit (`skip` leaves it alone).
+    #[arg(long, value_enum, default_value_t)]
+    pub lockfile: crate::update::regen::LockfileMode,
 }
 
 /// Parses a `--cooldown` value into a clamped second count.
