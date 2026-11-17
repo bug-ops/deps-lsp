@@ -7012,8 +7012,19 @@ mod gradle_legacy_watch_tests {
 
     /// Pushes `path`'s mtime forward so a change within one timestamp tick is still detected.
     fn bump_mtime(path: &Path, seconds: u64) {
-        std::fs::File::open(path)
-            .unwrap()
+        // Windows needs write-attributes access and backup semantics to open a file or a directory.
+        #[cfg(windows)]
+        let handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .access_mode(0x100)
+                .custom_flags(0x0200_0000)
+                .open(path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let handle = std::fs::File::open(path).unwrap();
+        handle
             .set_modified(SystemTime::now() + Duration::from_secs(seconds))
             .unwrap();
     }
@@ -7054,7 +7065,12 @@ mod gradle_legacy_watch_tests {
     async fn legacy_lock_set_follows_edit_create_and_delete_of_an_open_manifest() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        // A canonical Windows path is verbatim (`\\?\C:\...`), which `Uri::from_file_path` cannot round-trip.
+        let root = if cfg!(windows) {
+            dir.path().to_path_buf()
+        } else {
+            dir.path().canonicalize().unwrap()
+        };
         let locks = root.join("gradle/dependency-locks");
         let compile = write_lock(
             &locks,
