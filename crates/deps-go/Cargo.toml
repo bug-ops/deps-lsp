@@ -6,7 +6,12 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Go module support for deps-lsp"
+readme = "README.md"
+publish = true
 
 [lints]
 workspace = true
@@ -24,7 +29,7 @@ lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 [dependencies]
 bytes.workspace = true
 dashmap.workspace = true
-deps-core = { workspace = true }
+deps-core.workspace = true
 regex.workspace = true
 semver.workspace = true
 serde.workspace = true

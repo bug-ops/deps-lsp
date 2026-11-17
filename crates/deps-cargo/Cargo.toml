@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Cargo.toml support for deps-lsp"
+readme = "README.md"
 publish = true
 
 [lints]
@@ -40,28 +44,27 @@ test-util = ["deps-core/test-util"]
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
-bytes = { workspace = true }
-dashmap = { workspace = true }
-deps-core = { workspace = true }
-semver = { workspace = true }
+bytes.workspace = true
+dashmap.workspace = true
+deps-core.workspace = true
+semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["fs"] }
-toml-span = { workspace = true }
+toml-span.workspace = true
 tower-lsp-server = { workspace = true, optional = true }
-tracing = { workspace = true }
-url = { workspace = true }
-urlencoding = { workspace = true }
+tracing.workspace = true
+url.workspace = true
+urlencoding.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 deps-cargo = { path = ".", features = ["test-util"] }
 deps-core = { workspace = true, features = ["test-util"] }
-insta = { workspace = true, features = ["json"] }
-mockito = { workspace = true }
-tempfile = { workspace = true }
+mockito.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tokio-test = { workspace = true }
+tokio-test.workspace = true
 
 [[bench]]
 name = "cargo_benchmarks"

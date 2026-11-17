@@ -6,15 +6,19 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "pre-commit hook revision dependency support for deps-lsp"
 readme = "README.md"
+publish = true
 
 [lints]
 workspace = true
 
 [dependencies]
-deps-core = { workspace = true }
-deps-github-actions = { workspace = true }
+deps-core.workspace = true
+deps-github-actions.workspace = true
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }

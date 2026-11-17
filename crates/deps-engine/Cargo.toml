@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Composition root wiring deps-core's Ecosystem implementations for every driving adapter (deps-lsp, deps-cli, ...)"
+readme = "README.md"
 publish = true
 
 [lints]
@@ -85,7 +89,7 @@ ignored = ["deps-bundler", "deps-composer", "deps-dart", "deps-deno", "deps-gith
 deps-bundler = { workspace = true, optional = true }
 deps-cargo = { workspace = true, optional = true }
 deps-composer = { workspace = true, optional = true }
-deps-core = { workspace = true }
+deps-core.workspace = true
 deps-dart = { workspace = true, optional = true }
 deps-deno = { workspace = true, optional = true }
 deps-github-actions = { workspace = true, optional = true }
@@ -98,14 +102,14 @@ deps-nuget = { workspace = true, optional = true }
 deps-precommit = { workspace = true, optional = true }
 deps-pypi = { workspace = true, optional = true }
 deps-swift = { workspace = true, optional = true }
-futures = { workspace = true }
+futures.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
-tracing = { workspace = true }
-url = { workspace = true }
+tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }
 deps-swift = { workspace = true, features = ["test-util"] }
-mockito = { workspace = true }
-tempfile = { workspace = true }
+mockito.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
