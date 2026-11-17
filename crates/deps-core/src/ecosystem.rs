@@ -274,6 +274,8 @@ ecosystem_ids! {
     GithubActions => "github-actions",
     /// GitLab CI/CD ecosystem (`.gitlab-ci.yml`, `.gitlab/ci/*.yml`/`*.yaml`).
     GitlabCi => "gitlab-ci",
+    /// pre-commit hooks ecosystem (`.pre-commit-config.yaml`/`.yml`), a GitHub git-tag flavor.
+    PreCommit => "pre-commit",
 }
 
 impl EcosystemId {
@@ -319,6 +321,8 @@ impl EcosystemId {
             // A git-tag/release pin has no OSV coordinate by name (mirrors
             // `deps_gitlab_ci::formatter::GitlabCiFormatter`'s `OsvNaming` docs).
             Self::GitlabCi => None,
+            // Same: a hook `rev:` pin has no OSV coordinate by repository name.
+            Self::PreCommit => None,
         }
     }
 }
@@ -1824,6 +1828,7 @@ mod tests {
             EcosystemId::Deno,
             EcosystemId::GithubActions,
             EcosystemId::GitlabCi,
+            EcosystemId::PreCommit,
         ];
 
         for id in ALL {
@@ -1861,6 +1866,7 @@ mod tests {
 
         // A git-tag/release pin has no OSV coordinate by name (see `osv_ecosystem`'s doc).
         assert_eq!(EcosystemId::GitlabCi.osv_ecosystem(), None);
+        assert_eq!(EcosystemId::PreCommit.osv_ecosystem(), None);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
+use super::exemption::OperatorExemptions;
 use crate::deps_dev::DepsDevScope;
 use crate::diagnostic::{
     CodeDescription, Diagnostic, DiagnosticKind, RelatedInformation, Severity,
@@ -1873,7 +1874,16 @@ fn apply_vulnerability_rule<'a, F: DependencyFormatter>(
     else {
         return None;
     };
-    push_vulnerability_diagnostics(diagnostics, ctx.dep, dv, ctx.formatter, ctx.suppressed);
+    push_vulnerability_diagnostics(
+        diagnostics,
+        ctx.dep,
+        dv,
+        ctx.formatter,
+        ctx.suppressed,
+        ctx.versions
+            .advisory_exemptions
+            .map(|exemptions| (exemptions, ctx.now)),
+    );
     Some(dv)
 }
 
@@ -3192,6 +3202,7 @@ fn push_vulnerability_diagnostics(
     dv: &crate::osv::DependencyVulnerabilities,
     formatter: &dyn EcosystemFormatter,
     suppressed: SuppressedKinds,
+    exemptions: Option<(&OperatorExemptions, PublishTime)>,
 ) {
     let range: Range = version_anchor_range(dep);
 
@@ -3201,6 +3212,15 @@ fn push_vulnerability_diagnostics(
         &visible
     } else {
         dv
+    };
+    let unexempted;
+    let mut exempted_ids = Vec::new();
+    let dv = match exemptions {
+        Some((exemptions, now)) if !exemptions.is_empty() => {
+            (unexempted, exempted_ids) = dv.without_exempted(exemptions, now);
+            &unexempted
+        }
+        _ => dv,
     };
     let display_advisories = dv.advisories_for_display();
     for advisory in display_advisories.items() {
@@ -3238,6 +3258,41 @@ fn push_vulnerability_diagnostics(
             .with_severity(Severity::Information),
         );
     }
+
+    if !exempted_ids.is_empty() {
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticKind::AdvisoryExempted,
+                range,
+                exempted_notice(&exempted_ids),
+            )
+            .with_severity(Severity::Information),
+        );
+    }
+}
+
+/// Ids listed in an exemption notice before the rest collapse into "+N more".
+const EXEMPTED_NOTICE_ID_CAP: usize = 5;
+
+/// "N advisor(y|ies) exempted by operator config: ID, ..." for already-sorted `ids`.
+fn exempted_notice(ids: &[crate::osv::OsvId]) -> String {
+    let noun = if ids.len() == 1 {
+        "advisory"
+    } else {
+        "advisories"
+    };
+    let (shown, _) = ids.split_at(ids.len().min(EXEMPTED_NOTICE_ID_CAP));
+    let listed = crate::osv::OsvId::join(shown, ", ");
+    let more = ids.len().saturating_sub(EXEMPTED_NOTICE_ID_CAP);
+    let suffix = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {noun} exempted by operator config: {listed}{suffix}",
+        ids.len()
+    )
 }
 
 #[cfg(test)]
@@ -10231,6 +10286,187 @@ mod tests {
             ),
             ["+3 more advisories"]
         );
+    }
+
+    fn exemptions_for(ids: &[&str]) -> super::super::exemption::OperatorExemptions {
+        let body = ids
+            .iter()
+            .map(|id| format!("[[advisory]]\nid = \"{id}\"\nreason = \"accepted\"\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("advisory-exemptions.toml");
+        std::fs::write(&path, body).unwrap();
+        super::super::exemption::OperatorExemptions::load(
+            &super::super::exemption::ExemptionFile::for_test(path),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn diagnostics_with_exemptions(
+        vulnerabilities: crate::osv::DependencyVulnerabilities,
+        exemptions: &super::super::exemption::OperatorExemptions,
+    ) -> Vec<Diagnostic> {
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("noisy-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns = crate::osv::VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("noisy-pkg"),
+            crate::osv::ScanOutcome::Vulnerable(vulnerabilities),
+        );
+        generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_advisory_exemptions(exemptions),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        )
+    }
+
+    /// M2: the total shrinks only by fetched records that matched; records beyond the fetch
+    /// cap stay in "+N more" (fail closed).
+    #[test]
+    fn test_exempted_advisory_reduces_overflow_total_only_by_matched_fetched_records() {
+        use crate::osv::{Capped, DependencyVulnerabilities, VulnSeverity};
+
+        let dv = DependencyVulnerabilities::new(Capped::new(
+            vec![
+                sample_advisory("ADV-1", VulnSeverity::Low),
+                sample_advisory("ADV-2", VulnSeverity::Low),
+            ],
+            5,
+        ));
+        let diagnostics = diagnostics_with_exemptions(dv, &exemptions_for(&["ADV-1"]));
+
+        let overflow: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| *d.kind() == DiagnosticKind::AdvisoryOverflow)
+            .map(|d| d.message().to_owned())
+            .collect();
+        assert_eq!(overflow, ["+3 more advisories"]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| *d.kind() == DiagnosticKind::AdvisoryExempted
+                    && d.message() == "1 advisory exempted by operator config: ADV-1")
+        );
+    }
+
+    /// An at-least total stays a lower bound after exempting a record.
+    #[test]
+    fn test_exempted_advisory_keeps_lower_bound_total_wording() {
+        use crate::osv::{Capped, DependencyVulnerabilities, VulnSeverity};
+
+        let dv = DependencyVulnerabilities::new(
+            Capped::new(vec![sample_advisory("ADV-1", VulnSeverity::Low)], 1)
+                .with_total_as_lower_bound(),
+        );
+        let diagnostics = diagnostics_with_exemptions(dv, &exemptions_for(&["ADV-1"]));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| *d.kind() == DiagnosticKind::AdvisoryOverflow
+                    && d.message() == "+0 or more advisories; some lock entries were not checked")
+        );
+    }
+
+    #[test]
+    fn test_exempted_notice_caps_listed_ids_and_pluralizes() {
+        let ids: Vec<_> = (0..7)
+            .map(|i| crate::test_util::osv_id(&format!("ADV-{i}")))
+            .collect();
+        assert_eq!(
+            exempted_notice(&ids),
+            "7 advisories exempted by operator config: ADV-0, ADV-1, ADV-2, ADV-3, ADV-4 (+2 more)"
+        );
+    }
+
+    /// M3: the in-use version is the latest and every advisory on it is exempted; R2 still hands
+    /// the unfiltered findings to the flagged-latest dedup, so no flagged-latest diagnostic
+    /// appears, only the exemption notice.
+    #[test]
+    fn test_exempting_every_advisory_of_in_use_latest_keeps_flagged_latest_deduplicated() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+        use crate::position::{Position, Range};
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            NormalizedName::for_test("feed-widget-helper"),
+            PackageVersions {
+                latest: "1.0.8".into(),
+                available: Arc::from(vec!["1.0.8".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+                cooldown_fallback: None,
+            },
+        );
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(
+            NormalizedName::for_test("feed-widget-helper"),
+            "1.0.8".into(),
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: ConcreteVersion::new("1.0.8"),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("GHSA-xxxx")], 1),
+                worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
+            },
+        );
+        let mut vulnerabilities: VulnerabilityMap = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
+                advisories: Capped::new(vec![sample_advisory("GHSA-xxxx", VulnSeverity::High)], 1),
+                fix_target_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        let exemptions = exemptions_for(&["GHSA-xxxx"]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(EcosystemId::Npm)
+                .with_advisory_exemptions(&exemptions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let kinds: Vec<_> = diagnostics.iter().map(|d| d.kind().clone()).collect();
+        assert_eq!(kinds, [DiagnosticKind::AdvisoryExempted], "{diagnostics:?}");
     }
 
     /// #1996: an unchecked lock entry makes the count a lower bound, worded as such even when no

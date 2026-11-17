@@ -24,6 +24,8 @@ pub enum PinSubject {
     GitlabProject,
     /// A GitLab CI `component:` include.
     GitlabComponent,
+    /// A pre-commit `repos:` hook repository.
+    PreCommitHook,
 }
 
 impl PinSubject {
@@ -31,6 +33,47 @@ impl PinSubject {
         match self {
             Self::GithubAction => GitTagsPlatform::GithubActions,
             Self::GitlabProject | Self::GitlabComponent => GitTagsPlatform::GitlabCi,
+            Self::PreCommitHook => GitTagsPlatform::PreCommit,
+        }
+    }
+}
+
+/// Which `rev`/`ref` values an ecosystem treats as mutable.
+///
+/// GitHub Actions flags every tag ref; pre-commit applies its own rule (a rev is mutable
+/// iff it contains no `.` and is not all hex), so `v1.2` and `abc1234` are not flagged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutablePinPolicy {
+    /// Every tag ref is mutable.
+    AllTags,
+    /// Mutable iff the ref has no `.` and is not entirely hexadecimal.
+    DotlessNonHex,
+}
+
+impl MutablePinPolicy {
+    /// Whether the written `ref_text` is mutable under this policy.
+    ///
+    /// [`Self::AllTags`] defers to the caller, which has already established that the ref is a
+    /// tag, so it answers `true` for any text.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::MutablePinPolicy;
+    ///
+    /// assert!(MutablePinPolicy::DotlessNonHex.is_mutable_ref("v1"));
+    /// assert!(MutablePinPolicy::DotlessNonHex.is_mutable_ref("main"));
+    /// assert!(!MutablePinPolicy::DotlessNonHex.is_mutable_ref("v1.2"));
+    /// assert!(!MutablePinPolicy::DotlessNonHex.is_mutable_ref("abc1234"));
+    /// assert!(MutablePinPolicy::AllTags.is_mutable_ref("v1.2.3"));
+    /// ```
+    #[must_use]
+    pub fn is_mutable_ref(self, ref_text: &str) -> bool {
+        match self {
+            Self::AllTags => true,
+            Self::DotlessNonHex => {
+                !ref_text.contains('.') && !ref_text.chars().all(|c| c.is_ascii_hexdigit())
+            }
         }
     }
 }
@@ -197,6 +240,10 @@ fn ref_message(
         PinSubject::GitlabComponent => format!(
             "{name} component is pinned to the mutable ref `{tag}`; pin to a full commit SHA \
              to guard against ref mutation{suffix}"
+        ),
+        PinSubject::PreCommitHook => format!(
+            "{name} hook is pinned to the mutable rev `{tag}`; pin to a full commit SHA to \
+             guard against tag mutation{suffix}"
         ),
     }
 }

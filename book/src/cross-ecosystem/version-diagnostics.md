@@ -153,7 +153,7 @@ message is shown verbatim, which is the useful part), just not an automated rena
 
 ## Dependency-Count Ceiling Diagnostic (issue #796)
 
-**All 14 ecosystems.** A manifest may declare far more dependency entries than any real
+**All 15 ecosystems.** A manifest may declare far more dependency entries than any real
 project has — an adversarial or malformed file with hundreds of thousands of declarations
 would otherwise drive both server memory and outbound registry request volume linearly with
 a number the manifest's author controls. Each ecosystem's own parser threads a shared

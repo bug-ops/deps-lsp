@@ -875,7 +875,8 @@ mod tests {
                 | EcosystemId::Composer
                 | EcosystemId::NuGet
                 | EcosystemId::GithubActions
-                | EcosystemId::GitlabCi => deps_core::LicenseSource::RegistryDeclaredSpdx,
+                | EcosystemId::GitlabCi
+                | EcosystemId::PreCommit => deps_core::LicenseSource::RegistryDeclaredSpdx,
             }
         }
 

@@ -15,7 +15,7 @@ no single combined API-docs page — each crate has its own docs.rs entry, follo
 - Each ecosystem crate: `https://docs.rs/deps-<ecosystem>`, e.g.
   [`deps-cargo`](https://docs.rs/deps-cargo), [`deps-npm`](https://docs.rs/deps-npm),
   [`deps-pypi`](https://docs.rs/deps-pypi) — substitute the ecosystem name from the
-  [Ecosystem Reference](ecosystems/index.md) for any of the 14 supported ecosystems
+  [Ecosystem Reference](ecosystems/index.md) for any of the 15 supported ecosystems
 
 Use the API docs when you need exact type signatures, trait bounds, or module-level rustdoc;
 use this book when you need to understand ecosystem-level behavior or the reasoning behind a

@@ -35,9 +35,9 @@ use crate::types::{
     PinStyle,
 };
 use deps_core::lsp_helpers::{
-    CommentSlot, CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range,
-    comment_slot_after, is_plain_null, is_tag_shaped, marker_byte_offset, read_sha_pin_tail,
-    warn_rejected_value,
+    CommentSlot, CommentStyle, CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail,
+    byte_span_to_range, comment_slot_after, is_plain_null, is_tag_shaped, marker_byte_offset,
+    read_sha_pin_tail, warn_rejected_value,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
@@ -1071,6 +1071,7 @@ fn attach_sha_tail(
                 scalar.line(),
                 scalar.style(),
                 scalar.is_plain(),
+                CommentStyle::BARE_ONLY,
             );
             (
                 PinStyle::Sha {

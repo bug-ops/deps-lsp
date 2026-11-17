@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-core, deps-lsp, deps-cli**: operator-controlled advisory exemptions from the user config file (`<config dir>/deps-lsp/advisory-exemptions.toml`) or `deps-cli check --advisory-exemptions <PATH>`, shown as an `advisory-exempted` notice; repository config cannot exempt an advisory and confirmed malware is never exemptible (#2029)
+- **deps-precommit, deps-github-actions**: new `pre-commit` ecosystem for `.pre-commit-config.yaml` and `.pre-commit-config.yml` `repo`/`rev` pins, with `rev:` SHA pinning (`# frozen:` comments) and mutable-rev diagnostics (#2029)
+
+### Changed
+- **deps-core, deps-engine**: tag pins and update candidates are scanned against all release tags on the same commit, and a floating pin with no own full release is now scanned instead of skipped (#2029)
+
+### Documentation
+- **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)
+- **specs**: add spec 102 recording that pub and SwiftPM have no native release-age gate (#2029)
+
+### Breaking
+- **deps-core**: new variants on exhaustive public enums: `EcosystemId::PreCommit`, `DiagnosticKind::AdvisoryExempted`, `GitTagsPlatform::PreCommit`, `PinSubject::PreCommitHook` (#2029)
+- **deps-core**: new public fields `ShaPinComment::style` and `VersionData::advisory_exemptions`; `read_sha_pin_tail` takes the accepted comment styles (#2029)
+- **deps-core**: new public `PrimaryRole` enum, `ScanTarget::with_stand_in_primary` and `InUseVersions::primary_role` mark a scan target whose primary is a stand-in sibling tag (#2029)
+- **deps-cli**: new public fields `CheckArgs::advisory_exemptions` and `CheckContext::advisory_exemptions` (#2029)
+- **behavior**: a floating tag pin with no full release of its own (`@v4` on a commit also tagged `v5.0.0`) is now scanned instead of skipped; `--fail-on vulnerable` can newly fail (see spec 103) (#2029)
+
 ### Fixed
 - **workspace, deps-maven**: allow `clippy::empty_enums` for sealed marker enums and drop redundant clones in the POM parser to pass clippy 1.100 (#2027)
 

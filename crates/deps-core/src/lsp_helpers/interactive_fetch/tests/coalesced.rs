@@ -97,7 +97,7 @@ const fn shared_wait(ecosystem: EcosystemId) -> SharedWait {
         | EcosystemId::Deno
         | EcosystemId::GitlabCi => SharedWait::None,
         EcosystemId::NuGet => SharedWait::ServiceIndexCell,
-        EcosystemId::GithubActions => SharedWait::PerRepositoryLock,
+        EcosystemId::GithubActions | EcosystemId::PreCommit => SharedWait::PerRepositoryLock,
     }
 }
 

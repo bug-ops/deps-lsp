@@ -655,6 +655,7 @@ dependencies = [
  "dashmap",
  "deps-core",
  "deps-engine",
+ "deps-github-actions",
  "ignore",
  "insta",
  "jsonschema",
@@ -790,6 +791,7 @@ dependencies = [
  "deps-maven",
  "deps-npm",
  "deps-nuget",
+ "deps-precommit",
  "deps-pypi",
  "deps-swift",
  "futures",
@@ -964,6 +966,15 @@ dependencies = [
  "url",
  "urlencoding",
  "zeroize",
+]
+
+[[package]]
+name = "deps-precommit"
+version = "5.0.0"
+dependencies = [
+ "deps-core",
+ "deps-github-actions",
+ "tokio",
 ]
 
 [[package]]

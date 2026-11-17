@@ -88,6 +88,39 @@ kinds = ["deprecated"]
 - The "Update N outdated" code lens and update-all still count suppressed packages, and the
   "+N more advisories" line can still count a hidden unmaintained advisory.
 
+### Exempting an advisory (operator file)
+
+Per-package suppression never hides a vulnerability, because workspace settings can be written by
+the repository you open. To accept a specific advisory yourself, create an exemption file in your
+own user config directory:
+
+- Linux: `$XDG_CONFIG_HOME/deps-lsp/advisory-exemptions.toml` (default `~/.config/deps-lsp/`)
+- macOS: `~/Library/Application Support/deps-lsp/advisory-exemptions.toml`
+- Windows: `%APPDATA%\deps-lsp\advisory-exemptions.toml`
+
+```toml
+[[advisory]]
+id = "GHSA-xxxx-yyyy-zzzz"      # an advisory id or any of its aliases (CVE-..., RUSTSEC-...)
+reason = "Not reachable: we never call the vulnerable parser; tracked in JIRA-123"
+expires = "2027-03-31"          # optional, inclusive, UTC; an expired entry is ignored
+```
+
+- `reason` is required (1 to 500 characters, no control characters). Unknown fields, duplicate ids,
+  more than 1024 entries, or a file over 64 KiB make the whole file invalid.
+- The file is read once when the server starts; restart the language server after editing it. A
+  malformed file is ignored (nothing is exempted) and the server shows a warning.
+- Each dependency with exempted advisories gets one information diagnostic, for example
+  `1 advisory exempted by operator config: GHSA-xxxx-yyyy-zzzz`, so exemptions stay visible.
+- Confirmed-malware advisories (`MAL-` records) can never be exempted.
+- A file located inside an open workspace folder is refused with a warning, because a repository
+  can point `XDG_CONFIG_HOME` at itself. Opening your config directory as a workspace therefore
+  disables exemptions.
+- There is no `deps.toml` or editor-settings key for this. Hover, inlay hints and code actions
+  still show the raw advisories.
+
+`deps-cli check --advisory-exemptions <PATH>` takes the same file format; see the
+[CLI page](cli.md#exempting-advisories).
+
 ### Editor workspace settings and trust
 
 Editors merge project-level settings into the `initializationOptions` and

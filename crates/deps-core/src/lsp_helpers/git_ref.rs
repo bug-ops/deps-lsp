@@ -200,9 +200,10 @@ pub struct TagIndex {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SiblingScope {
-    /// Only tags of the primary's own major line, as for an exact-tag pin.
+    /// Only tags of the primary's own major line. No production caller has used it since
+    /// #1719 widened tag pins to [`Self::WholeCommit`].
     SameMajor,
-    /// Every release tag on the commit, as for a SHA pin that names the commit itself.
+    /// Every release tag on the commit, as for a SHA pin or a tag pin.
     WholeCommit,
 }
 
@@ -255,6 +256,31 @@ impl SiblingTags {
                     || (tag_components(n).all(|c| c.parse::<u64>().is_ok())
                         && !all.iter().any(|other| extends_tag(other, n))))
         });
+        Self::sorted_unique(ranked)
+    }
+
+    /// Every full-release name among `names` other than `primary`, whatever its major: the scan
+    /// targets of a floating pin that has no full release of its own (`@v4` on a commit
+    /// carrying only `v4` and `v5.0.0`).
+    pub(crate) fn commit_full_releases<'a>(
+        primary: &str,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let primary_normalized = crate::github::normalize_tag(primary);
+        let ranked = names
+            .into_iter()
+            .map(|n| (tag_specificity_rank(n), n))
+            .filter(|(rank, n)| {
+                let (kind, _, is_release) = rank.0;
+                kind == FULL_SEMVER_KIND
+                    && is_release
+                    && crate::github::normalize_tag(n) != primary_normalized
+            })
+            .collect();
+        Self::sorted_unique(ranked)
+    }
+
+    fn sorted_unique(mut ranked: Vec<(TagRank<'_>, &str)>) -> Self {
         ranked.sort_by(|a, b| b.0.cmp(&a.0));
         ranked.dedup_by(|a, b| {
             crate::github::normalize_tag(a.1) == crate::github::normalize_tag(b.1)
@@ -336,6 +362,13 @@ impl ResolvedPin {
         Self::Alias {
             tag,
             siblings: SiblingTags::default(),
+        }
+    }
+
+    fn with_siblings(self, siblings: SiblingTags) -> Self {
+        match self {
+            Self::MostSpecific { tag, .. } => Self::MostSpecific { tag, siblings },
+            Self::Alias { tag, .. } => Self::Alias { tag, siblings },
         }
     }
 
@@ -696,9 +729,10 @@ impl TagIndex {
     }
 
     /// Resolves the exact tag `written` (`v4.8.0`) to a pin whose primary is that tag itself,
-    /// with the other release tags of the same major line on its commit as siblings.
+    /// with the other release tags on its commit, across majors, as siblings.
     ///
-    /// Shorthand for [`Self::resolved_release`] with [`SiblingScope::SameMajor`]. Unlike
+    /// Shorthand for [`Self::resolved_release`] with [`SiblingScope::WholeCommit`], so a tag pin
+    /// is scanned exactly like a SHA pin naming the same commit. Unlike
     /// [`Self::resolved_pin`] the primary is never re-picked: the user wrote that tag. `None`
     /// when `written` is not in the index.
     ///
@@ -711,12 +745,12 @@ impl TagIndex {
     /// let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.9.0", &sha), ("v5.0.0", &sha)]);
     /// let pin = index.resolved_exact_tag("v4.8.0").unwrap();
     /// assert_eq!(pin.version().as_str(), "v4.8.0");
-    /// assert_eq!(pin.siblings().len(), 1);
+    /// assert_eq!(pin.siblings().len(), 2);
     /// assert!(index.resolved_exact_tag("v9.9.9").is_none());
     /// ```
     #[must_use]
     pub fn resolved_exact_tag(&self, written: &str) -> Option<ResolvedPin> {
-        self.resolved_release(written, SiblingScope::SameMajor)
+        self.resolved_release(written, SiblingScope::WholeCommit)
     }
 
     /// Resolves the tag `tag` (exact key text) to a pin whose primary is that tag, with the
@@ -990,7 +1024,12 @@ impl TagIndex {
     /// Resolves through the commit `written` currently points at, to the most specific release
     /// that equals or extends `written` on that commit: a commit that also carries an unrelated
     /// `v5.0.0` is not reported as that version. [`PinResolution::Unresolved`] when `written`
-    /// names no release on its commit. A `written` that a populated [`ListCoverage::Truncated`]
+    /// names no release on its commit.
+    ///
+    /// The pin's siblings span the whole commit (#1719): a full-release primary gets the releases
+    /// of its own specificity class; a partial primary (`v4` next to only `v5.0.0`) keeps itself
+    /// as primary and gets every full release on the commit as scan targets, so the pin is
+    /// scanned instead of skipped as an unqueryable tag. A `written` that a populated [`ListCoverage::Truncated`]
     /// index does not list is [`PinResolution::Unlisted`], and an unlisted one on a complete
     /// index [`PinResolution::Unresolved`]. The sub-selection never narrows
     /// [`PinResolution::Resolved`]'s `sibling_coverage`: it is this index's own.
@@ -1016,19 +1055,32 @@ impl TagIndex {
         let Some(commit) = self.tag_to_sha.get(written) else {
             return self.unlisted_or_unresolved();
         };
-        let candidates = self
+        let extending = self
             .tag_to_sha
             .iter()
             .filter(|(tag, sha)| {
                 *sha == commit && (tag.as_str() == written || extends_tag(tag.as_str(), written))
             })
             .map(|(tag, sha)| (tag.as_str(), sha));
-        Self::from_tags(candidates)
-            .resolved_pin(commit)
-            .map_or(PinResolution::Unresolved, |pin| PinResolution::Resolved {
-                pin,
-                sibling_coverage: self.coverage,
-            })
+        let Some(primary) = Self::from_tags(extending).resolved_pin(commit) else {
+            return PinResolution::Unresolved;
+        };
+        let names: Vec<&str> = self
+            .tag_to_sha
+            .iter()
+            .filter(|(_, sha)| *sha == commit)
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        let tag = primary.version().as_str();
+        let siblings = if tag_specificity_rank(tag).0.0 == FULL_SEMVER_KIND {
+            SiblingTags::from_candidates(tag, names.iter().copied())
+        } else {
+            SiblingTags::commit_full_releases(tag, names.iter().copied())
+        };
+        PinResolution::Resolved {
+            pin: primary.with_siblings(siblings),
+            sibling_coverage: self.coverage,
+        }
     }
 
     /// What the index proves about a pin written as the tag `written` of `ecosystem`: an exact
@@ -3327,10 +3379,10 @@ mod tests {
         assert_eq!(sibling_names(&pin), ["v1.2.4"]);
     }
 
-    /// #1709/#1719: the written exact tag stays primary; only its major line's releases on the
-    /// same commit are siblings.
+    /// #1709/#1719: the written exact tag stays primary; every release on the same commit,
+    /// across majors, is a sibling.
     #[test]
-    fn test_resolved_exact_tag_keeps_written_primary_and_same_major_siblings() {
+    fn test_resolved_exact_tag_keeps_written_primary_and_whole_commit_siblings() {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let other = CommitSha::parse(&"b".repeat(40)).unwrap();
         let index = TagIndex::from_tags([
@@ -3341,7 +3393,7 @@ mod tests {
         ]);
         let pin = index.resolved_exact_tag("v4.9.0").unwrap();
         assert_eq!(pin.version().as_str(), "v4.9.0");
-        assert_eq!(sibling_names(&pin), ["v4.8.0"]);
+        assert_eq!(sibling_names(&pin), ["v4.8.0", "v5.0.0"]);
         assert_eq!(index.resolved_exact_tag("v9.9.9"), None);
     }
 

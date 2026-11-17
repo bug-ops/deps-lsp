@@ -1,0 +1,21 @@
+[package]
+name = "deps-precommit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "pre-commit hook revision dependency support for deps-lsp"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+deps-core = { workspace = true }
+deps-github-actions = { workspace = true }
+
+[dev-dependencies]
+deps-core = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1427,6 +1427,61 @@ pub enum LoadingState {
     Failed,
 }
 
+/// Why [`deserialize_toml_checked`] rejected a document; the message is already redacted and
+/// bounded when the error is built, so it is safe to log or show.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TomlDeserializeError {
+    /// The text is not valid TOML, or exceeds the nesting-depth limit.
+    #[error("invalid TOML: {0}")]
+    Toml(String),
+    /// The TOML is valid but does not match the target type.
+    #[error("invalid configuration: {0}")]
+    Deserialize(String),
+}
+
+/// Parses `content` as TOML under the nesting-depth guard and deserializes it into `T`.
+///
+/// Extracted from deps-cli's config loader so every TOML-backed operator file shares one
+/// bounded, redacted path.
+///
+/// # Errors
+///
+/// [`TomlDeserializeError::Toml`] for a syntax or depth error,
+/// [`TomlDeserializeError::Deserialize`] when the value does not fit `T`.
+pub fn deserialize_toml_checked<T: serde::de::DeserializeOwned>(
+    content: &str,
+) -> std::result::Result<T, TomlDeserializeError> {
+    let redact = |text: &str| crate::net_policy::redact_parse_error_for_log(text).into_owned();
+    let value = parse_toml_checked(content)
+        .map_err(|e| TomlDeserializeError::Toml(redact(&e.to_string())))?;
+    let json = serde_json::to_value(&value)
+        .map_err(|e| TomlDeserializeError::Deserialize(redact(&e.to_string())))?;
+    serde_json::from_value(json)
+        .map_err(|e| TomlDeserializeError::Deserialize(redact_type_mismatch(&e.to_string())))
+}
+
+/// Redacts a `serde_json` deserialize message, and additionally drops the string payload of an
+/// "invalid type/value: string ..." mismatch when credential redaction found nothing to
+/// change: the offending value is operator-file content that has no reason to reach a log.
+fn redact_type_mismatch(raw: &str) -> String {
+    let redacted = crate::net_policy::redact_parse_error_for_log(raw);
+    if !matches!(redacted, std::borrow::Cow::Borrowed(_)) {
+        return redacted.into_owned();
+    }
+    const MARKERS: [&str; 2] = ["invalid type: string \"", "invalid value: string \""];
+    // `rfind`: an escaped quote inside the payload also reads `\", expected `.
+    const TAIL: &str = "\", expected ";
+    for marker in MARKERS {
+        if let Some(start) = raw.find(marker).map(|i| i + marker.len())
+            && let Some(end) = raw.rfind(TAIL).filter(|end| *end >= start)
+            && let (Some(head), Some(tail)) = (raw.get(..start), raw.get(end..))
+        {
+            return format!("{head}<redacted>{tail}");
+        }
+    }
+    raw.to_owned()
+}
+
 #[cfg(test)]
 #[expect(
     clippy::cast_possible_truncation,

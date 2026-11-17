@@ -6,7 +6,7 @@
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&component=deps-lsp)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
-Language Server Protocol implementation for dependency management across fourteen package ecosystems.
+Language Server Protocol implementation for dependency management across fifteen package ecosystems.
 
 This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides the LSP server binary and the ecosystem orchestration layer that wires together ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-go`, `deps-bundler`, `deps-dart`, `deps-maven`, `deps-gradle`, `deps-swift`, `deps-composer`, `deps-nuget`, `deps-deno`, `deps-github-actions`, `deps-gitlab-ci`) via the `Ecosystem` trait from `deps-core`.
 

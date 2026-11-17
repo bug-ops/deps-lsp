@@ -10,7 +10,7 @@ Run deps-lsp's dependency-health checks from the command line, in CI, or in a sh
 no editor required.
 
 This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. `deps-cli
-check` walks a workspace, routes every manifest it finds through the same 14-ecosystem
+check` walks a workspace, routes every manifest it finds through the same 15-ecosystem
 classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and diagnostics, and
 reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/mutable-ref-pin/
 sha-comment-mismatch findings as a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit
@@ -25,9 +25,9 @@ version-requirement edits to one manifest.
 ## Features
 
 - **Security-hardened workspace walk** — routes every discovered file through the same
-  `EcosystemRegistry` the LSP server uses, across all 14 supported ecosystems (Cargo, npm,
+  `EcosystemRegistry` the LSP server uses, across all 15 supported ecosystems (Cargo, npm,
   PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, Deno, GitHub Actions,
-  GitLab CI/CD). `check` does **not** honor `.gitignore`/`.ignore` by default, because in a CI
+  GitLab CI/CD, pre-commit). `check` does **not** honor `.gitignore`/`.ignore` by default, because in a CI
   gate (`git checkout && deps-cli check .` against an untrusted fork PR) both files are
   attacker-controlled input — a one-line addition to either would otherwise silently remove a
   manifest from the scan with no warning and exit code `0`. A compiled-in denylist

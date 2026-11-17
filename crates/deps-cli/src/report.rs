@@ -827,6 +827,9 @@ pub struct CheckContext {
     pub lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
     /// The resolved policy configuration for this run.
     pub policy: PolicyConfig,
+    /// Operator-supplied advisory exemptions (`check --advisory-exemptions`); never read from
+    /// `deps.toml`.
+    pub advisory_exemptions: Arc<deps_core::lsp_helpers::exemption::OperatorExemptions>,
 }
 
 /// Error running [`check_manifest`] for one manifest.
@@ -925,7 +928,8 @@ pub async fn check_manifest(
         .generate_diagnostics(
             analysis
                 .version_data()
-                .with_suppression(&ctx.policy.diagnostics.suppress),
+                .with_suppression(&ctx.policy.diagnostics.suppress)
+                .with_advisory_exemptions(&ctx.advisory_exemptions),
             &analysis.uri,
             ctx.policy.freshness.to_freshness(),
             severities,
@@ -1181,6 +1185,7 @@ const fn classify(kind: &DiagnosticKind) -> Category {
         DiagnosticKind::FlaggedLatest
         | DiagnosticKind::UnverifiedLatest
         | DiagnosticKind::Typosquat
+        | DiagnosticKind::AdvisoryExempted
         | DiagnosticKind::UnresolvedGitlabHost
         | DiagnosticKind::DuplicateDefaultCatalog
         | DiagnosticKind::Notice => Category::Other,
@@ -1408,6 +1413,11 @@ mod tests {
                 Category::ShaCommentMismatch,
             ),
             (DiagnosticKind::UnknownRef, Category::UnknownRef),
+            (
+                DiagnosticKind::MutableRefPin(GitTagsPlatform::PreCommit),
+                Category::MutableRefPin,
+            ),
+            (DiagnosticKind::AdvisoryExempted, Category::Other),
             (DiagnosticKind::UnresolvedGitlabHost, Category::Other),
             (DiagnosticKind::DuplicateDefaultCatalog, Category::Other),
             (DiagnosticKind::Notice, Category::Other),

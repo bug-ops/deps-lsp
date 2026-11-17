@@ -124,7 +124,7 @@ pub mod config_trust;
 #[cfg(any(test, feature = "test-util"))]
 pub mod conformance;
 /// Per-document ceiling on tracked dependencies, enforced by
-/// [`ecosystem::parse_manifest_blocking`] for all 14 ecosystems (#796).
+/// [`ecosystem::parse_manifest_blocking`] for all 15 ecosystems (#796).
 pub mod dependency_cap;
 pub mod deps_dev;
 pub mod detached_flight;

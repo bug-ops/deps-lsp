@@ -249,7 +249,7 @@ All questions are resolved or deferred; none block implementation.
 | Q9 | Surface suppressed diagnostics for auditability? | No user-visible surface and no log in the MVP. |
 
 > [!question] Deferred
-> - Q4: suppression by advisory ID (finer than per-package) is a separate, later spec.
+> - Q4: suppression by advisory ID (finer than per-package) is a separate spec: [[101-operator-advisory-exemptions/spec|101 Operator advisory exemptions]] (operator-owned file, never repository config).
 
 ## 10. See Also
 

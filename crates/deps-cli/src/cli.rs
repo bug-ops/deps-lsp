@@ -127,6 +127,15 @@ pub struct CheckArgs {
     /// scanned.
     #[arg(long)]
     pub follow_symlinks: bool,
+
+    /// Path to an operator-owned advisory exemption file (`[[advisory]]` entries with `id`,
+    /// `reason` and optional `expires`). Never discovered automatically and never read from
+    /// `deps.toml`. A missing or malformed file exits 2. Exempted advisories are replaced by an
+    /// informational notice per dependency (`--fail-on other` still fails on it);
+    /// confirmed-malware advisories cannot be exempted. When scanning an untrusted pull
+    /// request (`pull_request_target`, fork PRs), keep this file outside the checked-out tree.
+    #[arg(long, value_name = "PATH")]
+    pub advisory_exemptions: Option<PathBuf>,
 }
 
 impl CheckArgs {

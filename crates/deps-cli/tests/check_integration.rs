@@ -57,6 +57,7 @@ fn offline_context() -> (EcosystemRegistry, CheckContext) {
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
         deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        advisory_exemptions: Arc::new(deps_core::lsp_helpers::exemption::OperatorExemptions::none()),
         policy,
     };
     (registry, ctx)
@@ -666,6 +667,9 @@ mod catalog_duplicate_reporting {
             osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
             deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy,
         };
 
@@ -764,6 +768,9 @@ mod alternate_registry_not_found_with_lockfile {
             osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
             deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy,
         };
 
@@ -943,6 +950,9 @@ mod case_variant_names {
             osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
             deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy,
         };
 
@@ -1173,6 +1183,7 @@ async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_target
         osv: Arc::clone(&ctx.osv),
         deps_dev: Arc::clone(&ctx.deps_dev),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        advisory_exemptions: Arc::new(deps_core::lsp_helpers::exemption::OperatorExemptions::none()),
         policy: ctx.policy.clone(),
     };
     check_manifest(
@@ -1218,6 +1229,7 @@ fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, Chec
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
         deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        advisory_exemptions: Arc::new(deps_core::lsp_helpers::exemption::OperatorExemptions::none()),
         policy,
     };
     (registry, ctx)
@@ -1416,6 +1428,9 @@ mod tier3_wiring_regression {
             osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
             deps_dev: Arc::new(deps_core::DepsDevClient::new(cache)),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy,
         }
     }
@@ -1589,6 +1604,9 @@ mod gossip_prefetch_wiring_regression {
             osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
             deps_dev: Arc::new(deps_core::DepsDevClient::for_test(cache, deps_dev_base_url)),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy,
         }
     }
@@ -1822,6 +1840,9 @@ mod unverified_registry_note {
             osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
             deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy,
         };
 
@@ -2086,6 +2107,9 @@ mod osv_query_failure_gate {
             osv: Arc::new(OsvClient::for_test(Arc::clone(&cache), server.url())),
             deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            advisory_exemptions: Arc::new(
+                deps_core::lsp_helpers::exemption::OperatorExemptions::none(),
+            ),
             policy: policy.clone(),
         };
 

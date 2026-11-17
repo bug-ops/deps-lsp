@@ -30,6 +30,12 @@ pub const GITHUB_ACTIONS_MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "mutable-ref-pi
 /// Wire code of GitLab CI's mutable-ref-pin diagnostic.
 pub const GITLAB_CI_MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "gitlab-ci-mutable-ref-pin";
 
+/// Wire code of pre-commit's mutable-ref-pin diagnostic.
+pub const PRE_COMMIT_MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "pre-commit-mutable-ref-pin";
+
+/// Wire code of the informational notice that advisories were exempted by operator config.
+pub const ADVISORY_EXEMPTED_DIAGNOSTIC_CODE: &str = "advisory-exempted";
+
 /// Wire code of GitLab CI's unresolved-instance-host notice.
 pub const GITLAB_CI_UNRESOLVED_HOST_DIAGNOSTIC_CODE: &str = "unresolved-gitlab-host";
 
@@ -38,7 +44,7 @@ pub const PNPM_DUPLICATE_DEFAULT_CATALOG_DIAGNOSTIC_CODE: &str = "pnpm-duplicate
 
 /// Git-tag-pinning CI platform a mutable-ref-pin diagnostic was raised for.
 ///
-/// A dedicated two-variant enum rather than [`crate::EcosystemId`], which would admit
+/// A dedicated three-variant enum rather than [`crate::EcosystemId`], which would admit
 /// ecosystems that have no mutable-ref-pin diagnostic at all.
 ///
 /// # Examples
@@ -55,6 +61,8 @@ pub enum GitTagsPlatform {
     GithubActions,
     /// GitLab CI/CD pipelines.
     GitlabCi,
+    /// pre-commit hook configurations (`.pre-commit-config.yaml`).
+    PreCommit,
 }
 
 /// What a [`Diagnostic`] reports, set by the producer.
@@ -91,6 +99,9 @@ pub enum DiagnosticKind {
     /// entry makes the count a lower bound. Never suppressed itself: a `deprecated` suppression
     /// instead removes the hidden advisories from the count before it is rendered.
     AdvisoryOverflow,
+    /// Advisories affecting the resolved version were hidden by the operator's exemption file;
+    /// one per dependency, so the exemption stays visible.
+    AdvisoryExempted,
     /// The requirement matches no published version.
     Unsatisfiable,
     /// The declared license violates the configured policy.
@@ -140,6 +151,10 @@ impl DiagnosticKind {
             Self::MutableRefPin(GitTagsPlatform::GitlabCi) => {
                 Some(GITLAB_CI_MUTABLE_REF_PIN_DIAGNOSTIC_CODE)
             }
+            Self::MutableRefPin(GitTagsPlatform::PreCommit) => {
+                Some(PRE_COMMIT_MUTABLE_REF_PIN_DIAGNOSTIC_CODE)
+            }
+            Self::AdvisoryExempted => Some(ADVISORY_EXEMPTED_DIAGNOSTIC_CODE),
             Self::ShaCommentMismatch => Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
             Self::UnknownRef => Some(UNKNOWN_REF_DIAGNOSTIC_CODE),
             Self::UnresolvedGitlabHost => Some(GITLAB_CI_UNRESOLVED_HOST_DIAGNOSTIC_CODE),

@@ -257,7 +257,10 @@ attributed to the pin.
 ## Mutable-Ref Pinning
 
 GitHub Actions shares its mutable-ref-pin diagnostic and bulk "Pin All to SHA" code lens with
-GitLab CI/CD — see [CI/CD Pinning](../cross-ecosystem/ci-pinning.md) for the full detail.
+GitLab CI/CD and [pre-commit](pre-commit.md) — see [CI/CD Pinning](../cross-ecosystem/ci-pinning.md) for the full detail.
+
+pre-commit is the `PreCommit` flavor of this ecosystem type: both share one GitHub tags registry,
+tag index and rate budget when enabled together.
 
 ## Release-Freshness Coverage (shared with Swift)
 

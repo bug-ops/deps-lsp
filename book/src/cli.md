@@ -2,7 +2,7 @@
 
 `deps-cli` runs `deps-lsp`'s dependency-health checks from the command line — no editor
 required. It walks a workspace, routes every manifest it finds through the exact same
-14-ecosystem classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and
+15-ecosystem classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and
 diagnostics, and reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/
 mutable-ref-pin/sha-comment-mismatch findings as a table, as JSON, or as SARIF 2.1.0, with a
 CI-friendly exit code.
@@ -191,6 +191,28 @@ declaration and stay silent. In the editor, hover shows a "Vulnerability data no
 only for dependencies whose registry it can resolve (an npm dependency routed by a valid top-level
 `registry=`); an invalid npm entry and a Go module with every hop rejected get no footer, only the
 CLI note.
+
+### Exempting advisories
+
+`--advisory-exemptions <PATH>` reads an operator-owned file of accepted advisories (the format is
+described under [Exempting an advisory](configuration.md#exempting-an-advisory-operator-file)):
+
+```bash
+deps-cli check --advisory-exemptions ~/.config/deps-lsp/advisory-exemptions.toml
+```
+
+- The file is never discovered automatically and is not part of `deps.toml`. A missing or invalid
+  file exits `2` and the message names the path, not its content.
+- An exempted advisory no longer counts as `vulnerable`, so `--fail-on vulnerable` passes when every
+  advisory of a dependency is exempted. Each such dependency instead gets one informational finding
+  (`N advisories exempted by operator config: ...`) in the `other` category, so `--fail-on other`
+  fails on it and SARIF reports it as a `note`.
+- `MAL-` (confirmed malware) advisories can never be exempted, and an expired entry is ignored.
+- **Untrusted pull requests:** with `pull_request_target` or any workflow that checks out fork code,
+  a file path inside the checked-out tree is attacker-controlled. Keep the exemption file outside
+  the checkout (a runner path, a separate repository checkout, or a secret written to a temp file).
+- The editor reads the user config directory automatically; the CLI needs this flag by design so CI
+  input is explicit. For local parity pass the same path.
 
 ### Failing on unchecked vulnerability coverage
 

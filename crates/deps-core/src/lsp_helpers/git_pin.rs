@@ -284,7 +284,7 @@ mod tests {
         assert_matches!(
             git_candidate_tag_source(GitPinView::Tag { written: "v4" }, Some(idx)),
             CandidateTagSource::Indexed {
-                scope: SiblingScope::SameMajor,
+                scope: SiblingScope::WholeCommit,
                 ..
             }
         );

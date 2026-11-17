@@ -1386,7 +1386,7 @@ mod tests {
         assert_matches!(
             warm.candidate_tag_source(&tag_dep),
             CandidateTagSource::Indexed {
-                scope: SiblingScope::SameMajor,
+                scope: SiblingScope::WholeCommit,
                 ..
             }
         );

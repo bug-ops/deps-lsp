@@ -213,7 +213,7 @@ jobs:
           - name: ecosystems-2
             run: cargo hack nextest run -p deps-lsp --each-feature --include-features "github-actions, gitlab-ci, go, gradle, maven" --keep-going --profile ci --no-fail-fast
           - name: ecosystems-3
-            run: cargo hack nextest run -p deps-lsp --each-feature --include-features "npm, nuget, pypi, swift" --keep-going --profile ci --no-fail-fast
+            run: cargo hack nextest run -p deps-lsp --each-feature --include-features "npm, nuget, pre-commit, pypi, swift" --keep-going --profile ci --no-fail-fast
           - name: deps-engine
             # deps-engine (issue #1059): small enough (80 tests as of the classification-layer
             # move) to run every feature slice in one shard rather than splitting like
@@ -301,6 +301,7 @@ jobs:
             run: |
               cargo hack nextest run -p deps-npm --each-feature --keep-going --profile ci --no-fail-fast
               cargo hack nextest run -p deps-nuget --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-precommit --each-feature --keep-going --profile ci --no-fail-fast
               cargo hack nextest run -p deps-pypi --each-feature --keep-going --profile ci --no-fail-fast
               cargo hack nextest run -p deps-swift --each-feature --keep-going --profile ci --no-fail-fast
     steps:

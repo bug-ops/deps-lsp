@@ -24,6 +24,7 @@ mod code_actions;
 #[cfg(feature = "lsp-responses")]
 mod code_lenses;
 mod diagnostics;
+pub mod exemption;
 mod formatted_dependency;
 mod formatter;
 mod git_pin;
@@ -80,7 +81,9 @@ pub use diagnostics::{
     requirement_len_exceeds_cap, sanitize_advisory_text_for_diagnostic,
     sanitize_and_truncate_for_diagnostic, truncate_for_diagnostic,
 };
-pub use mutable_ref_pin::{FixAvailability, GitlabInclude, MutableRefPin, PinSubject};
+pub use mutable_ref_pin::{
+    FixAvailability, GitlabInclude, MutablePinPolicy, MutableRefPin, PinSubject,
+};
 // `pub` (#1578): `edit.rs`/`in_use_version.rs` share this in-crate, and it is also reused by
 // callers outside `deps-core` that need this same size gate before compiling a requirement
 // (mirroring `requirement_len_exceeds_cap`'s own `pub` rationale) rather than duplicating the
@@ -154,10 +157,11 @@ pub use probe_pass::{
 #[cfg(feature = "lsp-responses")]
 pub use sha_comment::build_sha_comment_fix_action;
 pub use sha_comment::{
-    ClosingDelimiters, CommentCheck, CommentMismatch, CommentRemainder, CommentSlot, CommentTag,
-    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, ShaPinComment, ShaPinTail, ShaPinTailRead,
+    ClosingDelimiters, CommentCheck, CommentMismatch, CommentRemainder, CommentSlot, CommentStyle,
+    CommentTag, SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, ShaPinComment, ShaPinTail, ShaPinTailRead,
     comment_slot_after, position_past_sha, read_sha_pin_tail, ref_is_last_on_line,
     sha_comment_mismatch_diagnostic, sha_comment_mismatch_hover_line, sha_pin_rewrite,
+    sha_pin_rewrite_with_default_style,
 };
 pub use suppression::{
     PackagePattern, PatternError, ResolvedSuppression, RuleError, SuppressedKinds, SuppressionKind,

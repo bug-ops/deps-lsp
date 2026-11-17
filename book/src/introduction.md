@@ -2,9 +2,9 @@
 
 `deps-lsp` is a universal Language Server Protocol server for dependency management. A single
 binary provides hover, completion, diagnostics, code actions, code lens, and inlay hints for
-outdated, unknown, yanked, vulnerable, and unsatisfiable dependencies across 14 package
+outdated, unknown, yanked, vulnerable, and unsatisfiable dependencies across 15 package
 ecosystems — Cargo, npm, Deno, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet,
-GitHub Actions, and GitLab CI/CD — instead of requiring a separate extension per language.
+GitHub Actions, GitLab CI/CD, and pre-commit — instead of requiring a separate extension per language.
 
 A companion binary, [`deps-cli`](cli.md), runs the same checks from the command line —
 routing every manifest through the identical classification pipeline — for CI pipelines,
@@ -47,6 +47,7 @@ material; it covers instead:
 | **[Deno](ecosystems/deno.md)** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered |
 | **[GitHub Actions](ecosystems/github-actions.md)** | YAML | `.github/workflows/*.yml`, `*.yaml`; `action.yml`, `action.yaml` (composite/Docker/JS actions — a repository root or `.github/actions/<name>/`, issue #706) | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` |
 | **[GitLab CI/CD](ecosystems/gitlab-ci.md)** | YAML | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered); `project:`+`ref:` pins via the GitLab repository-tags API, `component:` CI/CD Catalog pins via the GitLab project-releases API (SHA/exact-release/`~latest`/partial-semver priority ladder); self-hosted instances via `registries.gitlab_instance_host`; scalar YAML anchor/alias resolution within `include:` |
+| **[pre-commit](ecosystems/pre-commit.md)** | YAML | `.pre-commit-config.yaml`, `.pre-commit-config.yml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered); `repo:`+`rev:` pins of `https://github.com/` repositories via the GitHub tags API, SHA pinning with `# frozen:` comments, mutable-rev diagnostic |
 
 Many of the behaviors above are shared across several ecosystems rather than reimplemented per
 crate — see [Cross-Ecosystem Features](cross-ecosystem/index.md) for the conventions and

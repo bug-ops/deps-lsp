@@ -121,6 +121,7 @@ fn cli_context(setup: &Setup) -> (EcosystemRegistry, CheckContext) {
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
         deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        advisory_exemptions: Arc::new(deps_core::lsp_helpers::exemption::OperatorExemptions::none()),
         policy,
     };
     (registry, ctx)

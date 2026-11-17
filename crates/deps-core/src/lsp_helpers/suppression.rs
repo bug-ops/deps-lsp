@@ -125,6 +125,7 @@ impl SuppressedKinds {
             DiagnosticKind::FlaggedLatest
             | DiagnosticKind::UnverifiedLatest
             | DiagnosticKind::AdvisoryOverflow
+            | DiagnosticKind::AdvisoryExempted
             | DiagnosticKind::Unsatisfiable
             | DiagnosticKind::Typosquat
             | DiagnosticKind::MutableRefPin(_)
@@ -454,6 +455,7 @@ mod tests {
             (DiagnosticKind::FlaggedLatest, false),
             (DiagnosticKind::UnverifiedLatest, false),
             (DiagnosticKind::AdvisoryOverflow, false),
+            (DiagnosticKind::AdvisoryExempted, false),
             (DiagnosticKind::Unsatisfiable, false),
             (DiagnosticKind::Typosquat, false),
             (DiagnosticKind::Notice, false),

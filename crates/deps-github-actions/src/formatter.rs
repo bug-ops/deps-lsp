@@ -10,16 +10,16 @@ use deps_core::lsp_helpers::{
     PartialTagPolicy, PinResolution, ProbeRef, ProbeStores, RequirementResolution,
     RequirementStatus, ShaPinLookup, ShaPinTail, SourcePolicy, concrete_pin_version,
     git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, is_partial_semver_shaped,
-    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite,
+    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite_with_default_style,
     tag_has_precedence, tag_pin_is_up_to_date,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
-    lsp_helpers::warn_rejected_value,
+    ConcreteVersion, Dependency, InvalidPackageName, PackageName, lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
 
+use crate::GitTagsFlavor;
 use crate::parser::{is_full_sha, is_tag_shaped};
 use crate::types::{GithubActionsDependency, PinStyle, ShaComment};
 
@@ -33,6 +33,9 @@ pub struct GithubActionsFormatter {
     /// probes, read synchronously by diagnostics, status and hover. Empty unless shared with
     /// the registry through [`Self::with_probe_stores`].
     pub(crate) probe_stores: Arc<ProbeStores>,
+    /// Which manifest family this formatter renders; decides the [`deps_core::EcosystemId`] every shared
+    /// helper is keyed on and the comment spelling of a new SHA pin.
+    pub(crate) flavor: GitTagsFlavor,
 }
 
 impl GithubActionsFormatter {
@@ -69,7 +72,15 @@ impl GithubActionsFormatter {
         Self {
             tag_index,
             probe_stores: Arc::new(ProbeStores::default()),
+            flavor: GitTagsFlavor::Actions,
         }
+    }
+
+    /// Renders for `flavor` instead of the default [`GitTagsFlavor::Actions`].
+    #[must_use]
+    pub const fn with_flavor(mut self, flavor: GitTagsFlavor) -> Self {
+        self.flavor = flavor;
+        self
     }
 
     /// Reads probe evidence from `probe_stores`, the handle
@@ -141,10 +152,11 @@ impl GithubActionsFormatter {
     #[must_use]
     pub fn sha_pin_replacement_for(&self, name: &PackageName, tag: &str) -> Option<String> {
         let sha = self.commit_for_tag(name, tag)?;
-        Some(sha_pin_rewrite(
+        Some(sha_pin_rewrite_with_default_style(
             &ShaPinTail::Bare(CommentSlot::Appendable),
             &sha,
             &ConcreteVersion::new(tag),
+            self.flavor.default_comment_style(),
         ))
     }
 
@@ -367,7 +379,7 @@ impl DependencyFormatter for GithubActionsFormatter {
 
     /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
     /// new SHA for `version`'s tag in the shared [`TagIndex`] and rewrites the pin through
-    /// [`sha_pin_rewrite`]: `{sha}{closers} # {tag}` for a comment-annotated pin (the closing
+    /// [`sha_pin_rewrite_with_default_style`]: `{sha}{closers} # {tag}` for a comment-annotated pin (the closing
     /// quote/`}` are re-emitted, #1732) or a plain, last-on-line scalar, the bare SHA for a
     /// quoted/flow-style pin without a comment (`version_range` is then exactly the 40 hex,
     /// so no `#` may be injected, #1724). Otherwise (index miss) returns
@@ -391,7 +403,14 @@ impl DependencyFormatter for GithubActionsFormatter {
                 .zip(self.release_commit_for(gha_dep.name(), version.as_str()))
                 .map_or_else(
                     || gha_dep.version_literal().unwrap_or(current).to_string(),
-                    |(tail, (tag, sha))| sha_pin_rewrite(&tail, &sha, &tag),
+                    |(tail, (tag, sha))| {
+                        sha_pin_rewrite_with_default_style(
+                            &tail,
+                            &sha,
+                            &tag,
+                            self.flavor.default_comment_style(),
+                        )
+                    },
                 ),
             Some(PinStyle::Branch) | None => {
                 gha_dep.version_literal().unwrap_or(current).to_string()
@@ -468,7 +487,7 @@ impl DependencyFormatter for GithubActionsFormatter {
         resolve_git_pin(
             Self::pin_view(gha_dep),
             index.as_deref(),
-            EcosystemId::GithubActions,
+            self.flavor.ecosystem_id(),
         )
     }
 
@@ -548,7 +567,7 @@ impl GithubActionsFormatter {
             Some(PinStyle::Tag) => {
                 let tag = gha_dep.version_req.as_ref()?.as_str();
                 let floating = is_partial_semver_shaped(tag)
-                    && concrete_pin_version(tag, EcosystemId::GithubActions).is_none();
+                    && concrete_pin_version(tag, self.flavor.ecosystem_id()).is_none();
                 if !floating {
                     return None;
                 }
@@ -569,7 +588,7 @@ impl GithubActionsFormatter {
     ) -> RequirementStatus {
         let written = requirement.as_str();
         let is_tag_pin = gha_dep.pin == Some(PinStyle::Tag);
-        let is_version_shaped = concrete_pin_version(written, EcosystemId::GithubActions).is_some()
+        let is_version_shaped = concrete_pin_version(written, self.flavor.ecosystem_id()).is_some()
             || is_partial_semver_shaped(written);
         if !is_tag_pin || !is_version_shaped {
             return status;
@@ -675,6 +694,7 @@ impl OsvNaming for GithubActionsFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::EcosystemId;
     use deps_core::NormalizeName;
     #[cfg(feature = "lsp-responses")]
     use deps_core::NormalizedName;
@@ -1933,8 +1953,8 @@ mod tests {
         );
     }
 
-    /// #1727: a SHA pin gets whole-commit candidate siblings, any other pin same-major, and a
-    /// repository without an index entry is not yet indexed.
+    /// #1727/#1719: every indexed pin gets whole-commit candidate siblings, and a repository
+    /// without an index entry is not yet indexed.
     #[test]
     fn test_candidate_tag_source_scope_follows_pin_style() {
         use deps_core::lsp_helpers::{CandidateTagSource, SiblingScope};
@@ -1959,7 +1979,7 @@ mod tests {
         assert_matches!(
             fmt.candidate_tag_source(&tag_dep),
             CandidateTagSource::Indexed {
-                scope: SiblingScope::SameMajor,
+                scope: SiblingScope::WholeCommit,
                 ..
             }
         );
@@ -2176,10 +2196,12 @@ mod tests {
         let sha = "a".repeat(40);
         for other in ["v5.0.0", "v99.0.0"] {
             let tags = [("v4", sha.as_str()), (other, sha.as_str())];
+            let pin = floating_tag_pin_for("v4", &tags).unwrap();
+            assert_eq!(pin.version().as_str(), "v4", "{other}");
             assert_eq!(
-                floating_tag_pin_for("v4", &tags),
-                Some(ResolvedPin::most_specific(ConcreteVersion::new("v4"))),
-                "{other}: only the written tag itself remains, which is not a full version"
+                sibling_names(&pin),
+                [other],
+                "{other}: scanned as a sibling, never adopted as the primary (#1719)"
             );
         }
         let tags = [("v4", sha.as_str()), ("v4.2.2", sha.as_str())];
@@ -2192,10 +2214,9 @@ mod tests {
             ("v4.2.2", sha.as_str()),
             ("v5.0.0", sha.as_str()),
         ];
-        assert_eq!(
-            floating_tag_pin_for("v4", &tags),
-            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.2")))
-        );
+        let pin = floating_tag_pin_for("v4", &tags).unwrap();
+        assert_eq!(pin.version().as_str(), "v4.2.2");
+        assert_eq!(sibling_names(&pin), ["v5.0.0"]);
     }
 
     /// #1684 (critic N3): missing tags and a cold index stay on the text path.
@@ -2212,10 +2233,10 @@ mod tests {
         pin.siblings().iter().map(|t| t.as_str()).collect()
     }
 
-    /// #1709/#1719: an exact tag pin stays primary and gains the same-major releases on its
-    /// commit as siblings; other majors stay out.
+    /// #1709/#1719: an exact tag pin stays primary and gains every release on its commit,
+    /// across majors, as siblings.
     #[test]
-    fn test_resolved_pin_version_exact_tag_keeps_written_primary_with_same_major_siblings() {
+    fn test_resolved_pin_version_exact_tag_keeps_written_primary_with_whole_commit_siblings() {
         let sha = "a".repeat(40);
         let warm = [
             ("v4.8.0", sha.as_str()),
@@ -2224,10 +2245,10 @@ mod tests {
         ];
         let pin = floating_tag_pin_for("v4.8.0", &warm).unwrap();
         assert_eq!(pin.version().as_str(), "v4.8.0");
-        assert_eq!(sibling_names(&pin), ["v4.9.0"]);
+        assert_eq!(sibling_names(&pin), ["v4.9.0", "v5.0.0"]);
         let pin = floating_tag_pin_for("v4.9.0", &warm).unwrap();
         assert_eq!(pin.version().as_str(), "v4.9.0");
-        assert_eq!(sibling_names(&pin), ["v4.8.0"]);
+        assert_eq!(sibling_names(&pin), ["v4.8.0", "v5.0.0"]);
     }
 
     /// #1709 (N3): a non-full-semver tag pin never takes the exact-tag path.
