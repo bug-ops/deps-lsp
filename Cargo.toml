@@ -15,6 +15,9 @@ rust-version = "1.98"
 authors = ["Andrei G"]
 license = "MIT"
 repository = "https://github.com/bug-ops/deps-lsp"
+homepage = "https://bug-ops.github.io/deps-lsp"
+keywords = ["lsp", "language-server", "dependencies", "package-manager", "cargo"]
+categories = ["development-tools"]
 
 [workspace.dependencies]
 base64 = "0.23"
@@ -22,26 +25,24 @@ bytes = "1"
 clap = "4.6"
 criterion = "0.8"
 dashmap = "6.2"
-deps-bundler = { version = "5.0.0", path ="crates/deps-bundler" }
-deps-cargo = { version = "5.0.0", path ="crates/deps-cargo" }
-deps-cli = { version = "5.0.0", path ="crates/deps-cli" }
-deps-composer = { version = "5.0.0", path ="crates/deps-composer" }
-deps-core = { version = "5.0.0", path ="crates/deps-core" }
-deps-core-macros = { version = "5.0.0", path ="crates/deps-core-macros" }
-deps-dart = { version = "5.0.0", path ="crates/deps-dart" }
-deps-deno = { version = "5.0.0", path ="crates/deps-deno" }
-deps-engine = { version = "5.0.0", path ="crates/deps-engine" }
-deps-github-actions = { version = "5.0.0", path ="crates/deps-github-actions" }
-deps-gitlab-ci = { version = "5.0.0", path ="crates/deps-gitlab-ci" }
-deps-go = { version = "5.0.0", path ="crates/deps-go" }
-deps-gradle = { version = "5.0.0", path ="crates/deps-gradle" }
-deps-lsp = { version = "5.0.0", path ="crates/deps-lsp" }
-deps-maven = { version = "5.0.0", path ="crates/deps-maven" }
-deps-npm = { version = "5.0.0", path ="crates/deps-npm" }
-deps-nuget = { version = "5.0.0", path ="crates/deps-nuget" }
-deps-precommit = { version = "5.0.0", path ="crates/deps-precommit" }
-deps-pypi = { version = "5.0.0", path ="crates/deps-pypi" }
-deps-swift = { version = "5.0.0", path ="crates/deps-swift" }
+deps-bundler = { version = "5.0.0", path = "crates/deps-bundler" }
+deps-cargo = { version = "5.0.0", path = "crates/deps-cargo" }
+deps-composer = { version = "5.0.0", path = "crates/deps-composer" }
+deps-core = { version = "5.0.0", path = "crates/deps-core" }
+deps-core-macros = { version = "5.0.0", path = "crates/deps-core-macros" }
+deps-dart = { version = "5.0.0", path = "crates/deps-dart" }
+deps-deno = { version = "5.0.0", path = "crates/deps-deno" }
+deps-engine = { version = "5.0.0", path = "crates/deps-engine" }
+deps-github-actions = { version = "5.0.0", path = "crates/deps-github-actions" }
+deps-gitlab-ci = { version = "5.0.0", path = "crates/deps-gitlab-ci" }
+deps-go = { version = "5.0.0", path = "crates/deps-go" }
+deps-gradle = { version = "5.0.0", path = "crates/deps-gradle" }
+deps-maven = { version = "5.0.0", path = "crates/deps-maven" }
+deps-npm = { version = "5.0.0", path = "crates/deps-npm" }
+deps-nuget = { version = "5.0.0", path = "crates/deps-nuget" }
+deps-precommit = { version = "5.0.0", path = "crates/deps-precommit" }
+deps-pypi = { version = "5.0.0", path = "crates/deps-pypi" }
+deps-swift = { version = "5.0.0", path = "crates/deps-swift" }
 dirs = "7.0"
 futures = "0.3"
 globset = "0.4"
@@ -83,7 +84,6 @@ unicode-general-category = "1.1"
 url = "2.5"
 urlencoding = "2.1"
 yaml-rust2 = { version = "0.13", default-features = false }
-zed_extension_api = "0.7"
 zeroize = "1.9"
 
 [workspace.lints.rust]
@@ -119,9 +119,6 @@ empty_enums = "allow"
 # Documentation lints - allow for now, can enable incrementally
 doc_markdown = "allow"
 missing_docs_in_private_items = "allow"
-
-# Cargo lints - metadata can be added later
-cargo_common_metadata = "allow"
 
 # Nursery lints that are too pedantic
 option_if_let_else = "allow"

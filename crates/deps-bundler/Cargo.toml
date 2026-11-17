@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Gemfile support for deps-lsp"
+readme = "README.md"
 publish = true
 
 [lints]
@@ -23,20 +27,20 @@ workspace = true
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
-deps-core = { workspace = true }
-regex = { workspace = true }
+deps-core.workspace = true
+regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["fs"] }
 tower-lsp-server = { workspace = true, optional = true }
-tracing = { workspace = true }
-url = { workspace = true }
-urlencoding = { workspace = true }
+tracing.workspace = true
+url.workspace = true
+urlencoding.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 deps-core = { workspace = true, features = ["test-util"] }
-mockito = { workspace = true }
-tempfile = { workspace = true }
+mockito.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]

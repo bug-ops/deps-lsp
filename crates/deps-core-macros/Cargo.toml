@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Proc-macro derives for deps-core (RedactingDebug) — not for direct use, see deps-core::redact_debug"
+readme = "README.md"
 publish = true
 
 [lib]
@@ -16,6 +20,6 @@ proc-macro = true
 workspace = true
 
 [dependencies]
-proc-macro2 = { workspace = true }
-quote = { workspace = true }
-syn = { workspace = true }
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true

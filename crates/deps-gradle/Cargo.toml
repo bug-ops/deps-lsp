@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Gradle build system support for deps-lsp"
+readme = "README.md"
 publish = true
 
 [lints]
@@ -31,20 +35,20 @@ fuzzing = []
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses", "deps-maven/lsp-responses"]
 
 [dependencies]
-deps-core = { workspace = true }
-deps-maven = { workspace = true }
-quick-xml = { workspace = true }
-regex = { workspace = true }
-tokio = { workspace = true }
-toml-span = { workspace = true }
+deps-core.workspace = true
+deps-maven.workspace = true
+quick-xml.workspace = true
+regex.workspace = true
+tokio.workspace = true
+toml-span.workspace = true
 tower-lsp-server = { workspace = true, optional = true }
-tracing = { workspace = true }
-url = { workspace = true }
+tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json"] }
-mockito = { workspace = true }
-tempfile = { workspace = true }
+mockito.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tokio-test = { workspace = true }
+tokio-test.workspace = true

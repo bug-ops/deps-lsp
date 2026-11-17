@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Language Server Protocol implementation for dependency management"
+readme = "README.md"
 publish = true
 
 [lints]
@@ -50,18 +54,18 @@ deps-core = { workspace = true, features = ["lsp-responses"] }
 deps-engine = { workspace = true, features = ["lsp-responses"] }
 
 # External dependencies
-dashmap = { workspace = true }
-futures = { workspace = true }
+dashmap.workspace = true
+futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "io-std"] }
-tower-lsp-server = { workspace = true }
-tracing = { workspace = true }
+tower-lsp-server.workspace = true
+tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-url = { workspace = true }
+url.workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true }
+criterion.workspace = true
 # Path-only (no version): used solely by the FR-005 parity test, and deps-cli never depends on
 # deps-lsp, so there is no cycle and nothing to resolve on publish. No default features: the
 # ecosystem set both sides of the parity test register is the one deps-lsp's own features enable
@@ -79,8 +83,8 @@ deps-github-actions = { workspace = true, features = ["lsp-responses", "test-uti
 deps-gitlab-ci = { workspace = true, features = ["lsp-responses"] }
 deps-npm = { workspace = true, features = ["lsp-responses"] }
 insta = { workspace = true, features = ["json"] }
-mockito = { workspace = true }
-tempfile = { workspace = true }
+mockito.workspace = true
+tempfile.workspace = true
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs (`Builder::start_paused`);
 # previously reached transitively through the now-removed `tokio-test` dev-dependency, which
 # had no other, directly-used API in this crate — made explicit here instead.

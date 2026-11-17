@@ -6,7 +6,12 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Swift Package Manager support for deps-lsp"
+readme = "README.md"
+publish = true
 
 [lints]
 workspace = true
@@ -32,25 +37,25 @@ test-util = ["deps-core/test-util"]
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
-dashmap = { workspace = true }
-deps-core = { workspace = true }
-futures = { workspace = true }
-regex = { workspace = true }
-reqwest = { workspace = true }
-semver = { workspace = true }
+dashmap.workspace = true
+deps-core.workspace = true
+futures.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tower-lsp-server = { workspace = true, optional = true }
-tracing = { workspace = true }
-url = { workspace = true }
-urlencoding = { workspace = true }
-zeroize = { workspace = true }
+tracing.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
-bytes = { workspace = true }
+bytes.workspace = true
 deps-core = { workspace = true, features = ["test-util"] }
-mockito = { workspace = true }
-tempfile = { workspace = true }
+mockito.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

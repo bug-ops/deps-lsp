@@ -6,7 +6,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Core abstractions for deps-lsp: caching, errors, and traits"
+readme = "README.md"
 publish = true
 
 [lints]
@@ -51,46 +55,46 @@ lsp-responses = ["dep:tower-lsp-server"]
 test-util = ["dep:tracing-subscriber", "dep:tempfile"]
 
 [dependencies]
-base64 = { workspace = true }
-bytes = { workspace = true }
-dashmap = { workspace = true }
-deps-core-macros = { workspace = true }
-dirs = { workspace = true }
-futures = { workspace = true }
-http = { workspace = true }
+base64.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+deps-core-macros.workspace = true
+dirs.workspace = true
+futures.workspace = true
+http.workspace = true
 hyper-util = { workspace = true, features = ["client-proxy", "client-proxy-system"] }
-ipnet = { workspace = true }
-jsonc-parser = { workspace = true }
+ipnet.workspace = true
+jsonc-parser.workspace = true
 reqwest = { workspace = true, features = ["json", "gzip"] }
-semver = { workspace = true }
+semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
-thiserror = { workspace = true }
+thiserror.workspace = true
 time = { workspace = true, features = ["std", "parsing"] }
 tokio = { workspace = true, features = ["sync", "time", "fs", "net", "rt"] }
 toml-span = { workspace = true, features = ["serde"] }
 tower-lsp-server = { workspace = true, optional = true }
-tracing = { workspace = true }
+tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
-unicode-general-category = { workspace = true }
-url = { workspace = true }
-urlencoding = { workspace = true }
-yaml-rust2 = { workspace = true }
-zeroize = { workspace = true }
+unicode-general-category.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+yaml-rust2.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
-insta = { workspace = true }
-mockito = { workspace = true }
-proptest = { workspace = true }
-tempfile = { workspace = true }
+insta.workspace = true
+mockito.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-tokio-test = { workspace = true }
-trybuild = { workspace = true }
+tokio-test.workspace = true
+trybuild.workspace = true
 
 [[bench]]
 name = "core_benchmarks"
