@@ -230,7 +230,11 @@ async fn buildscript_named_legacy_files_are_build_script_scope_and_settings_file
         "buildscript-only name is not collapsed"
     );
     assert!(candidates[&agp].has_scope(LockScope::BuildScript));
-    assert!(candidates[&key("org.slf4j:slf4j-api")].has_scope(LockScope::Project));
+    assert_eq!(
+        versions[&key("org.slf4j:slf4j-api")].as_str(),
+        "2.0.9",
+        "Project-only name collapses to its single version"
+    );
     assert!(
         packages.all("org.settings:only").is_none(),
         "settings-* files are skipped"
