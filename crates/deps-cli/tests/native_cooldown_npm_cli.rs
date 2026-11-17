@@ -235,7 +235,13 @@ async fn update_skips_the_held_latest_with_exit_zero() {
     let plan = fx.update_plan().await;
     assert!(applied(&plan).is_empty(), "{:#?}", plan.items);
     assert_eq!(held_items(&plan), 1, "{:#?}", plan.items);
-    assert_eq!(update_exit_code(&plan), 0);
+    let run = deps_cli::update::UpdateRun {
+        plan,
+        lockfile: deps_cli::update::regen::LockfileOutcome::NotApplicable(
+            deps_cli::update::regen::NotApplicableReason::NothingApplied,
+        ),
+    };
+    assert_eq!(update_exit_code(&run), 0);
 }
 
 #[tokio::test]

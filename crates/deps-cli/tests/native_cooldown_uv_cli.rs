@@ -231,7 +231,13 @@ async fn update_skips_the_held_latest_as_within_native_cooldown_and_exits_zero()
         "{}",
         skipped[0].reason()
     );
-    assert_eq!(update_exit_code(&plan), 0);
+    let run = deps_cli::update::UpdateRun {
+        plan,
+        lockfile: deps_cli::update::regen::LockfileOutcome::NotApplicable(
+            deps_cli::update::regen::NotApplicableReason::NothingApplied,
+        ),
+    };
+    assert_eq!(update_exit_code(&run), 0);
 }
 
 #[tokio::test]
