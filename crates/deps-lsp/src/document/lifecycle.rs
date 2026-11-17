@@ -240,6 +240,7 @@ async fn open_with_reservation(
 /// [`open_document`] for tests that drive the spawned task themselves: the task is returned
 /// unregistered, and an open that lost a race fails the test.
 #[cfg(test)]
+#[allow(dead_code, reason = "used only by feature-gated test modules")]
 pub(crate) async fn open_document_task(
     uri: Uri,
     content: String,
@@ -2971,7 +2972,7 @@ mod tests {
             if stored {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         task.abort();
 

@@ -2307,6 +2307,7 @@ impl ServerState {
 
     /// Whether a change/open task is registered for `uri`.
     #[cfg(test)]
+    #[allow(dead_code, reason = "used only by feature-gated test modules")]
     pub(crate) async fn has_background_task(&self, uri: &Uri) -> bool {
         self.tasks.read().await.contains_key(uri)
     }

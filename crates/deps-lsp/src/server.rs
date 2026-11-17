@@ -3755,7 +3755,7 @@ let package = Package(
         let candidates = doc
             .signals
             .resolved_version_candidates
-            .get(&NormalizedName::for_test("com.example:plugin"))
+            .get(&deps_core::NormalizedName::for_test("com.example:plugin"))
             .expect("the classpath dependency's candidates are loaded from the companion change");
         assert!(candidates.has_scope(deps_core::LockScope::BuildScript));
     }
