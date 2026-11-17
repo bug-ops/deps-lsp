@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli**: `cooldown_disposition` takes a `NativeGate` argument, `CooldownDisposition::NativeHeld`, `UnplannableReason::WithinNativeCooldown`, `SkipReason::WithinNativeCooldown`, `PlannedUpdateItem::native_hold` and `PolicyConfigDiff::native_cooldown_changed` are new (#2043)
 - **deps-core**: new public fields `PackageVersions::publish_times`, `VersionData::now` and `FreshnessConfig::honor_native_cooldown` (#2043)
 - **deps-cargo**: `.cargo/config.toml` is now a watched config, so editing it re-parses and re-fetches open Cargo manifests (#2043)
-- **deps-npm**: `NpmParseContext::new` is no longer `const` (#2041)
-- **deps-engine**: `fetch_latest_versions_parallel` takes a `PublishTimeDemand` argument (#2041)
+- **deps-npm**: `NpmParseContext::new` is no longer `const` (#2041, #2055)
+- **deps-engine**: `fetch_latest_versions_parallel` takes a `PublishTimeDemand` argument (#2041, #2055)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
@@ -39,9 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp, deps-cli**: `freshness.honor_native_cooldown` (default `true`) turns the native window off (#2043)
 - **deps-core**: new `native_cooldown` module, `Dependency::native_cooldown`, `UserHome::is` (now public), `PackageVersions::published_at_of`, `VersionData::with_now` and `format_duration_bucket` (#2043)
 - **deps-engine**: `EcosystemRuntime::native_cooldown` live toggle (#2043)
-- **deps-npm, deps-core, deps-engine, deps-lsp, deps-cli**: native release-age windows of npm (`min-release-age`, `before`, `.npmrc`), pnpm (`minimumReleaseAge*`, `pnpm-workspace.yaml`) and Bun (`bunfig.toml`) are honored explain-only, with per-package exemptions and publish times fetched when a window applies (#2041)
-- **deps-pypi, deps-core, deps-lsp, deps-cli**: uv `exclude-newer` and `exclude-newer-package` from `uv.toml` and `[tool.uv]` are honored explain-only (#2042)
-- **deps-gradle, deps-core, deps-lsp**: in-use versions from the legacy `gradle/dependency-locks/<configuration>.lockfile` layout, and `LockFileProvider::lock_set_root` refreshes documents when a lock file disappears (#2039)
+- **deps-npm, deps-core, deps-engine, deps-lsp, deps-cli**: native release-age windows of npm (`min-release-age`, `before`, `.npmrc`), pnpm (`minimumReleaseAge*`, `pnpm-workspace.yaml`) and Bun (`bunfig.toml`) are honored explain-only, with per-package exemptions and publish times fetched when a window applies (#2041, #2055)
+- **deps-pypi, deps-core, deps-lsp, deps-cli**: uv `exclude-newer` and `exclude-newer-package` from `uv.toml` and `[tool.uv]` are honored explain-only (#2042, #2055)
+- **deps-gradle, deps-core, deps-lsp**: in-use versions from the legacy `gradle/dependency-locks/<configuration>.lockfile` layout, and `LockFileProvider::lock_set_root` refreshes documents when a lock file disappears (#2039, #2055)
 
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
