@@ -52,6 +52,32 @@ fn project() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// Compares after canonicalization: on Windows `locate_lockfile` yields a non-verbatim path while
+/// the tempdir path is verbatim (`\\?\C:\...`).
+fn assert_located(manifest: &Url, expected: &Path) {
+    let found = GradleLockParser.locate_lockfile(manifest).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(found).unwrap(),
+        std::fs::canonicalize(expected).unwrap()
+    );
+}
+
+/// Sets a directory's mtime; Windows needs write-attributes access and backup semantics to open one.
+fn set_dir_modified(dir: &Path, time: SystemTime) {
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(0x100)
+            .custom_flags(0x0200_0000)
+            .open(dir)
+            .unwrap()
+    };
+    #[cfg(not(windows))]
+    let handle = std::fs::File::open(dir).unwrap();
+    handle.set_modified(time).unwrap();
+}
+
 fn key(name: &str) -> deps_core::NormalizedName {
     Plain.normalize_package_name(&PackageName::new(name))
 }
@@ -61,10 +87,7 @@ fn locate_legacy_returns_the_first_name_sorted_lockfile() {
     let (_g, p) = project();
     write_lock(&p, "runtimeClasspath.lockfile", COMPILE_LOCK);
     let first = write_lock(&p, "compileClasspath.lockfile", COMPILE_LOCK);
-    assert_eq!(
-        GradleLockParser.locate_lockfile(&manifest_uri(&p)),
-        Some(first)
-    );
+    assert_located(&manifest_uri(&p), &first);
 }
 
 #[test]
@@ -91,10 +114,7 @@ fn unified_lockfile_wins_and_legacy_is_never_read() {
     let unified = p.join("gradle.lockfile");
     std::fs::write(&unified, "org.example:unified:1.0.0=runtimeClasspath\n").unwrap();
     write_lock(&p, "compileClasspath.lockfile", COMPILE_LOCK);
-    assert_eq!(
-        GradleLockParser.locate_lockfile(&manifest_uri(&p)),
-        Some(unified)
-    );
+    assert_located(&manifest_uri(&p), &unified);
 }
 
 #[tokio::test]
@@ -114,10 +134,7 @@ fn buildscript_lockfile_alone_also_beats_legacy() {
     let buildscript = p.join("buildscript-gradle.lockfile");
     std::fs::write(&buildscript, "org.example:agp:8.0.0=classpath\n").unwrap();
     write_lock(&p, "compileClasspath.lockfile", COMPILE_LOCK);
-    assert_eq!(
-        GradleLockParser.locate_lockfile(&manifest_uri(&p)),
-        Some(buildscript)
-    );
+    assert_located(&manifest_uri(&p), &buildscript);
 }
 
 #[test]
@@ -125,7 +142,7 @@ fn version_catalog_in_gradle_dir_finds_the_project_legacy_locks() {
     let (_g, p) = project();
     let located = write_lock(&p, "compileClasspath.lockfile", COMPILE_LOCK);
     let catalog = Url::from_file_path(p.join("gradle/libs.versions.toml")).unwrap();
-    assert_eq!(GradleLockParser.locate_lockfile(&catalog), Some(located));
+    assert_located(&catalog, &located);
 }
 
 #[test]
@@ -308,10 +325,7 @@ async fn cache_reparses_when_a_new_lockfile_appears_in_the_directory() {
         "ch.qos.logback:logback-classic:1.4.11\n",
     );
     let future = SystemTime::now() + Duration::from_secs(3600);
-    std::fs::File::open(locks_dir(&p))
-        .unwrap()
-        .set_modified(future)
-        .unwrap();
+    set_dir_modified(&locks_dir(&p), future);
 
     let second = cache
         .get_or_parse(&GradleLockParser, &compile)
@@ -345,10 +359,7 @@ async fn cache_reparses_when_a_lockfile_is_removed_from_the_directory() {
 
     std::fs::remove_file(&runtime).unwrap();
     let future = SystemTime::now() + Duration::from_secs(3600);
-    std::fs::File::open(locks_dir(&p))
-        .unwrap()
-        .set_modified(future)
-        .unwrap();
+    set_dir_modified(&locks_dir(&p), future);
 
     let second = cache
         .get_or_parse(&GradleLockParser, &compile)
