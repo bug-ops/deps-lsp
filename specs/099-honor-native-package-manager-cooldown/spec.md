@@ -14,7 +14,7 @@ tags:
   - deps-core
   - priority/p3
 created: 2026-11-09
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -32,9 +32,9 @@ related:
 > [!info] Metadata
 > **Author**: sdd (research/parity finding, live evidence 2026-11-09, HEAD 971ae08ae)
 > **Type / priority**: research / parity (enhancement), P3, cross-ecosystem (`deps-core`, `deps-cargo`, `deps-npm`, `deps-pypi`, `deps-cli`)
-> **Issue**: to be filed (labels `enhancement`, `research`, `P3`, `cross-ecosystem`)
+> **Issue**: #1982 (labels `enhancement`, `research`, `P3`, `cross-ecosystem`)
 > **Related issues**: #1569 (open, P4: installer-level cooldown for auto-following ecosystems), #1964 (untrusted-repository config must not hide advisories)
-> **Phase**: specify. Open `[NEEDS CLARIFICATION]`: 8.
+> **Phase**: Phase 1 (Cargo) implemented explain-only (#1982, PR pending). Open `[NEEDS CLARIFICATION]`: 4 (items 1, 2, 6, 8; items 3, 4, 5, 7 resolved below).
 
 > [!abstract]
 > deps-lsp's freshness signal (hover "recently published" callout, diagnostics, update code actions, `deps-cli update` fallback) is driven only by `freshness.cooldown_secs` (default 3 days). Since 2025-2026 every major package manager ships its own release-age gate (Cargo `min-publish-age`, npm `min-release-age`, pnpm `minimumReleaseAge`, Yarn `npmMinimalAgeGate`, Bun `minimumReleaseAge`, uv `exclude-newer`), but deps-lsp never reads them. The editor can therefore recommend a version the project's own resolver will refuse. This spec makes the native window an input to the effective freshness window, explains the reason in the UI, and keeps the untrusted-repository threat model intact: a native window may delay a recommended upgrade, but never hides a vulnerability diagnostic.
@@ -91,7 +91,7 @@ GIVEN .cargo/config.toml with [registry] global-min-publish-age = "7 days"
 WHEN the user hovers the dependency or requests code actions
 THEN the hover callout says the version is excluded by "cargo registry.global-min-publish-age = 7 days"
   AND no plain "Update to <that version>" action is offered
-  AND the newest eligible version is the one proposed
+  AND the newest eligible version is the one proposed (Phase 2; see Phase 1 resolution)
 ```
 
 ### US-002: npm and pnpm project with a release-age gate
@@ -149,7 +149,7 @@ Terminology: **native window** is the duration derived from the project's own pa
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN an ecosystem's manifest scope declares a native release-age window THE SYSTEM SHALL compute the effective window for each dependency in that scope from the native window and `freshness.cooldown_secs`, using the rule fixed by `[NEEDS CLARIFICATION]` item 3. | must |
-| FR-002 | WHEN a version's publish time is younger than the effective window and the window comes from a native source THE SYSTEM SHALL treat that version as ineligible for "latest" in hover, update code actions, the "Update N outdated" lens and `deps-cli update`, and SHALL propose the newest eligible version instead. | must |
+| FR-002 | WHEN a version's publish time is younger than the effective window and the window comes from a native source THE SYSTEM SHALL treat that version as ineligible for "latest" in hover, update code actions, the "Update N outdated" lens and `deps-cli update`, and SHALL propose the newest eligible version instead. **Phase 1 narrows this to explain-only: the held version is named and never proposed, and no older version is proposed in its place.** | must |
 | FR-003 | WHEN a version is excluded by a native window THE SYSTEM SHALL state the source in the hover callout and the diagnostic message, in the form `excluded by <tool> <setting> = <value>`. | must |
 | FR-004 | WHEN the native window comes from Cargo THE SYSTEM SHALL read `[registry] global-min-publish-age`, the matching `[registries.<name>] min-publish-age`, and `[resolver] incompatible-publish-age` from the `.cargo/config.toml` hierarchy already used for registry configuration, and SHALL apply the window only when `incompatible-publish-age` resolves to `deny`. | must |
 | FR-005 | WHEN a Cargo dependency resolves to a registry without publish-time data, or is a git or path dependency THE SYSTEM SHALL NOT apply a native window to it. | must |
@@ -264,6 +264,19 @@ Terminology: **native window** is the duration derived from the project's own pa
 | 3 | uv (`pyproject.toml` `[tool.uv]`, `uv.toml`), `exclude-newer-package`, absolute-timestamp semantics | Most semantic ambiguity (item 6), so last |
 
 Each phase ships behind the same opt-out and updates `.local/testing/coverage.md` and the relevant playbook per the branching rules.
+
+### Phase 1 resolution (Cargo, #1982)
+
+Resolved open questions and the shape that shipped:
+
+- **Item 3 (effective window):** the native window decides eligibility and the explanation; `freshness.cooldown_secs` keeps its advisory role unchanged. The native hold is independent of `freshness.enabled`.
+- **Item 4 (security fixes):** a fix inside the window is listed with its target unchanged, and annotated `inside <source>` (quick fix title, `deps-cli update --security-only` reason). The window never moves a fix target.
+- **Item 5 (Cargo version):** the window applies whenever configured; the installed Cargo version is not detected.
+- **Item 7 (surface and environment):** boolean opt-out `freshness.honor_native_cooldown` (default `true`). Only repository-level `.cargo/config.toml` files from the manifest directory up to the workspace root are read (the manifest directory alone without a workspace root); `~/.cargo/config.toml`, `$CARGO_HOME/config.toml` and `CARGO_*` environment variables are never read.
+- **Narrowed FR-002 / US-001:** explain-only. A held `latest` is never proposed and nothing older is proposed in its place; a version in `Cargo.lock` stays eligible.
+- **Read-time gate:** per-version publish times (`PackageVersions::publish_times`) are stored window-independently; the gate runs at read time against the lock maps and one instant (`VersionData::now`), so a `Cargo.lock` change or a release published after the fetch is judged correctly without a refetch.
+
+**F1 (Phase 2 follow-up):** steering a recommended fix past a held version (`steer_past_deprecated`) is not implemented, because Cargo never reports `AdvisoryDeprecated`. When another ecosystem needs it, the native steer filter must be applied identically in deps-engine `resolve_fix_target` and every `FixTargetContext` site, or the fix-target verifier and the action desync and a hostile window could hide a fix.
 
 ## 11. See Also
 

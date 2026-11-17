@@ -595,6 +595,7 @@ mod tests {
             gossip_excluded_version: None,
             cooldown_fallback: None,
             osv_sibling_match: None,
+            native_hold: None,
         }
     }
 

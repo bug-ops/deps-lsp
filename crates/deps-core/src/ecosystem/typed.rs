@@ -680,7 +680,7 @@ pub async fn hover<'a, E: TypedEcosystem>(
         registry.as_ref(),
         eco.own_formatter(),
         freshness,
-        crate::freshness::PublishTime::now(),
+        versions.now,
     );
     let decoration = eco.decorate_hover(parsed, hovered, versions);
     let (mut hover, decorator) = match E::HOVER_DECORATION {
@@ -787,7 +787,7 @@ pub async fn diagnostics<'a, E: TypedEcosystem>(
         uri,
         freshness,
         severities,
-        crate::freshness::PublishTime::now(),
+        versions.now,
     );
     eco.decorate_diagnostics(parsed, severities, &mut out).await;
     out

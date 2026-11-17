@@ -30,16 +30,19 @@
 //! ```
 
 use crate::config::{
-    ConfigFileCache, RegistryIndex, RegistryIndexError, SourceReplacement, strip_sparse_prefix,
+    ConfigFileCache, NativeScope, RegistryIndex, RegistryIndexError, SourceReplacement,
+    strip_sparse_prefix,
 };
 use crate::types::{
     CargoDependency, CargoDependencySection, CustomRegistryOrigin, DependencySource,
 };
+use deps_core::native_cooldown::NativeCooldown;
 use deps_core::net_policy::{
     EnvSource, ProcessEnv, RegistryAccessPolicy, RegistryRejectionClassifier,
 };
+use deps_core::policy_config::{AtomicToggle, NativeCooldownMode};
 use deps_core::position::Range;
-use deps_core::{DepsError, Result};
+use deps_core::{DepsError, Result, UserHome};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,6 +150,12 @@ pub struct CargoParseContext {
     /// The environment `CARGO_HOME` and `CARGO_REGISTRIES_*` are read from: the process
     /// environment in production.
     env: Arc<dyn EnvSource + Send + Sync>,
+    /// Whether the package manager's own publish-age window is read at all; live-updatable so
+    /// a configuration change applies to the next parse without rebuilding the ecosystem.
+    native_cooldown: Arc<AtomicToggle<NativeCooldownMode>>,
+    /// The user's home directory, whose `.cargo/config.toml` is never read for a publish-age
+    /// window: it is not part of the repository.
+    user_home: Option<UserHome>,
 }
 
 impl Default for CargoParseContext {
@@ -185,6 +194,8 @@ impl CargoParseContext {
             policy,
             config_cache,
             env: Arc::new(ProcessEnv),
+            native_cooldown: Arc::new(AtomicToggle::new(NativeCooldownMode::default())),
+            user_home: UserHome::current().cloned(),
         }
     }
 
@@ -194,6 +205,55 @@ impl CargoParseContext {
     #[must_use]
     pub fn with_env_for_test(mut self, env: deps_core::net_policy::MapEnv) -> Self {
         self.env = Arc::new(env);
+        self
+    }
+
+    /// Selects whether Cargo's `min-publish-age` window is read ([`NativeCooldownMode::Honor`],
+    /// the default) or ignored entirely.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cargo::parser::CargoParseContext;
+    /// use deps_core::policy_config::NativeCooldownMode;
+    ///
+    /// let _ctx = CargoParseContext::default().with_native_cooldown(NativeCooldownMode::Ignore);
+    /// ```
+    #[must_use]
+    pub fn with_native_cooldown(mut self, mode: NativeCooldownMode) -> Self {
+        self.native_cooldown = Arc::new(AtomicToggle::new(mode));
+        self
+    }
+
+    /// Shares a live [`NativeCooldownMode`] toggle with the caller, so flipping it applies to
+    /// the next parse of every document.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cargo::parser::CargoParseContext;
+    /// use deps_core::policy_config::{AtomicToggle, NativeCooldownMode};
+    /// use std::sync::Arc;
+    ///
+    /// let toggle = Arc::new(AtomicToggle::new(NativeCooldownMode::Honor));
+    /// let _ctx = CargoParseContext::default().with_native_cooldown_toggle(Arc::clone(&toggle));
+    /// toggle.set(NativeCooldownMode::Ignore);
+    /// ```
+    #[must_use]
+    pub fn with_native_cooldown_toggle(
+        mut self,
+        toggle: Arc<AtomicToggle<NativeCooldownMode>>,
+    ) -> Self {
+        self.native_cooldown = toggle;
+        self
+    }
+
+    /// Test-only: treats `home` as the user home directory whose config is never read for a
+    /// publish-age window, instead of the process's real one.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_user_home_for_test(mut self, home: UserHome) -> Self {
+        self.user_home = Some(home);
         self
     }
 }
@@ -271,8 +331,14 @@ pub fn parse_cargo_toml_with_context(
 
     let discovery = discover_workspace(doc_uri)?;
 
+    let native_cooldowns = resolve_native_cooldowns(&dependencies, &discovery, ctx);
+
     let (resolved_registries, blocked_registries, rejected_registries) =
         resolve_alternate_registries(&mut dependencies, &discovery.config_paths, ctx);
+
+    for (dep, cooldown) in dependencies.iter_mut().zip(native_cooldowns) {
+        dep.native_cooldown = cooldown;
+    }
 
     Ok(CargoParseResult {
         dependencies,
@@ -617,6 +683,7 @@ fn parse_dependencies_section(
             section,
             package: None,
             custom_registry_origin: None,
+            native_cooldown: None,
         };
 
         if let Some(s) = value.as_str() {
@@ -771,6 +838,8 @@ struct WorkspaceDiscovery {
     /// of the workspace-root search's own short-circuit (plan-1b §1.5: "only the
     /// `[workspace]` search short-circuits; config discovery does not").
     config_paths: Vec<PathBuf>,
+    /// The directory holding the parsed manifest: the innermost directory of the walk.
+    manifest_dir: PathBuf,
 }
 
 /// Finds the workspace root by walking up the directory tree from `doc_uri`'s manifest,
@@ -801,6 +870,7 @@ fn discover_workspace(doc_uri: &Url) -> Result<WorkspaceDiscovery> {
         return Ok(WorkspaceDiscovery {
             workspace_root,
             config_paths,
+            manifest_dir: PathBuf::new(),
         });
     };
 
@@ -879,7 +949,81 @@ fn discover_workspace(doc_uri: &Url) -> Result<WorkspaceDiscovery> {
     Ok(WorkspaceDiscovery {
         workspace_root,
         config_paths,
+        manifest_dir: start_dir.to_path_buf(),
     })
+}
+
+/// The `.cargo/config.toml` files whose publish-age keys apply to this manifest, closest-first.
+///
+/// Narrower than the ancestor walk the registry resolution uses: a publish-age window is read
+/// only from inside the repository, so a config planted in a parent directory, or the user's
+/// own home config, never changes what an opened repository's versions are held back by. The
+/// boundary is the workspace root (inclusive), or the manifest directory alone when there is
+/// none; the user's home directory is excluded wherever it falls in that range.
+fn native_config_paths(discovery: &WorkspaceDiscovery, ctx: &CargoParseContext) -> Vec<PathBuf> {
+    discovery
+        .config_paths
+        .iter()
+        .filter(|config| {
+            let Some(dir) = config.parent().and_then(std::path::Path::parent) else {
+                return false;
+            };
+            let in_repository = discovery
+                .workspace_root
+                .as_deref()
+                .map_or(dir == discovery.manifest_dir, |root| dir.starts_with(root));
+            // Canonical comparison also catches a symlinked dir or a symlinked config file.
+            let is_home = ctx.user_home.as_ref().is_some_and(|home| {
+                home.is(dir)
+                    || std::fs::canonicalize(dir).is_ok_and(|real| home.is(&real))
+                    || std::fs::canonicalize(config).is_ok_and(|real| {
+                        std::fs::canonicalize(home.path().join(".cargo/config.toml"))
+                            .is_ok_and(|home_config| home_config == real)
+                    })
+            });
+            in_repository && !is_home
+        })
+        .cloned()
+        .collect()
+}
+
+/// The publish-age window of each dependency, positionally parallel to `dependencies`.
+///
+/// Resolved against the registry scope the dependency declares *before* alternate-registry
+/// resolution rewrites its source, so a source-replaced crates.io dependency still reads the
+/// `crates-io` key. Each distinct scope is resolved once.
+fn resolve_native_cooldowns(
+    dependencies: &[CargoDependency],
+    discovery: &WorkspaceDiscovery,
+    ctx: &CargoParseContext,
+) -> Vec<Option<NativeCooldown>> {
+    if ctx.native_cooldown.get() == NativeCooldownMode::Ignore {
+        return vec![None; dependencies.len()];
+    }
+    let config_paths = native_config_paths(discovery, ctx);
+    let mut by_scope: HashMap<NativeScope, Option<NativeCooldown>> = HashMap::new();
+    dependencies
+        .iter()
+        .map(|dep| {
+            let scope = match (&dep.source, dep.custom_registry_origin) {
+                (DependencySource::Registry, _) => NativeScope::CratesIo,
+                (DependencySource::CustomRegistry { url }, Some(CustomRegistryOrigin::Alias)) => {
+                    NativeScope::Alias(url.clone())
+                }
+                (
+                    DependencySource::CustomRegistry { .. },
+                    Some(CustomRegistryOrigin::LiteralIndex),
+                ) => NativeScope::LiteralIndex,
+                _ => return None,
+            };
+            by_scope
+                .entry(scope)
+                .or_insert_with_key(|scope| {
+                    crate::config::resolve_native_cooldown(scope, &config_paths, &ctx.config_cache)
+                })
+                .clone()
+        })
+        .collect()
 }
 
 /// Parser for Cargo.toml manifests implementing the deps-core traits.

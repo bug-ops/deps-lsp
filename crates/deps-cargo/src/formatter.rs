@@ -358,6 +358,7 @@ mod tests {
             section: crate::types::CargoDependencySection::Dependencies,
             package: None,
             custom_registry_origin: None,
+            native_cooldown: None,
         };
         let picked = ConcreteVersion::new("0.10.3");
         assert_eq!(

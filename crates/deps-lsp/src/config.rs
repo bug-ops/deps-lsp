@@ -492,6 +492,10 @@ impl ReparseScope {
     }
 }
 
+/// The only ecosystem `freshness.honor_native_cooldown` affects: Cargo resolves its publish-age
+/// window at parse time.
+const NATIVE_COOLDOWN_ECOSYSTEMS: &[deps_core::EcosystemId] = &[deps_core::EcosystemId::Cargo];
+
 /// The only ecosystem `registries.nuget_user_profile_sources` affects.
 const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[deps_core::EcosystemId] =
     &[deps_core::EcosystemId::NuGet];
@@ -581,6 +585,7 @@ pub(crate) fn reparse_scope(
         swift_keychain_credentials_changed,
         swift_scm_to_registry_changed,
         gitlab_instance_host_changed,
+        native_cooldown_changed,
     } = PolicyConfig::diff(&old.policy, new_policy);
 
     let mut scope: Option<ReparseScope> = None;
@@ -613,6 +618,12 @@ pub(crate) fn reparse_scope(
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS.to_vec()),
+        );
+    }
+    if native_cooldown_changed.is_changed() {
+        union_in(
+            &mut scope,
+            ReparseScope::Ecosystems(NATIVE_COOLDOWN_ECOSYSTEMS.to_vec()),
         );
     }
     if gitlab_instance_host_changed.is_changed() {
@@ -1564,6 +1575,23 @@ mod tests {
             );
             assert!(scope.matches(EcosystemId::NuGet, &any_uri()));
             assert!(!scope.matches(EcosystemId::Cargo, &any_uri()));
+        }
+
+        #[test]
+        fn test_native_cooldown_change_scopes_to_cargo_only() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.policy.freshness.honor_native_cooldown =
+                deps_core::policy_config::NativeCooldownMode::Ignore;
+
+            let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
+                .expect("must trigger a reparse");
+            assert_eq!(
+                scope,
+                ReparseScope::Ecosystems(NATIVE_COOLDOWN_ECOSYSTEMS.to_vec())
+            );
+            assert!(scope.matches(EcosystemId::Cargo, &any_uri()));
+            assert!(!scope.matches(EcosystemId::NuGet, &any_uri()));
         }
 
         #[test]

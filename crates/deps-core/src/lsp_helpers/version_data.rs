@@ -451,6 +451,9 @@ pub struct VersionData<'a> {
     /// diagnostics rule, inlay hints and the vulnerability quick fix; hover marks exempted
     /// advisories. `None` and an empty set behave identically: nothing is hidden.
     pub advisory_exemptions: Option<&'a OperatorExemptions>,
+    /// The single instant every read-time freshness decision (native gate included) judges
+    /// against; stamped by [`Self::new`], overridable with [`Self::with_now`].
+    pub now: crate::freshness::PublishTime,
 }
 
 impl<'a> VersionData<'a> {
@@ -491,6 +494,7 @@ impl<'a> VersionData<'a> {
             interactive_fetch: None,
             suppression: None,
             advisory_exemptions: None,
+            now: crate::freshness::PublishTime::now(),
         }
     }
 
@@ -916,6 +920,13 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_advisory_exemptions(mut self, exemptions: &'a OperatorExemptions) -> Self {
         self.advisory_exemptions = Some(exemptions);
+        self
+    }
+
+    /// Overrides [`Self::now`].
+    #[must_use]
+    pub const fn with_now(mut self, now: crate::freshness::PublishTime) -> Self {
+        self.now = now;
         self
     }
 

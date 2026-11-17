@@ -153,6 +153,7 @@ pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
                     reason: SkipReason::NotRequested
                         | SkipReason::IgnoreRule
                         | SkipReason::WithinFreshnessCooldown
+                        | SkipReason::WithinNativeCooldown
                         | SkipReason::OverlapsAnotherEdit,
                     ..
                 }
@@ -556,6 +557,7 @@ mod tests {
             gossip_excluded_version: None,
             cooldown_fallback: None,
             osv_sibling_match: None,
+            native_hold: None,
         }
     }
 

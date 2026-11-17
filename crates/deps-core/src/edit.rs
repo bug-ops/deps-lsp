@@ -756,6 +756,9 @@ pub enum UnplannableReason {
     /// version is never distinguishable from a flagged one at write time, so neither is ever
     /// planned.
     LatestUnverified,
+    /// The cached `latest` is still inside the native package-manager publish-age window
+    /// (spec 099 Phase 1): explained, never proposed.
+    WithinNativeCooldown,
 }
 
 /// One [`crate::lsp_helpers::RequirementStatus::Outdated`] dependency's planning outcome.
@@ -903,6 +906,24 @@ where
                 });
                 continue;
             }
+        }
+
+        // Spec 099: a `latest` inside the native publish-age window is explained, never proposed.
+        if let Some(gate) = crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions)
+            && gate.excludes(
+                versions
+                    .cached_for(&key)
+                    .and_then(|v| v.published_at_of(latest)),
+                latest,
+                gate.now(),
+            )
+        {
+            candidates.push(UpdateCandidate::Unplannable {
+                key,
+                name_range,
+                reason: UnplannableReason::WithinNativeCooldown,
+            });
+            continue;
         }
 
         // Intentionally not calling `dependency_version_range_is_literal` (#919) —

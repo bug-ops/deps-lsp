@@ -174,6 +174,7 @@ pub mod lsp_helpers;
 pub mod macros;
 pub mod matched_spans;
 pub mod mtime_cache;
+pub mod native_cooldown;
 pub mod net_policy;
 pub mod netrc;
 pub mod osv;
@@ -275,7 +276,8 @@ pub use error::{
     DepsError, ErrorOrigin, FetchFailure, ParseFailureKind, RateLimitEvidence, Result,
 };
 pub use freshness::{
-    CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age,
+    CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_duration_bucket,
+    format_relative_age, format_remaining_duration,
 };
 pub use interpolation::{
     MAX_INTERPOLATED_VALUE_BYTES, OversizedPropertyValue, PropertyValue, insert_bounded,

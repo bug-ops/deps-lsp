@@ -122,6 +122,9 @@ pub struct PolicyConfigDiff {
     pub swift_scm_to_registry_changed: SettingChange,
     /// Whether [`RegistriesConfig::gitlab_instance_host`] changed.
     pub gitlab_instance_host_changed: SettingChange,
+    /// Whether [`FreshnessConfig::honor_native_cooldown`] changed. The window is resolved at
+    /// parse time, so every open Cargo document must be re-parsed.
+    pub native_cooldown_changed: SettingChange,
 }
 
 /// Whether one setting differs between two config snapshots.
@@ -608,6 +611,7 @@ impl PolicyConfig {
         let FreshnessConfig {
             enabled: _,
             cooldown_secs: _,
+            honor_native_cooldown: new_native_cooldown,
         } = new_freshness;
         let SupplyChainConfig { enabled: _ } = new_supply_chain;
         let NetworkConfig { offline: _ } = new_network;
@@ -651,6 +655,10 @@ impl PolicyConfig {
             gitlab_instance_host_changed: SettingChange::of(
                 old_gitlab_instance_host,
                 new_gitlab_instance_host,
+            ),
+            native_cooldown_changed: SettingChange::of(
+                &old.freshness.honor_native_cooldown,
+                new_native_cooldown,
             ),
         }
     }
@@ -1342,6 +1350,54 @@ pub struct FreshnessConfig {
         deserialize_with = "deserialize_cooldown_secs"
     )]
     pub cooldown_secs: u64,
+    /// Whether the package manager's own publish-age window is honored (explain-only).
+    #[serde(default, deserialize_with = "deserialize_native_cooldown_mode")]
+    pub honor_native_cooldown: NativeCooldownMode,
+}
+
+/// Whether native package-manager publish-age windows (Cargo's `min-publish-age`) are
+/// honored. Configured as the boolean `freshness.honor_native_cooldown`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::NativeCooldownMode;
+///
+/// assert_eq!(NativeCooldownMode::default(), NativeCooldownMode::Honor);
+/// assert_eq!(NativeCooldownMode::from(false), NativeCooldownMode::Ignore);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NativeCooldownMode {
+    /// Read and apply the window.
+    #[default]
+    Honor,
+    /// Ignore the window entirely: no window is resolved or logged.
+    Ignore,
+}
+
+impl ToggleRepr for NativeCooldownMode {
+    fn from_repr(on: bool) -> Self {
+        Self::from(on)
+    }
+
+    fn to_repr(self) -> bool {
+        matches!(self, Self::Honor)
+    }
+}
+
+impl ToggleValue for NativeCooldownMode {}
+
+impl From<bool> for NativeCooldownMode {
+    fn from(honor: bool) -> Self {
+        if honor { Self::Honor } else { Self::Ignore }
+    }
+}
+
+fn deserialize_native_cooldown_mode<'de, D>(deserializer: D) -> Result<NativeCooldownMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(NativeCooldownMode::from)
 }
 
 impl Default for FreshnessConfig {
@@ -1366,6 +1422,7 @@ impl FreshnessConfig {
         Self {
             enabled: true,
             cooldown_secs: default_cooldown_secs(),
+            honor_native_cooldown: NativeCooldownMode::Honor,
         }
     }
 
@@ -2559,6 +2616,40 @@ mod tests {
             serde_json::from_str(r#"[{"package":"x","kinds":["yanked"]}]"#).unwrap(),
         );
         assert_eq!(PolicyConfig::diff(&old, &new), PolicyConfigDiff::default());
+    }
+
+    #[test]
+    fn test_diff_flags_native_cooldown_changes() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.freshness.honor_native_cooldown = NativeCooldownMode::Ignore;
+        assert_eq!(
+            PolicyConfig::diff(&old, &new),
+            PolicyConfigDiff {
+                native_cooldown_changed: SettingChange::Changed,
+                ..PolicyConfigDiff::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_native_cooldown_mode_round_trips_through_an_atomic_toggle() {
+        let toggle = AtomicToggle::new(NativeCooldownMode::Honor);
+        assert_eq!(toggle.get(), NativeCooldownMode::Honor);
+        toggle.set(NativeCooldownMode::Ignore);
+        assert_eq!(toggle.get(), NativeCooldownMode::Ignore);
+    }
+
+    #[test]
+    fn test_freshness_config_native_cooldown_deserialization() {
+        let default: FreshnessConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.honor_native_cooldown, NativeCooldownMode::Honor);
+        let off: FreshnessConfig =
+            serde_json::from_str(r#"{"honor_native_cooldown":false}"#).unwrap();
+        assert_eq!(off.honor_native_cooldown, NativeCooldownMode::Ignore);
+        assert!(
+            serde_json::from_str::<FreshnessConfig>(r#"{"honor_native_cooldown":"yes"}"#).is_err()
+        );
     }
 
     #[test]

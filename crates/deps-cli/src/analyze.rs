@@ -12,6 +12,7 @@ use deps_core::lsp_helpers::{
     CachedVersionsMap, CooldownDisposition, DependencyOutcomes, FormattedDependency, LatestVerdict,
     ResolvedCandidatesMap, ResolvedVersionsMap, cooldown_disposition,
 };
+use deps_core::native_cooldown::{NativeCooldown, NativeGate, native_cooldowns_by_name};
 use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{
     Ecosystem, EcosystemId, FreshnessSettings, GossipFindings, LicenseSource, NormalizedName,
@@ -249,7 +250,8 @@ impl ManifestAnalysis {
             .with_license_source(self.license_source)
             .with_license_policy(&self.license_policy)
             .with_license_prefetch(&self.licenses)
-            .with_gossip_prefetch(&self.gossip_findings);
+            .with_gossip_prefetch(&self.gossip_findings)
+            .with_now(self.now);
         if let Some(vulnerabilities) = self.vulnerabilities.as_ref() {
             version_data = version_data.with_vulnerabilities(vulnerabilities);
         }
@@ -358,21 +360,43 @@ impl ManifestAnalysis {
 /// [`deps_core::edit::collect_update_candidates`]/[`build_latest_check_targets`] reading
 /// `PackageVersions::latest` as they always do — so a fallback candidate is verified and
 /// planned against identically, with no separate code path to drift out of sync.
+///
+/// A package held back by its native publish-age window (`native_cooldowns`, judged against the
+/// lock maps at `now`) is substituted too when its stored fallback survives both windows.
 pub(crate) fn cooldown_fallback_view(
     cached_versions: &CachedVersionsMap,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
+    native_cooldowns: &HashMap<NormalizedName, NativeCooldown>,
     gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
     freshness: FreshnessSettings,
     now: PublishTime,
 ) -> CachedVersionsMap {
+    let version_data = VersionData::new(cached_versions, resolved_versions)
+        .with_resolved_version_candidates(resolved_version_candidates)
+        .with_now(now);
     cached_versions
         .iter()
         .map(|(name, versions)| {
             let mut substituted = versions.clone();
+            let gate = native_cooldowns
+                .get(name)
+                .map(|cooldown| NativeGate::for_name(cooldown, name, &version_data));
             if let CooldownDisposition::Blocked {
                 fallback: Some(fallback),
                 ..
-            } = cooldown_disposition(versions, name, freshness, gossip_prefetch, now)
-            {
+            }
+            | CooldownDisposition::NativeHeld {
+                fallback: Some(fallback),
+                ..
+            } = cooldown_disposition(
+                versions,
+                name,
+                freshness,
+                gossip_prefetch,
+                gate.as_ref(),
+                now,
+            ) {
                 substituted.latest = fallback.version.clone();
             }
             (name.clone(), substituted)
@@ -592,6 +616,9 @@ pub async fn analyze_manifest(
         .then(|| {
             cooldown_fallback_view(
                 &cached_versions,
+                &resolved_versions,
+                &resolved_version_candidates,
+                &native_cooldowns_by_name(parse_result.as_ref()),
                 Some(&gossip_findings),
                 ctx.policy.freshness.to_freshness(),
                 now,

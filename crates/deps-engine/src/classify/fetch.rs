@@ -835,6 +835,13 @@ async fn fetch_and_classify_package(
                 .iter()
                 .map(|v| v.version_string().clone())
                 .collect();
+            // Per-version publish times parallel to `available`; empty when none is known.
+            let publish_times: Arc<[Option<deps_core::PublishTime>]> =
+                if versions.iter().any(|v| v.published_at().is_some()) {
+                    versions.iter().map(|v| v.published_at()).collect()
+                } else {
+                    Arc::from(Vec::new())
+                };
             // Retained alongside `available` so diagnostics can flag a requirement
             // satisfiable only by a yanked version (`PackageVersions::yanked`). Gated on
             // `check_yanked`: a registry unable to answer `removal_status()` (§#298) must
@@ -1004,8 +1011,9 @@ async fn fetch_and_classify_package(
                     published_at,
                     ..
                 }) => {
-                    let mut versions =
-                        PackageVersions::new(version, available).with_yanked(yanked_list);
+                    let mut versions = PackageVersions::new(version, available)
+                        .with_yanked(yanked_list)
+                        .with_publish_times(publish_times);
                     if let Some(published_at) = published_at {
                         versions = versions.with_published_at(published_at);
                     }
@@ -5457,6 +5465,7 @@ mod tests {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
                 None,
+                None,
                 now,
             );
             assert_eq!(
@@ -5499,6 +5508,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(narrowed_cooldown_secs),
                 },
+                None,
                 None,
                 now,
             );
@@ -5545,6 +5555,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
+                None,
                 None,
                 now,
             );
@@ -5650,6 +5661,7 @@ mod tests {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
                 Some(&gossip),
+                None,
                 now,
             );
             match disposition {

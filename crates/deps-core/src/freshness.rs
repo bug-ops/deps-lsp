@@ -239,13 +239,79 @@ const WEEK: u64 = 7 * DAY;
 const MONTH: u64 = 30 * DAY;
 const YEAR: u64 = 365 * DAY;
 
-/// Pluralizes a unit label: `"1 minute ago"` vs `"5 minutes ago"`.
-fn format_unit_ago(count: u64, unit: &str) -> String {
-    if count == 1 {
-        format!("1 {unit} ago")
+/// Buckets a duration by the largest whole unit that fits, as `(count, unit seconds, unit
+/// name)`; `None` below one minute.
+const fn duration_bucket(secs: u64) -> Option<(u64, u64, &'static str)> {
+    if secs < MINUTE {
+        None
+    } else if secs < HOUR {
+        Some((secs / MINUTE, MINUTE, "minute"))
+    } else if secs < DAY {
+        Some((secs / HOUR, HOUR, "hour"))
+    } else if secs < WEEK {
+        Some((secs / DAY, DAY, "day"))
+    } else if secs < MONTH {
+        Some((secs / WEEK, WEEK, "week"))
+    } else if secs < YEAR {
+        Some((secs / MONTH, MONTH, "month"))
     } else {
-        format!("{count} {unit}s ago")
+        Some((secs / YEAR, YEAR, "year"))
     }
+}
+
+/// Pluralizes a unit label: `"1 minute"` vs `"5 minutes"`.
+fn format_unit(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
+    }
+}
+
+/// Formats a remaining duration in seconds as a coarse, human-readable span, bucketed like
+/// [`format_relative_age`] (largest whole unit, no calendar arithmetic).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::format_duration_bucket;
+///
+/// assert_eq!(format_duration_bucket(30), "less than a minute");
+/// assert_eq!(format_duration_bucket(300), "5 minutes");
+/// assert_eq!(format_duration_bucket(86_400), "1 day");
+/// assert_eq!(format_duration_bucket(3 * 86_400 + 60), "3 days");
+/// ```
+#[must_use]
+pub fn format_duration_bucket(secs: u64) -> String {
+    duration_bucket(secs).map_or_else(
+        || "less than a minute".to_string(),
+        |(count, _, unit)| format_unit(count, unit),
+    )
+}
+
+/// Formats a time still to wait, bucketed like [`format_duration_bucket`] but rounded **up**, so
+/// a wait is never understated: 1.9 days left reads "2 days", not "1 day".
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::format_remaining_duration;
+///
+/// assert_eq!(format_remaining_duration(30), "less than a minute");
+/// assert_eq!(format_remaining_duration(86_400), "1 day");
+/// assert_eq!(format_remaining_duration(86_400 + 82_000), "2 days");
+/// assert_eq!(format_remaining_duration(3_570), "1 hour");
+/// ```
+#[must_use]
+pub fn format_remaining_duration(secs: u64) -> String {
+    let rounded_up = duration_bucket(secs).map_or(secs, |(count, unit_secs, _)| {
+        if count * unit_secs == secs {
+            secs
+        } else {
+            (count + 1).saturating_mul(unit_secs)
+        }
+    });
+    format_duration_bucket(rounded_up)
 }
 
 /// Formats an age in seconds as a coarse, human-readable relative duration.
@@ -272,21 +338,10 @@ fn format_unit_ago(count: u64, unit: &str) -> String {
 /// ```
 #[must_use]
 pub fn format_relative_age(age_secs: u64) -> String {
-    if age_secs < MINUTE {
-        "just now".to_string()
-    } else if age_secs < HOUR {
-        format_unit_ago(age_secs / MINUTE, "minute")
-    } else if age_secs < DAY {
-        format_unit_ago(age_secs / HOUR, "hour")
-    } else if age_secs < WEEK {
-        format_unit_ago(age_secs / DAY, "day")
-    } else if age_secs < MONTH {
-        format_unit_ago(age_secs / WEEK, "week")
-    } else if age_secs < YEAR {
-        format_unit_ago(age_secs / MONTH, "month")
-    } else {
-        format_unit_ago(age_secs / YEAR, "year")
-    }
+    duration_bucket(age_secs).map_or_else(
+        || "just now".to_string(),
+        |(count, _, unit)| format!("{} ago", format_unit(count, unit)),
+    )
 }
 
 /// LSP-facing freshness settings, threaded into hover/diagnostics/completion.
@@ -370,6 +425,14 @@ impl FreshnessSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_remaining_duration_is_total_and_rounds_up() {
+        assert!(format_remaining_duration(u64::MAX).ends_with(" years"));
+        assert_eq!(format_remaining_duration(YEAR * 3 + 1), "4 years");
+        assert_eq!(format_remaining_duration(DAY + 82_000), "2 days");
+        assert_eq!(format_remaining_duration(0), "less than a minute");
+    }
 
     // --- PublishTime::parse_rfc3339: one fixture per v1 ecosystem's wire format ---
 

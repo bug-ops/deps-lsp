@@ -422,6 +422,7 @@ async fn warn_if_gitlab_instance_host_invalid(
 /// before that move, so the ten side-effect steps live in one place instead of two.
 struct ConfigSideEffects {
     registries: deps_core::policy_config::RegistryRuntimeSettings,
+    native_cooldown: deps_core::policy_config::NativeCooldownMode,
     network: deps_core::NetworkMode,
     cache: deps_core::CacheMode,
     cold_start_min_interval: std::time::Duration,
@@ -450,6 +451,7 @@ impl ConfigSideEffects {
     ) -> Self {
         Self {
             registries: config.policy.registries.resolve(private_registries),
+            native_cooldown: config.policy.freshness.honor_native_cooldown,
             network: deps_core::NetworkMode::from_offline_flag(config.policy.network.offline),
             cache: deps_core::CacheMode::from_enabled_flag(config.policy.cache.enabled),
             cold_start_min_interval: std::time::Duration::from_millis(
@@ -602,6 +604,7 @@ impl Backend {
         self.state
             .nuget_user_profile_sources
             .set(effects.registries.nuget_user_profile_sources);
+        self.state.native_cooldown.set(effects.native_cooldown);
         self.state
             .keychain_credentials
             .set(effects.registries.swift_keychain_credentials);

@@ -66,6 +66,10 @@ pub struct CargoDependency {
     /// alone can't distinguish the two when two different dependencies happen to declare the
     /// identical string through different fields (#1453 impl-critic M1).
     pub(crate) custom_registry_origin: Option<CustomRegistryOrigin>,
+    /// The publish-age window Cargo's own configuration applies to this dependency, resolved
+    /// at parse time from the repository's `.cargo/config.toml` files; `None` when no window
+    /// applies or reading it is turned off.
+    pub(crate) native_cooldown: Option<deps_core::native_cooldown::NativeCooldown>,
 }
 
 /// See [`CargoDependency::custom_registry_origin`].
@@ -282,6 +286,10 @@ impl deps_core::Dependency for CargoDependency {
         self.package.as_ref().unwrap_or(&self.name)
     }
 
+    fn native_cooldown(&self) -> Option<&deps_core::native_cooldown::NativeCooldown> {
+        self.native_cooldown.as_ref()
+    }
+
     fn name_range(&self) -> Range {
         self.name_range
     }
@@ -369,6 +377,7 @@ impl deps_core::lsp_helpers::ProbeDependency for CargoDependency {
             section: CargoDependencySection::Dependencies,
             package: None,
             custom_registry_origin: None,
+            native_cooldown: None,
         }
     }
 

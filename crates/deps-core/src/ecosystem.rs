@@ -651,6 +651,11 @@ pub trait Dependency: Send + Sync {
     /// Package name
     fn name(&self) -> &crate::PackageName;
 
+    /// The native package-manager publish-age window that applies to this dependency, if any.
+    fn native_cooldown(&self) -> Option<&crate::native_cooldown::NativeCooldown> {
+        None
+    }
+
     /// Range of the dependency name
     fn name_range(&self) -> Range;
 
@@ -992,7 +997,9 @@ impl UserHome {
         &self.raw
     }
 
-    fn is(&self, dir: &Path) -> bool {
+    /// Whether `dir` is this home directory, in either its raw or its canonical spelling.
+    #[must_use]
+    pub fn is(&self, dir: &Path) -> bool {
         self.raw == dir || self.canonical.as_deref() == Some(dir)
     }
 }

@@ -10,7 +10,10 @@ use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
+use deps_core::{
+    ConfigReach, EcosystemBase, Registry, Result, TypedEcosystem, WatchedConfig,
+    WatchedConfigEffect,
+};
 
 use crate::formatter::CargoFormatter;
 use crate::parser::{CargoParseContext, CargoParseResult};
@@ -80,6 +83,14 @@ impl CargoEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for CargoEcosystem {}
 
+/// `.cargo/config.toml` carries the registry routing and the publish-age window, both resolved
+/// at parse time and invisible to a requirement diff, so a change re-parses and re-fetches.
+const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
+    ".cargo/config.toml",
+    WatchedConfigEffect::ChangesRouting,
+    ConfigReach::Subtree,
+)];
+
 impl EcosystemBase for CargoEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Cargo
@@ -95,6 +106,10 @@ impl EcosystemBase for CargoEcosystem {
 
     fn lockfile_filenames(&self) -> &[&'static str] {
         &["Cargo.lock"]
+    }
+
+    fn watched_configs(&self) -> &[WatchedConfig] {
+        &WATCHED_CONFIGS
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
@@ -196,6 +211,24 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watches_the_cargo_config_file_for_routing_changes() {
+        let ecosystem = CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let configs: Vec<_> = ecosystem
+            .watched_configs()
+            .iter()
+            .map(|c| (c.path_suffix(), c.effect(), c.reach()))
+            .collect();
+        assert_eq!(
+            configs,
+            [(
+                ".cargo/config.toml",
+                WatchedConfigEffect::ChangesRouting,
+                ConfigReach::Subtree
+            )]
+        );
+    }
 
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests. Does
     // not replace registry.rs's `test_registry_creation`, which constructs `CratesIoRegistry`
@@ -491,6 +524,7 @@ mod tests {
                 section: CargoDependencySection::Dependencies,
                 package: None,
                 custom_registry_origin: None,
+                native_cooldown: None,
             }
         }
 
