@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp, deps-core**: inlay hints now carry vulnerability data, so the in-use advisory glyph renders for vulnerable packages, and it and the flagged-latest warning survive `diagnostics.ignore` (#1967, #2033)
 - **workspace**: bump `jsonschema` to 0.61 (#2019, #2033)
 - **deps**: refresh `Cargo.lock` and bump SHA-pinned `taiki-e/install-action` to v2.90.5 (#2045)
+- **ci**: faster PR checks: `Swatinem/rust-cache` with main-only saves replaces `moonrepo/setup-rust`, fuzz/coverage/beta/aarch64 and build-only cross legs leave the PR path, feature-matrix check and Windows tests are sharded (#2056)
 
 ### Documentation
 - **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)
