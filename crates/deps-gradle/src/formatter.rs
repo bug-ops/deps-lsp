@@ -438,6 +438,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }
     }
 
@@ -1145,6 +1146,7 @@ mod tests {
             version_range: Some(version_range),
             configuration: "implementation".into(),
             source: DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         };
 
         let dv = vuln_fix_dv("1.2.0");

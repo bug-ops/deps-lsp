@@ -37,15 +37,38 @@ pub struct GradleDependency {
     /// binding in the Gradle DSL at all, so those stay `Registry`.
     #[raw]
     pub source: deps_core::parser::DependencySource,
+    /// [`deps_core::LockScope::BuildScript`] for a dependency declared inside a `buildscript { }` block
+    /// (locked in `buildscript-gradle.lockfile`), else [`deps_core::LockScope::Project`]. Set at parse
+    /// time from the block's position, never from the configuration name.
+    #[raw]
+    pub lock_scope: deps_core::LockScope,
 }
 
-deps_core::impl_dependency!(GradleDependency {
-    name: name,
-    name_range: name_range,
-    version: version_req,
-    version_range: version_range,
-    source: source,
-});
+impl deps_core::Dependency for GradleDependency {
+    fn name(&self) -> &deps_core::PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        self.source.clone()
+    }
+
+    fn lock_scope(&self) -> deps_core::LockScope {
+        self.lock_scope
+    }
+}
 
 /// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
 /// [`ProbeDependency`](deps_core::lsp_helpers::ProbeDependency).
@@ -64,6 +87,7 @@ impl deps_core::lsp_helpers::ProbeDependency for GradleDependency {
             version_range: None,
             configuration: String::from("implementation"),
             source,
+            lock_scope: deps_core::LockScope::Project,
         }
     }
 
@@ -88,6 +112,7 @@ mod tests {
             version_range: Some(Range::new(Position::new(5, 35), Position::new(5, 40))),
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }
     }
 
@@ -128,6 +153,7 @@ mod tests {
             version_range: None,
             configuration: "api".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());
@@ -159,6 +185,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         };
         let rendered = format!("{dep:?}");
         assert!(!rendered.contains("secretA"));

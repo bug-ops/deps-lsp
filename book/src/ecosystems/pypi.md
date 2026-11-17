@@ -7,7 +7,7 @@ pip's line-oriented requirements-file format from one crate.
 
 | | |
 |---|---|
-| Manifest files | `pyproject.toml` (PEP 621, PEP 735, Poetry, PEP 517/518 `build-system.requires`); `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, `constraints*.txt`; any `.txt` directly under a `requirements/` directory |
+| Manifest files | `pyproject.toml` (PEP 621, PEP 735, Poetry, PEP 517/518 `build-system.requires`); `Pipfile` (`[packages]`, `[dev-packages]`); `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, `constraints*.txt`; any `.txt` directly under a `requirements/` directory |
 | Lock file (in-use version) | `poetry.lock`, `uv.lock`, `pdm.lock` or `Pipfile.lock` |
 | Registry | PyPI — PEP 691 Simple API JSON (`pypi.org/simple/{package}/`) for version lookups, JSON API (`pypi.org/pypi/{package}/json`) for hover metadata |
 | Version syntax | PEP 440 version specifiers, parsed via `pep440_rs`; full PEP 508 requirement strings (extras, environment markers) via `pep508_rs` |
@@ -26,7 +26,13 @@ When several lock files sit in one directory the first of `poetry.lock`, `uv.loc
 
 - `pdm.lock` needs `[metadata] lock_version` 4.x; all groups are read.
 - `Pipfile.lock` needs `_meta.pipfile-spec` 6; `default` and `develop` are read, and only exact `==` pins count (git, path, editable and range entries show no in-use version).
-- A `Pipfile` is not a recognised manifest: `Pipfile.lock` helps only projects that also have a `pyproject.toml` or `requirements*.txt`.
+- A `Pipfile` manifest is paired only with `Pipfile.lock` in its own directory or an ancestor; a `poetry.lock`, `uv.lock` or `pdm.lock` next to it is never consulted.
+
+### Pipfile
+
+`[packages]` and `[dev-packages]` entries are read as a version string (`"*"` matches any version) or an inline table (`version`, `extras`, `markers`, `index`, `git` with `ref`, `path`, `file`). Git, path and `file` entries are non-registry sources. `[requires]` and custom pipenv categories are ignored.
+
+The first `[[source]]` is the primary index and every named `[[source]]` can be chosen per package with `index = "<name>"`; both go through the same registry-access policy as Poetry sources, so a private package name is never sent to pypi.org. Other packages are routed to the primary index only; pipenv's search across all sources is not modelled.
 
 Hover shows the requirement's PEP 440 satisfaction against the latest PyPI release, extras
 (`requests[socks]`), and — when present — the environment marker in a readable "Active when:"

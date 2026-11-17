@@ -46,8 +46,8 @@ async fn did_change_started_before_a_close_and_reopen_does_not_commit_over_the_r
         Arc::clone(&config),
     )
     .await
-    .unwrap()
-    .abort();
+    .unwrap();
+    state.cancel_background_task(&uri).await;
 
     // 1. did_change starts and suspends inside `parse_manifest_blocking`.
     let change = tokio::spawn(handle_document_change(

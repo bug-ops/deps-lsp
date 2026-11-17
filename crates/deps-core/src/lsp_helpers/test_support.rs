@@ -212,6 +212,9 @@ impl Dependency for Box<dyn Dependency> {
     fn name_range_is_synthetic(&self) -> bool {
         self.as_ref().name_range_is_synthetic()
     }
+    fn lock_scope(&self) -> crate::LockScope {
+        self.as_ref().lock_scope()
+    }
 }
 
 pub(crate) struct MockDep {

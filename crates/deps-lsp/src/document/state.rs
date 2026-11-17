@@ -282,6 +282,13 @@ impl Drop for OpenReservation<'_> {
     }
 }
 
+impl OpenReservation<'_> {
+    /// The epoch the reserved open will carry.
+    pub(crate) const fn epoch(&self) -> OpenEpoch {
+        self.epoch
+    }
+}
+
 impl OpenEpoch {
     /// Placeholder of a state not yet inserted by [`ServerState::update_document`]; no real open
     /// ever carries it.
@@ -1969,11 +1976,64 @@ impl ServerState {
         }
     }
 
-    /// Inserts the document an open produced, stamped with the epoch `reservation` holds.
-    pub(crate) fn insert_opened(&self, reservation: OpenReservation<'_>, mut state: DocumentState) {
+    /// Reserves an open for a cold start from disk, only if `uri` is neither tracked nor being
+    /// opened; `None` otherwise (#2036).
+    ///
+    /// Taken before the disk read, so a `didOpen` that arrives meanwhile supersedes the cold
+    /// start via [`Self::reserve_open`] and a `didClose` clears it, instead of either being
+    /// overwritten by the disk content. The vacancy and `documents` checks run under the
+    /// `opening` entry guard, so an open finishing concurrently is seen as one or the other.
+    pub(crate) fn try_reserve_cold_start(&self, uri: &Uri) -> Option<OpenReservation<'_>> {
+        let dashmap::mapref::entry::Entry::Vacant(slot) = self.opening.entry(uri.clone()) else {
+            return None;
+        };
+        if self.documents.contains_key(uri) {
+            return None;
+        }
+        let epoch = self.next_open_epoch();
+        slot.insert(epoch);
+        Some(OpenReservation {
+            state: self,
+            uri: uri.clone(),
+            epoch,
+        })
+    }
+
+    /// Logs that a request could not get its document: at debug while an open of `uri` is still
+    /// parsing (ordinary open traffic), at warn otherwise.
+    pub(crate) fn log_document_unavailable(&self, uri: &Uri, request: &str) {
+        if self.capture_open_epoch(uri).is_some() {
+            tracing::debug!("Document not tracked yet (open in flight) for {request}: {uri:?}");
+        } else {
+            tracing::warn!("Could not load document for {request}: {uri:?}");
+        }
+    }
+
+    /// Inserts the document an open produced, stamped with the epoch `reservation` holds, only
+    /// if the reservation is still current; returns whether it was inserted (#2036).
+    ///
+    /// A `didClose` or a newer `didOpen` that landed during the parse cleared or replaced the
+    /// reservation, so inserting would resurrect a closed document or let the older open
+    /// overwrite the newer one. The check and the insert run under the `opening` entry guard,
+    /// and [`Self::remove_document`] clears `opening` before `documents`, so a close either
+    /// precedes the check (refused) or follows the insert (removes it).
+    pub(crate) fn insert_opened(
+        &self,
+        reservation: OpenReservation<'_>,
+        mut state: DocumentState,
+    ) -> bool {
         state.open_epoch = reservation.epoch;
-        self.documents.insert(reservation.uri.clone(), state);
+        let inserted = match self.opening.entry(reservation.uri.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) if *entry.get() == reservation.epoch => {
+                self.documents.insert(reservation.uri.clone(), state);
+                entry.remove();
+                true
+            }
+            _ => false,
+        };
+        // Dropped only after the entry guard is released: its `Drop` locks the same shard.
         drop(reservation);
+        inserted
     }
 
     /// The open a change to `uri` would land on: the tracked document's, else the one a
@@ -1994,10 +2054,12 @@ impl ServerState {
     /// Returns `None` if no document exists at the given URI.
     #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub fn remove_document(&self, uri: &Uri) -> Option<(Uri, DocumentState)> {
-        // Documents first, then the claim: [`Self::claim_publish`] re-checks the document after
-        // inserting, so a generation racing this close cannot leave an entry behind.
-        let removed = self.documents.remove(uri);
+        // `opening` before `documents`, so [`Self::insert_opened`] either sees the reservation
+        // gone or has already inserted a document this removal then takes (#2036). Documents
+        // before the claim: [`Self::claim_publish`] re-checks the document after inserting, so a
+        // generation racing this close cannot leave an entry behind.
         self.opening.remove(uri);
+        let removed = self.documents.remove(uri);
         self.published.remove(uri);
         self.refetch_escalations.remove(uri);
         removed
@@ -2241,6 +2303,13 @@ impl ServerState {
             .await
             .get(uri)
             .is_some_and(|(current_id, _)| *current_id == task_id)
+    }
+
+    /// Whether a change/open task is registered for `uri`.
+    #[cfg(test)]
+    #[allow(dead_code, reason = "used only by feature-gated test modules")]
+    pub(crate) async fn has_background_task(&self, uri: &Uri) -> bool {
+        self.tasks.read().await.contains_key(uri)
     }
 
     /// Forces `uri`'s document out of `Loading` into `Failed`, seeding a

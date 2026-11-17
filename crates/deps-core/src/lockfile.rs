@@ -381,6 +381,52 @@ pub struct ResolvedPackage {
     /// Dependencies of this package (for dependency tree analysis)
     pub dependencies: Vec<String>,
     placement: EntryPlacement,
+    lock_scope: LockScope,
+}
+
+/// Which dependency scope a lock-file entry or a manifest dependency belongs to.
+///
+/// Most lock formats have a single scope ([`Self::Project`]). Gradle keeps the build-script
+/// classpath (`buildscript { dependencies { classpath(..) } }`) in a separate
+/// `buildscript-gradle.lockfile`, so the same coordinate can resolve to a different version
+/// there than in the application's `gradle.lockfile`.
+///
+/// Exhaustive on purpose: every `match` must decide how each scope is treated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LockScope {
+    /// The project's own dependencies (the default for every ecosystem).
+    #[default]
+    Project,
+    /// Build-tool classpath dependencies, locked separately from the project's.
+    BuildScript,
+}
+
+/// A set of [`LockScope`]s: which scopes' lock entries resolved to one version.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LockScopes {
+    project: bool,
+    build_script: bool,
+}
+
+impl LockScopes {
+    pub(crate) const fn insert(&mut self, scope: LockScope) {
+        match scope {
+            LockScope::Project => self.project = true,
+            LockScope::BuildScript => self.build_script = true,
+        }
+    }
+
+    pub(crate) const fn contains(self, scope: LockScope) -> bool {
+        match scope {
+            LockScope::Project => self.project,
+            LockScope::BuildScript => self.build_script,
+        }
+    }
+
+    /// Whether any scope other than [`LockScope::Project`] is in the set.
+    pub(crate) const fn has_non_project(self) -> bool {
+        self.build_script
+    }
 }
 
 /// Where a lock-file entry sits relative to the project root, for lock formats that record
@@ -588,6 +634,7 @@ impl std::fmt::Debug for ResolvedPackage {
             .field("version", &self.version)
             .field("source", &self.source)
             .field("placement", &self.placement)
+            .field("lock_scope", &self.lock_scope)
             .field(
                 "dependencies",
                 &self
@@ -630,7 +677,21 @@ impl ResolvedPackage {
             source,
             dependencies: Vec::new(),
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         }
+    }
+
+    /// Marks which dependency scope this entry belongs to. See [`LockScope`].
+    #[must_use]
+    pub const fn with_lock_scope(mut self, lock_scope: LockScope) -> Self {
+        self.lock_scope = lock_scope;
+        self
+    }
+
+    /// The scope this entry belongs to ([`LockScope::Project`] unless set).
+    #[must_use]
+    pub const fn lock_scope(&self) -> LockScope {
+        self.lock_scope
     }
 
     /// Marks where this entry sits. See [`EntryPlacement`].
@@ -893,16 +954,22 @@ fn split_one_name(
         .copied()
         .filter(|package| is_owned(package))
         .collect();
-    let best = if owned.is_empty() {
-        best_package(packages.iter().copied())
+    let in_project = |package: &&ResolvedPackage| package.lock_scope == LockScope::Project;
+    let has_non_project = packages.iter().any(|package| !in_project(package));
+    let owned_project: Vec<&ResolvedPackage> = owned.iter().copied().filter(in_project).collect();
+    // The collapsed value serves Project dependencies only; another scope's entries live in
+    // the candidates alone, so a caller without candidates fails closed for them.
+    let best = if owned_project.is_empty() {
+        best_package(packages.iter().copied().filter(in_project))
     } else {
-        best_package(owned.iter().copied())
+        best_package(owned_project.iter().copied())
     }
     .map(|best| crate::ConcreteVersion::from(best.version.clone()));
 
     struct Distinct<'a> {
         version: &'a str,
         owned: bool,
+        scopes: LockScopes,
         descriptors: Vec<crate::VersionReq>,
         seen_descriptors: HashSet<&'a str>,
     }
@@ -914,6 +981,7 @@ fn split_one_name(
             distinct.push(Distinct {
                 version,
                 owned: false,
+                scopes: LockScopes::default(),
                 descriptors: Vec::new(),
                 seen_descriptors: HashSet::new(),
             });
@@ -923,6 +991,7 @@ fn split_one_name(
             continue;
         };
         slot.owned |= is_owned(package);
+        slot.scopes.insert(package.lock_scope);
         if let Some(EntryOwner::Descriptors(declared)) = owner_of(package) {
             for descriptor in declared.iter() {
                 if slot.descriptors.len() < MAX_ENTRY_DESCRIPTORS {
@@ -935,7 +1004,7 @@ fn split_one_name(
             }
         }
     }
-    if distinct.len() <= 1 {
+    if distinct.len() <= 1 && !has_non_project {
         return (best, None);
     }
 
@@ -955,10 +1024,11 @@ fn split_one_name(
         .iter()
         .map(|d| crate::ConcreteVersion::from(d.version))
         .collect();
-    (
-        best,
-        Some(LockCandidates::with_preference(versions, preference)),
-    )
+    let mut candidates = LockCandidates::with_preference(versions, preference);
+    if has_non_project {
+        candidates = candidates.with_scopes(distinct.iter().map(|d| d.scopes).collect());
+    }
+    (best, Some(candidates))
 }
 
 impl ResolvedPackages {
@@ -1278,6 +1348,19 @@ pub trait LockFileProvider: Send + Sync {
         lockfile_path: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>;
 
+    /// Other lock files in the same logical set as `located` (the file [`Self::locate_lockfile`]
+    /// returned), parsed together with it and merged into one [`ResolvedPackages`].
+    ///
+    /// The cache treats the set as one unit: a change to, or the appearance or disappearance
+    /// of, any listed path invalidates the entry, and the file watcher refreshes documents
+    /// whose companions changed. Gradle uses it for `buildscript-gradle.lockfile`.
+    ///
+    /// Default: none.
+    fn companion_lockfiles(&self, located: &Path) -> Vec<PathBuf> {
+        let _ = located;
+        Vec::new()
+    }
+
     /// Extra packages to resolve alongside what [`Self::parse_lockfile`] returned, derived at
     /// load time from state outside the lock file.
     ///
@@ -1310,7 +1393,9 @@ pub const DEFAULT_MAX_CACHED_LOCKFILES: usize = 256;
 /// Cached lock file entry with staleness detection.
 struct CachedLockFile {
     packages: Arc<ResolvedPackages>,
-    modified_at: SystemTime,
+    /// The located file's mtime and each companion's mtime (`None` when it was absent at parse
+    /// time), stat'ed before the parse. The entry is fresh while every one still matches.
+    stamps: Vec<FileStamp>,
     /// When this entry was last parsed *or* served from a cache hit — the recency key
     /// [`LockFileCache::evict_oldest`] evicts by once the cache is at capacity. Refreshed on
     /// every access (not only on (re)parse), so eviction is genuinely LRU rather than
@@ -1318,6 +1403,36 @@ struct CachedLockFile {
     /// and get evicted first, while one that keeps changing (and reparsing) would never age
     /// out.
     parsed_at: Instant,
+}
+
+/// A lock-file path and its mtime when last parsed; `None` records absence.
+#[derive(Clone)]
+struct FileStamp {
+    path: PathBuf,
+    modified_at: Option<SystemTime>,
+}
+
+/// The file's mtime, or `None` when it is absent or has none.
+async fn current_mtime(path: &Path) -> Option<SystemTime> {
+    tokio::fs::metadata(path).await.ok()?.modified().ok()
+}
+
+impl FileStamp {
+    /// The stamp of a companion, absence included.
+    async fn of_companion(path: PathBuf) -> Self {
+        let modified_at = current_mtime(&path).await;
+        Self { path, modified_at }
+    }
+
+    /// Whether the file still looks as it did when stamped: a newer mtime, or a companion
+    /// appearing or vanishing, is a change.
+    async fn is_fresh(&self) -> bool {
+        match (self.modified_at, current_mtime(&self.path).await) {
+            (Some(stamped), Some(now)) => now <= stamped,
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
 }
 
 /// Cache for parsed lock files with automatic staleness detection.
@@ -1437,29 +1552,41 @@ impl LockFileCache {
         let cached = self
             .entries
             .get(lockfile_path)
-            .map(|entry| (entry.modified_at, Arc::clone(&entry.packages)));
+            .map(|entry| (entry.stamps.clone(), Arc::clone(&entry.packages)));
 
-        if let Some((cached_modified_at, cached_packages)) = cached
-            && let Ok(metadata) = tokio::fs::metadata(lockfile_path).await
-            && let Ok(mtime) = metadata.modified()
-            && mtime <= cached_modified_at
-        {
-            tracing::debug!("Lock file cache hit: {}", lockfile_path.display());
-            // Refresh the recency marker on a hit too, not only on (re)parse: otherwise
-            // eviction is FIFO-by-parse-time rather than LRU, evicting a stable,
-            // frequently-read lock file before one that keeps changing and reparsing.
-            if let Some(mut entry) = self.entries.get_mut(lockfile_path) {
-                entry.parsed_at = Instant::now();
+        if let Some((stamps, cached_packages)) = cached {
+            let mut fresh = true;
+            for stamp in &stamps {
+                if !stamp.is_fresh().await {
+                    fresh = false;
+                    break;
+                }
             }
-            return Ok(cached_packages);
+            if fresh {
+                tracing::debug!("Lock file cache hit: {}", lockfile_path.display());
+                // Refresh the recency marker on a hit too, not only on (re)parse: otherwise
+                // eviction is FIFO-by-parse-time rather than LRU, evicting a stable,
+                // frequently-read lock file before one that keeps changing and reparsing.
+                if let Some(mut entry) = self.entries.get_mut(lockfile_path) {
+                    entry.parsed_at = Instant::now();
+                }
+                return Ok(cached_packages);
+            }
         }
 
         // Stat *before* parsing and use that pre-parse mtime as the cache key's freshness
         // marker: stat'ing after would let a concurrent rewrite mid-parse store content from
         // the old version under the new version's mtime, looking fresh when stale (#359).
+        // Companions get the same treatment.
         tracing::debug!("Lock file cache miss: {}", lockfile_path.display());
         let metadata = tokio::fs::metadata(lockfile_path).await?;
-        let modified_at = metadata.modified()?;
+        let mut stamps = vec![FileStamp {
+            path: lockfile_path.to_path_buf(),
+            modified_at: Some(metadata.modified()?),
+        }];
+        for companion in provider.companion_lockfiles(lockfile_path) {
+            stamps.push(FileStamp::of_companion(companion).await);
+        }
 
         let packages = Arc::new(provider.parse_lockfile(lockfile_path).await?);
 
@@ -1470,7 +1597,7 @@ impl LockFileCache {
             lockfile_path.to_path_buf(),
             CachedLockFile {
                 packages: Arc::clone(&packages),
-                modified_at,
+                stamps,
                 parsed_at: Instant::now(),
             },
         );
@@ -1482,8 +1609,12 @@ impl LockFileCache {
     ///
     /// Forces next access to re-parse the file. Use when you know
     /// the file has changed but modification time might not reflect it.
+    ///
+    /// Also drops every entry whose companion set includes `lockfile_path`.
     pub fn invalidate(&self, lockfile_path: &Path) {
         self.entries.remove(lockfile_path);
+        self.entries
+            .retain(|_, entry| entry.stamps.iter().all(|stamp| stamp.path != lockfile_path));
     }
 
     /// Returns the number of cached lock files.
@@ -1696,6 +1827,7 @@ mod tests {
             },
             dependencies: vec!["serde_derive".into()],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         };
 
         packages.insert(pkg);
@@ -1730,6 +1862,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1741,6 +1874,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         // Both versions stored, but len counts unique names
@@ -1763,6 +1897,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1774,6 +1909,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1785,6 +1921,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         assert_eq!(packages.len(), 1);
@@ -1802,6 +1939,7 @@ mod tests {
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1810,6 +1948,7 @@ mod tests {
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         // Falls back to string comparison: "xyz" > "abc"
@@ -1826,6 +1965,7 @@ mod tests {
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1834,6 +1974,7 @@ mod tests {
             source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         // Parseable semver is preferred over non-parseable
@@ -1872,6 +2013,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         packages.insert(ResolvedPackage {
@@ -1883,6 +2025,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         let count = packages.iter().count();
@@ -1906,6 +2049,7 @@ mod tests {
             },
             dependencies: vec![],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         });
 
         let map = packages.into_map();
@@ -1933,7 +2077,10 @@ mod tests {
             test_path.clone(),
             CachedLockFile {
                 packages: Arc::default(),
-                modified_at: SystemTime::now(),
+                stamps: vec![FileStamp {
+                    path: test_path.clone(),
+                    modified_at: Some(SystemTime::now()),
+                }],
                 parsed_at: Instant::now(),
             },
         );
@@ -2321,6 +2468,7 @@ mod tests {
                     source: ResolvedSource::Path { path: ".".into() },
                     dependencies: vec![],
                     placement: EntryPlacement::default(),
+                    lock_scope: LockScope::default(),
                 });
                 Ok(packages)
             })
@@ -2546,6 +2694,7 @@ mod tests {
                     source: ResolvedSource::Path { path: ".".into() },
                     dependencies: vec![],
                     placement: EntryPlacement::default(),
+                    lock_scope: LockScope::default(),
                 });
                 Ok(packages)
             })
@@ -2624,6 +2773,7 @@ mod tests {
             },
             dependencies: vec![crate::conformance::CREDENTIAL_PROBE_KEY.to_string()],
             placement: EntryPlacement::default(),
+            lock_scope: LockScope::default(),
         },
     );
 
@@ -3124,5 +3274,122 @@ mod tests {
             .collect();
         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
         assert_eq!(left_pad_candidate_versions(&refs).len(), DISTINCT);
+    }
+
+    /// Provider whose lock set is `test.lock` plus a `companion.lock` beside it.
+    struct CompanionProvider {
+        inner: CountingLockFileProvider,
+    }
+
+    impl LockFileProvider for CompanionProvider {
+        fn locate_lockfile(&self, _manifest_uri: &Url) -> Option<PathBuf> {
+            None
+        }
+
+        fn companion_lockfiles(&self, located: &Path) -> Vec<PathBuf> {
+            located
+                .parent()
+                .map(|dir| dir.join("companion.lock"))
+                .into_iter()
+                .collect()
+        }
+
+        fn parse_lockfile<'a>(
+            &'a self,
+            lockfile_path: &'a Path,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>,
+        > {
+            self.inner.parse_lockfile(lockfile_path)
+        }
+    }
+
+    fn bump_mtime(path: &Path, secs: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    async fn companion_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, CompanionProvider) {
+        let dir = tempfile::tempdir().unwrap();
+        let located = dir.path().join("test.lock");
+        std::fs::write(&located, "1.0.0").unwrap();
+        let companion = dir.path().join("companion.lock");
+        let provider = CompanionProvider {
+            inner: CountingLockFileProvider::new(),
+        };
+        (dir, located, companion, provider)
+    }
+
+    #[tokio::test]
+    async fn companion_appearing_invalidates_the_cached_entry() {
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let (_dir, located, companion, provider) = companion_fixture().await;
+        let cache = LockFileCache::new();
+
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        assert_eq!(provider.inner.parse_count(), 1);
+
+        std::fs::write(&companion, "x").unwrap();
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        assert_eq!(provider.inner.parse_count(), 2, "appearance is a change");
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        assert_eq!(provider.inner.parse_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn companion_rewrite_and_removal_invalidate_the_cached_entry() {
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let (_dir, located, companion, provider) = companion_fixture().await;
+        std::fs::write(&companion, "x").unwrap();
+        let cache = LockFileCache::new();
+
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        std::fs::write(&companion, "y").unwrap();
+        bump_mtime(&companion, 5);
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        assert_eq!(provider.inner.parse_count(), 2, "rewrite is a change");
+
+        std::fs::remove_file(&companion).unwrap();
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        assert_eq!(provider.inner.parse_count(), 3, "vanishing is a change");
+    }
+
+    #[tokio::test]
+    async fn invalidating_a_companion_drops_the_entry_it_belongs_to() {
+        let _guard = fs_probe::snapshot_guard_async().await;
+        let (_dir, located, companion, provider) = companion_fixture().await;
+        let cache = LockFileCache::new();
+
+        cache.get_or_parse(&provider, &located).await.unwrap();
+        assert_eq!(cache.len(), 1);
+
+        cache.invalidate(&companion);
+
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn collapsed_map_holds_project_scope_only() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(registry_pkg("lib", "1.0.0").with_lock_scope(LockScope::BuildScript));
+        let (versions, candidates) = packages.split_normalized(&Lowercase);
+        assert!(versions.is_empty());
+        let candidates = &candidates[&normalized("lib")];
+        assert!(candidates.has_scope(LockScope::BuildScript));
+        assert!(!candidates.has_scope(LockScope::Project));
+
+        packages.insert(registry_pkg("lib", "2.0.0"));
+        let (versions, _) = packages.split_normalized(&Lowercase);
+        assert_eq!(
+            versions
+                .get(&normalized("lib"))
+                .map(crate::ConcreteVersion::as_str),
+            Some("2.0.0")
+        );
     }
 }

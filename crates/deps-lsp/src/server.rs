@@ -106,15 +106,22 @@ fn initialize_workspace_roots(params: &InitializeParams) -> Vec<std::path::PathB
 /// that sits inside one of `roots`. Returns the exemptions to use (none on any failure, so a
 /// problem never hides an advisory) and a warning for the user when something was refused.
 ///
+/// `config_dir` is the user config directory (`None` when the platform reports none), injected
+/// so tests do not depend on the process environment.
+///
 /// Blocks on the filesystem; call from `spawn_blocking`.
 fn load_operator_exemptions(
+    config_dir: Option<deps_core::config_trust::OperatorPath>,
     roots: Vec<std::path::PathBuf>,
 ) -> (OperatorExemptions, Option<String>) {
     let roots = WorkspaceRoots::new(
         roots,
         deps_core::config_trust::OperatorPath::home().as_ref(),
     );
-    exemptions_for_lookup(ExemptionFile::user_config_default(&roots))
+    let lookup = config_dir.map_or(UserConfigLookup::NoConfigDir, |dir| {
+        ExemptionFile::under_config_dir(dir, &roots)
+    });
+    exemptions_for_lookup(lookup)
 }
 
 /// Turns a config-directory lookup into the exemptions to use and the warning to show.
@@ -217,6 +224,111 @@ mod exemption_lookup_tests {
 
         assert!(exemptions.is_empty());
         assert!(warning.is_some_and(|w| w.contains("inside the workspace")));
+    }
+
+    #[cfg(not(windows))]
+    mod initialize {
+        use super::*;
+        use futures::StreamExt as _;
+        use tower_lsp_server::ls_types::{InitializeParams, WorkspaceFolder};
+
+        /// Runs `initialize` with `workspace` as the only workspace folder and the exemption
+        /// file looked up under `config`; returns the backend's exemption count and the
+        /// `window/showMessage` texts the client received.
+        async fn initialize_with(
+            config: &std::path::Path,
+            workspace: &std::path::Path,
+        ) -> (usize, Vec<String>) {
+            let dir = config_dir(config);
+            let (service, mut socket) = tower_lsp_server::LspService::build(move |client| {
+                Backend::new(client).with_exemption_config_dir(dir)
+            })
+            .finish();
+            let backend = service.inner();
+            let uri: Uri = format!("file://{}", workspace.display())
+                .parse()
+                .expect("workspace uri");
+            backend
+                .initialize(InitializeParams {
+                    workspace_folders: Some(vec![WorkspaceFolder {
+                        uri,
+                        name: "ws".to_owned(),
+                    }]),
+                    ..Default::default()
+                })
+                .await
+                .expect("initialize");
+
+            let mut messages = Vec::new();
+            while let Ok(Some(request)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), socket.next()).await
+            {
+                if request.method() == "window/showMessage"
+                    && let Some(params) = request.params()
+                    && let Ok(params) = serde_json::from_value::<
+                        tower_lsp_server::ls_types::ShowMessageParams,
+                    >(params.clone())
+                {
+                    messages.push(params.message);
+                }
+            }
+            (backend.state.advisory_exemptions().len(), messages)
+        }
+
+        #[tokio::test]
+        async fn initialize_refuses_an_exemption_file_inside_the_workspace() {
+            let home = tempfile::tempdir().expect("home");
+            let workspace = home.path().join("proj");
+            let config = workspace.join(".config");
+            write_file(&config, VALID);
+
+            let (count, messages) = initialize_with(&config, &workspace).await;
+
+            assert_eq!(count, 0);
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains("advisory exemptions ignored")
+                        && m.contains("inside the workspace")),
+                "messages: {messages:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn initialize_ignores_a_malformed_exemption_file_with_a_warning() {
+            let home = tempfile::tempdir().expect("home");
+            let workspace = home.path().join("proj");
+            std::fs::create_dir_all(&workspace).expect("workspace");
+            let config = home.path().join("cfg");
+            write_file(&config, "[[advisory]]\nid = ");
+
+            let (count, messages) = initialize_with(&config, &workspace).await;
+
+            assert_eq!(count, 0);
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.starts_with("deps-lsp: advisory exemptions ignored")),
+                "messages: {messages:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn initialize_loads_a_valid_exemption_file_outside_the_workspace() {
+            let home = tempfile::tempdir().expect("home");
+            let workspace = home.path().join("proj");
+            std::fs::create_dir_all(&workspace).expect("workspace");
+            let config = home.path().join("cfg");
+            write_file(&config, VALID);
+
+            let (count, messages) = initialize_with(&config, &workspace).await;
+
+            assert_eq!(count, 1);
+            assert!(
+                messages.iter().all(|m| !m.contains("advisory exemptions")),
+                "messages: {messages:?}"
+            );
+        }
     }
 }
 
@@ -371,6 +483,8 @@ pub struct Backend {
     /// `parse -> swap -> mirror onto ServerState` sequences could leave one config's mirrored
     /// flags next to the other's `DepsConfig`.
     config_apply: tokio::sync::Mutex<()>,
+    /// Where the operator's advisory exemption file lives, resolved once at construction.
+    exemption_config_dir: Option<deps_core::config_trust::OperatorPath>,
 }
 
 /// What a changed watched config file means for open documents.
@@ -457,7 +571,15 @@ impl Backend {
             config_apply: tokio::sync::Mutex::new(()),
             config: Arc::new(RwLock::new(DepsConfig::default())),
             client_capabilities: Arc::new(RwLock::new(None)),
+            exemption_config_dir: deps_core::config_trust::OperatorPath::user_config_dir(),
         }
+    }
+
+    /// Points the advisory exemption lookup at `dir` instead of the user's config directory.
+    #[cfg(all(test, not(windows)))]
+    fn with_exemption_config_dir(mut self, dir: deps_core::config_trust::OperatorPath) -> Self {
+        self.exemption_config_dir = Some(dir);
+        self
     }
 
     /// Get a reference to the LSP client (primarily for testing/benchmarking).
@@ -651,8 +773,9 @@ impl Backend {
         )
         .await
         {
-            Ok(task) => {
-                self.state.spawn_background_task(uri, task).await;
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(?uri, "open superseded by a close or a newer open");
             }
             Err(e) => {
                 tracing::error!("failed to open document {:?}: {}", uri, e);
@@ -710,7 +833,8 @@ impl Backend {
         }
     }
 
-    /// Open manifests whose lock file is `lockfile_path`, each paired with the one reload of it.
+    /// Open manifests whose lock set includes `lockfile_path` (their located lock file, or one
+    /// of its companions), each paired with the one reload of its own located lock file.
     async fn refreshes_for_present_lockfile(
         &self,
         lockfile_path: &std::path::Path,
@@ -724,7 +848,7 @@ impl Backend {
         let state = Arc::clone(&self.state);
         let lock_provider_for_scan = Arc::clone(&lock_provider);
         let lockfile_path_owned = lockfile_path.to_path_buf();
-        let affected: Vec<(Uri, Option<deps_core::ImporterPath>)> =
+        let affected: Vec<(Uri, std::path::PathBuf, Option<deps_core::ImporterPath>)> =
             tokio::task::spawn_blocking(move || {
                 state
                     .documents
@@ -737,7 +861,11 @@ impl Backend {
                         }
                         let domain_uri = crate::lsp_types_interop::from_lsp_uri(uri)?;
                         let doc_lockfile = lock_provider_for_scan.locate_lockfile(&domain_uri)?;
-                        (doc_lockfile == lockfile_path_owned).then(|| {
+                        (doc_lockfile == lockfile_path_owned
+                            || lock_provider_for_scan
+                                .companion_lockfiles(&doc_lockfile)
+                                .contains(&lockfile_path_owned))
+                        .then(|| {
                             let scope =
                                 deps_core::lockfile::resolve_manifest_file_path(&domain_uri)
                                     .and_then(|manifest| {
@@ -746,7 +874,7 @@ impl Backend {
                                             &manifest,
                                         )
                                     });
-                            (uri.clone(), scope)
+                            (uri.clone(), doc_lockfile, scope)
                         })
                     })
                     .collect()
@@ -774,27 +902,53 @@ impl Backend {
         // impl-critic M1), that empty pair is never actually written into the document on
         // error, so `doc.signals.resolved_versions` itself survives a transient reload failure
         // untouched.
-        // The lock is parsed once; each distinct importer scope is split once, off the async
-        // task, and shared by the manifests that resolve to it (#1993).
+        // Documents sharing a located lock file share one parse of it, which is the document's
+        // own file and not necessarily the changed one (a companion changed).
+        let mut by_located: std::collections::BTreeMap<
+            std::path::PathBuf,
+            Vec<(Uri, Option<deps_core::ImporterPath>)>,
+        > = std::collections::BTreeMap::new();
+        for (uri, located, scope) in affected {
+            by_located.entry(located).or_default().push((uri, scope));
+        }
+        let mut refreshes = Vec::new();
+        for (located, documents) in by_located {
+            refreshes.extend(
+                self.reload_located_lockfile(&located, documents, ecosystem_impl, &lock_provider)
+                    .await,
+            );
+        }
+        refreshes
+    }
+
+    /// Parses `located` once and splits it once per distinct importer scope, off the async task,
+    /// sharing each split among the manifests that resolve to it (#1993).
+    async fn reload_located_lockfile(
+        &self,
+        located: &std::path::Path,
+        documents: Vec<(Uri, Option<deps_core::ImporterPath>)>,
+        ecosystem_impl: &Arc<dyn deps_core::Ecosystem>,
+        lock_provider: &Arc<dyn deps_core::LockFileProvider>,
+    ) -> Vec<(Uri, LockfileLoad)> {
         let Some(packages) = deps_engine::classify::resolved::load_lockfile_packages(
             &self.state.lockfile_cache,
             lock_provider.as_ref(),
-            lockfile_path,
+            located,
         )
         .await
         else {
-            let message = format!("Failed to reload lock file: {}", lockfile_path.display());
+            let message = format!("Failed to reload lock file: {}", located.display());
             tracing::error!("{}", message);
             self.client.log_message(MessageType::ERROR, message).await;
-            return affected
+            return documents
                 .into_iter()
                 .map(|(uri, _)| (uri, LockfileLoad::Failed))
                 .collect();
         };
         let mut loads: std::collections::HashMap<Option<deps_core::ImporterPath>, LockfileLoad> =
             std::collections::HashMap::new();
-        let mut refreshes = Vec::with_capacity(affected.len());
-        for (uri, scope) in affected {
+        let mut refreshes = Vec::with_capacity(documents.len());
+        for (uri, scope) in documents {
             if !loads.contains_key(&scope) {
                 let packages = Arc::clone(&packages);
                 let ecosystem = Arc::clone(ecosystem_impl);
@@ -1265,16 +1419,18 @@ impl LanguageServer for Backend {
         }
 
         let roots = initialize_workspace_roots(&params);
-        let (exemptions, exemption_warning) =
-            tokio::task::spawn_blocking(move || load_operator_exemptions(roots))
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::error!(%error, "advisory exemption load task failed");
-                    (
-                        OperatorExemptions::none(),
-                        Some("advisory exemptions ignored: the load task failed".to_owned()),
-                    )
-                });
+        let exemption_config_dir = self.exemption_config_dir.clone();
+        let (exemptions, exemption_warning) = tokio::task::spawn_blocking(move || {
+            load_operator_exemptions(exemption_config_dir, roots)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "advisory exemption load task failed");
+            (
+                OperatorExemptions::none(),
+                Some("advisory exemptions ignored: the load task failed".to_owned()),
+            )
+        });
         self.state.set_advisory_exemptions(Arc::new(exemptions));
         if let Some(message) = exemption_warning {
             self.client
@@ -3537,6 +3693,71 @@ let package = Package(
              (reusing whichever document's dependency count ran first) both documents would \
              reach the same verdict instead of diverging"
         );
+    }
+
+    /// #2034: a change to `buildscript-gradle.lockfile` (the companion of the located
+    /// `gradle.lockfile`) must refresh the open build script, reloading its own located file.
+    #[cfg(feature = "gradle")]
+    #[tokio::test]
+    async fn test_handle_lockfile_change_refreshes_document_on_companion_change() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("gradle.lockfile"),
+            "org.slf4j:slf4j-api:2.0.9=runtimeClasspath\n",
+        )
+        .unwrap();
+        let buildscript_lock = temp_dir.path().join("buildscript-gradle.lockfile");
+        std::fs::write(&buildscript_lock, "com.example:plugin:1.2.3=classpath\n").unwrap();
+
+        let manifest = "buildscript {\n    dependencies {\n        classpath(\"com.example:plugin:1.2.3\")\n    }\n}\n";
+        let uri = Uri::from_file_path(temp_dir.path().join("build.gradle.kts")).unwrap();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        backend
+            .config
+            .write()
+            .await
+            .policy
+            .diagnostics
+            .vulnerabilities_enabled = false;
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(EcosystemId::Gradle)
+            .unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(
+                manifest,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
+        backend.state.update_document(
+            uri.clone(),
+            DocumentState::new_from_parse_result(
+                EcosystemId::Gradle,
+                manifest.to_string(),
+                parse_result,
+            ),
+        );
+
+        backend.state.lockfile_cache.invalidate(&buildscript_lock);
+        backend
+            .handle_lockfile_change(&buildscript_lock, EcosystemId::Gradle)
+            .await;
+
+        let doc = backend.state.get_document(&uri).unwrap();
+        let candidates = doc
+            .signals
+            .resolved_version_candidates
+            .get(&deps_core::NormalizedName::for_test("com.example:plugin"))
+            .expect("the classpath dependency's candidates are loaded from the companion change");
+        assert!(candidates.has_scope(deps_core::LockScope::BuildScript));
     }
 
     /// Regression coverage for issue #1395: `handle_lockfile_change` must re-run the OSV

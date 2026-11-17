@@ -16,7 +16,8 @@ use super::osv_scan::{
 use super::probes::spawn_background_probes;
 use super::resolved::RefetchPolicy;
 use super::state::{
-    DocumentState, OpenEpoch, ParseFailure, RefetchEscalation, ServerState, spawn_supervised,
+    DocumentState, OpenEpoch, OpenReservation, ParseFailure, RefetchEscalation, ServerState,
+    spawn_supervised,
 };
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
@@ -81,17 +82,19 @@ fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
 /// Generic document open handler using ecosystem registry.
 ///
 /// Parses manifest using the ecosystem's parser, creates document state,
-/// and spawns a background task to fetch version information from the registry.
+/// spawns a background task to fetch version information from the registry, and registers
+/// that task for the document.
+///
+/// Returns `Ok(true)` when the document is tracked and its fetch task registered. Returns
+/// `Ok(false)` when a `didClose` or a newer `didOpen` for `uri` won the race against this
+/// open (during the parse, or between the insert and the task registration); the document is
+/// then left to whichever won, and no task from this open remains.
 ///
 /// # Errors
 ///
 /// Returns an error if no ecosystem handler matches `uri`, or if `content` exceeds
 /// the configured maximum manifest size. A manifest-parse failure is not an error
 /// here: the document is stored without a parse result instead.
-#[tracing::instrument(
-    skip_all,
-    fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
-)]
 pub async fn handle_document_open(
     uri: Uri,
     content: String,
@@ -99,7 +102,60 @@ pub async fn handle_document_open(
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
-) -> Result<JoinHandle<()>> {
+) -> Result<bool> {
+    let Some(change) = open_document(
+        uri.clone(),
+        content,
+        version,
+        Arc::clone(&state),
+        client,
+        config,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    Ok(state
+        .register_change_task(uri, change.task, change.epoch)
+        .await)
+}
+
+/// [`handle_document_open`] without registering the spawned task: returns it with the open it
+/// belongs to, or `None` when the open lost the race (nothing was inserted or spawned).
+///
+/// # Errors
+///
+/// Same as [`handle_document_open`].
+pub(crate) async fn open_document(
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Result<Option<CommittedChange>> {
+    open_with_reservation(None, uri, content, version, state, client, config).await
+}
+
+/// [`open_document`] for a cold start that reserved its open before reading the file; with
+/// `None` the open reserves its own epoch once its input is validated.
+///
+/// # Errors
+///
+/// Same as [`handle_document_open`].
+#[tracing::instrument(
+    skip_all,
+    fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
+)]
+async fn open_with_reservation(
+    reservation: Option<OpenReservation<'_>>,
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Result<Option<CommittedChange>> {
     // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
     // same as "no ecosystem handles this URI" — see its own doc for why this happens.
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
@@ -122,7 +178,7 @@ pub async fn handle_document_open(
 
     check_content_size(&content, &uri)?;
 
-    let reservation = state.reserve_open(&uri);
+    let reservation = reservation.unwrap_or_else(|| state.reserve_open(&uri));
 
     tracing::info!(
         "Opening {:?} with ecosystem: {}",
@@ -149,7 +205,11 @@ pub async fn handle_document_open(
     };
     doc_state.set_version(version);
 
-    state.insert_opened(reservation, doc_state);
+    let epoch = reservation.epoch();
+    if !state.insert_opened(reservation, doc_state) {
+        tracing::debug!("open of {:?} superseded by a close or a newer open", uri);
+        return Ok(None);
+    }
 
     // Read before any OSV request is built, so disabling the feature (or being offline)
     // suppresses the network call itself (FR-011; issue #1517 critique S3 — an explicit
@@ -174,7 +234,25 @@ pub async fn handle_document_open(
         .instrument(span),
     );
 
-    Ok(task)
+    Ok(Some(CommittedChange { task, epoch }))
+}
+
+/// [`open_document`] for tests that drive the spawned task themselves: the task is returned
+/// unregistered, and an open that lost a race fails the test.
+#[cfg(test)]
+#[allow(dead_code, reason = "used only by feature-gated test modules")]
+pub(crate) async fn open_document_task(
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Result<JoinHandle<()>> {
+    Ok(open_document(uri, content, version, state, client, config)
+        .await?
+        .expect("open must not lose a race in this test")
+        .task)
 }
 
 /// The background task [`handle_document_open`] spawns: loads lockfile-resolved
@@ -421,7 +499,9 @@ fn seed_cached_versions_from_lockfile(
     resolved_versions: &ResolvedVersionsMap,
     resolved_version_candidates: &ResolvedCandidatesMap,
 ) {
-    if resolved_versions.is_empty() {
+    // Candidates can exist without collapsed entries (a name locked only in a scope-restricted
+    // file), and the document still needs them.
+    if resolved_versions.is_empty() && resolved_version_candidates.is_empty() {
         return;
     }
     let Some(mut doc) = state.documents.get_mut(uri) else {
@@ -1047,11 +1127,12 @@ pub async fn handle_document_change(
     )
 }
 
-/// A committed change: the background task it spawned and the open it was committed against.
+/// A committed change or open: the background task it spawned and the open it was committed
+/// against.
 pub(crate) struct CommittedChange {
     /// The debounced fetch/diagnostics task, not yet registered.
     pub(crate) task: JoinHandle<()>,
-    /// The open the commit replaced; register `task` with
+    /// The open the commit (or the open itself) belongs to; register `task` with
     /// [`ServerState::register_change_task`] using it (#2022).
     pub(crate) epoch: OpenEpoch,
 }
@@ -2253,6 +2334,14 @@ pub async fn ensure_document_loaded(
         return true;
     }
 
+    // Reserved before any await below: a `didOpen` arriving meanwhile supersedes this cold start
+    // and a `didClose` cancels it, so the disk content can neither overwrite the editor's nor
+    // resurrect a closed document (#2036). `None`: an open already owns this URI.
+    let Some(reservation) = state.try_reserve_cold_start(uri) else {
+        tracing::debug!("Open in flight, skipping cold start: {:?}", uri);
+        return state.get_document(uri).is_some();
+    };
+
     // Clone cold start config before async operations to release lock
     let cold_start_config = { config.read().await.cold_start.clone() };
 
@@ -2292,7 +2381,8 @@ pub async fn ensure_document_loaded(
     // `version: None` — content came from disk, not an LSP didOpen, so there is no
     // client-tracked version to record (see `DocumentState::version` and the
     // cold-start refusal in `handlers::code_lens`).
-    match handle_document_open(
+    match open_with_reservation(
+        Some(reservation),
         uri.clone(),
         content,
         None,
@@ -2302,10 +2392,14 @@ pub async fn ensure_document_loaded(
     )
     .await
     {
-        Ok(task) => {
-            state.spawn_background_task(uri.clone(), task).await;
+        Ok(opened) => {
+            if let Some(change) = opened {
+                state
+                    .register_change_task(uri.clone(), change.task, change.epoch)
+                    .await;
+            }
             tracing::info!("Document loaded successfully from disk: {:?}", uri);
-            true
+            state.get_document(uri).is_some()
         }
         Err(e) => {
             tracing::warn!("Failed to process loaded document {:?}: {}", uri, e);
@@ -2639,7 +2733,7 @@ mod tests {
             .policy
             .diagnostics
             .vulnerabilities_enabled = false;
-        handle_document_open(
+        open_document_task(
             uri.clone(),
             original_content,
             Some(1),
@@ -2829,6 +2923,68 @@ mod tests {
                 .message
                 .contains("exceeding deps-lsp's per-document limit")),
             "a manifest at exactly the ceiling must get no ceiling diagnostic, got: {diags:?}"
+        );
+    }
+
+    /// #2034 S4: a project with only `buildscript-gradle.lockfile` has an empty collapsed
+    /// map (it holds Project entries only) but non-empty candidates; the cold open must still
+    /// store the candidates so a `classpath(...)` dependency resolves before any edit.
+    #[cfg(feature = "gradle")]
+    #[tokio::test]
+    async fn test_cold_open_stores_candidates_of_a_buildscript_only_lock() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::test_utils::test_helpers::create_test_client_and_config;
+        use deps_core::NormalizedName;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("buildscript-gradle.lockfile"),
+            "com.example:plugin:1.2.3=classpath\n",
+        )
+        .unwrap();
+        let manifest_path = temp_dir.path().join("build.gradle.kts");
+        let content =
+            "buildscript {\n    dependencies {\n        classpath(\"com.example:plugin:1.2.3\")\n    }\n}\n"
+                .to_string();
+        std::fs::write(&manifest_path, &content).unwrap();
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let state = Arc::new(ServerState::new());
+        let (client, config) = create_test_client_and_config();
+        config
+            .write()
+            .await
+            .policy
+            .diagnostics
+            .vulnerabilities_enabled = false;
+        let task = open_document_task(uri.clone(), content, Some(1), state.clone(), client, config)
+            .await
+            .expect("open should succeed");
+
+        let key = NormalizedName::for_test("com.example:plugin");
+        let mut stored = false;
+        for _ in 0..100 {
+            stored = state
+                .with_document(&uri, |doc| {
+                    doc.signals.resolved_version_candidates.contains_key(&key)
+                })
+                .unwrap_or(false);
+            if stored {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        task.abort();
+
+        assert!(
+            stored,
+            "the buildscript-only candidates must be stored on a cold open"
+        );
+        assert!(
+            state
+                .with_document(&uri, |doc| doc.signals.resolved_versions.is_empty())
+                .unwrap(),
+            "the collapsed map holds Project entries only"
         );
     }
 
@@ -3567,7 +3723,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 handles.push(tokio::spawn(async move {
                     barrier.wait().await;
-                    handle_document_open(
+                    open_document_task(
                         uri,
                         "irrelevant-content".to_string(),
                         Some(1),
@@ -3632,7 +3788,7 @@ mod tests {
             ));
 
             let background = async {
-                handle_document_open(uri, "x".to_string(), Some(1), state, client, config)
+                open_document_task(uri, "x".to_string(), Some(1), state, client, config)
                     .await
                     .unwrap()
                     .await
@@ -4238,7 +4394,7 @@ serde = "1.0"
             let (client, config) = create_test_client_and_config();
 
             let task =
-                handle_document_open(uri.clone(), content, Some(1), state.clone(), client, config)
+                open_document_task(uri.clone(), content, Some(1), state.clone(), client, config)
                     .await
                     .expect("normal-sized content should be accepted");
 
@@ -4275,7 +4431,7 @@ serde = "1.0"
 "#
             .to_string();
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content,
                 Some(1),
@@ -4339,7 +4495,7 @@ serde = "1.0"
 "#
             .to_string();
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content,
                 Some(1),
@@ -4428,7 +4584,7 @@ serde = { git = "https://github.com/serde-rs/serde" }
 "#
             .to_string();
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content,
                 Some(1),
@@ -4493,7 +4649,7 @@ serde = "1.0"
 "#
             .to_string();
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content,
                 Some(1),
@@ -4608,7 +4764,7 @@ tokio = "1.0"
 
             let state = Arc::new(ServerState::new());
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content.clone(),
                 Some(1),
@@ -4699,7 +4855,7 @@ tokio = "1.0"
 
             let state = Arc::new(ServerState::new());
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content.clone(),
                 Some(1),
@@ -4836,7 +4992,7 @@ tokio = "1.0"
 
             let state = Arc::new(ServerState::new());
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content.clone(),
                 Some(1),
@@ -4962,7 +5118,7 @@ tokio = "1.0"
 
             let state = Arc::new(ServerState::new());
             let (client, config) = create_test_client_and_config();
-            handle_document_open(
+            open_document_task(
                 uri.clone(),
                 original_content.clone(),
                 Some(1),
@@ -5730,7 +5886,7 @@ mod parse_failure_tests {
     async fn open(state: &Arc<ServerState>, path: &str, content: &str) -> Uri {
         let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(path));
         let (client, config) = create_test_client_and_config();
-        let task = handle_document_open(
+        let task = open_document_task(
             uri.clone(),
             content.to_owned(),
             Some(1),

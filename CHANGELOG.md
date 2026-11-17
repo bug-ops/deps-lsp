@@ -14,8 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: new public fields `CheckArgs::advisory_exemptions` and `CheckContext::advisory_exemptions` (#2029)
 - **behavior**: a floating tag pin with no full release of its own (`@v4` on a commit also tagged `v5.0.0`) is now scanned instead of skipped; `--fail-on vulnerable` can newly fail (see spec 103) (#2029)
 - **deps-core, ecosystem crates**: `ProbeDependency::route_probes` has no default, so every implementation states its routes (#2023, #2033)
+- **deps-lsp**: `handle_document_open` returns `Result<bool>` and registers its fetch task itself; `false` means a close or a newer open won the parse (#2036, #2040)
+- **deps-core, deps-gradle, deps-pypi**: new public `LockScope`, `Dependency::lock_scope`, `LockFileProvider::companion_lockfiles`, `VersionData::is_resolved_for`, `LockCandidates::has_scope`, `GradleDependency::lock_scope` and `PypiDependencySection::{PipfilePackages, PipfileDevPackages}` variants (#2034, #2035, #2040)
+- **behavior**: deps-cli and the Action now discover `Pipfile`, so pipenv repositories can newly fail `--fail-on` (#2035, #2040)
 
 ### Added
+- **deps-pypi**: `Pipfile` is a PyPI manifest (`[packages]`, `[dev-packages]`, primary `[[source]]` and per-package `index`) (#2035, #2040)
+- **deps-gradle, deps-core**: in-use versions for `classpath(...)` dependencies from `buildscript-gradle.lockfile`, kept apart from application dependencies (#2034, #2040)
+- **github-action**: `advisory-exemptions` input forwarded to `deps-cli check --advisory-exemptions` (#2032, #2040)
 - **deps-core, deps-lsp, deps-cli**: operator-controlled advisory exemptions from the user config file (`<config dir>/deps-lsp/advisory-exemptions.toml`) or `deps-cli check --advisory-exemptions <PATH>`, shown as an `advisory-exempted` notice; repository config cannot exempt an advisory and confirmed malware is never exemptible (#2029)
 - **deps-precommit, deps-github-actions**: new `pre-commit` ecosystem for `.pre-commit-config.yaml` and `.pre-commit-config.yml` `repo`/`rev` pins, with `rev:` SHA pinning (`# frozen:` comments) and mutable-rev diagnostics (#2029)
 - **deps-pypi**: in-use versions from `pdm.lock` and `Pipfile.lock` (#1926, #2033)
@@ -34,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **specs**: add spec 102 recording that pub and SwiftPM have no native release-age gate (#2029)
 
 ### Fixed
+- **deps-lsp**: a `didClose` during the first parse of a `didOpen` no longer brings the closed document back, and a cold-start load no longer replaces an open still parsing (#2036, #2040)
+- **deps-core, deps-lsp**: inlay hints, the vulnerability quick fix and hover honour operator advisory exemptions (#2030, #2040)
+- **deps-lsp**: initialize wiring of the advisory exemption file is covered by tests through an injected config dir (#2031, #2040)
 - **deps-lsp**: a configuration change without a reparse now also refreshes inlay hints and code lenses (#1967, #2033)
 - **deps-lsp**: a `didChange` that started before a close and reopen of the same document no longer commits over the reopened document or replaces its tasks (#2022, #2033)
 - **workspace, deps-maven**: allow `clippy::empty_enums` for sealed marker enums and drop redundant clones in the POM parser to pass clippy 1.100 (#2027)

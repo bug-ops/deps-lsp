@@ -153,6 +153,10 @@ pub enum PypiDependencySection {
     /// requirements file format). Both file kinds map to this single variant —
     /// nothing downstream distinguishes a constraint from a requirement.
     Requirements,
+    /// Pipfile runtime dependencies (`[packages]`)
+    PipfilePackages,
+    /// Pipfile development dependencies (`[dev-packages]`)
+    PipfileDevPackages,
 }
 
 pub use deps_core::parser::DependencySource as PypiDependencySource;

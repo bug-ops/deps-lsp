@@ -43,7 +43,7 @@ pub async fn handle_code_lens(
     let uri = &params.text_document.uri;
 
     if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
-        tracing::warn!("Could not load document for code lens: {:?}", uri);
+        state.log_document_unavailable(uri, "code lens");
         return vec![];
     }
 

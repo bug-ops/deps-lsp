@@ -130,6 +130,7 @@ pub(crate) fn build_dependency(
         version_range,
         configuration: config.to_string(),
         source: deps_core::parser::DependencySource::Registry,
+        lock_scope: deps_core::LockScope::Project,
     }
 }
 
@@ -265,6 +266,8 @@ pub fn parse_gradle_with_cache(
         kind,
         GradleManifestKind::KotlinBuild | GradleManifestKind::GroovyBuild
     ) {
+        tag_buildscript_scope(&mut result.dependencies, content);
+
         // Directory derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()`
         // string used for dispatch above: that string has no scheme/host check, so joining it
         // straight onto `load_gradle_properties` would let a non-file:/remote-host URI read a
@@ -384,6 +387,33 @@ fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Marks every dependency declared inside a `buildscript { }` block as
+/// [`deps_core::LockScope::BuildScript`]: those are locked in `buildscript-gradle.lockfile`,
+/// apart from the project's own `gradle.lockfile`. Positional, so a `classpath` string outside
+/// the block stays [`deps_core::LockScope::Project`].
+fn tag_buildscript_scope(dependencies: &mut [GradleDependency], content: &str) {
+    let spans = find_buildscript_spans(content);
+    if spans.is_empty() {
+        return;
+    }
+    let table = LineOffsetTable::new(content);
+    let at = |offset: usize| {
+        let position = table.byte_offset_to_position(content, offset);
+        (position.line, position.character)
+    };
+    let bounds: Vec<_> = spans.iter().map(|&(s, e)| (at(s), at(e))).collect();
+    for dependency in dependencies {
+        let start = dependency.name_range.start;
+        let from = (start.line, start.character);
+        if bounds
+            .iter()
+            .any(|&(open, close)| open <= from && from <= close)
+        {
+            dependency.lock_scope = deps_core::LockScope::BuildScript;
+        }
+    }
 }
 
 /// Byte ranges of every `buildscript { }` block found anywhere in `content` (#1212 impl-critic
@@ -905,6 +935,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("2.1.10".into()));
@@ -926,6 +957,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("3.2.0".into()));
@@ -943,6 +975,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("$unknownVar".into()));
@@ -964,6 +997,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("1.2.3".into()));
@@ -993,6 +1027,7 @@ mod tests {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("${bigVersion}".into()));
@@ -1233,6 +1268,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "org.springframework.boot".into(),
@@ -1243,6 +1279,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
         ];
         apply_repository_content_restrictions(&mut deps, &restrictions);
@@ -1329,6 +1366,7 @@ repositories {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         apply_repository_content_restrictions(&mut deps, &restrictions);
         assert_eq!(
@@ -1387,6 +1425,7 @@ repositories {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         apply_repository_content_restrictions(&mut deps, &restrictions);
         assert_eq!(
@@ -1424,6 +1463,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.acme".into(),
@@ -1434,6 +1474,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
         ];
         apply_repository_content_restrictions(&mut deps, &restrictions);
@@ -1502,6 +1543,7 @@ repositories {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         apply_repository_content_restrictions(&mut deps, &restrictions);
         assert_eq!(
@@ -1560,6 +1602,7 @@ repositories {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         apply_repository_content_restrictions(&mut deps, &restrictions);
         assert_eq!(
@@ -1599,6 +1642,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.acme.internal".into(),
@@ -1609,6 +1653,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.notacme.other".into(),
@@ -1619,6 +1664,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             // G2 (impl-critic follow-up): unlike `com.notacme.other` (which `com\.acme.*`
             // never matches even unanchored, since "acme" alone isn't "com.acme"), this group
@@ -1634,6 +1680,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
         ];
         apply_repository_content_restrictions(&mut deps, &restrictions);
@@ -1706,6 +1753,7 @@ dependencies {
             version_range: None,
             configuration: "implementation".into(),
             source: deps_core::parser::DependencySource::Registry,
+            lock_scope: deps_core::LockScope::Project,
         }];
         apply_repository_content_restrictions(&mut deps, &restrictions);
         assert_eq!(
@@ -1763,6 +1811,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.other".into(),
@@ -1773,6 +1822,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.third".into(),
@@ -1783,6 +1833,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
         ];
         apply_repository_content_restrictions(&mut deps, &restrictions);
@@ -1864,6 +1915,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.b".into(),
@@ -1874,6 +1926,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
         ];
         apply_repository_content_restrictions(&mut deps, &restrictions);
@@ -1948,6 +2001,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.b".into(),
@@ -1958,6 +2012,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
             GradleDependency {
                 group_id: "com.c".into(),
@@ -1968,6 +2023,7 @@ repositories {
                 version_range: None,
                 configuration: "implementation".into(),
                 source: deps_core::parser::DependencySource::Registry,
+                lock_scope: deps_core::LockScope::Project,
             },
         ];
         apply_repository_content_restrictions(&mut deps, &restrictions);

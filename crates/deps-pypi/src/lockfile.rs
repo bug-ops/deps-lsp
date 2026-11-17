@@ -133,7 +133,15 @@ pub struct PypiLockParser;
 
 impl LockFileProvider for PypiLockParser {
     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
-        locate_lockfile_for_manifest(manifest_uri, &PypiLockFormat::FILE_NAMES)
+        let is_pipfile = manifest_uri.path().rsplit('/').next() == Some("Pipfile");
+        // A Pipfile is only ever locked by `Pipfile.lock`; a stray `poetry.lock`/`uv.lock`
+        // beside it must not supply its in-use versions.
+        let names: &[&str] = if is_pipfile {
+            &[PypiLockFormat::Pipfile.file_name()]
+        } else {
+            &PypiLockFormat::FILE_NAMES
+        };
+        locate_lockfile_for_manifest(manifest_uri, names)
     }
 
     fn parse_lockfile<'a>(
@@ -878,6 +886,24 @@ version = 1
         let located = parser.locate_lockfile(&manifest_uri);
         assert!(located.is_some());
         assert_eq!(located.unwrap(), uv_lock);
+    }
+
+    #[test]
+    fn test_locate_lockfile_pipfile_manifest_uses_only_pipfile_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Pipfile");
+        std::fs::write(&manifest_path, "[packages]\n").unwrap();
+        std::fs::write(temp_dir.path().join("poetry.lock"), "").unwrap();
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+
+        assert_eq!(PypiLockParser.locate_lockfile(&manifest_uri), None);
+
+        let pipfile_lock = temp_dir.path().join("Pipfile.lock");
+        std::fs::write(&pipfile_lock, "{}").unwrap();
+        assert_eq!(
+            PypiLockParser.locate_lockfile(&manifest_uri),
+            Some(pipfile_lock)
+        );
     }
 
     /// #1085 regression: `locate_lockfile` delegates entirely to

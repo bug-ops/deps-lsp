@@ -739,6 +739,14 @@ pub trait Dependency: Send + Sync {
     fn name_range_is_synthetic(&self) -> bool {
         false
     }
+
+    /// The lock-file scope this dependency resolves in.
+    ///
+    /// Default [`crate::LockScope::Project`], correct for every ecosystem except one that
+    /// locks some dependencies separately (Gradle's build-script classpath).
+    fn lock_scope(&self) -> crate::LockScope {
+        crate::LockScope::Project
+    }
 }
 
 /// Configuration for LSP inlay hints feature.

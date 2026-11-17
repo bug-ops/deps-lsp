@@ -34,6 +34,7 @@ use lsp::{
 #[derive(Clone, Copy)]
 enum PypiManifestKind {
     PyProject,
+    Pipfile,
     Requirements,
 }
 
@@ -42,6 +43,8 @@ impl PypiManifestKind {
         let basename = uri.path().rsplit('/').next().unwrap_or_default();
         if basename == "pyproject.toml" {
             Self::PyProject
+        } else if basename == "Pipfile" {
+            Self::Pipfile
         } else {
             Self::Requirements
         }
@@ -50,6 +53,7 @@ impl PypiManifestKind {
     const fn file_type(self) -> &'static str {
         match self {
             Self::PyProject => "pyproject.toml",
+            Self::Pipfile => "Pipfile",
             Self::Requirements => "requirements.txt",
         }
     }
@@ -159,7 +163,7 @@ impl EcosystemBase for PypiEcosystem {
     }
 
     fn manifest_filenames(&self) -> &[&'static str] {
-        &["pyproject.toml"]
+        &["pyproject.toml", "Pipfile"]
     }
 
     fn manifest_patterns(&self) -> &[&'static str] {
@@ -261,6 +265,10 @@ impl TypedEcosystem for PypiEcosystem {
                 PypiManifestKind::PyProject => {
                     self.parser
                         .parse_content_with_policy(content, uri, &self.policy)
+                }
+                PypiManifestKind::Pipfile => {
+                    self.parser
+                        .parse_pipfile_with_policy(content, uri, &self.policy)
                 }
                 PypiManifestKind::Requirements => {
                     let require_strong_signal = self.matched_only_via_directory_pattern(uri);
@@ -693,7 +701,7 @@ mod tests {
         ty: PypiEcosystem;
         id: "pypi";
         display_name: "PyPI (Python)";
-        manifest_filenames: &["pyproject.toml"];
+        manifest_filenames: &["pyproject.toml", "Pipfile"];
         lockfile_filenames: &["poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock"];
         non_registry_fixture: "requirements.txt" => "mylib @ https://example.com/mylib.tar.gz\n";
     }
@@ -712,7 +720,7 @@ mod tests {
 
     // #1374/#1379/#1391: unlike the PEP 440 `mylib==${VERSION}` requirements.txt/PEP 621 form
     // above, `[tool.poetry.dependencies]`'s string-form entries have no upstream PEP 440/508
-    // validation (`PypiParser::parse_poetry_dependency` takes the raw TOML string value
+    // validation (`PypiParser::parse_table_dependency` takes the raw TOML string value
     // directly) — an unresolved external-templating placeholder there (`$VAR`/`${VAR}`,
     // `{{ }}`, `@VAR@`, `%VAR%`, `<%= %>`) stays a normal `Some(version_requirement)` and
     // reaches `deps_core::edit::plan_vulnerability_fix` directly, depending entirely on
@@ -802,6 +810,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.dependencies().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_pipfile_uri_yields_dependencies() {
+        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let uri = deps_core::test_util::test_uri("/test/Pipfile");
+        let parsed = ecosystem
+            .parse("[packages]\nrequests = \"*\"\n", &uri)
+            .await
+            .unwrap();
+        assert_eq!(parsed.dependencies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_invalid_pipfile_reports_pipfile_file_type() {
+        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let uri = deps_core::test_util::test_uri("/test/Pipfile");
+        let err = ecosystem.parse("[packages", &uri).await.err().unwrap();
+        assert_matches!(
+            err,
+            deps_core::DepsError::ParseError { file_type, .. } if file_type == "Pipfile"
+        );
     }
 
     #[tokio::test]

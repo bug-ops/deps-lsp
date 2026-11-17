@@ -94,6 +94,7 @@ runs; neither `sarif-file` nor `exit-code` is set in that case.
 | `fail-on` | Comma-separated categories that exit 1 (`outdated,yanked,vulnerable,unsatisfiable,mutable-ref,sha-comment-mismatch,unknown-ref,license,deprecated,other`); `sha-comment-mismatch` and `unknown-ref` require the next release of the action image | `vulnerable,yanked,unsatisfiable` |
 | `cooldown` | Overrides `freshness.cooldown_secs` (e.g. `3d`) | unset |
 | `config` | Path to a **fully-trusted** `deps.toml` config file — see warning below | unset (`deps-cli`'s own hardened auto-discovery of `./deps.toml`) |
+| `advisory-exemptions` | Path to an operator advisory-exemptions TOML file (`deps-cli check --advisory-exemptions`); requires the next release of the action image — see warning below | unset (no exemptions) |
 
 > [!NOTE]
 > A `config` that sets `registries.workspace_registries = "all"` reaches private hosts only if
@@ -110,6 +111,14 @@ runs; neither `sarif-file` nor `exit-code` is set in that case.
 > control (e.g. a path in a separate, trusted repository checked out earlier in the job) —
 > never at a path inside the checkout you are scanning, especially in a
 > `pull_request_target` workflow scanning a fork.
+
+> [!WARNING]
+> `advisory-exemptions` must point at a file outside the scanned checkout and under your own
+> control. Under `pull_request_target` and other fork-PR workflows a path inside the checkout is
+> attacker-controlled, so the scanned repository could exempt its own vulnerable dependencies
+> (spec 101, section 3). Only `GITHUB_WORKSPACE` and `/github/home` are visible inside the action's
+> container, so check the scanned repository out with `path:` and keep the file elsewhere in the
+> workspace (for example a trusted checkout of a separate repository), as advised for `config`.
 
 ## Outputs
 

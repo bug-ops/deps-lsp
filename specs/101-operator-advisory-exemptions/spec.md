@@ -90,7 +90,12 @@ The editor reads the user config directory automatically while the CLI needs the
 
 - Exempted records are removed from the item list and from the total before `advisories_for_display()`, after the user's `deprecated` suppression. The notice only counts advisories that would otherwise have been shown.
 - The rule returns the unfiltered `DependencyVulnerabilities` to its callers (suppression `hides`, the outdated rule, the `FlaggedLatest` dedup). When the in-use version equals the latest and every advisory on it is exempted, `FlaggedLatest` stays deduplicated and hidden. When the latest differs from the in-use version, flagged-latest and candidate checks ignore exemptions (out of scope).
-- Hover, inlay hints and code actions still show the raw advisories; only the diagnostics rule and the `deps-cli check` report apply exemptions.
+- Every editor surface that signals risk applies exemptions through one shared `ExemptionCheck` (#2030):
+  - Inlay hints compute their advisory state on the exempted view. A dependency whose fetched advisories are all exempted keeps its plain hint; otherwise the warning names only the remaining ids. Unfetched overflow stays flagged. When the in-use version equals the latest and every advisory on it is exempted, the hint does not flag the latest (the `FlaggedLatest` dedup above).
+  - The vulnerability quick fix is offered only while at least one advisory it resolves is unexempted. Its title and `diagnostic_codes` name the unexempted ids only. The edit target stays the full-set fix that phase B verified, so it may jump past what the unexempted advisories alone need.
+  - Hover keeps the raw advisory list for audit and marks each exempted advisory with `exempted by operator config`. With no exemptions the output is unchanged.
+  - Exemption expiry for inlay hints and the quick fix is evaluated at request time (those entry points take no clock).
+- The `deps-cli check` report applies exemptions as before.
 - deps-cli classifies `AdvisoryExempted` as `Category::Other`. `--fail-on other` therefore fails on a visible exemption, and SARIF emits a `note`-level result per dependency. `--fail-on vulnerable` passes when every advisory of a dependency is exempted. This is intended: an exemption is a decision someone should be able to audit.
 
 ## 5. Acceptance tests
@@ -105,7 +110,7 @@ The editor reads the user config directory automatically while the CLI needs the
 
 | # | Decision |
 |---|----------|
-| D1 | Per-package narrowing, reload without restart, and a GitHub Action input are out of scope (follow-ups). |
+| D1 | Per-package narrowing and reload without restart are out of scope (follow-ups). The GitHub Action input shipped separately (#2032). |
 | D2 | The deserialize helper keeps deps-cli's redaction. For `invalid type: string "..."` mismatches where credential redaction changed nothing, the string payload is dropped so an operator-file value never reaches a log. Required by the protected acceptance test `deserialize_toml_checked_messages_do_not_echo_input_values`; a deviation from plan N2, approved by team-lead (2026-11-17). |
 | D4 | A reason is validated (required, 1..=500 characters, no control characters) but not retained: no code path reads it. |
 | D3 | `vulnerabilities_enabled` settable by a repository is a separate known gap (follow-up). |

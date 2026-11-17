@@ -122,7 +122,7 @@ async fn fixture(diagnostics: Value, react: &str) -> Fixture {
 
     let url = url::Url::from_file_path(&path).expect("absolute path");
     let uri = to_lsp_uri(&url);
-    let fetch = handle_document_open(
+    let opened = handle_document_open(
         uri.clone(),
         MANIFEST.to_owned(),
         Some(1),
@@ -132,7 +132,7 @@ async fn fixture(diagnostics: Value, react: &str) -> Fixture {
     )
     .await
     .expect("document opens");
-    let _ = tokio::time::timeout(Duration::from_secs(10), fetch).await;
+    assert!(opened, "the open must not lose a race");
     tokio::time::timeout(Duration::from_secs(10), async {
         while !state
             .with_document(&uri, |doc| {

@@ -214,6 +214,7 @@ where
             vuln_outcome,
             suppressed,
         },
+        now,
     );
 
     let (trust_signal, gossip_low_usage) =
@@ -265,9 +266,7 @@ where
     // the same write-path guard `codeAction` routes every fix through (`edit::replacement_text`
     // / #1393), so `Cmd+.` would return zero actions here regardless of what data was rendered
     // above — the footer must consult the identical predicate to avoid advertising a dead action.
-    let requirement_is_placeholder = dep
-        .version_requirement()
-        .is_some_and(|req| requirement_is_placeholder_for(formatter, dep, req.as_str()));
+    let requirement_is_placeholder = declares_placeholder_requirement(dep, formatter);
     let offline = versions.network.is_offline();
     let code_actions = match &fetched {
         Some(fetched)
@@ -293,6 +292,12 @@ where
     Some(markdown.finish(Some(dep.name_range())))
 }
 
+/// Whether `dep`'s declared requirement is an unexpanded template placeholder (#1402).
+fn declares_placeholder_requirement<F: DependencyFormatter>(dep: &F::Dep, formatter: &F) -> bool {
+    dep.version_requirement()
+        .is_some_and(|req| requirement_is_placeholder_for(formatter, dep, req.as_str()))
+}
+
 /// What the deprecation and advisory hover sections are rendered from.
 struct PackageContext<'a, D> {
     dep: &'a D,
@@ -309,6 +314,7 @@ fn push_package_context_hover_sections<D: Dependency>(
     markdown: &mut HoverMarkdown,
     formatter: &dyn EcosystemFormatter,
     ctx: PackageContext<'_, D>,
+    now: PublishTime,
 ) {
     let PackageContext {
         dep,
@@ -350,6 +356,7 @@ fn push_package_context_hover_sections<D: Dependency>(
         advisories,
         latest_status,
         versions.lookup_miss_for(key),
+        super::exemption::ExemptionCheck::new(versions.advisory_exemptions, now),
     );
 }
 
@@ -1393,6 +1400,7 @@ fn push_vulnerability_hover_section(
     outcome: Option<&ScanOutcome>,
     latest_status: Option<&crate::osv::UpgradeStatus>,
     registry_miss: Option<LookupMiss>,
+    exemptions: Option<super::exemption::ExemptionCheck<'_>>,
 ) {
     match outcome {
         Some(ScanOutcome::Vulnerable(dv)) => {
@@ -1413,6 +1421,9 @@ fn push_vulnerability_hover_section(
                     FieldKind::Prose,
                 );
                 markdown.push_static("\n");
+                if exemptions.is_some_and(|check| check.exempts(advisory)) {
+                    markdown.push_static("  *(exempted by operator config)*\n");
+                }
                 if let Some(tags) = dv.sibling_match(advisory.id()) {
                     let note = SiblingMatchNote::new(formatter, tags);
                     markdown.push_static("  *(");
@@ -5931,6 +5942,7 @@ mod tests {
             Some(&outcome),
             Some(&latest),
             None,
+            None,
         );
 
         // `S`/`F`/`V` are not ASCII punctuation, so `escape_markdown`/`markdown_code_span`
@@ -6011,6 +6023,7 @@ mod tests {
             Some(&outcome),
             None,
             None,
+            None,
         );
 
         assert!(
@@ -6021,6 +6034,45 @@ mod tests {
         assert!(
             !markdown.as_str().contains("Fixed in: `0.55.0`"),
             "must not render the unconverted OSV wire spelling; got: {markdown}"
+        );
+    }
+
+    /// #2030: hover keeps every advisory but marks the ones the operator exempted.
+    #[test]
+    fn push_vulnerability_hover_section_marks_exempted_advisories() {
+        use crate::osv::{Capped, DependencyVulnerabilities, ScanOutcome, VulnSeverity};
+
+        let dv = DependencyVulnerabilities::new(Capped::new(
+            vec![
+                sample_advisory("A-1", VulnSeverity::High),
+                sample_advisory("A-2", VulnSeverity::High),
+            ],
+            2,
+        ));
+        let exemptions = super::super::exemption::test_exemptions(&["A-1"]);
+        let mut markdown = HoverMarkdown::new();
+        push_vulnerability_hover_section(
+            &mut markdown,
+            &crate::test_util::StubFormatter::DEFAULT,
+            Some(&ScanOutcome::Vulnerable(dv)),
+            None,
+            None,
+            super::super::exemption::ExemptionCheck::new(Some(&exemptions), PublishTime::now()),
+        );
+
+        let rendered = markdown.as_str();
+        assert!(
+            rendered.contains("A\\-1") || rendered.contains("A-1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("A\\-2") || rendered.contains("A-2"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("exempted by operator config").count(),
+            1,
+            "{rendered}"
         );
     }
 
@@ -6055,6 +6107,7 @@ mod tests {
             &mut markdown,
             &crate::test_util::StubFormatter::DEFAULT,
             Some(&ScanOutcome::Vulnerable(dv)),
+            None,
             None,
             None,
         );
@@ -6095,6 +6148,7 @@ mod tests {
             Some(&ScanOutcome::Vulnerable(dv)),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -6133,6 +6187,7 @@ mod tests {
             &crate::test_util::StubFormatter::DEFAULT,
             Some(&ScanOutcome::Vulnerable(dv)),
             Some(&sibling_only_latest()),
+            None,
             None,
         );
 
