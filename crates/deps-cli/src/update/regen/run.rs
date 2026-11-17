@@ -8,7 +8,7 @@ use std::io::ErrorKind;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::ffi::OsString;
 
 use tokio::io::AsyncReadExt;
@@ -28,7 +28,7 @@ pub(super) enum SearchPath {
     Inherit,
     /// Fake tools live in this directory: executables are resolved there only, and the child's
     /// `PATH` is this directory followed by the inherited one so scripts keep coreutils.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Override(OsString),
 }
 
@@ -46,7 +46,7 @@ impl ToolRunner {
         let executable = invocation.program().executable();
         let mut command = match &self.search_path {
             SearchPath::Inherit => Command::new(executable),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             SearchPath::Override(dir) => {
                 let mut command = Command::new(std::path::Path::new(dir).join(executable));
                 let inherited = std::env::var_os("PATH").unwrap_or_default();

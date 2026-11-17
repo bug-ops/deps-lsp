@@ -219,6 +219,7 @@ fn pin_rows(outcome: &LockfileOutcome) -> Vec<(String, String, PinResolution)> {
         .collect()
 }
 
+#[cfg(unix)]
 fn mismatch(outcome: &LockfileOutcome) -> (String, String, Option<String>) {
     let LockfileOutcome::Failed(RegenerationError::VersionMismatch {
         package,
