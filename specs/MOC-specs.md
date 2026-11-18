@@ -53,7 +53,7 @@ status: moc
 | 101 | [[101-operator-advisory-exemptions/spec\|Operator-controlled advisory exemptions that a repository cannot grant]] | specify | shipped — advisory exemptions from the user config file (LSP) or `--advisory-exemptions` (deps-cli), never from repository config (PR #2029, issue #1964) |
 | 102 | [[102-installer-level-cooldown-dart-swift/spec\|Installer-level cooldown findings for Dart and Swift]] | specify | shipped — research, P4: pub and SwiftPM have no native release-age gate as of 2026-11-17, no code change (PR #2029, issue #1569) |
 | 103 | [[103-cross-major-sibling-scan/spec\|OSV scan and candidate vetting of tag pins against cross-major release tags on the same commit]] | specify | shipped — tag pins use whole-commit sibling tags (PR #2029, issue #1719) |
-| 104 | [[104-cli-update-open-pr/spec\|deps-cli update opens a pull request, optionally for one update group]] | tasks | shipped — `deps-cli update --open-pr github\|gitlab` commits the manifest and lock file on a content-addressed branch and opens a PR/MR via `gh`/`glab`, `[update.groups]` + `--group` batch matching updates (PR #PRNUM, issues #1117, #1118); follow-ups #2071, #2072, #2073, #2074 |
+| 104 | [[104-cli-update-open-pr/spec\|deps-cli update opens a pull request, optionally for one update group]] | tasks | shipped — `deps-cli update --open-pr github\|gitlab` commits the manifest and lock file on a content-addressed branch and opens a PR/MR via `gh`/`glab`, `[update.groups]` + `--group` batch matching updates (PR #2075, issues #1117, #1118); follow-ups #2071, #2072, #2073, #2074 |
 
 ## Completed Specs
 

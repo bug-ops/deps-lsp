@@ -222,7 +222,7 @@ None.
 ## 10. As Shipped
 
 > [!success] Status
-> Shipped in PR #PRNUM (issues #1117, #1118), together with #2065 and #2066 in the same PR.
+> Shipped in PR #2075 (issues #1117, #1118), together with #2065 and #2066 in the same PR.
 
 ### Deltas from the plan (approved)
 
