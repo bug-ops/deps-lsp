@@ -38,7 +38,7 @@ use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, PinResolution,
     RegenerationError, RegenerationGate, SkipCause, Strategy, UnsupportedReason,
-    regenerate_lockfile_with, regenerate_until, strategy,
+    regenerate_lockfile_with, strategy,
 };
 use crate::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
@@ -2367,6 +2367,7 @@ async fn test_interrupts_recv_resolves_on_sigterm_instead_of_killing_the_process
 #[cfg(all(unix, feature = "npm"))]
 mod interrupted {
     use super::*;
+    use crate::update::regen::regenerate_until;
     use std::os::unix::fs::PermissionsExt;
 
     fn alive(pid: u32) -> bool {

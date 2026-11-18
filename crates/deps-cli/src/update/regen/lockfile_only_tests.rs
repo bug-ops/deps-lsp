@@ -12,6 +12,11 @@
 //!   `regenerate_lockfile` settlement.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::too_many_lines)]
+// Helpers serve the feature-gated cargo/npm/go/pypi tests; a partial feature build leaves them unused.
+#![cfg_attr(
+    not(all(feature = "cargo", feature = "npm", feature = "go", feature = "pypi")),
+    allow(dead_code, unused_imports)
+)]
 
 use std::assert_matches;
 use std::path::{Path, PathBuf};
@@ -20,6 +25,7 @@ use std::time::Duration;
 
 use deps_core::edit::ManifestEdit;
 use deps_core::net_policy::{MapEnv, RegistryEnvironment};
+#[cfg(unix)]
 use deps_core::osv::{AffectedRanges, OsvEcosystem, OsvPackageName};
 use deps_core::policy_config::PolicyConfig;
 use deps_core::position::{Position, Range};
@@ -29,17 +35,19 @@ use deps_core::{
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use url::Url;
 
+#[cfg(unix)]
+use super::PinResolution;
 use super::command::NpmPackageArg;
 use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
-    LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, PinResolution,
-    RegenerationGate, SkipCause, UnsupportedReason, regenerate_lockfile, regenerate_lockfile_with,
+    LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, RegenerationGate,
+    SkipCause, UnsupportedReason, regenerate_lockfile, regenerate_lockfile_with,
 };
 use crate::exit::{EXIT_CLEAN, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
-use crate::update::{
-    CurrentVersion, LockfileState, Outcome, PlannedUpdateItem, UpdatePlan, UpdateRun,
-};
+#[cfg(unix)]
+use crate::update::LockfileState;
+use crate::update::{CurrentVersion, Outcome, PlannedUpdateItem, UpdatePlan, UpdateRun};
 
 struct Project {
     root: PathBuf,
@@ -141,6 +149,7 @@ async fn regenerate(
 // NpmPackageArg
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(feature = "npm")]
 #[test]
 fn test_npm_package_arg_parse_accepts_plain_scoped_and_legacy_names() {
     for name in [
@@ -160,6 +169,7 @@ fn test_npm_package_arg_parse_accepts_plain_scoped_and_legacy_names() {
     }
 }
 
+#[cfg(feature = "npm")]
 #[test]
 fn test_npm_package_arg_parse_rejects_patterns_flags_and_malformed_shapes() {
     for name in [
@@ -188,6 +198,7 @@ fn test_npm_package_arg_parse_rejects_patterns_flags_and_malformed_shapes() {
     }
 }
 
+#[cfg(feature = "npm")]
 #[test]
 fn test_npm_package_arg_parse_enforces_the_214_byte_cap() {
     assert!(NpmPackageArg::parse(&"a".repeat(214)).is_ok());
@@ -284,6 +295,7 @@ fn test_update_to_document_applied_via_lockfile_serializes_as_applied() {
 // Gate and strategy behaviour that needs no tool
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(feature = "npm")]
 #[tokio::test]
 async fn test_regenerate_lockfile_with_skip_gate_reports_skipped_for_lockfile_only_plan() {
     let project = Project::new();
@@ -309,6 +321,7 @@ async fn test_regenerate_lockfile_with_skip_gate_reports_skipped_for_lockfile_on
     }
 }
 
+#[cfg(feature = "npm")]
 #[tokio::test]
 async fn test_regenerate_lockfile_yarn_lock_stays_requires_lockfile_update() {
     let project = Project::new();
@@ -343,6 +356,7 @@ async fn test_regenerate_lockfile_yarn_lock_stays_requires_lockfile_update() {
     assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
 }
 
+#[cfg(feature = "pypi")]
 #[tokio::test]
 async fn test_regenerate_lockfile_deferred_ecosystem_keeps_requires_lockfile_update() {
     let project = Project::new();
@@ -458,6 +472,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_regenerate_lockfile_cargo_lockfile_only_pin_skips_workspace_update() {
         let project = Project::new();
@@ -494,6 +509,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_regenerate_lockfile_cargo_lockfile_only_class_comes_from_the_locked_version() {
         let project = Project::new();
@@ -526,6 +542,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_regenerate_lockfile_cargo_mixed_pins_run_workspace_update_once() {
         let project = Project::new();
@@ -565,6 +582,7 @@ mod shim_tools {
         }
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_regenerate_lockfile_cargo_manifest_edit_wins_over_lockfile_only_duplicate() {
         let project = Project::new();
@@ -652,6 +670,7 @@ mod shim_tools {
         (outcome, calls)
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_npm_lockfile_only_pins_run_update_no_save_with_names() {
         let (outcome, calls) = run_npm_lockfile_only(
@@ -680,6 +699,7 @@ mod shim_tools {
         assert_eq!(rows(&outcome).len(), 3, "{outcome:?}");
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_npm_lockfile_only_stale_lock_is_a_mismatch() {
         let (outcome, _) = run_npm_lockfile_only(
@@ -697,6 +717,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_pnpm_lockfile_only_pins_run_update_lockfile_only() {
         let pnpm = |lodash: &str| {
@@ -741,6 +762,7 @@ mod shim_tools {
         assert!(project.read("pnpm-lock.yaml").contains("4.17.21"));
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_npm_unsafe_lockfile_only_name_is_rejected_before_any_update()
     {
@@ -802,6 +824,7 @@ mod shim_tools {
         }
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_npm_mixed_pins_install_then_update_naming_only_lockfile_only()
     {
@@ -843,6 +866,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_npm_mixed_pins_stale_lockfile_only_pin_is_a_mismatch() {
         let project = Project::new();
@@ -872,6 +896,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_pnpm_mixed_pins_install_then_update_naming_only_lockfile_only()
      {
@@ -917,9 +942,12 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "go")]
     const GO_MOD: &str = "module example.com/app\n\ngo 1.21\n\nrequire (\n\tgolang.org/x/net v0.20.0\n\tgolang.org/x/text v0.30.0\n)\n";
+    #[cfg(feature = "go")]
     const GO_SUM_AFTER: &str = "golang.org/x/net v0.21.0 h1:net=\ngolang.org/x/net v0.21.0/go.mod h1:netmod=\ngolang.org/x/text v0.31.0 h1:text=\ngolang.org/x/text v0.31.0/go.mod h1:textmod=\n";
 
+    #[cfg(feature = "go")]
     async fn run_go(plan: &UpdatePlan, sum_after: &str) -> (LockfileOutcome, Vec<String>) {
         let project = Project::new();
         let manifest = project.write("go.mod", GO_MOD);
@@ -938,6 +966,7 @@ mod shim_tools {
         (outcome, bin.calls())
     }
 
+    #[cfg(feature = "go")]
     #[tokio::test]
     async fn test_regenerate_lockfile_go_lockfile_only_pin_shares_the_go_get_list() {
         let plan = UpdatePlan {
@@ -974,6 +1003,7 @@ mod shim_tools {
         );
     }
 
+    #[cfg(feature = "go")]
     #[tokio::test]
     async fn test_regenerate_lockfile_go_only_lockfile_only_pins_still_run_go_get() {
         let plan = UpdatePlan {
@@ -1041,6 +1071,7 @@ mod cargo_real {
         lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\""))
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_regenerate_lockfile_cargo_caret_range_fix_settles_as_applied_via_lockfile() {
         let (project, manifest) = project();
@@ -1080,6 +1111,7 @@ mod cargo_real {
         assert_eq!(project.read("Cargo.toml"), before, "manifest never edited");
     }
 
+    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_regenerate_lockfile_cargo_mixed_plan_settles_only_lockfile_only_items() {
         let (project, manifest) = project();
@@ -1196,6 +1228,7 @@ mod newer_in_range {
         );
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_without_captured_ranges_stays_unsettled() {
         let (outcome, run) = settle_with_lock_after_update("4.17.22", vec![]).await;
@@ -1208,6 +1241,7 @@ mod newer_in_range {
         assert_stays_unsettled_at(&run, "4.17.22");
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_inside_a_later_affected_range_stays_unsettled() {
         let (_, run) = settle_with_lock_after_update("4.18.1", vec![ranges()]).await;
@@ -1215,6 +1249,7 @@ mod newer_in_range {
         assert_stays_unsettled_at(&run, "4.18.1");
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_outside_every_affected_range_becomes_applied() {
         let (outcome, run) = settle_with_lock_after_update("4.17.22", vec![ranges()]).await;
@@ -1231,6 +1266,7 @@ mod newer_in_range {
         assert_eq!(update_exit_code(&run), EXIT_CLEAN);
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_with_one_undecidable_range_set_stays_unsettled() {
         let undecidable = AffectedRanges::from_affected_json_for_test(
@@ -1243,6 +1279,7 @@ mod newer_in_range {
         assert_stays_unsettled_at(&run, "4.17.22");
     }
 
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_lock_resolving_exactly_the_target_becomes_applied_via_lockfile() {
         let (_, run) = settle_with_lock_after_update("4.17.21", vec![]).await;
@@ -1254,6 +1291,7 @@ mod newer_in_range {
         assert_eq!(update_exit_code(&run), EXIT_CLEAN);
     }
 
+    #[cfg(feature = "npm")]
     #[test]
     fn test_settle_records_the_moved_lockfile_only_on_requires_lockfile_update_items() {
         let skipped = item(
@@ -1303,6 +1341,7 @@ mod newer_in_range {
     }
 }
 
+#[cfg(feature = "npm")]
 #[test]
 fn test_npm_package_arg_parse_rejects_non_registry_specs_and_non_url_safe_characters() {
     for spec in [

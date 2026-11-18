@@ -613,6 +613,7 @@ fn parse_yarnrc(path: &Path, content: &str) -> Option<Settings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn explicit_scope_off_wins_even_when_the_scope_name_is_not_a_valid_label() {
@@ -677,7 +678,7 @@ mod tests {
 
         let yaml = "npmMinimalAgeGate: 7d\nnpmScopes:\n  myorg: oops\n";
         let settings = parse_yarnrc(Path::new(".yarnrc.yml"), yaml).expect("global window");
-        assert!(matches!(settings.scopes, ScopedGates::Absent));
+        assert_matches!(settings.scopes, ScopedGates::Absent);
     }
 
     #[test]
@@ -689,6 +690,6 @@ mod tests {
             ));
         }
         let settings = parse_yarnrc(Path::new(".yarnrc.yml"), &yaml).expect("declared file");
-        assert!(matches!(settings.scopes, ScopedGates::Declared(ref gates) if gates.len() == 2001));
+        assert_matches!(settings.scopes, ScopedGates::Declared(ref gates) if gates.len() == 2001);
     }
 }

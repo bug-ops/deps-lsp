@@ -11,6 +11,7 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -100,8 +101,9 @@ async fn test_run_timeout_with_own_group_kills_leader_and_grandchild() {
         )
         .await;
 
-    assert!(
-        matches!(result, Err(RegenerationError::TimedOut { .. })),
+    assert_matches!(
+        result,
+        Err(RegenerationError::TimedOut { .. }),
         "{result:?}"
     );
     let leader = tool.pid("leader.pid");
@@ -158,8 +160,9 @@ async fn test_run_timeout_with_inherit_group_kills_at_least_the_leader() {
         )
         .await;
 
-    assert!(
-        matches!(result, Err(RegenerationError::TimedOut { .. })),
+    assert_matches!(
+        result,
+        Err(RegenerationError::TimedOut { .. }),
         "{result:?}"
     );
     let leader = tool.pid("leader.pid");
