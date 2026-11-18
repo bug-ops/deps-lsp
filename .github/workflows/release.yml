@@ -25,6 +25,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      is_latest: ${{ steps.resolve.outputs.is_latest }}
     steps:
       # Single source of the release tag for every job: the dispatched `tag` input, or the
       # pushed tag. Passed via env (never interpolated into the script) and format-validated.
@@ -32,13 +33,35 @@ jobs:
         id: resolve
         env:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Invalid release tag '${TAG}' (expected vX.Y.Z or vX.Y.Z-prerelease)"
             exit 1
           fi
+          # is_latest gates the moving GHCR tags (latest/major/minor), the action.yml digest pin
+          # PR, and nothing else. Pre-release tags are never latest; a stable tag is latest only
+          # if it is the highest stable vX.Y.Z tag on the remote.
+          if [[ "$TAG" == *-* ]]; then
+            is_latest=false
+          else
+            highest=$(git ls-remote --tags --refs "https://github.com/${REPO}.git" 'refs/tags/v*' \
+              | sed 's|.*refs/tags/||' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n1)
+            if [[ -z "$highest" ]]; then
+              echo "::error::Could not determine the highest release tag"
+              exit 1
+            fi
+            if [[ "$(printf '%s\n%s\n' "$TAG" "$highest" | sort -V | tail -n1)" == "$TAG" ]]; then
+              is_latest=true
+            else
+              is_latest=false
+            fi
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "is_latest=${is_latest}" >> "$GITHUB_OUTPUT"
 
   create-release:
     name: Create Release
@@ -271,6 +294,10 @@ jobs:
         with:
           ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
+      - name: Resolve tag commit
+        id: tag-commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build image locally for scanning
@@ -315,6 +342,8 @@ jobs:
         uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: trivy-results.sarif
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
+          sha: ${{ steps.tag-commit.outputs.sha }}
 
       - name: Fail on vulnerabilities found
         if: steps.trivy.outcome == 'failure'
@@ -339,13 +368,26 @@ jobs:
 
       - name: Compute image tags
         id: tags
+        env:
+          IS_LATEST: ${{ needs.resolve-tag.outputs.is_latest }}
+          VERSION: ${{ needs.create-release.outputs.version }}
         run: |
-          version="${{ needs.create-release.outputs.version }}"
+          version="$VERSION"
           major="${version%%.*}"
           minor="${version%.*}"
+          image="ghcr.io/bug-ops/deps-lsp-github-action"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "major=$major" >> "$GITHUB_OUTPUT"
-          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+          {
+            echo "list<<EOF"
+            echo "${image}:${version}"
+            # Moving tags only for the latest release; re-dispatching an older tag must not rewind them.
+            if [[ "$IS_LATEST" == "true" ]]; then
+              echo "${image}:${minor}"
+              echo "${image}:${major}"
+              echo "${image}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
@@ -372,15 +414,12 @@ jobs:
           push: true
           build-args: |
             DEPS_CLI_VERSION=v${{ steps.tags.outputs.version }}
-          tags: |
-            ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.version }}
-            ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.minor }}
-            ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.major }}
-            ghcr.io/bug-ops/deps-lsp-github-action:latest
+          tags: ${{ steps.tags.outputs.list }}
 
   pin-action-digest:
     name: Pin action.yml to Published Image Digest
-    needs: [create-release, build-github-action-image]
+    needs: [resolve-tag, create-release, build-github-action-image]
+    if: needs.resolve-tag.outputs.is_latest == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
