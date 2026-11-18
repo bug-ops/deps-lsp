@@ -6,12 +6,12 @@
         "sources": [{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]
     },
     "default": {
-        "requests": {"hashes": ["sha256:aa"], "index": "pypi", "version": "==2.31.0"},
+        "requests": {"hashes": ["sha256:aa"], "index": "pypi", "version": "==2.33.0"},
         "mylib": {"git": "https://github.com/example/mylib.git", "ref": "0123456789abcdef"},
         "localpkg": {"path": "./localpkg", "editable": true},
         "loose": {"version": ">=1.0"}
     },
     "develop": {
-        "pytest": {"hashes": [], "index": "pypi", "version": "==7.4.0"}
+        "pytest": {"hashes": [], "index": "pypi", "version": "==9.0.3"}
     }
 }
