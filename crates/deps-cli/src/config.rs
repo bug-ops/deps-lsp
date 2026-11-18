@@ -123,6 +123,63 @@ pub struct GroupRule {
     /// Update kinds in the group; `None` admits every kind.
     #[serde(default)]
     pub update_types: Option<Vec<UpdateTypeToken>>,
+    /// `*`-only name globs in the group, a union with [`Self::dependencies`]; `None` adds none.
+    #[serde(default)]
+    pub patterns: Option<Vec<GroupPattern>>,
+    /// Dependency role in the group; `None` admits every role.
+    #[serde(default)]
+    pub dependency_type: Option<DependencyTypeToken>,
+}
+
+/// A validated `[update.groups.<name>].patterns` entry: 1 to 214 bytes, no whitespace or control
+/// characters; `*` is the only wildcard.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct GroupPattern(String);
+
+/// A group pattern outside the [`GroupPattern`] grammar.
+#[derive(Debug, thiserror::Error)]
+#[error("group patterns are 1 to 214 bytes without whitespace or control characters")]
+pub struct InvalidGroupPattern;
+
+impl TryFrom<String> for GroupPattern {
+    type Error = InvalidGroupPattern;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        let valid = (1..=Self::MAX_LEN).contains(&text.len())
+            && !text.chars().any(|ch| ch.is_whitespace() || ch.is_control());
+        if valid {
+            Ok(Self(text))
+        } else {
+            Err(InvalidGroupPattern)
+        }
+    }
+}
+
+impl GroupPattern {
+    const MAX_LEN: usize = 214;
+
+    /// The pattern as written in the config file.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `dependency_type` token of an `[update.groups.<name>]` table.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DependencyTypeToken {
+    /// Every role except development.
+    Production,
+    /// Development-only dependencies.
+    Development,
+    /// Build-only dependencies.
+    Build,
+    /// Peer dependencies.
+    Peer,
+    /// Optional dependencies.
+    Optional,
 }
 
 /// One `[update].ignore` entry: a dependency name, optionally scoped to specific update

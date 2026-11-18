@@ -107,10 +107,7 @@ fn descriptor_placement<'a>(
 
 fn unquote(value: &str) -> &str {
     let value = value.trim();
-    value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value)
+    value.strip_circumfix('"', '"').unwrap_or(value)
 }
 
 // ---------------------------------------------------------------- Yarn v1

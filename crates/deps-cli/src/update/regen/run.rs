@@ -309,9 +309,7 @@ impl ToolRunner {
             .args(invocation.args())
             .current_dir(invocation.cwd())
             .stdin(Stdio::null());
-        if let Some((key, value)) = invocation.env() {
-            command.env(key, value);
-        }
+        command.envs(invocation.env().iter().copied());
         command
     }
 

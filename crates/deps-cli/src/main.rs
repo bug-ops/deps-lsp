@@ -21,7 +21,7 @@ use deps_cli::update::pr;
 use deps_cli::update::regen::{LockfileMode, LockfileOutcome, LockfileSupport, lockfile_support};
 use deps_cli::{format, walk};
 use deps_core::net_policy::{EnvSource, ProcessEnv, RegistryEnvironment};
-use deps_core::osv::OsvClient;
+use deps_core::osv::{OSV_BASE_URL_ENV, OsvClient, OsvEndpoint};
 use deps_core::policy_config::{PolicyConfig, WorkspaceRegistriesEffect};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
@@ -38,6 +38,20 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    let osv_endpoint = match OsvEndpoint::from_env(&ProcessEnv) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("deps-cli: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if let OsvEndpoint::Operator(origin) = &osv_endpoint {
+        eprintln!(
+            "deps-cli: {OSV_BASE_URL_ENV} is set: querying OSV at {}",
+            origin.base()
+        );
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -50,8 +64,8 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
-        Command::Check(args) => run_check_command(&runtime, &args),
-        Command::Update(args) => run_update_command(&runtime, &args),
+        Command::Check(args) => run_check_command(&runtime, &args, &osv_endpoint),
+        Command::Update(args) => run_update_command(&runtime, &args, &osv_endpoint),
     }
 }
 
@@ -128,7 +142,11 @@ impl Drop for EgressNoticeOnExit {
     }
 }
 
-fn build_runtime_handles(policy: &PolicyConfig, source: &impl EnvSource) -> RuntimeHandles {
+fn build_runtime_handles(
+    policy: &PolicyConfig,
+    source: &impl EnvSource,
+    osv_endpoint: &OsvEndpoint,
+) -> RuntimeHandles {
     let environment = RegistryEnvironment::read(source);
     for message in startup_warnings(policy, &environment) {
         eprintln!("deps-cli: {message}");
@@ -153,7 +171,7 @@ fn build_runtime_handles(policy: &PolicyConfig, source: &impl EnvSource) -> Runt
         register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &ecosystem_runtime);
 
     RuntimeHandles {
-        osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+        osv: Arc::new(OsvClient::with_endpoint(Arc::clone(&cache), osv_endpoint)),
         deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache,
         cache,
@@ -164,6 +182,7 @@ fn build_runtime_handles(policy: &PolicyConfig, source: &impl EnvSource) -> Runt
 fn run_check_command(
     runtime: &tokio::runtime::Runtime,
     args: &deps_cli::cli::CheckArgs,
+    osv_endpoint: &OsvEndpoint,
 ) -> ExitCode {
     let walk_paths = args.walk_paths();
     let default_config_dir = config_default_dir(&walk_paths);
@@ -218,6 +237,7 @@ fn run_check_command(
         Arc::new(advisory_exemptions),
         args.gitignore_policy(),
         args.symlink_policy(),
+        osv_endpoint,
     ));
     for note in deps_cli::report::probe_notes(&probe_summary, &fail_on) {
         eprintln!("deps-cli: note: {note}");
@@ -294,6 +314,7 @@ async fn run_check(
     advisory_exemptions: Arc<deps_core::lsp_helpers::exemption::OperatorExemptions>,
     gitignore_policy: walk::GitignorePolicy,
     symlink_policy: walk::SymlinkPolicy,
+    osv_endpoint: &OsvEndpoint,
 ) -> (
     CheckReport,
     bool,
@@ -301,7 +322,7 @@ async fn run_check(
     deps_cli::report::OsvCoverage,
 ) {
     let policy = cli_config.policy;
-    let handles = build_runtime_handles(&policy, &ProcessEnv);
+    let handles = build_runtime_handles(&policy, &ProcessEnv, osv_endpoint);
     let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
     let ctx = CheckContext {
         cache: Arc::clone(&handles.cache),
@@ -469,7 +490,11 @@ fn load_update_config(explicit_path: Option<&Path>) -> Result<CliConfig, config:
     }
 }
 
-fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> ExitCode {
+fn run_update_command(
+    runtime: &tokio::runtime::Runtime,
+    args: &UpdateArgs,
+    osv_endpoint: &OsvEndpoint,
+) -> ExitCode {
     let cli_config = match load_update_config(args.config.as_deref()) {
         Ok(config) => config::apply_overrides(
             config,
@@ -560,7 +585,13 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
         return ExitCode::from(2);
     }
 
-    runtime.block_on(run_update_flow(args, policy, ignore_config, group_rule))
+    runtime.block_on(run_update_flow(
+        args,
+        policy,
+        ignore_config,
+        group_rule,
+        osv_endpoint,
+    ))
 }
 
 /// Runs one `update` end to end: the optional `--open-pr` preflight, the update itself, the
@@ -571,6 +602,7 @@ async fn run_update_flow(
     policy: PolicyConfig,
     ignore_config: Option<Vec<config::IgnoreRule>>,
     group_rule: Option<(config::GroupName, config::GroupRule)>,
+    osv_endpoint: &OsvEndpoint,
 ) -> ExitCode {
     let mut signals = args.open_pr.map(|_| pr::PrSignals::install());
     let repo = match args.open_pr {
@@ -598,6 +630,7 @@ async fn run_update_flow(
             policy,
             ignore_config,
             group_rule,
+            osv_endpoint,
             repo.as_ref(),
         )),
     )
@@ -620,8 +653,15 @@ async fn run_update_flow(
             dry_run = true;
             eprintln!("deps-cli: already proposed on {}", branch.as_str());
         }
-        Publish::Propose { repo, branch } => match pr::readiness(&run) {
-            pr::Readiness::Ready(publishable) => ready = Some((repo, branch, publishable)),
+        Publish::Propose {
+            repo,
+            branch,
+            marker,
+            ecosystem,
+        } => match pr::readiness(&run) {
+            pr::Readiness::Ready(publishable) => {
+                ready = Some((repo, branch, publishable, marker, ecosystem));
+            }
             pr::Readiness::LockfileNotRegenerated => {
                 dry_run = true;
                 let reason = pr::PrError::LockfileNotRegenerated;
@@ -666,14 +706,18 @@ async fn run_update_flow(
     if let Some(message) = failure {
         return fail(&message);
     }
-    if let (Some((repo, branch, publishable)), Some(host), Some(signals)) =
+    if let (Some((repo, branch, publishable, marker, ecosystem)), Some(host), Some(signals)) =
         (ready, args.open_pr, signals.as_mut())
     {
-        let text = pr::describe(repo, &publishable, group.as_ref());
+        let text = pr::describe(repo, &publishable, group.as_ref()).with_marker(&marker);
+        let superseded = match pr::SupersededPolicy::from_flag(args.close_superseded) {
+            pr::SupersededPolicy::Close => Some((&marker, ecosystem.formatter())),
+            pr::SupersededPolicy::Keep => None,
+        };
         let published = signals
             .guard(
                 pr::PrPhase::Publish,
-                publish_request(repo, host, branch, &text),
+                publish_request(repo, host, branch, &text, superseded),
             )
             .await
             .flatten();
@@ -691,16 +735,40 @@ async fn publish_request(
     host: pr::PrHost,
     branch: pr::FreeBranch,
     text: &pr::PullRequestText,
+    superseded: Option<(
+        &pr::RequestMarker,
+        &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    )>,
 ) -> Result<(), pr::PrError> {
     match pr::open(repo, host, branch, text).await? {
         pr::PrOutcome::Opened(request) => {
             eprintln!("deps-cli: opened {}", request.url());
+            if let Some((marker, formatter)) = superseded {
+                let report = pr::close_superseded(repo, host, &request, marker, formatter).await;
+                print_supersede_report(&report);
+            }
             request.switch_back(repo).await
         }
         pr::PrOutcome::NothingToCommit => {
             eprintln!("deps-cli: nothing to commit");
             Ok(())
         }
+    }
+}
+
+/// Prints what the superseded-request cleanup did; it never changes the exit code.
+fn print_supersede_report(report: &pr::SupersedeReport) {
+    for number in &report.closed {
+        eprintln!("deps-cli: closed superseded request {number}");
+    }
+    if report.listing_full {
+        eprintln!(
+            "deps-cli: notice: the listing of open requests was full, so older superseded \
+             requests may remain open"
+        );
+    }
+    for failure in &report.failures {
+        eprintln!("deps-cli: warning: closing superseded requests: {failure}");
     }
 }
 
@@ -733,6 +801,8 @@ enum Publish<'a> {
     Propose {
         repo: &'a pr::RepoContext,
         branch: pr::FreeBranch,
+        marker: pr::RequestMarker,
+        ecosystem: Arc<dyn deps_core::Ecosystem>,
     },
 }
 
@@ -784,12 +854,14 @@ async fn decide_publish<'a>(
     repo: Option<&'a pr::RepoContext>,
     ecosystem: deps_core::EcosystemId,
     plan: &update::UpdatePlan,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem_impl: &Arc<dyn deps_core::Ecosystem>,
+    security_only: bool,
     group: Option<&UpdateGroup>,
 ) -> Result<Publish<'a>, String> {
     let Some(repo) = repo else {
         return Ok(Publish::NotRequested);
     };
+    let formatter = ecosystem_impl.formatter();
     let Some(branch) = pr::branch_for(repo, ecosystem, plan, formatter, group) else {
         return Ok(Publish::NoUpdates);
     };
@@ -797,8 +869,39 @@ async fn decide_publish<'a>(
         .await
         .map_err(|error| error.to_string())?
     {
-        pr::BranchCheck::Free(branch) => Ok(Publish::Propose { repo, branch }),
+        pr::BranchCheck::Free(branch) => Ok(Publish::Propose {
+            repo,
+            branch,
+            marker: pr::RequestMarker::new(
+                repo,
+                ecosystem,
+                pr::RunMode::from_security_only(security_only),
+                plan,
+                formatter,
+                group,
+            ),
+            ecosystem: Arc::clone(ecosystem_impl),
+        }),
         pr::BranchCheck::AlreadyProposed(branch) => Ok(Publish::AlreadyProposed(branch)),
+    }
+}
+
+/// Reads the update target without following a symlink, within the manifest size cap.
+fn read_update_manifest(manifest: &walk::DiscoveredManifest) -> Result<String, String> {
+    match deps_core::fs_probe::read_to_string_capped_no_follow(
+        &manifest.path,
+        MAX_MANIFEST_FILE_SIZE,
+    ) {
+        Ok(Some(content)) => Ok(content),
+        Ok(None) => Err(format!(
+            "{} exceeds the manifest size cap",
+            manifest.display_path.display()
+        )),
+        // The no-follow read's own error already names a symlink refusal; propagate its `Display`.
+        Err(error) => Err(format!(
+            "could not read {}: {error}",
+            manifest.display_path.display()
+        )),
     }
 }
 
@@ -817,9 +920,10 @@ async fn run_update<'a>(
     policy: PolicyConfig,
     ignore_config: Option<Vec<config::IgnoreRule>>,
     group_rule: Option<(config::GroupName, config::GroupRule)>,
+    osv_endpoint: &OsvEndpoint,
     repo: Option<&'a pr::RepoContext>,
 ) -> Result<UpdateOutput<'a>, String> {
-    let handles = build_runtime_handles(&policy, &ProcessEnv);
+    let handles = build_runtime_handles(&policy, &ProcessEnv, osv_endpoint);
     let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
 
     let walk_outcome = walk::walk(
@@ -866,28 +970,7 @@ async fn run_update<'a>(
     // `read_to_string_capped_no_follow`, which passes `O_NOFOLLOW` to the single `open(2)`
     // call itself on Linux/macOS — see that function's doc for the narrower (documented, not
     // fully closed) fallback on other platforms.
-    let content = match deps_core::fs_probe::read_to_string_capped_no_follow(
-        &manifest.path,
-        MAX_MANIFEST_FILE_SIZE,
-    ) {
-        Ok(Some(content)) => content,
-        Ok(None) => {
-            return Err(format!(
-                "{} exceeds the manifest size cap",
-                manifest.display_path.display()
-            ));
-        }
-        // `read_to_string_capped_no_follow`'s own error message already names the symlink
-        // refusal specifically (mirroring how `ApplyError::Write`'s `{source}` Display already
-        // carries `write_atomic`'s equivalent message) — no need to re-detect it by `ErrorKind`
-        // here, just propagate `error`'s own `Display`.
-        Err(error) => {
-            return Err(format!(
-                "could not read {}: {error}",
-                manifest.display_path.display()
-            ));
-        }
-    };
+    let content = read_update_manifest(manifest)?;
 
     let ctx = CheckContext {
         cache: Arc::clone(&handles.cache),
@@ -992,7 +1075,15 @@ async fn run_update<'a>(
     if let Some(group) = &group {
         update::group::demote_outside_group(&mut plan.items, group, formatter);
     }
-    let publish = decide_publish(repo, ecosystem_id, &plan, formatter, group.as_ref()).await?;
+    let publish = decide_publish(
+        repo,
+        ecosystem_id,
+        &plan,
+        &manifest.ecosystem,
+        args.security_only,
+        group.as_ref(),
+    )
+    .await?;
     let dry_run =
         format::DryRun::from_flag(args.dry_run || matches!(publish, Publish::AlreadyProposed(_)));
 

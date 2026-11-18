@@ -286,6 +286,15 @@ impl deps_core::Dependency for CargoDependency {
         self.package.as_ref().unwrap_or(&self.name)
     }
 
+    fn kind(&self) -> Option<deps_core::DependencyKind> {
+        match self.section {
+            CargoDependencySection::Dependencies => Some(deps_core::DependencyKind::Normal),
+            CargoDependencySection::DevDependencies => Some(deps_core::DependencyKind::Development),
+            CargoDependencySection::BuildDependencies => Some(deps_core::DependencyKind::Build),
+            CargoDependencySection::WorkspaceDependencies => None,
+        }
+    }
+
     fn native_cooldown(&self) -> Option<&deps_core::native_cooldown::NativeCooldown> {
         self.native_cooldown.as_ref()
     }

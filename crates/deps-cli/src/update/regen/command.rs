@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use deps_core::ConcreteVersion;
 
+pub(super) mod lockers;
+
 /// An external tool `deps-cli` may spawn to regenerate a lockfile.
 ///
 /// A closed set, so no program name ever originates from manifest content.
@@ -23,6 +25,14 @@ pub enum Program {
     Npm,
     /// `pnpm` (`pnpm.cmd` on Windows).
     Pnpm,
+    /// `yarn` (`yarn.cmd` on Windows).
+    Yarn,
+    /// `uv`.
+    Uv,
+    /// Bundler's `bundle` (`bundle.bat` on Windows).
+    Bundle,
+    /// `deno`.
+    Deno,
 }
 
 impl Program {
@@ -34,19 +44,27 @@ impl Program {
             Self::Go => "go",
             Self::Npm => "npm",
             Self::Pnpm => "pnpm",
+            Self::Yarn => "yarn",
+            Self::Uv => "uv",
+            Self::Bundle => "bundle",
+            Self::Deno => "deno",
         }
     }
 
     /// The executable file name looked up on `PATH`.
     pub(super) const fn executable(self) -> &'static str {
         match self {
-            Self::Cargo | Self::Go => self.as_str(),
+            Self::Cargo | Self::Go | Self::Uv | Self::Deno => self.as_str(),
             #[cfg(windows)]
             Self::Npm => "npm.cmd",
             #[cfg(windows)]
             Self::Pnpm => "pnpm.cmd",
+            #[cfg(windows)]
+            Self::Yarn => "yarn.cmd",
+            #[cfg(windows)]
+            Self::Bundle => "bundle.bat",
             #[cfg(not(windows))]
-            Self::Npm | Self::Pnpm => self.as_str(),
+            Self::Npm | Self::Pnpm | Self::Yarn | Self::Bundle => self.as_str(),
         }
     }
 }
@@ -93,6 +111,53 @@ impl NpmClient {
             Self::Bun => "bun",
         }
     }
+}
+
+/// The Python lock tool that owns a lockfile, identified by its exact file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonLocker {
+    /// uv (`uv.lock`).
+    Uv,
+    /// Poetry (`poetry.lock`); regeneration is deferred.
+    Poetry,
+    /// PDM (`pdm.lock`); regeneration is deferred.
+    Pdm,
+    /// Pipenv (`Pipfile.lock`); regeneration is deferred.
+    Pipenv,
+}
+
+impl PythonLocker {
+    /// Maps an exact lockfile file name to its locker; `None` for any other name.
+    #[must_use]
+    pub fn from_lockfile_name(name: &str) -> Option<Self> {
+        match name {
+            "uv.lock" => Some(Self::Uv),
+            "poetry.lock" => Some(Self::Poetry),
+            "pdm.lock" => Some(Self::Pdm),
+            "Pipfile.lock" => Some(Self::Pipenv),
+            _ => None,
+        }
+    }
+
+    /// The stable lowercase token used in reports and JSON output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Uv => "uv",
+            Self::Poetry => "poetry",
+            Self::Pdm => "pdm",
+            Self::Pipenv => "pipenv",
+        }
+    }
+}
+
+/// Whether a `go` invocation sees the surrounding Go workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoWork {
+    /// The inherited environment decides.
+    Inherit,
+    /// `GOWORK=off`: the module resolves on its own `go.mod`/`go.sum`.
+    Off,
 }
 
 /// A rejected [`ArgComponent`] candidate.
@@ -164,6 +229,43 @@ impl NpmPackageArg {
     }
 }
 
+/// A workspace member's directory relative to the workspace root, proven safe for a
+/// `--workspace=<path>` / `--filter=./<path>` argument: `/`-separated normal components only, no
+/// leading `-`, no whitespace or control characters, and none of `* ? [ ] { } !`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkspaceMember(String);
+
+impl WorkspaceMember {
+    /// Validates `relative` (the member directory below the workspace root).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsafeArgument`] for an empty path, a component that is not a plain name
+    /// (`.`, `..`, a prefix or a root), non-UTF-8 text, or any character the rules above reject.
+    pub(super) fn parse(relative: &Path) -> Result<Self, UnsafeArgument> {
+        let unsafe_char = |c: char| c.is_whitespace() || c.is_control() || "*?[]{}!".contains(c);
+        let parts = relative
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(part) => part.to_str().ok_or(UnsafeArgument),
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir => Err(UnsafeArgument),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let joined = parts.join("/");
+        if joined.is_empty() || joined.starts_with('-') || joined.chars().any(unsafe_char) {
+            return Err(UnsafeArgument);
+        }
+        Ok(Self(joined))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The caret compatibility class of a concrete version, as `cargo update --package name@class`
 /// expects it (`1.2.3` -> `1`, `0.2.3` -> `0.2`, `0.0.3` -> `0.0.3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,10 +308,16 @@ pub(super) struct Invocation {
     program: Program,
     args: Vec<OsString>,
     cwd: PathBuf,
-    env: Option<(&'static str, &'static str)>,
+    env: &'static [(&'static str, &'static str)],
 }
 
-const COREPACK_NO_PROMPT: (&str, &str) = ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+const COREPACK_ENV: &[(&str, &str)] = &[("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")];
+const YARN_ENV: &[(&str, &str)] = &[
+    ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
+    ("YARN_ENABLE_IMMUTABLE_INSTALLS", "false"),
+    ("YARN_ENABLE_SCRIPTS", "false"),
+];
+const GOWORK_OFF_ENV: &[(&str, &str)] = &[("GOWORK", "off")];
 
 impl Invocation {
     fn new(program: Program, cwd: &Path, args: Vec<OsString>) -> Self {
@@ -217,7 +325,7 @@ impl Invocation {
             program,
             args,
             cwd: cwd.to_path_buf(),
-            env: None,
+            env: &[],
         }
     }
 
@@ -237,7 +345,7 @@ impl Invocation {
         &self.cwd
     }
 
-    pub(super) const fn env(&self) -> Option<(&'static str, &'static str)> {
+    pub(super) const fn env(&self) -> &'static [(&'static str, &'static str)] {
         self.env
     }
 
@@ -282,14 +390,22 @@ impl Invocation {
     }
 
     /// `go get -- <module>@<version>...`; `--` ends flag parsing.
-    pub(super) fn go_get(cwd: &Path, modules: &[(ArgComponent, ArgComponent)]) -> Self {
+    pub(super) fn go_get(
+        cwd: &Path,
+        modules: &[(ArgComponent, ArgComponent)],
+        work: GoWork,
+    ) -> Self {
         let mut args = Self::strs(&["get", "--"]);
         args.extend(
             modules.iter().map(|(module, version)| {
                 format!("{}@{}", module.as_str(), version.as_str()).into()
             }),
         );
-        Self::new(Program::Go, cwd, args)
+        let mut invocation = Self::new(Program::Go, cwd, args);
+        if work == GoWork::Off {
+            invocation.env = GOWORK_OFF_ENV;
+        }
+        invocation
     }
 
     /// `npm install --package-lock-only --ignore-scripts --no-audit --no-fund`.
@@ -305,13 +421,18 @@ impl Invocation {
                 "--no-fund",
             ]),
         );
-        invocation.env = Some(COREPACK_NO_PROMPT);
+        invocation.env = COREPACK_ENV;
         invocation
     }
 
-    /// `npm update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund <names>`:
-    /// moves the named packages inside their declared ranges without editing `package.json`.
-    pub(super) fn npm_update(cwd: &Path, names: &[NpmPackageArg]) -> Self {
+    /// `npm update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund
+    /// [--workspace=<member>] <names>`: moves the named packages inside their declared ranges
+    /// without editing `package.json`, for one workspace member when `member` is given.
+    pub(super) fn npm_update(
+        cwd: &Path,
+        names: &[NpmPackageArg],
+        member: Option<&WorkspaceMember>,
+    ) -> Self {
         let mut args = Self::strs(&[
             "update",
             "--no-save",
@@ -320,18 +441,24 @@ impl Invocation {
             "--no-audit",
             "--no-fund",
         ]);
+        args.extend(member.map(|member| format!("--workspace=./{}", member.as_str()).into()));
         args.extend(names.iter().map(|name| OsString::from(name.as_str())));
         let mut invocation = Self::new(Program::Npm, cwd, args);
-        invocation.env = Some(COREPACK_NO_PROMPT);
+        invocation.env = COREPACK_ENV;
         invocation
     }
 
-    /// `pnpm update --lockfile-only --no-save --ignore-scripts <names>`.
-    pub(super) fn pnpm_update(cwd: &Path, names: &[NpmPackageArg]) -> Self {
+    /// `pnpm update --lockfile-only --no-save --ignore-scripts [--filter=./<member>] <names>`.
+    pub(super) fn pnpm_update(
+        cwd: &Path,
+        names: &[NpmPackageArg],
+        member: Option<&WorkspaceMember>,
+    ) -> Self {
         let mut args = Self::strs(&["update", "--lockfile-only", "--no-save", "--ignore-scripts"]);
+        args.extend(member.map(|member| format!("--filter=./{}", member.as_str()).into()));
         args.extend(names.iter().map(|name| OsString::from(name.as_str())));
         let mut invocation = Self::new(Program::Pnpm, cwd, args);
-        invocation.env = Some(COREPACK_NO_PROMPT);
+        invocation.env = COREPACK_ENV;
         invocation
     }
 
@@ -347,7 +474,65 @@ impl Invocation {
                 "--no-frozen-lockfile",
             ]),
         );
-        invocation.env = Some(COREPACK_NO_PROMPT);
+        invocation.env = COREPACK_ENV;
+        invocation
+    }
+
+    /// `npm prefix`: the directory npm treats as the workspace root of `cwd`.
+    pub(super) fn npm_prefix(cwd: &Path) -> Self {
+        let mut invocation = Self::new(Program::Npm, cwd, Self::strs(&["prefix"]));
+        invocation.env = COREPACK_ENV;
+        invocation
+    }
+
+    /// `pnpm root -w`: the `node_modules` directory of the workspace root.
+    pub(super) fn pnpm_workspace_root(cwd: &Path) -> Self {
+        let mut invocation = Self::new(Program::Pnpm, cwd, Self::strs(&["root", "-w"]));
+        invocation.env = COREPACK_ENV;
+        invocation
+    }
+
+    /// `pnpm list --filter=./<member> --depth=-1 --json`, run at the workspace root: a read-only
+    /// probe that lists the workspace projects matching the member path.
+    pub(super) fn pnpm_list_member(root: &Path, member: &WorkspaceMember) -> Self {
+        let mut invocation = Self::new(
+            Program::Pnpm,
+            root,
+            vec![
+                "list".into(),
+                format!("--filter=./{}", member.as_str()).into(),
+                "--depth=-1".into(),
+                "--json".into(),
+            ],
+        );
+        invocation.env = COREPACK_ENV;
+        invocation
+    }
+
+    /// `yarn --version`.
+    pub(super) fn yarn_version(cwd: &Path) -> Self {
+        let mut invocation = Self::new(Program::Yarn, cwd, Self::strs(&["--version"]));
+        invocation.env = COREPACK_ENV;
+        invocation
+    }
+
+    /// `yarn install --mode=update-lockfile` (Yarn 2+): resolves without linking or scripts.
+    pub(super) fn yarn_lock(cwd: &Path) -> Self {
+        let mut invocation = Self::new(
+            Program::Yarn,
+            cwd,
+            Self::strs(&["install", "--mode=update-lockfile"]),
+        );
+        invocation.env = YARN_ENV;
+        invocation
+    }
+
+    /// `yarn up --recursive --mode=update-lockfile <names>` (Yarn 2+).
+    pub(super) fn yarn_update(cwd: &Path, names: &[NpmPackageArg]) -> Self {
+        let mut args = Self::strs(&["up", "--recursive", "--mode=update-lockfile"]);
+        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
+        let mut invocation = Self::new(Program::Yarn, cwd, args);
+        invocation.env = YARN_ENV;
         invocation
     }
 }

@@ -17,7 +17,7 @@ use super::body::BodyLimit;
 use super::body::read_body_capped;
 use super::errors::http_status_error;
 use super::errors::send_error;
-use super::guard::ensure_https;
+use super::guard::{SchemeRule, ensure_https, ensure_scheme};
 use super::response::CachedResponse;
 use super::response::CredentialPartition;
 use super::response::ResponseValidators;
@@ -582,6 +582,7 @@ impl HttpCache {
                     policy.limit,
                     transport,
                     policy.quota,
+                    SchemeRule::HttpsOnly,
                 )
                 .await;
         }
@@ -827,8 +828,14 @@ impl HttpCache {
         url: &str,
         body: &T,
     ) -> Result<Bytes> {
-        self.post_json_via(url, body, BodyLimit::DEFAULT, &self.baseline)
-            .await
+        self.post_json_via(
+            url,
+            body,
+            BodyLimit::DEFAULT,
+            &self.baseline,
+            SchemeRule::HttpsOnly,
+        )
+        .await
     }
 
     /// Same as [`Self::post_json`], but additionally takes an explicit [`BodyLimit`]
@@ -855,7 +862,8 @@ impl HttpCache {
         trusted_origin: &TrustedPrefix,
     ) -> Result<Bytes> {
         let transport = self.transport_for_origin(trusted_origin);
-        self.post_json_via(url, body, limit, &transport).await
+        self.post_json_via(url, body, limit, &transport, SchemeRule::HttpsOnly)
+            .await
     }
 
     /// Shared POST body for [`Self::post_json`] and [`Self::post_json_limited_trusted_origin`]
@@ -877,9 +885,10 @@ impl HttpCache {
         body: &T,
         limit: BodyLimit,
         transport: &Transport,
+        scheme: SchemeRule<'_>,
     ) -> Result<Bytes> {
         self.ensure_online(url)?;
-        ensure_https(url)?;
+        ensure_scheme(url, scheme)?;
         let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;
@@ -897,6 +906,54 @@ impl HttpCache {
         }
 
         read_body_capped(url, response, limit, body_note).await
+    }
+
+    /// [`Self::post_json`] against an operator-selected OSV endpoint: redirect hops are confined
+    /// to `origin`, and plain `http` is accepted only for `origin`'s exact scheme, host and
+    /// port. The waiver lives in this call's arguments, never in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::post_json`].
+    pub(crate) async fn post_json_operator<T: Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+        origin: &crate::osv::OperatorOrigin,
+    ) -> Result<Bytes> {
+        let transport = self.transport_for_origin(origin.prefix());
+        self.post_json_via(
+            url,
+            body,
+            BodyLimit::DEFAULT,
+            &transport,
+            SchemeRule::PlainHttpExactOrigin(origin),
+        )
+        .await
+    }
+
+    /// [`Self::get_transport_only`] against an operator-selected OSV endpoint, with the same
+    /// confinement as [`Self::post_json_operator`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_transport_only`].
+    pub(crate) async fn get_transport_only_operator(
+        &self,
+        url: &str,
+        origin: &crate::osv::OperatorOrigin,
+    ) -> Result<Bytes> {
+        let transport = self.transport_for_origin(origin.prefix());
+        self.transport_only_response_via(
+            url,
+            &wire_accept_headers(&[]),
+            BodyLimit::DEFAULT,
+            &transport,
+            None,
+            SchemeRule::PlainHttpExactOrigin(origin),
+        )
+        .await
+        .map(|response| response.body)
     }
 
     /// GETs `url` and returns the response body, bypassing the entry-map
@@ -1041,6 +1098,7 @@ impl HttpCache {
             limit,
             transport,
             None,
+            SchemeRule::HttpsOnly,
         )
         .await
         .map(|response| response.body)
@@ -1054,9 +1112,10 @@ impl HttpCache {
         limit: BodyLimit,
         transport: &Transport,
         quota: Option<&Arc<QuotaMeter>>,
+        scheme: SchemeRule<'_>,
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
-        ensure_https(url)?;
+        ensure_scheme(url, scheme)?;
         let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;

@@ -26,6 +26,8 @@
 ///   this exact order — `version_literal` alone, or before `source`, matches no arm): field
 ///   name for [`Dependency::version_literal`](crate::ecosystem::Dependency::version_literal)
 ///   (`Option<String>`), read via `.as_deref()` (defaults to the trait's `None` when omitted)
+/// * `kind` - Optional, last: path of a `fn(&$type) -> Option<DependencyKind>` backing
+///   [`Dependency::kind`](crate::ecosystem::Dependency::kind) (defaults to `None` when omitted)
 ///
 /// # Examples
 ///
@@ -53,6 +55,7 @@ macro_rules! impl_dependency {
         name_range: $name_range:ident,
         version: $version:ident,
         version_range: $version_range:ident $(,)?
+        $(kind: $kind:path $(,)?)?
     }) => {
         impl $crate::ecosystem::Dependency for $type {
             fn name(&self) -> &$crate::PackageName {
@@ -74,6 +77,12 @@ macro_rules! impl_dependency {
             fn source(&self) -> $crate::parser::DependencySource {
                 $crate::parser::DependencySource::Registry
             }
+
+            $(
+                fn kind(&self) -> Option<$crate::DependencyKind> {
+                    $kind(self)
+                }
+            )?
         }
     };
     ($type:ty {
@@ -82,6 +91,7 @@ macro_rules! impl_dependency {
         version: $version:ident,
         version_range: $version_range:ident,
         source: $source:ident $(,)?
+        $(kind: $kind:path $(,)?)?
     }) => {
         impl $crate::ecosystem::Dependency for $type {
             fn name(&self) -> &$crate::PackageName {
@@ -103,6 +113,12 @@ macro_rules! impl_dependency {
             fn source(&self) -> $crate::parser::DependencySource {
                 self.$source.clone()
             }
+
+            $(
+                fn kind(&self) -> Option<$crate::DependencyKind> {
+                    $kind(self)
+                }
+            )?
         }
     };
     ($type:ty {
@@ -112,6 +128,7 @@ macro_rules! impl_dependency {
         version_range: $version_range:ident,
         source: $source:ident,
         version_literal: $version_literal:ident $(,)?
+        $(kind: $kind:path $(,)?)?
     }) => {
         impl $crate::ecosystem::Dependency for $type {
             fn name(&self) -> &$crate::PackageName {
@@ -137,6 +154,12 @@ macro_rules! impl_dependency {
             fn version_literal(&self) -> Option<&str> {
                 self.$version_literal.as_deref()
             }
+
+            $(
+                fn kind(&self) -> Option<$crate::DependencyKind> {
+                    $kind(self)
+                }
+            )?
         }
     };
 }

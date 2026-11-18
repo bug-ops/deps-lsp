@@ -135,15 +135,20 @@ pub fn metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
 /// that read produced more than `max_bytes` — shared body for [`read_to_string_capped`] and
 /// [`read_to_string_capped_no_follow`], which differ only in how they obtain `file`.
 fn read_capped(file: std::fs::File, max_bytes: u64) -> std::io::Result<Option<String>> {
+    read_capped_bytes(file, max_bytes)?
+        .map(|buf| {
+            String::from_utf8(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+        })
+        .transpose()
+}
+
+/// Byte-level core of [`read_capped`]: no UTF-8 validation.
+fn read_capped_bytes(file: std::fs::File, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
-    if buf.len() as u64 > max_bytes {
-        return Ok(None);
-    }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+    Ok((buf.len() as u64 <= max_bytes).then_some(buf))
 }
 
 /// Counted, size-bounded wrapper around [`std::fs::File::open`] + [`Read::take`].
@@ -203,6 +208,29 @@ pub fn read_to_string_capped_no_follow(
     READ_COUNT.fetch_add(1, Ordering::Relaxed);
     let file = open_no_follow(path)?;
     read_capped(file, max_bytes)
+}
+
+/// Reads `path` without following a symlinked final component, returning raw bytes.
+///
+/// `Ok(None)` means the file is larger than `max_bytes`. No UTF-8 validation is done.
+///
+/// # Errors
+///
+/// Same conditions as [`read_to_string_capped_no_follow`].
+pub fn read_capped_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
+    #[cfg(any(test, feature = "test-util"))]
+    READ_COUNT.fetch_add(1, Ordering::Relaxed);
+    let file = open_no_follow(path)?;
+    read_capped_bytes(file, max_bytes)
+}
+
+/// Atomically replaces `path` with `content`, with the guarantees of [`write_atomic`].
+///
+/// # Errors
+///
+/// Same conditions as [`write_atomic`].
+pub fn write_atomic_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    write_atomic_impl(path, content)
 }
 
 /// `std::io::ErrorKind::FilesystemLoop` (the semantically exact kind for this) is still an
@@ -291,6 +319,10 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 /// be created (including because something already exists at the generated temp path) or
 /// written, or if the rename fails.
 pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    write_atomic_impl(path, content.as_bytes())
+}
+
+fn write_atomic_impl(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -353,7 +385,7 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
 fn write_atomic_content(
     file: &mut std::fs::File,
     original_path: &Path,
-    content: &str,
+    content: &[u8],
 ) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Ok(original_meta) = std::fs::metadata(original_path) {
@@ -362,7 +394,7 @@ fn write_atomic_content(
     #[cfg(not(unix))]
     let _ = original_path;
 
-    file.write_all(content.as_bytes())?;
+    file.write_all(content)?;
     file.sync_all()
 }
 

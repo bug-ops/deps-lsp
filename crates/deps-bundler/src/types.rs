@@ -185,6 +185,18 @@ impl GemInfo {
     }
 }
 
+fn dependency_kind(dependency: &BundlerDependency) -> Option<deps_core::DependencyKind> {
+    match &dependency.group {
+        DependencyGroup::Default | DependencyGroup::Production => {
+            Some(deps_core::DependencyKind::Normal)
+        }
+        DependencyGroup::Development | DependencyGroup::Test => {
+            Some(deps_core::DependencyKind::Development)
+        }
+        DependencyGroup::Custom(_) => None,
+    }
+}
+
 deps_core::impl_dependency!(BundlerDependency {
     name: name,
     name_range: name_range,
@@ -192,6 +204,7 @@ deps_core::impl_dependency!(BundlerDependency {
     version_range: version_range,
     source: source,
     version_literal: version_literal,
+    kind: dependency_kind,
 });
 
 /// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see

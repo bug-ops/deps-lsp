@@ -14,6 +14,7 @@
 //! one [`ScanOutcome`] back, so an OSV outage degrades to an empty-ish map
 //! rather than propagating an error into the LSP response (FR-007).
 
+mod endpoint;
 mod local_match;
 mod lock_fan_out;
 mod severity;
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
+pub use endpoint::{OSV_BASE_URL_ENV, OperatorOrigin, OsvEndpoint, OsvEndpointError};
 use local_match::{LocalVersion, Verdict, match_affected};
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
@@ -336,11 +338,10 @@ pub struct OsvClient {
     /// test). See [`InFlightRecord`] for how eviction avoids both stranding a live waiter and
     /// leaking an entry no caller is left to clean up (issue #1539).
     record_in_flight: DashMap<OsvId, Arc<InFlightRecord>>,
-    /// Overridable in test builds only, so `mockito` can stand in for
-    /// `https://api.osv.dev` — mirrors `crate::cache::guard::ensure_https`'s existing
-    /// `#[cfg(test)]` relaxation for the same reason, and [`crate::deps_dev::DepsDevClient`]'s
-    /// own `base_url` field.
-    #[cfg(any(test, feature = "test-util"))]
+    /// Selects the per-request scheme rule and redirect scope.
+    endpoint: OsvEndpoint,
+    /// API base without a trailing slash: [`OSV_API_BASE`] unless the endpoint is an operator
+    /// one (or a `mockito` stand-in in test builds).
     base_url: String,
 }
 
@@ -350,16 +351,18 @@ impl OsvClient {
     /// per-advisory GET.
     #[must_use]
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self {
-            cache,
-            query_cache: DashMap::new(),
-            record_cache: DashMap::new(),
-            raw_record_cache: DashMap::new(),
-            record_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(RECORD_FETCH_CONCURRENCY)),
-            record_in_flight: DashMap::new(),
-            #[cfg(any(test, feature = "test-util"))]
-            base_url: OSV_API_BASE.to_string(),
-        }
+        Self::with_endpoint(cache, &OsvEndpoint::Public)
+    }
+
+    /// Creates a client for `endpoint`: [`OsvEndpoint::Public`] is [`Self::new`]; an operator
+    /// endpoint replaces the API base and confines redirects to its origin.
+    #[must_use]
+    pub fn with_endpoint(cache: Arc<HttpCache>, endpoint: &OsvEndpoint) -> Self {
+        let base_url = match endpoint {
+            OsvEndpoint::Public => OSV_API_BASE.to_string(),
+            OsvEndpoint::Operator(origin) => origin.base().to_string(),
+        };
+        Self::assemble(cache, endpoint.clone(), base_url)
     }
 
     /// Creates a client pointed at `base_url` instead of the real OSV.dev API, for
@@ -375,6 +378,10 @@ impl OsvClient {
 
     #[cfg(any(test, feature = "test-util"))]
     fn with_base_url(cache: Arc<HttpCache>, base_url: String) -> Self {
+        Self::assemble(cache, OsvEndpoint::Public, base_url)
+    }
+
+    fn assemble(cache: Arc<HttpCache>, endpoint: OsvEndpoint, base_url: String) -> Self {
         Self {
             cache,
             query_cache: DashMap::new(),
@@ -382,18 +389,33 @@ impl OsvClient {
             raw_record_cache: DashMap::new(),
             record_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(RECORD_FETCH_CONCURRENCY)),
             record_in_flight: DashMap::new(),
+            endpoint,
             base_url,
         }
     }
 
-    #[cfg(any(test, feature = "test-util"))]
     fn api_base(&self) -> &str {
         &self.base_url
     }
 
-    #[cfg(not(any(test, feature = "test-util")))]
-    const fn api_base(&self) -> &str {
-        OSV_API_BASE
+    async fn post_json<T: serde::Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> crate::error::Result<bytes::Bytes> {
+        match &self.endpoint {
+            OsvEndpoint::Public => self.cache.post_json(url, body).await,
+            OsvEndpoint::Operator(origin) => self.cache.post_json_operator(url, body, origin).await,
+        }
+    }
+
+    async fn get_bytes(&self, url: &str) -> crate::error::Result<bytes::Bytes> {
+        match &self.endpoint {
+            OsvEndpoint::Public => self.cache.get_transport_only(url).await,
+            OsvEndpoint::Operator(origin) => {
+                self.cache.get_transport_only_operator(url, origin).await
+            }
+        }
     }
 
     fn batch_url(&self) -> String {
@@ -710,7 +732,7 @@ impl OsvClient {
         let queries: Vec<OsvQuery> = chunk.iter().map(|t| OsvQuery::new(t, osv_eco)).collect();
 
         let body = OsvBatchRequest { queries };
-        let response_bytes = match self.cache.post_json(&url, &body).await {
+        let response_bytes = match self.post_json(&url, &body).await {
             Ok(b) => b,
             Err(e) => {
                 // #756: never interpolate `e`'s `Display` — it can embed the raw request
@@ -1235,7 +1257,7 @@ impl OsvClient {
             "url",
             tracing::field::display(crate::redact::RedactedUrl::new(&url)),
         );
-        match self.cache.get_transport_only(&url).await {
+        match self.get_bytes(&url).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<OsvVulnRecord>(&bytes) {
                 Ok(record) => Some(record),
                 Err(e) => {
@@ -1274,7 +1296,7 @@ impl OsvClient {
 
         let body = OsvQuery::new(target, osv_eco);
 
-        let bytes = match self.cache.post_json(&url, &body).await {
+        let bytes = match self.post_json(&url, &body).await {
             Ok(b) => b,
             // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
             Err(e) => {
@@ -1555,6 +1577,73 @@ mod tests {
             .check_candidates(EcosystemId::Cargo, &[], TEST_TIMEOUT)
             .await;
         assert!(statuses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_via_operator_endpoint_uses_its_base_path() {
+        let mut server = mockito::Server::new_async().await;
+        let endpoint = operator_endpoint(&format!("{}/mirror/", server.url()));
+        let client = OsvClient::with_endpoint(Arc::new(HttpCache::new()), &endpoint);
+        let mock = server
+            .mock("POST", "/mirror/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .create_async()
+            .await;
+
+        let outcomes = client
+            .scan(
+                EcosystemId::Npm,
+                &[target("left-pad", "1.0.0")],
+                TEST_TIMEOUT,
+            )
+            .await;
+
+        mock.assert_async().await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("left-pad")),
+            Some(ScanOutcome::Clean)
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_via_operator_endpoint_does_not_follow_redirects_off_origin() {
+        let mut elsewhere = mockito::Server::new_async().await;
+        let landed = elsewhere
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        let mut server = mockito::Server::new_async().await;
+        let endpoint = operator_endpoint(&server.url());
+        let client = OsvClient::with_endpoint(Arc::new(HttpCache::new()), &endpoint);
+        let _redirect = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(307)
+            .with_header("location", &format!("{}/v1/querybatch", elsewhere.url()))
+            .create_async()
+            .await;
+
+        let outcomes = client
+            .scan(
+                EcosystemId::Npm,
+                &[target("left-pad", "1.0.0")],
+                TEST_TIMEOUT,
+            )
+            .await;
+
+        landed.assert_async().await;
+        assert!(!matches!(
+            outcomes.get(&crate::test_util::vuln_key("left-pad")),
+            Some(ScanOutcome::Clean)
+        ));
+    }
+
+    fn operator_endpoint(url: &str) -> OsvEndpoint {
+        OsvEndpoint::from_env(&crate::net_policy::MapEnv::new().with_var(OSV_BASE_URL_ENV, url))
+            .unwrap()
     }
 
     #[tokio::test]

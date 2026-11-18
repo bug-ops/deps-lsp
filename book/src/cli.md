@@ -448,12 +448,13 @@ explicit choice.
   is not rewritten to the deprecated version. Every vulnerable dependency is classified into
   exactly one of three outcomes:
   - `applied` — the fix was written to the manifest, or (with `--lockfile regenerate` for
-    Cargo, npm, pnpm and Go) the lock file was moved to the fix target because the declared
+    Cargo, npm, pnpm, Yarn Berry, Go, uv, Bundler and Deno) the lock file was moved to the fix target because the declared
     requirement already admits it; the report's reason tells the two apart.
   - `requires-lockfile-update` — the declared requirement already admits the fix, so there
     is nothing to rewrite at the manifest level, and the lock file still resolves a vulnerable
-    version. Pass `--lockfile regenerate` to let `update` move the lock file (Cargo, npm, pnpm
-    and Go); for other ecosystems and for Yarn and Bun, update the lock file yourself.
+    version. Pass `--lockfile regenerate` to let `update` move the lock file (Cargo, npm, pnpm,
+    Yarn Berry, Go, uv, Bundler and Deno); for other ecosystems and for Yarn Classic and Bun,
+    update the lock file yourself.
   - `unfixable` — no independently-verified fix target exists, the registry fetch for that
     dependency failed, the fix target is itself yanked, the declared requirement's syntax has
     no safe single-value rewrite and is confirmed not to already admit the fix target, or the
@@ -516,7 +517,17 @@ the fresh lockfile against every applied version:
 | Cargo | `cargo update --workspace` (only when a manifest was edited), then `cargo update --package=<name>@<class> --precise=<version>` per update | the lockfile holds exactly the target |
 | npm (`package-lock.json`) | `npm install --package-lock-only --ignore-scripts --no-audit --no-fund` (manifest edits), then `npm update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund <names>` (lock-file-only fixes) | a locked version satisfies the declared requirement and is at least the target |
 | pnpm (`pnpm-lock.yaml`) | `pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile`, then `pnpm update --lockfile-only --no-save --ignore-scripts <names>` | same as npm |
-| Go | `go get -- <module>@<version>` | `go.sum` holds the module's content checksum for the target |
+| Yarn Berry (`yarn.lock`, Yarn 2+) | `yarn install --mode=update-lockfile` (manifest edits), then `yarn up --recursive --mode=update-lockfile <names>` (lock-file-only fixes), with scripts disabled | same as npm |
+| Go | `go get -- <module>@<version>` (with `GOWORK=off`) | `go.sum` holds the module's content checksum for the target |
+| PyPI (`uv.lock`) | `uv lock --no-build --no-python-downloads --upgrade-package <name>==<version>` per update | the lockfile holds exactly the target |
+| Bundler (`Gemfile.lock`) | `bundle lock` (manifest edits), then `bundle lock --conservative --update <names>` (lock-file-only fixes) | a locked version satisfies the declared requirement and is at least the target |
+| Deno (`deno.lock`) | `deno install --lockfile-only --lock=./deno.lock` (manifest edits), then `deno update --compatible --lockfile-only --lock=./deno.lock <names>` (lock-file-only fixes) | same as Bundler |
+
+For PyPI, Bundler and Deno the lock file must sit beside the manifest, and for PyPI only `uv.lock`
+beside a `pyproject.toml` is regenerated: `poetry.lock`, `pdm.lock` and `Pipfile.lock` report
+`unsupported`. `--no-build` means a dependency that exists only as a source distribution fails the
+run (the lock file is restored, see below). Bundler and Deno never use a cooldown-fallback version
+(the item reports `unsupported`); uv accepts it.
 
 A `--security-only` fix whose declared requirement already admits the target (a caret range,
 say) needs no manifest edit: with `--lockfile regenerate` only the lock file moves, and the item
@@ -531,26 +542,57 @@ and it needs a manual review; the report's `lockfile` object shows it as `newer`
 and `pnpm update` are validated (pnpm treats them as patterns, so `*` and a leading `!` are
 refused with exit `2`). `go get` may also raise the module's `require` line in `go.mod`.
 
+**npm and pnpm workspace members.** When the manifest is a member of an npm or pnpm workspace and the
+lock file sits in the workspace root, a plain run regenerates that root lock file with the member
+selected (`--workspace=./<member>` for npm, `--filter=./<member>` for pnpm). For pnpm the member must
+be listed by the workspace (probed before anything is written), otherwise the report is `unsupported` with the reason
+`workspace-member-lockfile`. The tool's own root
+(`npm prefix`, `pnpm root -w`) must equal the directory holding the lock file; otherwise the report is
+`unsupported` with the reason `lockfile-ownership-mismatch`. `--open-pr` refuses members, because the
+root lock file is outside the manifest's directory.
+
+**Go workspaces.** A `go.work` no longer blocks regeneration: `go get` runs with `GOWORK=off`, so
+only the module's own `go.mod` and `go.sum` change.
+
+**Yarn.** Yarn Berry (2 and later) is regenerated. The version is probed first with
+`yarn --version`; Yarn Classic (1.x) reports `unsupported` with the reason `yarn-classic`.
+
 The JSON report always has a `lockfile` object tagged by `status` (`regenerated`, `skipped`,
 `not-applicable`, `unsupported`, `failed`). A failed regeneration prints the full report and
-exits `2`; the manifest edit stays on disk and no rollback is attempted. Nothing runs under
-`--dry-run` or `--offline`. Yarn, Bun and the other ecosystems report `unsupported`, as do npm and
-pnpm workspace members (including a manifest below an ancestor that declares workspaces), a
-symlinked lockfile, Go vendored modules and Go workspaces, and updates chosen by the cooldown
-fallback for npm and pnpm. A binary `bun.lockb` is not recognized as a lockfile, so a Bun project
+exits `2`; the manifest edit stays on disk, and the lock files the run touched are restored (see
+below). Nothing runs under `--dry-run` or `--offline`. Bun, Yarn Classic, Dart, Composer, Gradle,
+Swift, NuGet and Maven report `unsupported`, as do a symlinked lockfile, Go vendored modules, a
+lockfile in an ancestor directory for PyPI, Bundler and Deno (workspace members; for Deno also any
+ancestor `deno.jsonc`, a `deno.json` with `workspace`, or a `package.json` with `workspaces`), a non-uv Python locker, and updates chosen
+by the cooldown fallback for npm, pnpm, Bundler and Deno. A binary `bun.lockb` is not recognized as a lockfile, so a Bun project
 with only that file reports `no-lockfile-present`.
 
 **Check-then-spawn window.** Workspace, ownership and symlink checks run before the tool starts, so
 a change made to the tree in between is not noticed.
 
-**Trust model.** The tool runs with the repository's own configuration (`.cargo/config.toml`,
-`rust-toolchain.toml`, `.npmrc`, `.pnpmfile.cjs`, the `go.mod` toolchain directive) and its
-network traffic is not subject to deps-cli's registry policy. Child processes inherit the full
-environment, so tokens in it are readable by `.pnpmfile.cjs` and the like, and corepack may
-download a package manager silently. Known limits: a Cargo cooldown
-fallback below a sibling's new minimum fails the `--precise` step and leaves the lockfile at the
-newest compatible version; `go get` may raise indirect requirements and the `go` directive in `go.mod`, and download a newer
-toolchain to satisfy it.
+**Trust model.** Lockfile regeneration runs the ecosystem's tool on a checkout you trust. Repository
+files such as `.pnpmfile.cjs`, `Gemfile`, Yarn plugins and `yarnPath`, and `.cargo/config.toml` can
+execute code, so run `--lockfile regenerate` only on repositories you trust. pnpm executes
+`.pnpmfile.cjs` even with `--ignore-scripts`. The tool also reads the repository's other
+configuration (`rust-toolchain.toml`, `.npmrc`, the `go.mod` toolchain directive), its network
+traffic is not subject to deps-cli's registry policy, child processes inherit the full environment
+(so tokens in it are readable by those files), and corepack may download a package manager silently.
+Bundler has no version override and may switch to the Bundler version recorded in `Gemfile.lock`.
+
+**Known limits.** `go get` may raise indirect requirements and the `go` directive in `go.mod`, and
+download a newer toolchain to satisfy it. Deno always reads and writes `./deno.lock` beside the
+manifest (`--lock=./deno.lock` overrides a `lock` key in `deno.json`). `deno update` receives names
+without the `npm:` or `jsr:` scheme, so an `npm:x` and a `jsr:x` of the same name in one manifest
+both move; the result is still checked against the lock file. A Cargo cooldown-fallback pin below a sibling's new minimum fails the `--precise` step: the
+run ends `failed` with the lock file restored (the fallback itself is not yet fixed).
+
+**Lock file restore.** Before the first tool starts, `update` snapshots the lock files it may change
+(Cargo: `Cargo.lock`; Go: `go.mod` and `go.sum`; npm, pnpm and Yarn: the located lock file; PyPI:
+`uv.lock`; Bundler: `Gemfile.lock`; Deno: `deno.lock`). When the
+regeneration fails, files whose bytes changed are written back and unchanged files are not touched.
+If writing back fails, the report says `restore-failed` and names the file. After a timeout or an
+interrupt the restore runs on unix only: on Windows a `.cmd` shim's child may still be writing after
+the kill, so no restore is attempted. The manifest edit itself is not reverted outside `--open-pr`.
 
 **Timeouts and signals (unix).** The whole regeneration shares a 5-minute budget. Each tool runs
 in its own process group. On a timeout, on SIGINT or on SIGTERM deps-cli sends SIGTERM to the tool,
@@ -558,9 +600,8 @@ waits up to 2 seconds for it to exit, then sends SIGKILL to the whole group (als
 itself exited, so a grandchild that ignored SIGTERM does not outlive the run). An interrupted run
 prints the report with `lockfile: failed` (`kind: interrupted`) and exits `2`. The grace period lets
 a tool run its own cleanup, but it does not make the lock file safe: `cargo` and `go` keep the
-default SIGTERM disposition and can still leave a truncated lock file, so the truncation risk is
-reduced, not removed. Check `git diff` on the lock file after a failed or interrupted run (with
-`--open-pr` the restore described below does this for you). When deps-cli is in the foreground group
+default SIGTERM disposition and can still leave a truncated lock file; the snapshot restore above
+then puts the original bytes back. When deps-cli is in the foreground group
 of its controlling terminal (an interactive run) the tool stays in that group instead, so `/dev/tty`
 prompts keep working and Ctrl-C reaches it. Limits: in that foreground mode a timeout, or a SIGTERM
 sent to deps-cli alone, signals only the direct child and grandchildren may survive; a SIGKILL of
@@ -585,11 +626,23 @@ dependencies = ["tokio", "tokio-util", "tracing"]
 deps-cli update --config deps.toml --group minor-patch Cargo.toml
 ```
 
-A group has two optional keys: `dependencies` (names, matched exactly after normalization) and
-`update_types` (`major`, `minor`, `patch`). A group without keys matches every update. An update is
-inside the group when its name is listed (or `dependencies` is absent) **and** its kind is listed
-(or `update_types` is absent); an update whose kind cannot be classified is inside only a group
-without `update_types`. Group names are 1 to 64 characters of `a-z`, `0-9` and `-`, not starting or
+A group has four optional keys: `dependencies` (names, matched exactly after normalization),
+`patterns` (name globs where `*` is the only wildcard, 1 to 214 bytes without whitespace),
+`update_types` (`major`, `minor`, `patch`) and `dependency_type` (`production`, `development`,
+`build`, `peer`, `optional`).
+
+```toml
+[update.groups.prod-serde]
+patterns = ["serde*"]
+dependency_type = "production"
+```
+
+A group without keys matches every update. An update is inside the group when its name is listed in
+`dependencies` or matches a pattern (or both keys are absent), **and** its kind is listed (or
+`update_types` is absent), **and** its role matches `dependency_type` (or that key is absent).
+`production` means every role except development. An update whose kind cannot be classified is inside
+only a group without `update_types`; a dependency whose role is unknown (for example an npm catalog
+entry or override) is inside only a group without `dependency_type`. Group names are 1 to 64 characters of `a-z`, `0-9` and `-`, not starting or
 ending with `-`; unknown keys are rejected.
 
 `--group <name>` requires `--config` (groups are read only from an explicit config, like
@@ -598,7 +651,7 @@ group is not defined. Every `applied` update outside the group is reported
 `skipped (outside the selected --group)` and does not change the exit code. The group filter runs
 after planning, so a dependency outside the group whose OSV latest-version check fails still aborts
 the run (fail-closed). Groups are for splitting the update set into several runs, for instance one
-for `minor-patch` and one for the rest; patterns and dependency-type groups are not supported.
+for `minor-patch` and one for the rest.
 
 ### Opening a pull request (`--open-pr`)
 
@@ -610,9 +663,10 @@ deps-cli update --lockfile regenerate --open-pr gitlab --config deps.toml --grou
 `--open-pr github|gitlab` commits the manifest and lock file change of one run on a new branch,
 pushes it to `origin` and opens a pull request with `gh` (GitHub) or a merge request with `glab`
 (GitLab). It requires `--lockfile regenerate`, conflicts with `--dry-run` and `--offline`, and
-supports the ecosystems whose lock file regeneration is implemented (Cargo, npm, pnpm, Go) plus
-those without a lock file format (GitHub Actions, GitLab CI/CD, pre-commit, Maven); the others
-(PyPI, Bundler, Dart, Composer, Gradle, Swift, NuGet, Deno) exit `2` before any analysis.
+supports the ecosystems whose lock file regeneration is implemented (Cargo, npm, pnpm, Yarn Berry,
+Go, PyPI with `uv.lock`, Bundler, Deno) plus those without a lock file format (GitHub Actions, GitLab
+CI/CD, pre-commit, Maven); the others (Dart, Composer, Gradle, Swift, NuGet) exit `2` before any
+analysis.
 
 deps-cli never reads, logs or passes a token: `git`, `gh` and `glab` use their own credentials, and
 every process runs without a shell, without stdin and with `GIT_TERMINAL_PROMPT=0` and
@@ -643,8 +697,8 @@ different one never shares it. Re-running while that branch exists on `origin` w
 prints `already proposed on <branch>` on stderr and reports the plan as a dry run, with the exit
 code `update` computes for it. A local branch of that name that is not on `origin` exits `2`
 before any write; delete it. A pull request closed without merging keeps its branch, and the same
-update set is not proposed again until the branch is deleted; superseded pull requests are not
-closed or updated.
+update set is not proposed again until the branch is deleted. Superseded pull requests stay open
+unless you pass `--close-superseded`.
 
 Publishing first lists the tracked files that differ from `HEAD`. Only the manifest and the lock
 file a `regenerated` outcome names may differ: any other changed tracked file (an editor autosave,
@@ -692,6 +746,32 @@ with the URL already printed.
 | No update settled | as `update` for the dry-run report (`1` in practice) |
 | Flag violation, preflight failure, deferred ecosystem, stale local branch, lock file not regenerated, unexpected changed file, git/`gh`/`glab` failure or timeout, interrupt | `2` |
 
+### Closing superseded requests (`--close-superseded`)
+
+```bash
+deps-cli update --lockfile regenerate --open-pr github --close-superseded Cargo.toml
+```
+
+After the new request is opened and its URL printed, `--close-superseded` closes your earlier
+`deps-cli` requests that the new one replaces, with the comment `Superseded by <url>.`. It requires
+`--open-pr`. Every request carries a hidden marker comment in its body describing the update set, so
+a later run can match it. An earlier request is closed only when all six checks pass:
+
+- it has the same author as the current `gh`/`glab` user;
+- it is in the same repository;
+- its branch starts with `deps-cli/<ecosystem>/`;
+- it has exactly one commit;
+- its marker has the same ecosystem, manifest, group and mode (`--security-only` or default);
+- the new request covers every dependency of the old one at the same or a newer version.
+
+A request that fails any check stays open, and its branch is never deleted. Closing never changes the
+exit code: failures are printed as warnings. Only Cargo, npm, PyPI, Bundler, Dart, Composer and Deno
+requests are closed; Go, Maven, Gradle, Swift, NuGet, GitHub Actions, GitLab CI and pre-commit never
+are, because their versions cannot be ordered safely (this is decided before any `gh` or `glab` call
+and reported as a warning). Requests opened without the marker are not closed. The checks catch extra
+commits only: an edit of the request's title or body text is not detected. The `glab` calls of
+this step have not been run against a real host.
+
 ### Write safety and exit codes
 
 Writes are atomic: a temp file is created in the manifest's own directory
@@ -727,6 +807,16 @@ applied, others not) exits `1` with the applied edits already written to disk. A
 script deciding what to do with the result (e.g. whether to commit a diff) must inspect each
 item's `outcome` field in `--format json` output, never branch on the process exit code
 alone.
+
+### `DEPS_OSV_BASE_URL`
+
+An operator can point OSV lookups at a mirror or a local test double with the `DEPS_OSV_BASE_URL`
+environment variable. It is a testing aid for the person running `deps-cli`; repository files cannot
+set it. The value must be an absolute `https` URL (not a loopback, link-local or cloud-metadata
+host) without userinfo, query or fragment, or an `http` URL to a loopback IP literal such as
+`http://127.0.0.1:8080`. Plain `http` is allowed for that exact origin only, and redirects away from
+the configured origin are not followed. A valid value prints one notice on stderr; an invalid value
+prints the error and exits `2` in every subcommand, even with `--offline`.
 
 ## Pre-commit hook
 

@@ -323,10 +323,10 @@ async fn test_regenerate_lockfile_with_skip_gate_reports_skipped_for_lockfile_on
 
 #[cfg(feature = "npm")]
 #[tokio::test]
-async fn test_regenerate_lockfile_yarn_lock_stays_requires_lockfile_update() {
+async fn test_regenerate_lockfile_bun_lock_stays_requires_lockfile_update() {
     let project = Project::new();
     let manifest = project.write("package.json", "{\"dependencies\":{\"lodash\":\"^4\"}}");
-    project.write("yarn.lock", "# yarn lockfile v1\n");
+    project.write("bun.lock", "{}\n");
     let ecosystem = ecosystem(EcosystemId::Npm);
     let uri = Url::from_file_path(&manifest).expect("file url");
     let display = PathBuf::from("package.json");
@@ -383,8 +383,8 @@ async fn test_regenerate_lockfile_deferred_ecosystem_keeps_requires_lockfile_upd
     assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
     let reason = run.plan.items[0].reason();
     assert!(
-        reason.contains("Cargo, npm, pnpm and Go"),
-        "the text names the ecosystems deps-cli can regenerate, so it promises nothing for PyPI: {reason}"
+        reason.contains(&super::supported_tools_text()),
+        "the text names exactly the tools deps-cli can regenerate: {reason}"
     );
 }
 

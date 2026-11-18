@@ -361,20 +361,23 @@ fn test_strategy_is_decided_for_every_ecosystem() {
             EcosystemId::Cargo => "cargo",
             EcosystemId::Npm => "npm",
             EcosystemId::Go => "go",
-            EcosystemId::Pypi
-            | EcosystemId::Bundler
-            | EcosystemId::Dart
+            EcosystemId::Pypi => "pypi",
+            EcosystemId::Bundler => "bundler",
+            EcosystemId::Deno => "deno",
+            EcosystemId::Dart
             | EcosystemId::Composer
             | EcosystemId::Gradle
             | EcosystemId::Swift
-            | EcosystemId::NuGet
-            | EcosystemId::Deno => "deferred",
+            | EcosystemId::NuGet => "deferred",
         };
         let actual = match strategy(*id) {
             Strategy::NoLockfileFormat => "no-format",
             Strategy::Cargo => "cargo",
             Strategy::NpmFamily => "npm",
             Strategy::Go => "go",
+            Strategy::Pypi => "pypi",
+            Strategy::Bundler => "bundler",
+            Strategy::Deno => "deno",
             Strategy::Deferred => "deferred",
         };
         assert_eq!(actual, expected, "{id:?}");
@@ -624,7 +627,6 @@ fn test_reason_display_texts_are_distinct_and_non_empty() {
         UnsupportedReason::WorkspaceMemberLockfile,
         UnsupportedReason::LockfileOwnershipMismatch,
         UnsupportedReason::GoVendored,
-        UnsupportedReason::GoWorkspace,
         UnsupportedReason::CooldownFallbackTarget,
         UnsupportedReason::LockfileSymlink,
         UnsupportedReason::EcosystemDeferred(EcosystemId::Pypi),
@@ -889,11 +891,11 @@ mod cargo_real {
         assert_eq!(project.read("mid/Cargo.lock"), "version = 4\n");
     }
 
-    /// Pins the documented M2 limit: a target below the version the edited requirement forces
-    /// makes `--precise` fail, and the lock is left at the step-1 version (no rollback).
+    /// A target below the version the edited requirement forces makes `--precise` fail, and the
+    /// lock is restored to its pre-run bytes (#2071).
     #[tokio::test]
-    async fn test_regenerate_lockfile_cargo_precise_below_requirement_floor_fails_without_rollback()
-    {
+    async fn test_regenerate_lockfile_cargo_precise_below_requirement_floor_fails_and_restores_the_lock()
+     {
         let project = project();
         let manifest = lock_then_restore(&project, "Cargo.toml", CARGO_TOML);
 
@@ -918,7 +920,9 @@ mod cargo_real {
                 code: Some(101)
             })
         );
-        assert!(lock_has(&project.read("Cargo.lock"), "stuba", "1.0.2"));
+        let lock = project.read("Cargo.lock");
+        assert!(!lock_has(&lock, "stuba", "1.0.2"));
+        assert!(lock_has(&lock, "stuba", "1.0.0"));
     }
 }
 
@@ -1864,13 +1868,22 @@ mod fake_tools {
         }
 
         #[tokio::test]
-        async fn test_regenerate_lockfile_yarn_lockfile_is_deferred_without_spawning() {
+        async fn test_regenerate_lockfile_pnpm_dir_outside_the_workspace_globs_is_refused_before_any_write()
+         {
             let project = Project::new();
+            project.write("package.json", "{\"name\":\"root\",\"private\":true}");
+            project.write("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+            project.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
             let content = package_json(&[LODASH_EXACT], |d| d.from);
-            let manifest = project.write("package.json", &content);
-            project.write("yarn.lock", "# yarn lockfile v1\n");
+            let manifest = project.write("examples/b/package.json", &content);
             let bin = FakeBin::new();
-            bin.install("yarn", "exit 0");
+            let root = project.root.display();
+            bin.install(
+                "pnpm",
+                &format!(
+                    "case \"$1\" in\n  root) echo '{root}/node_modules';;\n  list) echo '[]';;\nesac\nexit 0"
+                ),
+            );
 
             let outcome = apply_and_regenerate(
                 EcosystemId::Npm,
@@ -1886,7 +1899,43 @@ mod fake_tools {
             assert_matches!(
                 outcome,
                 LockfileOutcome::Unsupported {
-                    reason: UnsupportedReason::NpmClientDeferred(NpmClient::Yarn),
+                    reason: UnsupportedReason::WorkspaceMemberLockfile,
+                    ..
+                }
+            );
+            assert!(
+                bin.calls()
+                    .iter()
+                    .all(|call| !call.starts_with("install") && !call.starts_with("update")),
+                "{:?}",
+                bin.calls()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_regenerate_lockfile_bun_lockfile_is_deferred_without_spawning() {
+            let project = Project::new();
+            let content = package_json(&[LODASH_EXACT], |d| d.from);
+            let manifest = project.write("package.json", &content);
+            project.write("bun.lock", "{}\n");
+            let bin = FakeBin::new();
+            bin.install("bun", "exit 0");
+
+            let outcome = apply_and_regenerate(
+                EcosystemId::Npm,
+                &manifest,
+                "package.json",
+                &content,
+                &bumps(&[LODASH_EXACT]),
+                run_gate(),
+                &bin.runner(secs(30)),
+            )
+            .await;
+
+            assert_matches!(
+                outcome,
+                LockfileOutcome::Unsupported {
+                    reason: UnsupportedReason::NpmClientDeferred(NpmClient::Bun),
                     ..
                 }
             );
@@ -2315,17 +2364,16 @@ mod fake_tools {
         }
 
         #[tokio::test]
-        async fn test_regenerate_lockfile_go_workspace_probe_path_is_unsupported_without_get() {
+        async fn test_regenerate_lockfile_go_workspace_probe_path_runs_get_with_gowork_off() {
             let run = run_go("/ws/go.work", "", false).await;
 
-            assert_matches!(
-                run.outcome,
-                LockfileOutcome::Unsupported {
-                    reason: UnsupportedReason::GoWorkspace,
-                    ..
-                }
+            assert_eq!(
+                run.calls,
+                vec![
+                    call("env GOWORK", &run.root, ""),
+                    call("get -- golang.org/x/text@v0.31.0", &run.root, ""),
+                ]
             );
-            assert_eq!(run.calls, vec![call("env GOWORK", &run.root, "")]);
         }
 
         #[tokio::test]
@@ -2367,7 +2415,7 @@ async fn test_interrupts_recv_resolves_on_sigterm_instead_of_killing_the_process
 #[cfg(all(unix, feature = "npm"))]
 mod interrupted {
     use super::*;
-    use crate::update::regen::regenerate_until;
+    use crate::update::regen::{WorkspaceMembers, regenerate_until};
     use std::os::unix::fs::PermissionsExt;
 
     fn alive(pid: u32) -> bool {
@@ -2437,7 +2485,15 @@ mod interrupted {
             fire.send(()).expect("receiver alive");
         });
 
-        let outcome = regenerate_until(&plan, &target, run_gate(), &runner, interrupt).await;
+        let outcome = regenerate_until(
+            &plan,
+            &target,
+            run_gate(),
+            &runner,
+            WorkspaceMembers::Allowed,
+            interrupt,
+        )
+        .await;
         signaller.await.expect("signaller");
 
         assert_matches!(

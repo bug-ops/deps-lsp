@@ -11,3 +11,6 @@ GitHub tags registry, so the parser, registry and diagnostics live in `deps-gith
 ```rust,ignore
 let ecosystem = deps_precommit::standalone(cache);
 ```
+
+> [!IMPORTANT]
+> Requires Rust 1.98 or later.

@@ -74,6 +74,7 @@ deps_core::impl_dependency!(NuGetDependency {
     version: version_requirement,
     version_range: version_range,
     source: source,
+    kind: deps_core::normal_kind,
 });
 
 /// A single version of a package, as returned by the NuGet flat-container endpoint.

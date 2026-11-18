@@ -227,6 +227,7 @@ mod sealed;
 /// selection state (#1444).
 pub mod selection;
 mod single_flight;
+pub mod star_glob;
 pub mod swr_store;
 pub mod tag_index_refresh;
 #[cfg(any(test, feature = "test-util"))]
@@ -258,11 +259,11 @@ pub use deps_dev::{
 };
 pub use detached_flight::{FlightEnd, FlightHandle, SingleFlight};
 pub use ecosystem::{
-    BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
-    EcosystemBase, EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult,
-    ParsedManifest, RegistryOccurrence, RejectedRegistryOccurrence, RejectedSourceClass,
-    TypedEcosystem, UserHome, WatchedConfig, WatchedConfigEffect, parse_manifest_blocking,
-    parse_manifest_now,
+    BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency,
+    DependencyKind, Ecosystem, EcosystemBase, EcosystemConfig, EcosystemId, LicenseSource,
+    OwnerReach, ParseResult, ParsedManifest, RegistryOccurrence, RejectedRegistryOccurrence,
+    RejectedSourceClass, TypedEcosystem, UserHome, WatchedConfig, WatchedConfigEffect, normal_kind,
+    parse_manifest_blocking, parse_manifest_now,
 };
 pub use ecosystem_registry::{EcosystemRegistry, WatchedConfigMatch};
 pub use edit::{

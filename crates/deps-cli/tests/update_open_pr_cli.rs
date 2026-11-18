@@ -144,10 +144,13 @@ fn test_update_open_pr_outside_a_git_repository_exits_2() {
     assert_refused(&output, "refusal");
 }
 
-#[cfg(feature = "pypi")]
+#[cfg(feature = "composer")]
 #[test]
 fn test_update_open_pr_for_a_deferred_ecosystem_exits_2_naming_the_supported_ones() {
-    let repo = repository("requirements.txt", "requests==2.0.0\n");
+    let repo = repository(
+        "composer.json",
+        "{\"require\": {\"monolog/monolog\": \"1.0.0\"}}\n",
+    );
 
     let output = run(
         repo.path(),
@@ -156,7 +159,7 @@ fn test_update_open_pr_for_a_deferred_ecosystem_exits_2_naming_the_supported_one
             "github",
             "--lockfile",
             "regenerate",
-            "requirements.txt",
+            "composer.json",
         ],
     );
 
@@ -169,8 +172,8 @@ fn test_update_open_pr_for_a_deferred_ecosystem_exits_2_naming_the_supported_one
         );
     }
     assert_eq!(
-        std::fs::read_to_string(repo.path().join("requirements.txt")).expect("read"),
-        "requests==2.0.0\n"
+        std::fs::read_to_string(repo.path().join("composer.json")).expect("read"),
+        "{\"require\": {\"monolog/monolog\": \"1.0.0\"}}\n"
     );
 }
 

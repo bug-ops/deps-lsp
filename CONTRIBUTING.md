@@ -6,7 +6,8 @@ Thank you for your interest in contributing to deps-lsp!
 
 ### Prerequisites
 
-- Rust 1.85+ (Edition 2024)
+- Rust 1.98+ (Edition 2024)
+- Nightly toolchain for formatting (`cargo +nightly fmt`)
 - cargo-nextest (`cargo install cargo-nextest`)
 - cargo-llvm-cov (`cargo install cargo-llvm-cov`)
 - cargo-deny (`cargo install cargo-deny`)
@@ -19,6 +20,22 @@ cd deps-lsp
 cargo build --workspace
 cargo nextest run
 ```
+
+## MSRV policy
+
+The minimum supported Rust version is `rust-version` in the root `Cargo.toml`.
+
+- The MSRV trails the latest stable release by at least two releases (N-2).
+- An MSRV bump is a breaking change for consumers of the published crates and goes under `### Breaking` in `CHANGELOG.md`.
+- Bump triggers (see #549): a resolved dependency's `rust-version` exceeds the MSRV; new code needs an API whose pre-MSRV form is a correctness or safety liability; or the number of cosmetic simplification sites justifies the churn.
+
+Bump checklist, update every mirror in one PR:
+
+- `Cargo.toml` `[workspace.package]` `rust-version` (the CI `msrv` job follows it)
+- `README.md` badge and setup line
+- `crates/*/README.md` "Requires Rust X or later" lines, including `deps-precommit`
+- `CONTRIBUTING.md` prerequisites
+- `CHANGELOG.md`
 
 ## Code Style
 

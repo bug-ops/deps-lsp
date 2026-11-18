@@ -428,6 +428,7 @@ fn classify_vulnerable_dependency(
                 None,
             )
             .with_native_hold(native_hold)
+            .with_dependency_kind(dep.kind())
         }
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
         // forward to the fix target — see `bounded_requirement_already_resolves_to`'s and
@@ -624,6 +625,7 @@ fn skipped_not_requested(
         None,
         None,
     )
+    .with_dependency_kind(bound.dependency().kind())
 }
 
 fn unfixable_item(
@@ -642,6 +644,7 @@ fn unfixable_item(
         None,
         None,
     )
+    .with_dependency_kind(dep.kind())
 }
 
 fn requires_lockfile_update_item(
@@ -660,6 +663,7 @@ fn requires_lockfile_update_item(
         None,
         None,
     )
+    .with_dependency_kind(dep.kind())
 }
 
 #[cfg(test)]

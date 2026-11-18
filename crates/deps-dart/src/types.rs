@@ -154,6 +154,14 @@ impl deps_core::Dependency for DartDependency {
         &self.name
     }
 
+    fn kind(&self) -> Option<deps_core::DependencyKind> {
+        match self.section {
+            DependencySection::Dependencies => Some(deps_core::DependencyKind::Normal),
+            DependencySection::DevDependencies => Some(deps_core::DependencyKind::Development),
+            DependencySection::DependencyOverrides => None,
+        }
+    }
+
     fn name_range(&self) -> Range {
         self.name_range
     }

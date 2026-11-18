@@ -9,8 +9,8 @@
 use super::DryRun;
 use crate::report::{Category, CheckReport};
 use crate::update::regen::{
-    LockfileOutcome, NotApplicableReason, NpmClient, PinResolution, Program, RegenerationError,
-    SkipCause, UnsupportedReason,
+    LockfileOutcome, NotApplicableReason, NpmClient, PinResolution, Program, PythonLocker,
+    RegenerationError, SkipCause, UnsupportedReason,
 };
 use deps_core::EcosystemId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -342,6 +342,14 @@ pub enum ToolToken {
     Npm,
     /// `pnpm`.
     Pnpm,
+    /// `yarn`.
+    Yarn,
+    /// `uv`.
+    Uv,
+    /// Bundler's `bundle`.
+    Bundle,
+    /// `deno`.
+    Deno,
 }
 
 impl From<Program> for ToolToken {
@@ -351,6 +359,10 @@ impl From<Program> for ToolToken {
             Program::Go => Self::Go,
             Program::Npm => Self::Npm,
             Program::Pnpm => Self::Pnpm,
+            Program::Yarn => Self::Yarn,
+            Program::Uv => Self::Uv,
+            Program::Bundle => Self::Bundle,
+            Program::Deno => Self::Deno,
         }
     }
 }
@@ -418,12 +430,14 @@ pub enum UnsupportedToken {
     LockfileOwnershipMismatch,
     /// The Go module vendors its dependencies.
     GoVendored,
-    /// A Go workspace is active.
-    GoWorkspace,
     /// A cooldown-fallback target cannot be pinned by range resolution.
     CooldownFallbackTarget,
     /// The lockfile is a symlink or not a regular file.
     LockfileSymlink,
+    /// The project uses Yarn Classic (1.x).
+    YarnClassic,
+    /// The Python locker is not supported yet.
+    PythonLockerDeferred,
 }
 
 /// The kind of a failed regeneration, as a JSON token.
@@ -452,6 +466,10 @@ pub enum FailureKind {
     LockfileUnreadable,
     /// The regenerated lockfile does not hold the applied target.
     VersionMismatch,
+    /// A lock file could not be snapshotted before the tool ran.
+    SnapshotFailed,
+    /// The lock file could not be restored after a failure.
+    RestoreFailed,
 }
 
 impl From<&RegenerationError> for FailureKind {
@@ -468,6 +486,8 @@ impl From<&RegenerationError> for FailureKind {
             RegenerationError::ManifestReparseFailed { .. } => Self::ManifestReparseFailed,
             RegenerationError::LockfileUnreadable { .. } => Self::LockfileUnreadable,
             RegenerationError::VersionMismatch { .. } => Self::VersionMismatch,
+            RegenerationError::SnapshotFailed { .. } => Self::SnapshotFailed,
+            RegenerationError::RestoreFailed { .. } => Self::RestoreFailed,
         }
     }
 }
@@ -497,7 +517,32 @@ impl From<NpmClient> for ClientToken {
     }
 }
 
-/// What an `unsupported` reason refers to; both shapes are a bare string on the wire.
+/// The Python locker an `unsupported` report refers to, as a JSON token.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LockerToken {
+    /// uv.
+    Uv,
+    /// Poetry.
+    Poetry,
+    /// PDM.
+    Pdm,
+    /// Pipenv.
+    Pipenv,
+}
+
+impl From<PythonLocker> for LockerToken {
+    fn from(locker: PythonLocker) -> Self {
+        match locker {
+            PythonLocker::Uv => Self::Uv,
+            PythonLocker::Poetry => Self::Poetry,
+            PythonLocker::Pdm => Self::Pdm,
+            PythonLocker::Pipenv => Self::Pipenv,
+        }
+    }
+}
+
+/// What an `unsupported` reason refers to; every shape is a bare string on the wire.
 ///
 /// The token sets overlap on `"npm"`, so an untagged `"npm"` deserializes as
 /// [`Self::Ecosystem`] first. This is harmless: only `yarn` and `bun`
@@ -509,6 +554,8 @@ pub enum UnsupportedDetail {
     Ecosystem(EcosystemToken),
     /// The client whose regeneration is deferred.
     Client(ClientToken),
+    /// The Python locker whose regeneration is deferred.
+    Locker(LockerToken),
 }
 
 /// The lockfile step of an `update` run, tagged by `status`.
@@ -616,11 +663,15 @@ impl From<&LockfileOutcome> for LockfileDocument {
                         (UnsupportedToken::LockfileOwnershipMismatch, None)
                     }
                     UnsupportedReason::GoVendored => (UnsupportedToken::GoVendored, None),
-                    UnsupportedReason::GoWorkspace => (UnsupportedToken::GoWorkspace, None),
                     UnsupportedReason::CooldownFallbackTarget => {
                         (UnsupportedToken::CooldownFallbackTarget, None)
                     }
                     UnsupportedReason::LockfileSymlink => (UnsupportedToken::LockfileSymlink, None),
+                    UnsupportedReason::YarnClassic => (UnsupportedToken::YarnClassic, None),
+                    UnsupportedReason::PythonLockerDeferred(locker) => (
+                        UnsupportedToken::PythonLockerDeferred,
+                        Some(UnsupportedDetail::Locker(LockerToken::from(*locker))),
+                    ),
                 };
                 Self::Unsupported {
                     reason: token,
@@ -629,7 +680,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                 }
             }
             LockfileOutcome::Failed(error) => {
-                let (package, expected, found) = match error {
+                let (package, expected, found) = match error.root_cause() {
                     RegenerationError::VersionMismatch {
                         package,
                         expected,
@@ -648,7 +699,9 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::UnsafeArgument { .. }
                     | RegenerationError::UnrecognizedLockfile { .. }
                     | RegenerationError::ManifestReparseFailed { .. }
-                    | RegenerationError::LockfileUnreadable { .. } => (None, None, None),
+                    | RegenerationError::LockfileUnreadable { .. }
+                    | RegenerationError::SnapshotFailed { .. }
+                    | RegenerationError::RestoreFailed { .. } => (None, None, None),
                 };
                 Self::Failed {
                     kind: error.into(),
@@ -947,6 +1000,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            dependency_kind: None,
             lockfile_fix: crate::update::LockfileFix::default(),
         }
     }

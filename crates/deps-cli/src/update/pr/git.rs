@@ -86,6 +86,12 @@ pub enum Step {
     CreateRequest,
     /// `git switch` back to the base branch.
     SwitchBack,
+    /// Listing the open requests of the same author.
+    ListRequests,
+    /// Reading one request's author, branch, commit count and body.
+    ReadRequest,
+    /// Closing a superseded request with its comment.
+    CloseRequest,
 }
 
 impl fmt::Display for Step {
@@ -106,6 +112,9 @@ impl fmt::Display for Step {
             Self::Push => "pushing the branch",
             Self::CreateRequest => "creating the pull request",
             Self::SwitchBack => "switching back to the base branch",
+            Self::ListRequests => "listing the open requests",
+            Self::ReadRequest => "reading a request",
+            Self::CloseRequest => "closing a superseded request",
         })
     }
 }
