@@ -23,8 +23,8 @@ use deps_core::EcosystemId;
 
 use super::git::{Step, Tool};
 use super::{
-    BranchCheck, PrError, PrHost, PrOutcome, PrPhase, PrSignals, RepoContext, branch_for,
-    check_branch, describe, open, preflight, restore,
+    BranchCheck, PrError, PrHost, PrOutcome, PrPhase, PrSignals, Readiness, RepoContext,
+    branch_for, check_branch, describe, open, preflight, readiness, restore,
 };
 use crate::cli::Cli;
 use crate::update::group::UpdateGroup;
@@ -32,13 +32,13 @@ use crate::update::group_tests::{applied, group_from, item, skipped};
 use crate::update::regen::{LockfileOutcome, NotApplicableReason, ProcessGroup};
 use crate::update::{CurrentVersion, Outcome, SkipReason, UpdatePlan, UpdateRun};
 
-const STUB_FORMATTER: deps_core::test_util::StubFormatter =
+pub(super) const STUB_FORMATTER: deps_core::test_util::StubFormatter =
     deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
-const URL: &str = "https://example.test/pr/1";
+pub(super) const URL: &str = "https://example.test/pr/1";
 
 // --- fixture ---
 
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(super) fn git(dir: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -55,14 +55,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .to_owned()
 }
 
-struct Fixture {
-    tmp: tempfile::TempDir,
-    root: PathBuf,
-    origin: PathBuf,
+pub(super) struct Fixture {
+    pub(super) tmp: tempfile::TempDir,
+    pub(super) root: PathBuf,
+    pub(super) origin: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let tmp = tempfile::tempdir().expect("fixture dir");
         let origin = tmp.path().join("origin.git");
         let root = tmp.path().join("work");
@@ -115,26 +115,26 @@ impl Fixture {
         fixture
     }
 
-    fn write(&self, relative: &str, content: &str) {
+    pub(super) fn write(&self, relative: &str, content: &str) {
         let path = self.root.join(relative);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(path, content).expect("write");
     }
 
-    fn read(&self, relative: &str) -> String {
+    pub(super) fn read(&self, relative: &str) -> String {
         std::fs::read_to_string(self.root.join(relative)).expect("read")
     }
 
-    fn tools(&self) -> PathBuf {
+    pub(super) fn tools(&self) -> PathBuf {
         self.tmp.path().join("tools")
     }
 
-    fn record(&self, file: &str) -> PathBuf {
+    pub(super) fn record(&self, file: &str) -> PathBuf {
         self.tmp.path().join(file)
     }
 
     /// A shim named `name` that records argv, `GH_PROMPT_DISABLED` and cwd, then prints noise and a URL.
-    fn url_shim(&self, name: &str) {
+    pub(super) fn url_shim(&self, name: &str) {
         self.shim(
             name,
             &format!(
@@ -146,13 +146,13 @@ impl Fixture {
         );
     }
 
-    fn shim(&self, name: &str, body: &str) {
+    pub(super) fn shim(&self, name: &str, body: &str) {
         let path = self.tools().join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write shim");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
-    fn argv(&self, name: &str) -> Vec<String> {
+    pub(super) fn argv(&self, name: &str) -> Vec<String> {
         let bytes = std::fs::read(self.record(&format!("{name}.argv"))).expect("shim was not run");
         bytes
             .split(|byte| *byte == 0)
@@ -161,7 +161,7 @@ impl Fixture {
             .collect()
     }
 
-    async fn ctx(&self, manifest: &str) -> RepoContext {
+    pub(super) async fn ctx(&self, manifest: &str) -> RepoContext {
         let mut ctx = match preflight(&self.root.join(manifest)).await {
             Ok(ctx) => ctx,
             Err(error) => panic!("preflight must pass on the fixture: {error:?}"),
@@ -171,7 +171,7 @@ impl Fixture {
         ctx
     }
 
-    fn status(&self) -> Vec<String> {
+    pub(super) fn status(&self) -> Vec<String> {
         let mut lines: Vec<String> = git(
             &self.root,
             &["status", "--porcelain", "--untracked-files=no"],
@@ -183,11 +183,11 @@ impl Fixture {
         lines
     }
 
-    fn head(&self) -> String {
+    pub(super) fn head(&self) -> String {
         git(&self.root, &["symbolic-ref", "--short", "HEAD"])
     }
 
-    fn origin_has(&self, branch: &str) -> bool {
+    pub(super) fn origin_has(&self, branch: &str) -> bool {
         std::process::Command::new("git")
             .arg("--git-dir")
             .arg(&self.origin)
@@ -203,14 +203,26 @@ impl Fixture {
     }
 }
 
-fn error<T>(result: Result<T, PrError>) -> PrError {
+/// `readiness` then `describe`, as `main.rs` does; the run must be publishable.
+fn text_of(
+    ctx: &RepoContext,
+    run: &UpdateRun,
+    group: Option<&UpdateGroup>,
+) -> super::PullRequestText {
+    let Readiness::Ready(publishable) = readiness(run) else {
+        panic!("the run must be publishable");
+    };
+    describe(ctx, &publishable, group)
+}
+
+pub(super) fn error<T>(result: Result<T, PrError>) -> PrError {
     match result {
         Ok(_) => panic!("expected an error"),
         Err(error) => error,
     }
 }
 
-fn plan(updates: &[(&str, &str, &str)]) -> UpdatePlan {
+pub(super) fn plan(updates: &[(&str, &str, &str)]) -> UpdatePlan {
     UpdatePlan {
         items: updates
             .iter()
@@ -219,7 +231,7 @@ fn plan(updates: &[(&str, &str, &str)]) -> UpdatePlan {
     }
 }
 
-fn run_of(plan: UpdatePlan) -> UpdateRun {
+pub(super) fn run_of(plan: UpdatePlan) -> UpdateRun {
     UpdateRun {
         plan,
         lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
@@ -698,7 +710,10 @@ struct Opened {
     commit_body: String,
 }
 
-async fn open_with(fx: &Fixture, host: PrHost) -> (Opened, Result<PrOutcome, PrError>) {
+async fn open_with(
+    fx: &Fixture,
+    host: PrHost,
+) -> (Opened, RepoContext, Result<PrOutcome, PrError>) {
     let ctx = fx.ctx("Cargo.toml").await;
     fx.write("Cargo.toml", "bumped\n");
     fx.write("notes.txt", "untracked, must not be committed\n");
@@ -710,15 +725,15 @@ async fn open_with(fx: &Fixture, host: PrHost) -> (Opened, Result<PrOutcome, PrE
     let Ok(BranchCheck::Free(free)) = check_branch(&ctx, proposed).await else {
         panic!("the branch must be free");
     };
-    let text = describe(&ctx, &run, None);
-    let result = open(&ctx, host, free, &run, &text).await;
+    let text = text_of(&ctx, &run, None);
+    let result = open(&ctx, host, free, &text).await;
     let opened = Opened {
         branch: name,
         title: text.title.clone(),
         body: text.body.clone(),
         commit_body: text.commit_body.clone(),
     };
-    (opened, result)
+    (opened, ctx, result)
 }
 
 #[tokio::test]
@@ -739,9 +754,17 @@ async fn test_open_github_commits_pushes_opens_the_pull_request_and_switches_bac
     )
     .expect("chmod");
 
-    let (opened, result) = open_with(&fx, PrHost::Github).await;
+    let (opened, ctx, result) = open_with(&fx, PrHost::Github).await;
 
-    assert_matches!(result, Ok(PrOutcome::Opened { url }) if url == URL);
+    let Ok(PrOutcome::Opened(request)) = result else {
+        panic!("the request must be opened");
+    };
+    assert_eq!(request.url(), URL);
+    assert_eq!(
+        fx.head(),
+        opened.branch,
+        "HEAD stays on the update branch until switch_back"
+    );
     assert!(fx.origin_has(&opened.branch), "the branch must be pushed");
     let argv = fx.argv("gh");
     assert_eq!(&argv[..2], ["pr", "create"]);
@@ -772,6 +795,7 @@ async fn test_open_github_commits_pushes_opens_the_pull_request_and_switches_bac
         "Cargo.toml",
         "only the tracked modification is committed"
     );
+    request.switch_back(&ctx).await.expect("switch back");
     assert_eq!(fx.head(), "main");
     assert!(fx.status().is_empty());
     assert_eq!(
@@ -801,9 +825,12 @@ async fn test_open_gitlab_creates_a_merge_request_with_glab() {
     let fx = Fixture::new();
     fx.url_shim("glab");
 
-    let (opened, result) = open_with(&fx, PrHost::Gitlab).await;
+    let (opened, _ctx, result) = open_with(&fx, PrHost::Gitlab).await;
 
-    assert_matches!(result, Ok(PrOutcome::Opened { url }) if url == URL);
+    let Ok(PrOutcome::Opened(request)) = result else {
+        panic!("the request must be opened");
+    };
+    assert_eq!(request.url(), URL);
     let argv = fx.argv("glab");
     assert_eq!(&argv[..2], ["mr", "create"]);
     for expected in [
@@ -831,9 +858,9 @@ async fn test_open_without_tracked_changes_is_nothing_to_commit_and_creates_no_b
     let Ok(BranchCheck::Free(free)) = check_branch(&ctx, proposed).await else {
         panic!("the branch must be free");
     };
-    let text = describe(&ctx, &run, None);
+    let text = text_of(&ctx, &run, None);
 
-    let result = open(&ctx, PrHost::Github, free, &run, &text).await;
+    let result = open(&ctx, PrHost::Github, free, &text).await;
 
     assert_matches!(result, Ok(PrOutcome::NothingToCommit));
     assert_eq!(git(&fx.root, &["branch", "--list", &name]), "");
@@ -845,7 +872,7 @@ async fn test_open_without_tracked_changes_is_nothing_to_commit_and_creates_no_b
 async fn test_open_without_the_host_cli_is_tool_missing() {
     let fx = Fixture::new();
 
-    let (_, result) = open_with(&fx, PrHost::Github).await;
+    let (_, _ctx, result) = open_with(&fx, PrHost::Github).await;
 
     assert_matches!(error(result), PrError::ToolMissing { tool: Tool::Gh });
 }
@@ -855,7 +882,7 @@ async fn test_open_host_cli_failure_names_the_step_and_the_exit_code() {
     let fx = Fixture::new();
     fx.shim("gh", "exit 3\n");
 
-    let (_, result) = open_with(&fx, PrHost::Github).await;
+    let (_, _ctx, result) = open_with(&fx, PrHost::Github).await;
 
     assert_matches!(
         error(result),
@@ -885,8 +912,8 @@ async fn test_open_dropped_future_terminates_the_host_cli_process_tree() {
     let Ok(BranchCheck::Free(free)) = check_branch(&ctx, proposed).await else {
         panic!("the branch must be free");
     };
-    let text = describe(&ctx, &run, None);
-    let mut publishing = Box::pin(open(&ctx, PrHost::Github, free, &run, &text));
+    let text = text_of(&ctx, &run, None);
+    let mut publishing = Box::pin(open(&ctx, PrHost::Github, free, &text));
 
     let sleeper = tokio::select! {
         result = &mut publishing => panic!("open finished while gh blocks: {result:?}"),
@@ -928,12 +955,9 @@ async fn test_signals_guard_sigint_during_publish_drops_the_phase_and_terminates
     let Ok(BranchCheck::Free(free)) = check_branch(&ctx, proposed).await else {
         panic!("the branch must be free");
     };
-    let text = describe(&ctx, &run, None);
+    let text = text_of(&ctx, &run, None);
     let mut signals = PrSignals::install();
-    let guarded = signals.guard(
-        PrPhase::Publish,
-        open(&ctx, PrHost::Github, free, &run, &text),
-    );
+    let guarded = signals.guard(PrPhase::Publish, open(&ctx, PrHost::Github, free, &text));
     let interrupter = async {
         let sleeper = pid_from(&pid_file).await;
         rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT)
@@ -962,7 +986,7 @@ fn describe_plan(
     plan: UpdatePlan,
     group: Option<&UpdateGroup>,
 ) -> super::PullRequestText {
-    describe(ctx, &run_of(plan), group)
+    text_of(ctx, &run_of(plan), group)
 }
 
 #[tokio::test]

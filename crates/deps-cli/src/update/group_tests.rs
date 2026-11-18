@@ -31,9 +31,9 @@ fn normalized(declared: &str) -> NormalizedName {
         .clone()
 }
 
-/// Loads `body` as an explicit `--config` file and returns the `[update.groups.<group>]` rule
-/// as an [`UpdateGroup`]; panics when the file is rejected.
-pub(super) fn group_from(body: &str, group: &str) -> UpdateGroup {
+/// Loads `body` as an explicit `--config` file and returns the `[update.groups.<group>]` rule;
+/// panics when the file is rejected.
+fn rule_from(body: &str, group: &str) -> (GroupName, crate::config::GroupRule) {
     let dir = tempfile::tempdir().expect("config dir");
     let path = dir.path().join("deps.toml");
     std::fs::write(&path, body).expect("write config");
@@ -44,6 +44,12 @@ pub(super) fn group_from(body: &str, group: &str) -> UpdateGroup {
         .groups
         .remove(&name)
         .expect("the group must be parsed");
+    (name, rule)
+}
+
+/// The `[update.groups.<group>]` rule of `body` as an [`UpdateGroup`] over the identity formatter.
+pub(super) fn group_from(body: &str, group: &str) -> UpdateGroup {
+    let (name, rule) = rule_from(body, group);
     UpdateGroup::new(name, rule, &STUB_FORMATTER)
 }
 
@@ -165,6 +171,36 @@ fn test_group_contains_requires_name_and_kind_to_match() {
             "dependencies={dependencies:?} update_types={update_types:?} item={name} kind={kind:?}"
         );
     }
+}
+
+// --- FR-018: names are normalized with the ecosystem's formatter ---
+
+#[cfg(feature = "pypi")]
+#[test]
+fn test_group_names_are_normalized_with_the_ecosystem_formatter_on_both_sides() {
+    use deps_core::PackageName;
+    use deps_core::lsp_helpers::NormalizeName;
+    use deps_engine::setup::PypiFormatter;
+
+    let (name, rule) = rule_from("[update.groups.g]\ndependencies = [\"Flask_Login\"]\n", "g");
+    let group = UpdateGroup::new(name, rule, &PypiFormatter);
+    let mut items = vec![
+        item("Flask.Login", "1.0.0", applied("1.0.1")),
+        item("other", "1.0.0", applied("1.0.1")),
+    ];
+
+    demote_outside_group(&mut items, &group, &PypiFormatter);
+
+    let key = PypiFormatter.normalize_package_name(&PackageName::new("flask-login"));
+    assert!(group.contains(&key, UpdateKind::Patch));
+    assert!(matches!(items[0].outcome, Outcome::Applied { .. }));
+    assert!(matches!(
+        items[1].outcome,
+        Outcome::Skipped {
+            reason: SkipReason::NotInGroup,
+            ..
+        }
+    ));
 }
 
 // --- FR-017: demotion ---

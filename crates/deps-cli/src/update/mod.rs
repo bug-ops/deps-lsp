@@ -513,6 +513,26 @@ impl PlannedUpdateItem {
         self.outcome.target()
     }
 
+    /// Whether this item is something the run wanted to fix but could not (exit `1`), as opposed
+    /// to applied, or deliberately left alone: the single source for the exit code and for the
+    /// pull request body's "could not be updated" count.
+    #[must_use]
+    pub const fn is_unresolved(&self) -> bool {
+        match &self.outcome {
+            Outcome::Applied { .. } | Outcome::AppliedViaLockfile { .. } => false,
+            Outcome::Skipped { reason, .. } => match reason {
+                SkipReason::NotRequested
+                | SkipReason::IgnoreRule
+                | SkipReason::WithinFreshnessCooldown
+                | SkipReason::WithinNativeCooldown
+                | SkipReason::OverlapsAnotherEdit
+                | SkipReason::NotInGroup => false,
+                SkipReason::NotSafelyEditable(_) => true,
+            },
+            Outcome::RequiresLockfileUpdate { .. } | Outcome::Unfixable(_) => true,
+        }
+    }
+
     /// A one-line human-readable reason for [`Self::outcome`] (FR-021's `reason` field).
     #[must_use]
     pub fn reason(&self) -> String {

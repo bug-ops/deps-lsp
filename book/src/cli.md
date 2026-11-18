@@ -553,18 +553,144 @@ newest compatible version; `go get` may raise indirect requirements and the `go`
 toolchain to satisfy it.
 
 **Timeouts and signals (unix).** The whole regeneration shares a 5-minute budget. Each tool runs
-in its own process group, and on a timeout, on SIGINT or on SIGTERM the whole group is killed
-(SIGKILL), so no grandchild outlives the run; an interrupted run prints the report with
-`lockfile: failed` (`kind: interrupted`) and exits `2`. When deps-cli is in the foreground group of
-its controlling terminal (an interactive run) the tool stays in that group instead, so `/dev/tty`
+in its own process group. On a timeout, on SIGINT or on SIGTERM deps-cli sends SIGTERM to the tool,
+waits up to 2 seconds for it to exit, then sends SIGKILL to the whole group (also after the tool
+itself exited, so a grandchild that ignored SIGTERM does not outlive the run). An interrupted run
+prints the report with `lockfile: failed` (`kind: interrupted`) and exits `2`. The grace period lets
+a tool run its own cleanup, but it does not make the lock file safe: `cargo` and `go` keep the
+default SIGTERM disposition and can still leave a truncated lock file, so the truncation risk is
+reduced, not removed. Check `git diff` on the lock file after a failed or interrupted run (with
+`--open-pr` the restore described below does this for you). When deps-cli is in the foreground group
+of its controlling terminal (an interactive run) the tool stays in that group instead, so `/dev/tty`
 prompts keep working and Ctrl-C reaches it. Limits: in that foreground mode a timeout, or a SIGTERM
-sent to deps-cli alone, kills only the direct child and grandchildren may survive; a SIGKILL of
+sent to deps-cli alone, signals only the direct child and grandchildren may survive; a SIGKILL of
 deps-cli's own process group (`timeout -k`, `kill -9 -- -PGID`) does not reach a tool in its own
 group; a `deps-cli ... &` job brought back with `fg` while `stty tostop` is set leaves the tool in
 its own, background group, so its first terminal write stops it and the run waits for the 5-minute
 timeout (exit `2`); the signal handlers are installed whenever a regeneration has pins to verify,
 even for ecosystems where nothing is spawned, stay installed until exit, and override an inherited
 `SIG_IGN` for SIGINT or SIGTERM; on Windows only the direct child is killed.
+
+### Update groups (`[update.groups]`, `--group`)
+
+```toml
+[update.groups.minor-patch]
+update_types = ["minor", "patch"]
+
+[update.groups.tokio-stack]
+dependencies = ["tokio", "tokio-util", "tracing"]
+```
+
+```bash
+deps-cli update --config deps.toml --group minor-patch Cargo.toml
+```
+
+A group has two optional keys: `dependencies` (names, matched exactly after normalization) and
+`update_types` (`major`, `minor`, `patch`). A group without keys matches every update. An update is
+inside the group when its name is listed (or `dependencies` is absent) **and** its kind is listed
+(or `update_types` is absent); an update whose kind cannot be classified is inside only a group
+without `update_types`. Group names are 1 to 64 characters of `a-z`, `0-9` and `-`, not starting or
+ending with `-`; unknown keys are rejected.
+
+`--group <name>` requires `--config` (groups are read only from an explicit config, like
+`[update].ignore`), conflicts with `--security-only`, and exits `2` before any analysis when the
+group is not defined. Every `applied` update outside the group is reported
+`skipped (outside the selected --group)` and does not change the exit code. The group filter runs
+after planning, so a dependency outside the group whose OSV latest-version check fails still aborts
+the run (fail-closed). Groups are for splitting the update set into several runs, for instance one
+for `minor-patch` and one for the rest; patterns and dependency-type groups are not supported.
+
+### Opening a pull request (`--open-pr`)
+
+```bash
+deps-cli update --lockfile regenerate --open-pr github Cargo.toml
+deps-cli update --lockfile regenerate --open-pr gitlab --config deps.toml --group minor-patch go.mod
+```
+
+`--open-pr github|gitlab` commits the manifest and lock file change of one run on a new branch,
+pushes it to `origin` and opens a pull request with `gh` (GitHub) or a merge request with `glab`
+(GitLab). It requires `--lockfile regenerate`, conflicts with `--dry-run` and `--offline`, and
+supports the ecosystems whose lock file regeneration is implemented (Cargo, npm, pnpm, Go) plus
+those without a lock file format (GitHub Actions, GitLab CI/CD, pre-commit, Maven); the others
+(PyPI, Bundler, Dart, Composer, Gradle, Swift, NuGet, Deno) exit `2` before any analysis.
+
+deps-cli never reads, logs or passes a token: `git`, `gh` and `glab` use their own credentials, and
+every process runs without a shell, without stdin and with `GIT_TERMINAL_PROMPT=0` and
+`GH_PROMPT_DISABLED=1`. A GitHub token needs `contents: write` and `pull-requests: write`; a GitLab
+token needs `api` scope and push access. Pull requests created with the GitHub Actions
+`GITHUB_TOKEN` do not trigger workflows (GitHub's rule). With several remotes, keep only `origin`
+or run `gh repo set-default`. git 2.23 or newer is required (`git switch`, `git restore`).
+
+The host CLIs are called with exactly these arguments (cwd = repository root):
+
+```text
+gh pr create --base=<base> --head=<branch> --title=<title> --body=<body>
+glab mr create --source-branch=<branch> --target-branch=<base> --title=<title> --description=<body> --yes
+```
+
+Neither host CLI was run against a real host: both are covered by argv-recording shims, and the
+`gh` flags were checked against `gh pr create --help` (2.103). The URL is the last non-empty line
+the CLI prints, shown with control characters removed.
+
+Before the manifest is read, `update` checks that the manifest is inside a git work tree, `HEAD` is
+a named branch starting with neither `deps-cli/` nor `-`, a committer identity is configured and no tracked
+file is modified (untracked files are fine and are never committed); otherwise it exits `2`.
+
+The branch is `deps-cli/<ecosystem>/[<dir>/]<label>-<hash>`, where the label is the group name, the
+`<name>-<version>` of a single update, or `all`. The hash covers the ecosystem, the manifest path,
+the group and the exact update set, so the same update set always maps to the same branch and a
+different one never shares it. Re-running while that branch exists on `origin` writes nothing,
+prints `already proposed on <branch>` on stderr and reports the plan as a dry run, with the exit
+code `update` computes for it. A local branch of that name that is not on `origin` exits `2`
+before any write; delete it. A pull request closed without merging keeps its branch, and the same
+update set is not proposed again until the branch is deleted; superseded pull requests are not
+closed or updated.
+
+Publishing first lists the tracked files that differ from `HEAD`. Only the manifest and the lock
+file a `regenerated` outcome names may differ: any other changed tracked file (an editor autosave,
+a formatter, another tool running during the update) stops the run with exit `2` naming up to 10 of
+them, with nothing committed or pushed. Otherwise the run creates the branch, stages exactly those
+files (an untracked or ignored lock file is never added), commits, pushes with upstream, creates
+the request against the branch `HEAD` was on, prints its URL on stderr and only then switches back.
+
+The title is `Bump <name> from <a> to <b>`, `Bump <n> dependencies in <manifest>` or
+`Bump the <group> group with <n> updates in <manifest>`, at most 250 bytes; the body is a table of
+at most 50 updates with every name and version rendered as code. When nothing changed on disk it
+prints `nothing to commit`.
+
+If no item was settled (for example a `--security-only` run whose only fix stays
+`requires-lockfile-update` because the regenerated lock file moved to a version not proven outside
+the advisory ranges), no request is opened: the files are restored as below, the run prints
+`no update was settled; no pull request opened (the manifest and the regenerated lock file were
+reverted)`, renders the report as a dry run and exits with the
+code `update` computes (`1` in practice).
+
+If the lock file could not be regenerated (`failed`, `unsupported` or `skipped`), the tracked files
+directly inside the manifest's directory are restored to `HEAD` (including the index), the report is
+printed as a dry run and the run exits `2`; edits elsewhere are untouched, but an edit made beside
+the manifest while the run was going is reverted too.
+
+The manifest name is compared with git's spelling, so on a case-insensitive file system a manifest
+given as `cargo.toml` for `Cargo.toml` is refused as an unexpected change (exit `2`, nothing
+committed).
+
+Each git, `gh` or `glab` step, including the commit and pre-push hooks it triggers, is limited to
+2 minutes. SIGINT or SIGTERM in any phase stops every running process tree (SIGTERM, 2 seconds,
+SIGKILL) and exits `2` naming the phase. After a failed or interrupted step the repository is left
+as it was: a run interrupted while updating leaves the manifest edit (the next run refuses with a
+dirty tree; `git restore <dir>`), and a failure after the branch switch leaves `HEAD` on the update
+branch (`git switch <base>`, `git branch -D <branch>`). If the push may have happened, also delete
+the remote branch with `git push origin --delete <branch>` (or, after a failed or interrupted
+`gh pr create`, open the request by hand); otherwise the next run reports the branch as already
+proposed and opens nothing. A failed switch-back after the request was created still exits `2`,
+with the URL already printed.
+
+| Situation | Exit code |
+|---|---|
+| Pull request opened, nothing to commit, no update proposed | as `update` (`0`, or `1` for a mixed run) |
+| Already proposed | as `update` for the dry-run report |
+| No update settled | as `update` for the dry-run report (`1` in practice) |
+| Flag violation, preflight failure, deferred ecosystem, stale local branch, lock file not regenerated, unexpected changed file, git/`gh`/`glab` failure or timeout, interrupt | `2` |
 
 ### Write safety and exit codes
 

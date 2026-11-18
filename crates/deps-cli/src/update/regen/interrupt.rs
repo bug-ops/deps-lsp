@@ -52,6 +52,8 @@ impl Interrupts {
 
     /// Resolves on the first Ctrl-C; never resolves if the handler cannot be registered.
     #[cfg(not(unix))]
+    // Keeps the `&mut self` signature of the unix version, which polls its signal streams.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(in crate::update) async fn recv(&mut self) {
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;

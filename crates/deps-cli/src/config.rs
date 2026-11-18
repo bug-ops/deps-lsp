@@ -72,14 +72,25 @@ pub struct GroupName(String);
 
 /// A group name outside the [`GroupName`] grammar.
 #[derive(Debug, thiserror::Error)]
-#[error("invalid group name")]
+#[error("group names are 1 to 64 characters of a-z, 0-9 and '-', not starting or ending with '-'")]
 pub struct InvalidGroupName;
 
 impl std::str::FromStr for GroupName {
     type Err = InvalidGroupName;
 
-    fn from_str(_text: &str) -> Result<Self, Self::Err> {
-        todo!()
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let valid_chars = text
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if valid_chars
+            && (1..=Self::MAX_LEN).contains(&text.len())
+            && !text.starts_with('-')
+            && !text.ends_with('-')
+        {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(InvalidGroupName)
+        }
     }
 }
 
@@ -92,6 +103,8 @@ impl TryFrom<String> for GroupName {
 }
 
 impl GroupName {
+    const MAX_LEN: usize = 64;
+
     /// The name as written in the config file and on the command line.
     #[must_use]
     pub fn as_str(&self) -> &str {

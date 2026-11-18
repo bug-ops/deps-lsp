@@ -236,3 +236,38 @@ fn test_update_group_defined_in_the_config_runs_like_a_plain_update() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(String::from_utf8_lossy(&output.stdout).contains("No eligible updates."));
 }
+
+/// Network-free end to end: with nothing to propose, `--open-pr` passes the preflight, opens
+/// nothing, creates no branch and exits as a plain `update` does.
+#[test]
+fn test_update_open_pr_with_no_proposed_update_opens_nothing_and_exits_clean() {
+    let repo = repository(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    );
+
+    let output = run(
+        repo.path(),
+        &[
+            "--open-pr",
+            "github",
+            "--lockfile",
+            "regenerate",
+            "Cargo.toml",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No eligible updates."));
+    let branches = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["branch", "--list"])
+        .output()
+        .expect("run git");
+    assert_eq!(
+        String::from_utf8_lossy(&branches.stdout).trim(),
+        "* main",
+        "no branch is created"
+    );
+}
