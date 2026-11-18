@@ -97,18 +97,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-          bins: cross
-          cache-target: release
-          # setup-rust's cache key hashes $GITHUB_JOB, which is identical across every
-          # matrix leg — without this, all ubuntu-latest legs (gnu/musl x86_64/aarch64)
-          # collide on one cache key and race on the same target/ dir, corrupting it
-          # (e.g. a missing zerofrom_derive proc-macro artifact).
-          cache-extra-identifier: ${{ matrix.target }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Matrix legs sharing a runner OS differ by target, so the key carries the target to
+      # keep them from racing on one cache entry. Tag refs only restore: a tag-scoped cache
+      # is never reused by the next tag and would just consume the repository cache budget.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cross
 
       - name: Build release (cross)
         if: matrix.use_cross
@@ -195,11 +201,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
 
       - name: Install cargo-cyclonedx
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
@@ -434,12 +438,16 @@ jobs:
         with:
           submodules: true
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           targets: wasm32-wasip1
-          cache-target: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: crates/deps-zed
+          shared-key: release-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build Zed extension
         working-directory: crates/deps-zed
@@ -469,11 +477,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          cache: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
 
       - name: Verify version matches tag
         run: |
