@@ -24,7 +24,7 @@ dev = ["pytest>=8"]
 
 #[test]
 fn kind_maps_pyproject_sections() {
-    let uri = url::Url::from_file_path("/project/pyproject.toml").expect("uri");
+    let uri = url::Url::parse("file:///project/pyproject.toml").expect("uri");
     let result = PypiParser::new()
         .parse_content(PYPROJECT, &uri)
         .expect("parse");

@@ -33,7 +33,7 @@ const POM: &str = r"<project>
 
 #[test]
 fn kind_maps_maven_scopes() {
-    let uri = url::Url::from_file_path("/project/pom.xml").expect("uri");
+    let uri = url::Url::parse("file:///project/pom.xml").expect("uri");
     let result = deps_maven::parse_pom_xml(POM, &uri).expect("parse");
     let kind_of = |needle: &str| {
         result

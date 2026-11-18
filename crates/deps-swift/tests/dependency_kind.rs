@@ -6,7 +6,7 @@ use deps_core::{DependencyKind, ParseResult};
 
 #[test]
 fn kind_is_normal_for_every_package() {
-    let uri = url::Url::from_file_path("/project/Package.swift").expect("uri");
+    let uri = url::Url::parse("file:///project/Package.swift").expect("uri");
     let manifest = r#"// swift-tools-version:5.9
 import PackageDescription
 

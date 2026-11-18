@@ -18,7 +18,7 @@ dependency_overrides:
 
 #[test]
 fn kind_maps_pubspec_sections_and_leaves_overrides_unknown() {
-    let uri = url::Url::from_file_path("/project/pubspec.yaml").expect("uri");
+    let uri = url::Url::parse("file:///project/pubspec.yaml").expect("uri");
     let result = deps_dart::parse_pubspec_yaml(PUBSPEC, &uri).expect("parse");
     let kind_of = |name: &str| {
         result

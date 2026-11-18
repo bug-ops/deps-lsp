@@ -6,7 +6,7 @@ use deps_core::{DependencyKind, ParseResult};
 
 #[test]
 fn kind_is_normal_for_every_requirement() {
-    let uri = url::Url::from_file_path("/project/go.mod").expect("uri");
+    let uri = url::Url::parse("file:///project/go.mod").expect("uri");
     let result = deps_go::parse_go_mod(
         "module example.com/m\n\ngo 1.21\n\nrequire github.com/foo/bar v1.2.3\n",
         &uri,

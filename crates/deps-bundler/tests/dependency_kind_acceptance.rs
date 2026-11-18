@@ -28,7 +28,7 @@ end
 
 #[test]
 fn kind_maps_gemfile_groups_and_leaves_custom_groups_unknown() {
-    let uri = url::Url::from_file_path("/project/Gemfile").expect("uri");
+    let uri = url::Url::parse("file:///project/Gemfile").expect("uri");
     let result = deps_bundler::parse_gemfile(GEMFILE, &uri).expect("parse");
     let kind_of = |name: &str| {
         result

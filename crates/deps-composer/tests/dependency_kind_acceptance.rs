@@ -14,7 +14,7 @@ const MANIFEST: &str = r#"{
 
 #[test]
 fn kind_maps_require_and_require_dev() {
-    let uri = url::Url::from_file_path("/project/composer.json").expect("uri");
+    let uri = url::Url::parse("file:///project/composer.json").expect("uri");
     let result = deps_composer::parse_composer_json(MANIFEST, &uri).expect("parse");
     let kind_of = |name: &str| {
         result

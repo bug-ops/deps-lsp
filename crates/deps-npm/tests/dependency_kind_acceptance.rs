@@ -15,7 +15,7 @@ const MANIFEST: &str = r#"{
 
 #[test]
 fn kind_maps_package_json_sections() {
-    let uri = url::Url::from_file_path("/project/package.json").expect("uri");
+    let uri = url::Url::parse("file:///project/package.json").expect("uri");
     let result = deps_npm::parse_package_json(MANIFEST, &uri).expect("parse");
     let kind_of = |name: &str| {
         result

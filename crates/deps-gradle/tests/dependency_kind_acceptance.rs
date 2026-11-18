@@ -18,7 +18,7 @@ const BUILD_GRADLE: &str = r"dependencies {
 
 #[test]
 fn kind_maps_gradle_configuration_names() {
-    let uri = url::Url::from_file_path("/project/build.gradle").expect("uri");
+    let uri = url::Url::parse("file:///project/build.gradle").expect("uri");
     let result = deps_gradle::parse_gradle(BUILD_GRADLE, &uri).expect("parse");
     let kind_of = |needle: &str| {
         result

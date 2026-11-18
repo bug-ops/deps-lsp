@@ -7,7 +7,7 @@ use deps_core::{DependencyKind, ParseResult};
 
 #[test]
 fn kind_is_normal_for_every_package_reference() {
-    let uri = url::Url::from_file_path("/project/App.csproj").expect("uri");
+    let uri = url::Url::parse("file:///project/App.csproj").expect("uri");
     let project = r#"<Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" PrivateAssets="all" />
