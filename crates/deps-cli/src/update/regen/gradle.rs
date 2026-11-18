@@ -235,6 +235,8 @@ impl Session<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     fn touch(root: &Path, rel: &str) {
@@ -327,10 +329,10 @@ mod tests {
             "sub/gradle/dependency-locks/compileClasspath.lockfile",
         );
 
-        assert!(matches!(
+        assert_matches!(
             lock_set(dir.path()),
             Err(LockSetError::Refused(UnsupportedReason::LegacyLockLayout))
-        ));
+        );
     }
 
     #[test]
@@ -348,12 +350,12 @@ mod tests {
             touch(dir.path(), &format!("p{index}/gradle.lockfile"));
         }
 
-        assert!(matches!(
+        assert_matches!(
             lock_set(dir.path()),
             Err(LockSetError::Refused(
                 UnsupportedReason::LockfileSetTooLarge
             ))
-        ));
+        );
     }
 
     #[test]
@@ -364,12 +366,12 @@ mod tests {
             touch(dir.path(), &format!("{long}{index}/gradle.lockfile"));
         }
 
-        assert!(matches!(
+        assert_matches!(
             lock_set(dir.path()),
             Err(LockSetError::Refused(
                 UnsupportedReason::LockfileSetTooLarge
             ))
-        ));
+        );
     }
 
     #[cfg(unix)]

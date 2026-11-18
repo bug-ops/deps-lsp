@@ -531,6 +531,7 @@ async fn test_an_ecosystem_without_a_version_ordering_never_calls_the_host() {
     assert!(calls(&fx, "gh").is_empty());
 }
 
+#[cfg(feature = "go")]
 #[tokio::test]
 async fn test_a_go_request_is_closed_through_the_native_ordering() {
     let go_marker = |ctx: &RepoContext, target: &str| {
