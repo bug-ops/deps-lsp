@@ -393,6 +393,21 @@ impl deps_core::Dependency for PypiDependency {
         &self.name
     }
 
+    fn kind(&self) -> Option<deps_core::DependencyKind> {
+        use deps_core::DependencyKind;
+        match &self.section {
+            PypiDependencySection::BuildSystem => Some(DependencyKind::Build),
+            PypiDependencySection::Dependencies
+            | PypiDependencySection::PoetryDependencies
+            | PypiDependencySection::PipfilePackages => Some(DependencyKind::Normal),
+            PypiDependencySection::OptionalDependencies { .. } => Some(DependencyKind::Optional),
+            PypiDependencySection::DependencyGroup { .. }
+            | PypiDependencySection::PoetryGroup { .. }
+            | PypiDependencySection::PipfileDevPackages => Some(DependencyKind::Development),
+            PypiDependencySection::Requirements => None,
+        }
+    }
+
     fn native_cooldown(&self) -> Option<&deps_core::native_cooldown::NativeCooldown> {
         self.native_cooldown.as_ref()
     }

@@ -1,0 +1,10 @@
+---
+source: crates/deps-cli/tests/update_json_lockfile_tokens.rs
+expression: "lockfile_json(LockfileOutcome::Unsupported\n{\n    lockfile: None, reason:\n    UnsupportedReason::PythonLockerDeferred(PythonLocker::Poetry),\n})"
+---
+{
+  "status": "unsupported",
+  "reason": "python-locker-deferred",
+  "path": null,
+  "detail": "poetry"
+}

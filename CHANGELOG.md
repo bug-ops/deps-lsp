@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **behavior**: `update --security-only` without `--lockfile` reports the lockfile as `skipped`/`not-enabled` (#2049, #2068)
 - **deps-core**: new `NativeCooldownSource` variants for Yarn and uv index windows, `GateOrigin`, and defaulted `LockFileProvider::{parse_lock_set, companion_listing_dir}` (#2051, #2052, #2054, #2068)
 - **deps-cli**: `UpdateArgs` gains public `open_pr` and `group` fields, and the exhaustive `SkipReason` gains `NotInGroup` (#1117, #1118, #2075)
+- **deps-cli**: new variants on public regeneration enums and JSON tokens, `UnsupportedReason::GoWorkspace` removed, `PlannedUpdateItem::dependency_kind`, `UpdateGroup::contains` signature and `UpdateArgs::close_superseded` (#2046, #2047, #2071, #2072, #2073, #PR)
+- **deps-core**: new `DependencyKind` enum, `Dependency::kind()` (defaults to `None`), `star_glob`, `fs_probe::{read_capped_no_follow, write_atomic_bytes}` and `osv::{OsvEndpoint, OsvEndpointError}` (#2072, #2074, #PR)
+- **behavior**: `update --lockfile regenerate` now runs `uv`, `bundle` and `deno` for `uv.lock`, `Gemfile.lock` and `deno.lock`, and npm or pnpm workspace members and Go workspaces no longer report `unsupported` (#2046, #2047, #PR)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
@@ -52,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-pypi**: uv per-index `exclude-newer` under `[[tool.uv.index]]` is honoured with package, index, global precedence (#2052, #2068)
 - **deps-cli**: `update --open-pr github|gitlab` commits the manifest and lockfile change to a content-addressed branch and opens one PR through `git` and `gh`/`glab` (#1117, #2075)
 - **deps-cli**: `[update.groups.<name>]` config and `update --group <name>` batch selected updates into one run and PR (#1118, #2075)
+- **deps-cli**: `update --lockfile regenerate` re-resolves `uv.lock`, `Gemfile.lock` and `deno.lock`, npm and pnpm workspace members in plain runs, standalone Yarn berry, and Go workspaces (#2046, #2047, #PR)
+- **deps-cli**: `[update.groups.<name>]` accepts `patterns` (wildcards) and `dependency_type` (`production`, `development`, `build`, `peer`, `optional`), backed by a new `Dependency::kind()` in every ecosystem (#2072, #PR)
+- **deps-cli**: `update --open-pr --close-superseded` closes earlier deps-cli pull requests that the new one supersedes (#2073, #PR)
+- **deps-core, deps-cli**: `DEPS_OSV_BASE_URL` points OSV queries at an operator-chosen server, a testing aid read only from the environment (#2074, #PR)
 
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
@@ -74,6 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-core**: the OSV record cache is keyed per package and ecosystem, so a second package covered by the same advisory no longer shows the first package's fix target (#2065, #2075)
 - **deps-cli**: a lockfile regeneration tool group gets SIGTERM and a 2-second grace before SIGKILL on timeout or interrupt (#2066, #2075)
+- **deps-cli**: a failed or interrupted `update --lockfile regenerate` restores the lock file, `go.mod` and `go.sum` byte for byte (#2071, #PR)
+- **docs**: `CONTRIBUTING.md` states the real MSRV 1.98 and an MSRV policy, `deps-precommit` README gets its MSRV line, and the yarn lockfile parser uses `str::strip_circumfix` (#2069, #2070, #PR)
 - **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves the GHCR `latest`/major/minor tags or the `action.yml` digest pin, and SARIF is attributed to the tag (#2067)
 - **deps-cli**: SIGTERM, SIGINT and timeout now kill the whole process group of a lockfile regeneration tool instead of leaving it running (#2048, #2068)
 - **deps-core, deps-gradle**: the legacy lock-set directory is listed once while parsing and stat-ed only for symlinks, with the directory stamped before the listing (#2054, #2068)

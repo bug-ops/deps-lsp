@@ -316,6 +316,7 @@ deps_core::impl_dependency!(GitlabCiDependency {
     version_range: version_range,
     source: source,
     version_literal: version_literal,
+    kind: deps_core::normal_kind,
 });
 
 /// Version information for a GitLab CI dependency: a repository tag (`project:`) or a

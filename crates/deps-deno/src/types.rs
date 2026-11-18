@@ -50,6 +50,7 @@ deps_core::impl_dependency!(DenoDependency {
     version: version_req,
     version_range: version_range,
     source: source,
+    kind: deps_core::normal_kind,
 });
 
 /// Section of a `deno.json` manifest a dependency was declared in.

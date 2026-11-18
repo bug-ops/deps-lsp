@@ -245,7 +245,7 @@ deps-cli update --lockfile regenerate Cargo.toml
 Flags: `--package <NAME>` (repeatable), `--security-only`, `--dry-run`, `--format
 table|json`, `--config <PATH>`, `--offline`, `--lockfile skip|regenerate` (default `skip`), and
 `--cooldown <DURATION>` (`--cooldown` has no effect under `--security-only`), `--open-pr
-github|gitlab` and `--group <NAME>`.
+github|gitlab`, `--close-superseded` (needs `--open-pr`) and `--group <NAME>`.
 
 - **Default mode** honors the freshness cooldown (default 3 days) even with no flags: a
   version published inside the window is replaced by the newest already-cooled-down, OSV-verified
@@ -256,32 +256,39 @@ github|gitlab` and `--group <NAME>`.
   against OSV, and classifies every vulnerable dependency as `applied`,
   `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule. When the
   declared requirement already admits the fix, `--lockfile regenerate` moves only the lock file
-  (Cargo, npm, pnpm, Go): the item becomes `applied` (exit `0`) once the lock file holds the fix
+  (Cargo, npm, pnpm, Yarn Berry, Go, uv, Bundler, Deno): the item becomes `applied` (exit `0`) once the lock file holds the fix
   or, for npm and pnpm, a newer in-range version that every advisory affecting the locked
   version places outside its affected ranges; otherwise it stays `requires-lockfile-update`.
 - **`[update].ignore`** (`{ name = "tokio", update_types = ["major"] }`) is honored only from
   an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
-- **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm` or `go` in the manifest's directory after
-  the write and verifies that the lockfile holds every applied version; the JSON report always
-  carries a `lockfile` object. It does nothing under `--dry-run` or `--offline`, never creates a
-  lockfile, and reports `unsupported` for Yarn, Bun, workspace members and the other ecosystems.
-  The tool runs with the repository's own configuration and your full environment. On unix a
+- **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm`, `yarn` (Berry), `go`, `uv`, `bundle` or
+  `deno` in the manifest's directory after the write and verifies that the lockfile holds every
+  applied version; the JSON report always carries a `lockfile` object. It does nothing under
+  `--dry-run` or `--offline`, never creates a lockfile, and reports `unsupported` for Yarn Classic,
+  Bun, non-uv Python lockers and the other ecosystems. npm and pnpm workspace members are regenerated
+  in plain runs. Run it only on repositories you trust: the tool executes repository files such as
+  `.pnpmfile.cjs`, a `Gemfile` or `.cargo/config.toml`, with your full environment. On unix a
   timeout, SIGINT or SIGTERM sends SIGTERM to the tool's process group, waits 2 seconds, then
-  kills the group (exit `2`, see the mdBook for the limits); `cargo` and `go` can still leave a
-  truncated lock file, so check `git diff` after a failed run.
+  kills the group (exit `2`, see the mdBook for the limits). Lock files are snapshotted first and
+  restored after a failed run (after a timeout or interrupt on unix only).
 - **`--open-pr github|gitlab`** (with `--lockfile regenerate`; not with `--dry-run` or `--offline`)
   commits the manifest and lock file change on a `deps-cli/...` branch, pushes it to `origin` and
   opens a pull request with `gh` or a merge request with `glab`. The same update set maps to the
   same branch, so a re-run while it is open writes nothing. The working tree must be clean;
-  deps-cli never reads a token. Cargo, npm, pnpm, Go and ecosystems without a lock file are
-  supported; see the mdBook for the full contract.
+  deps-cli never reads a token. Ecosystems with regeneration (see above) and ecosystems without a
+  lock file are supported; npm and pnpm workspace members are not. `--close-superseded` then closes
+  your earlier `deps-cli` requests the new one supersedes (Cargo, npm, PyPI, Bundler, Dart, Composer
+  and Deno only); see the mdBook for the full contract.
 - **`--group <NAME>`** (needs `--config`, not with `--security-only`) keeps only the updates of one
-  `[update.groups.<name>]` rule (`dependencies`, `update_types`); the rest are reported
-  `skipped (outside the selected --group)`.
+  `[update.groups.<name>]` rule (`dependencies`, `patterns`, `update_types`, `dependency_type`);
+  the rest are reported `skipped (outside the selected --group)`.
 - **Exit codes**: `0` all selected updates applied or deliberately skipped, `1` at least one
   wanted fix could not be applied, `2` execution error (including a failed lockfile
   regeneration). A non-zero exit does not imply the
   manifest is unmodified; inspect each item's `outcome` in `--format json`.
+
+Setting `DEPS_OSV_BASE_URL` points OSV lookups at an operator-chosen endpoint (`https`, or `http` to
+a loopback IP literal); an invalid value exits `2`.
 
 See the [`update` usage](https://bug-ops.github.io/deps-lsp/cli.html#update-usage) mdBook
 section for the full reference.

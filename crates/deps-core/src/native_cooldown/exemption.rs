@@ -273,39 +273,17 @@ const fn is_name_byte(byte: u8) -> bool {
 fn matches_name(pattern: &str, name: &str, scope: StarScope) -> bool {
     match scope {
         StarScope::Exact => pattern == name,
-        StarScope::AnyCharacter => glob_matches(pattern, name),
+        StarScope::AnyCharacter => crate::star_glob::matches(pattern, name),
         StarScope::WithinSegment => {
             let mut pattern_segments = pattern.split('/');
             let mut name_segments = name.split('/');
             loop {
                 match (pattern_segments.next(), name_segments.next()) {
                     (None, None) => return true,
-                    (Some(p), Some(n)) if glob_matches(p, n) => {}
+                    (Some(p), Some(n)) if crate::star_glob::matches(p, n) => {}
                     _ => return false,
                 }
             }
         }
     }
-}
-
-/// Linear-time `*` matcher: the text between stars is located left to right with one
-/// substring search each, so there is no backtracking and no nested scan.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    let Some((first, after_first)) = pattern.split_once('*') else {
-        return pattern == text;
-    };
-    let Some(rest) = text.strip_prefix(first) else {
-        return false;
-    };
-    let (middle, last) = after_first.rsplit_once('*').unwrap_or(("", after_first));
-    let Some(mut rest) = rest.strip_suffix(last) else {
-        return false;
-    };
-    for piece in middle.split('*').filter(|piece| !piece.is_empty()) {
-        let Some((_, after)) = rest.split_once(piece) else {
-            return false;
-        };
-        rest = after;
-    }
-    true
 }

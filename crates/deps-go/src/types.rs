@@ -137,6 +137,7 @@ deps_core::impl_dependency!(GoDependency {
     version: version,
     version_range: version_range,
     source: source,
+    kind: deps_core::normal_kind,
 });
 
 // Can't use impl_version! here: GoVersion's is_prerelease() has custom pseudo-version/+incompatible logic.

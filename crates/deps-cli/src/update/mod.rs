@@ -200,6 +200,8 @@ pub struct PlannedUpdateItem {
     /// The package manager's own publish-age hold that kept `latest` out of this item
     /// (spec 099), set on [`SkipReason::WithinNativeCooldown`] items only.
     pub native_hold: Option<NativeHoldNote>,
+    /// The dependency's role in its manifest; `None` when unknown.
+    pub dependency_kind: Option<deps_core::DependencyKind>,
     /// Evidence for settling a [`Outcome::RequiresLockfileUpdate`] item after a lock-file
     /// regeneration; written only by the security planner (`affected`) and the regeneration
     /// settlement (`lockfile`), and meaningful only for that outcome.
@@ -484,8 +486,19 @@ impl PlannedUpdateItem {
             cooldown_fallback,
             osv_sibling_match: None,
             native_hold: None,
+            dependency_kind: None,
             lockfile_fix: LockfileFix::default(),
         }
+    }
+
+    /// Attaches the dependency's role ([`Self::dependency_kind`]).
+    #[must_use]
+    pub const fn with_dependency_kind(
+        mut self,
+        dependency_kind: Option<deps_core::DependencyKind>,
+    ) -> Self {
+        self.dependency_kind = dependency_kind;
+        self
     }
 
     /// Attaches the native publish-age hold ([`Self::native_hold`]).
@@ -625,7 +638,7 @@ impl PlannedUpdateItem {
                 ..
             } => "outside the selected --group",
             Outcome::RequiresLockfileUpdate { .. } => {
-                "declared requirement already admits the fix target, but the lock file still resolves a vulnerable version; update the lock file (deps-cli can do it with --lockfile regenerate for Cargo, npm, pnpm and Go)"
+                "declared requirement already admits the fix target, but the lock file still resolves a vulnerable version; update the lock file"
             }
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix) => {
                 "no independently-verified fix target is available"
@@ -648,6 +661,10 @@ impl PlannedUpdateItem {
             (Outcome::RequiresLockfileUpdate { .. }, LockfileState::MovedTo(version)) => format!(
                 "the lock file now resolves {version}, a newer in-range version that could not be \
                  confirmed outside the advisory's affected ranges; review it manually"
+            ),
+            (Outcome::RequiresLockfileUpdate { .. }, _) => format!(
+                "{base} (deps-cli can do it with --lockfile regenerate for {})",
+                regen::supported_tools_text()
             ),
             _ => base.to_string(),
         };
@@ -1336,6 +1353,7 @@ fn resolve_occurrence(
     let gossip_excluded = gossip_excluded_version(analysis, &package_key);
     let fallback_candidate = fallback_by_key.remove(&key);
 
+    let dependency_kind = dep.and_then(|dep| dep.dependency().kind());
     let build = |current: CurrentVersion,
                  outcome: Outcome,
                  advisory_ids: Vec<deps_core::osv::OsvId>,
@@ -1349,6 +1367,7 @@ fn resolve_occurrence(
             gossip_excluded.clone(),
             cooldown_fallback,
         )
+        .with_dependency_kind(dependency_kind)
     };
 
     if !is_requested(package_filter, package_key.normalized(), formatter) {
@@ -2855,6 +2874,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                dependency_kind: None,
                 lockfile_fix: LockfileFix::default(),
             }],
         };
@@ -2895,6 +2915,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                dependency_kind: None,
                 lockfile_fix: LockfileFix::default(),
             }],
         };
@@ -2935,6 +2956,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                dependency_kind: None,
                 lockfile_fix: LockfileFix::default(),
             }],
         };
@@ -2972,6 +2994,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                dependency_kind: None,
                 lockfile_fix: LockfileFix::default(),
             }],
         };
@@ -3009,6 +3032,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            dependency_kind: None,
             lockfile_fix: LockfileFix::default(),
         }
     }

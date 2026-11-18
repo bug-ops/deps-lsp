@@ -242,6 +242,10 @@ impl deps_core::Dependency for GithubActionsDependency {
         &self.name
     }
 
+    fn kind(&self) -> Option<deps_core::DependencyKind> {
+        deps_core::normal_kind(self)
+    }
+
     fn name_range(&self) -> Range {
         self.name_range
     }

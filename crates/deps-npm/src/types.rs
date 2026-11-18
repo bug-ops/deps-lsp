@@ -449,6 +449,18 @@ impl deps_core::Dependency for NpmDependency {
         self.package.as_ref().unwrap_or(&self.name)
     }
 
+    fn kind(&self) -> Option<deps_core::DependencyKind> {
+        match &self.origin {
+            NpmDependencyOrigin::Manifest { section, .. } => Some(match section {
+                NpmDependencySection::Dependencies => deps_core::DependencyKind::Normal,
+                NpmDependencySection::DevDependencies => deps_core::DependencyKind::Development,
+                NpmDependencySection::PeerDependencies => deps_core::DependencyKind::Peer,
+                NpmDependencySection::OptionalDependencies => deps_core::DependencyKind::Optional,
+            }),
+            NpmDependencyOrigin::CatalogEntry { .. } | NpmDependencyOrigin::Override { .. } => None,
+        }
+    }
+
     fn name_range(&self) -> Range {
         self.name_range
     }

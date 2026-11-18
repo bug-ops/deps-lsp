@@ -39,12 +39,20 @@ pub struct ComposerDependency {
     pub source: deps_core::parser::DependencySource,
 }
 
+fn dependency_kind(dependency: &ComposerDependency) -> Option<deps_core::DependencyKind> {
+    match dependency.section {
+        ComposerSection::Require => Some(deps_core::DependencyKind::Normal),
+        ComposerSection::RequireDev => Some(deps_core::DependencyKind::Development),
+    }
+}
+
 deps_core::impl_dependency!(ComposerDependency {
     name: name,
     name_range: name_range,
     version: version_req,
     version_range: version_range,
     source: source,
+    kind: dependency_kind,
 });
 
 /// Section in composer.json where a dependency is declared.

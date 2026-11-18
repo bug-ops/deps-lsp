@@ -208,6 +208,10 @@ pub enum UpdateOutputFormat {
 /// `--respect-gitignore`/`--follow-symlinks` (Out of Scope: an explicitly named manifest path
 /// is already an explicit choice).
 #[derive(Debug, Parser)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is an independent command-line switch clap parses as a flag"
+)]
 pub struct UpdateArgs {
     /// The single manifest to update (FR-002 — a directory, a glob expanding to more than
     /// one path, or a path no ecosystem recognizes is an execution error).
@@ -258,6 +262,12 @@ pub struct UpdateArgs {
     /// request with `gh` or `glab`. Requires `--lockfile regenerate`.
     #[arg(long, value_enum, conflicts_with_all = ["dry_run", "offline"])]
     pub open_pr: Option<crate::update::pr::PrHost>,
+
+    /// After opening the request, closes this author's open `deps-cli/...` requests that it
+    /// supersedes (same manifest, group and mode; one commit; every target at or below the new
+    /// one). Requires `--open-pr`.
+    #[arg(long, requires = "open_pr")]
+    pub close_superseded: bool,
 
     /// Restricts the update to the named `[update.groups.<name>]` group of `--config`.
     #[arg(long, requires = "config", conflicts_with = "security_only")]

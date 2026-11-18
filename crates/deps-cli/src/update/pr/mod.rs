@@ -8,9 +8,17 @@
 //! child guards terminate the process trees of whatever it spawned.
 
 pub mod git;
+mod supersede;
+
+pub use supersede::{
+    RequestMarker, RequestNumber, RunMode, SupersedeError, SupersedeReport, SupersededPolicy,
+    close_superseded,
+};
 
 #[cfg(all(test, unix))]
 mod acceptance_tests;
+#[cfg(all(test, unix))]
+mod close_superseded_tests;
 #[cfg(all(test, unix))]
 mod publish_safety_tests;
 
@@ -145,6 +153,25 @@ pub struct PullRequestText {
     commit_body: String,
     /// Repo-relative files the commit may contain: the manifest and a regenerated lock file.
     publishable_paths: Vec<String>,
+}
+
+impl PullRequestText {
+    /// Appends the hidden `marker` to the body, cutting the body so both fit the body limit.
+    /// A marker too large to embed is left out.
+    #[must_use]
+    pub fn with_marker(mut self, marker: &RequestMarker) -> Self {
+        if let Some(comment) = marker.render() {
+            let room = BODY_MAX_BYTES.saturating_sub(comment.len() + 2);
+            self.body.truncate(self.body.floor_char_boundary(room));
+            // A cut inside a code fence must not swallow the comment: end on a whole line.
+            if let Some(end) = self.body.rfind('\n') {
+                self.body.truncate(end + 1);
+            }
+            self.body.push('\n');
+            self.body.push_str(&comment);
+        }
+        self
+    }
 }
 
 /// How the publish phase ended.
@@ -391,7 +418,10 @@ fn cleanup_hint(step: Step) -> &'static str {
         | Step::LocalBranch
         | Step::Restore
         | Step::Diff
-        | Step::Switch => "",
+        | Step::Switch
+        | Step::ListRequests
+        | Step::ReadRequest
+        | Step::CloseRequest => "",
     }
 }
 

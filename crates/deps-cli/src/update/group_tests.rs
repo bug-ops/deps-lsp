@@ -72,6 +72,7 @@ pub(super) fn item(name: &str, current: &str, outcome: Outcome) -> PlannedUpdate
         cooldown_fallback: None,
         osv_sibling_match: None,
         native_hold: None,
+        dependency_kind: None,
         lockfile_fix: LockfileFix::default(),
     }
 }
@@ -167,7 +168,7 @@ fn test_group_contains_requires_name_and_kind_to_match() {
         }
         let group = group_from(&body, "g");
         assert_eq!(
-            group.contains(&normalized(name), kind),
+            group.contains(&normalized(name), kind, None),
             inside,
             "dependencies={dependencies:?} update_types={update_types:?} item={name} kind={kind:?}"
         );
@@ -193,7 +194,7 @@ fn test_group_names_are_normalized_with_the_ecosystem_formatter_on_both_sides() 
     demote_outside_group(&mut items, &group, &PypiFormatter);
 
     let key = PypiFormatter.normalize_package_name(&PackageName::new("flask-login"));
-    assert!(group.contains(&key, UpdateKind::Patch));
+    assert!(group.contains(&key, UpdateKind::Patch, None));
     assert_matches!(items[0].outcome, Outcome::Applied { .. });
     assert_matches!(
         items[1].outcome,

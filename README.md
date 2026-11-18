@@ -237,7 +237,7 @@ through a registry with the opt-in `registries.swift_scm_to_registry`. Details a
 
 ## Development
 
-Requires Rust 1.98+ (Edition 2024). See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup,
+Requires Rust 1.98+ (Edition 2024). See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup, the [MSRV policy](CONTRIBUTING.md#msrv-policy),
 build, test, and lint commands, and the book's
 [**Architecture Overview**](https://bug-ops.github.io/deps-lsp/architecture.html#the-ecosystem-trait)
 for how the `Ecosystem` trait ties ecosystem crates into the LSP server, the workspace's

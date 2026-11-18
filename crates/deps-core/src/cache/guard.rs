@@ -58,7 +58,28 @@ pub(super) fn is_loopback_host(url: &str) -> bool {
 /// environment" just because the feature is on.
 #[inline]
 pub(super) fn ensure_https(url: &str) -> Result<()> {
+    ensure_scheme(url, SchemeRule::HttpsOnly)
+}
+
+/// Which plain-`http` exceptions [`ensure_scheme`] honours for one request.
+///
+/// Passed per request, never stored on the cache, so a waiver cannot leak to other callers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SchemeRule<'a> {
+    /// `https` only (test builds additionally allow loopback).
+    HttpsOnly,
+    /// Also allow plain `http` to the exact scheme, host and port of the operator endpoint.
+    PlainHttpExactOrigin(&'a crate::osv::OperatorOrigin),
+}
+
+/// [`ensure_https`] with an optional per-request operator waiver.
+pub(super) fn ensure_scheme(url: &str, rule: SchemeRule<'_>) -> Result<()> {
     if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let SchemeRule::PlainHttpExactOrigin(origin) = rule
+        && origin.permits_plain_http(url)
+    {
         return Ok(());
     }
     #[cfg(any(test, feature = "test-util"))]
@@ -132,5 +153,45 @@ impl AddrGuard {
                 || !snapshot.permits(Target::Resolved { name, ip }))
             .then(|| BlockedHost::new(class, snapshot.level)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net_policy::MapEnv;
+    use crate::osv::{OSV_BASE_URL_ENV, OsvEndpoint};
+
+    fn origin(value: &str) -> crate::osv::OperatorOrigin {
+        match OsvEndpoint::from_env(&MapEnv::new().with_var(OSV_BASE_URL_ENV, value)) {
+            Ok(OsvEndpoint::Operator(origin)) => origin,
+            other => panic!("expected an operator endpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_http_waiver_is_limited_to_the_operator_origin() {
+        let origin = origin("http://127.0.0.1:8080");
+        let rule = SchemeRule::PlainHttpExactOrigin(&origin);
+
+        assert!(ensure_scheme("http://127.0.0.1:8080/v1/query", rule).is_ok());
+        for other in [
+            "http://10.0.0.1:8080/v1/query",
+            "http://192.168.0.1/v1/query",
+            "http://example.com/v1/query",
+        ] {
+            assert!(
+                matches!(
+                    ensure_scheme(other, rule),
+                    Err(DepsError::InsecureScheme { .. })
+                ),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_only_rejects_non_loopback_http() {
+        assert!(ensure_scheme("http://10.0.0.1/x", SchemeRule::HttpsOnly).is_err());
     }
 }

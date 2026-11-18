@@ -68,6 +68,64 @@ impl deps_core::Dependency for GradleDependency {
     fn lock_scope(&self) -> deps_core::LockScope {
         self.lock_scope
     }
+
+    fn kind(&self) -> Option<deps_core::DependencyKind> {
+        configuration_kind(&self.configuration)
+    }
+}
+
+/// Whether a camelCase configuration name has a standalone `test` word (`testImplementation`,
+/// `androidTestImplementation`), so a name that merely contains the letters (`latestApi`) is
+/// not a test configuration.
+fn has_test_word(configuration: &str) -> bool {
+    let mut word = String::new();
+    let mut previous_lower_or_digit = false;
+    for ch in configuration.chars().chain(std::iter::once('_')) {
+        let boundary =
+            !ch.is_ascii_alphanumeric() || (ch.is_ascii_uppercase() && previous_lower_or_digit);
+        if boundary {
+            if word.eq_ignore_ascii_case("test") {
+                return true;
+            }
+            word.clear();
+        }
+        if ch.is_ascii_alphanumeric() {
+            word.push(ch);
+        }
+        previous_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    false
+}
+
+/// Classifies a Gradle configuration name, checked in this order: a configuration with a
+/// `test` word is development, build-time classpaths are build, the common production
+/// configurations (matched case-insensitively) are normal, anything else is unknown.
+fn configuration_kind(configuration: &str) -> Option<deps_core::DependencyKind> {
+    use deps_core::DependencyKind;
+    let name = configuration.to_ascii_lowercase();
+    if has_test_word(configuration) {
+        Some(DependencyKind::Development)
+    } else if name.contains("classpath")
+        || ["annotationprocessor", "kapt", "ksp"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        Some(DependencyKind::Build)
+    } else if [
+        "implementation",
+        "api",
+        "compileonly",
+        "runtimeonly",
+        "compile",
+        "runtime",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
+    {
+        Some(DependencyKind::Normal)
+    } else {
+        None
+    }
 }
 
 /// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
@@ -101,6 +159,30 @@ mod tests {
     use super::*;
     use deps_core::position::Position;
     use std::assert_matches;
+
+    #[test]
+    fn configuration_kind_matches_test_as_a_word_not_a_substring() {
+        use deps_core::DependencyKind::{Build, Development, Normal};
+
+        let rows = [
+            ("testImplementation", Some(Development)),
+            ("testRuntimeOnly", Some(Development)),
+            ("androidTestImplementation", Some(Development)),
+            ("debugAndroidTestImplementation", Some(Development)),
+            ("latestApi", Some(Normal)),
+            ("contestImplementation", Some(Normal)),
+            ("implementation", Some(Normal)),
+            ("kapt", Some(Build)),
+            ("custom", None),
+        ];
+        for (configuration, expected) in rows {
+            assert_eq!(
+                configuration_kind(configuration),
+                expected,
+                "{configuration}"
+            );
+        }
+    }
 
     fn test_dep() -> GradleDependency {
         GradleDependency {

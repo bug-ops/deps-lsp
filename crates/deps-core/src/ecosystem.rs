@@ -644,6 +644,31 @@ pub trait ParseResult: Send + Sync {
     }
 }
 
+/// Role a dependency plays in its manifest.
+///
+/// Exhaustive by design: adding a variant must break every `match` on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DependencyKind {
+    /// Needed at runtime.
+    Normal,
+    /// Needed only for development or tests.
+    Development,
+    /// Needed only to build the package.
+    Build,
+    /// Supplied by the consumer.
+    Peer,
+    /// Optional at runtime.
+    Optional,
+}
+
+/// [`Dependency::kind`] for ecosystems whose manifests have no non-production section.
+///
+/// Usable as the `kind:` argument of [`impl_dependency!`](crate::impl_dependency).
+#[must_use]
+pub const fn normal_kind<T: ?Sized>(_dependency: &T) -> Option<DependencyKind> {
+    Some(DependencyKind::Normal)
+}
+
 /// Generic dependency trait.
 ///
 /// All parsed dependencies must implement this for generic handler access.
@@ -653,6 +678,11 @@ pub trait Dependency: Send + Sync {
 
     /// The native package-manager publish-age window that applies to this dependency, if any.
     fn native_cooldown(&self) -> Option<&crate::native_cooldown::NativeCooldown> {
+        None
+    }
+
+    /// Role of this dependency within its manifest; `None` when unknown.
+    fn kind(&self) -> Option<crate::DependencyKind> {
         None
     }
 

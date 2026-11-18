@@ -571,6 +571,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            dependency_kind: None,
             lockfile_fix: crate::update::LockfileFix::default(),
         }
     }

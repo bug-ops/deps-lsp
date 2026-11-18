@@ -202,12 +202,23 @@ impl ArtifactInfo {
     }
 }
 
+fn dependency_kind(dependency: &MavenDependency) -> Option<deps_core::DependencyKind> {
+    match dependency.scope {
+        MavenScope::Compile | MavenScope::Runtime | MavenScope::Provided | MavenScope::System => {
+            Some(deps_core::DependencyKind::Normal)
+        }
+        MavenScope::Test => Some(deps_core::DependencyKind::Development),
+        MavenScope::Import => None,
+    }
+}
+
 deps_core::impl_dependency!(MavenDependency {
     name: name,
     name_range: name_range,
     version: version_req,
     version_range: version_range,
     source: source,
+    kind: dependency_kind,
 });
 
 impl deps_core::Version for MavenVersion {

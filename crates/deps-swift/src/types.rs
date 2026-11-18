@@ -54,6 +54,7 @@ deps_core::impl_dependency!(SwiftDependency {
     version_range: version_range,
     source: source,
     version_literal: version_literal,
+    kind: deps_core::normal_kind,
 });
 
 /// Version information for a Swift package (GitHub tag or SE-0292 registry release).
