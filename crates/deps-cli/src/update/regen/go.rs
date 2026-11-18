@@ -7,7 +7,7 @@ use deps_core::ConcreteVersion;
 
 use super::command::{ArgComponent, GoModuleMode, GoWork};
 use super::{
-    Companion, Invocation, LockfileOutcome, NotApplicableReason, PinCheck, Program,
+    Companion, Invocation, IoOperation, LockfileOutcome, NotApplicableReason, PinCheck, Program,
     RegenerationError, Session, UnsupportedReason, arg_pair, unsupported,
 };
 
@@ -47,6 +47,16 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// `path`, or `.` when the manifest sits at the repository root and its display directory is
+/// empty, so an error message never names an empty path.
+fn non_empty_or_dot(path: PathBuf) -> PathBuf {
+    if path.is_empty() {
+        PathBuf::from(".")
+    } else {
+        path
     }
 }
 
@@ -153,11 +163,20 @@ impl Session<'_> {
         modules: &[(ArgComponent, ArgComponent)],
         work: GoWork,
     ) -> Result<Vec<super::PinReport>, RegenerationError> {
-        let io_failed = |source| RegenerationError::Spawn {
-            program: Program::Go,
-            source,
+        let vendor_shown = self.display_lock_path(vendor).shown;
+        let io_failed = |operation, path: &Path| {
+            let path = path.to_path_buf();
+            move |source| RegenerationError::Io {
+                operation,
+                path,
+                source,
+            }
         };
-        let scratch = Scratch::create(self.manifest_dir).map_err(io_failed)?;
+        let manifest_dir_shown = non_empty_or_dot(self.display_lock_path(self.manifest_dir).shown);
+        let scratch = Scratch::create(self.manifest_dir).map_err(io_failed(
+            IoOperation::CreateScratchDirectory,
+            &manifest_dir_shown,
+        ))?;
         self.runner
             .run(
                 &Invocation::go_mod_vendor(
@@ -175,12 +194,15 @@ impl Session<'_> {
         self.verify_vendored(&scratch.path.join("modules.txt"), modules)?;
 
         let old = scratch.sibling(".old");
-        std::fs::rename(vendor, &old).map_err(io_failed)?;
+        std::fs::rename(vendor, &old)
+            .map_err(io_failed(IoOperation::MoveVendorAside, &vendor_shown))?;
         if let Err(source) = std::fs::rename(&scratch.path, vendor) {
             if let Err(error) = std::fs::rename(&old, vendor) {
                 tracing::warn!(%error, path = %old.display(), "could not put the previous vendor tree back");
             }
-            return Err(io_failed(source));
+            return Err(io_failed(IoOperation::MoveVendorIntoPlace, &vendor_shown)(
+                source,
+            ));
         }
         if let Err(error) = std::fs::remove_dir_all(&old) {
             tracing::warn!(%error, path = %old.display(), "could not remove the previous vendor tree");
@@ -218,9 +240,17 @@ impl Session<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::vendored_version;
+    use std::path::PathBuf;
+
+    use super::{non_empty_or_dot, vendored_version};
 
     const MODULES: &str = "# golang.org/x/text v0.31.0\n## explicit; go 1.24\ngolang.org/x/text/unicode\n# example.com/dep v1.0.0 => ../dep\n## explicit; go 1.21\nexample.com/dep\n";
+
+    #[test]
+    fn an_empty_display_directory_is_shown_as_dot() {
+        assert_eq!(non_empty_or_dot(PathBuf::new()), PathBuf::from("."));
+        assert_eq!(non_empty_or_dot(PathBuf::from("sub")), PathBuf::from("sub"));
+    }
 
     #[test]
     fn vendored_version_reads_plain_and_replaced_modules() {

@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use super::command::NonEmpty;
 use super::command::lockers::DenoFilter;
-use super::fallback::ExactPinRun;
+use super::fallback::{DescriptorLock, ExactPinRun, Relax};
 use super::{
     ArgComponent, Invocation, LockfileOutcome, NotApplicableReason, NpmClient, PinCheck, Program,
     RegenerationError, Session, UnsupportedReason, declares_workspace, same_file, unsupported,
@@ -76,6 +76,8 @@ impl Session<'_> {
                     manifest: self.target.manifest_path,
                     install: &install,
                     update: update.as_ref(),
+                    relax: Relax::Reinstall,
+                    siblings: &[],
                 })
                 .await;
         }
@@ -115,15 +117,28 @@ impl Session<'_> {
                 UnsupportedReason::WorkspaceMemberLockfile,
             ));
         }
-        // Deno keys the lock file by specifier, so relaxing an exact fallback pin back to the
-        // declared range would re-resolve to the withheld release.
-        if let Some(outcome) = self.cooldown_refusal(&located) {
-            return Ok(outcome);
-        }
         if let Some(outcome) = self.placement_refusal(&located) {
             return Ok(outcome);
         }
 
+        if self.has_fallback_pins() {
+            let filters = NonEmpty::new(self.update_only_args(DenoFilter::parse)?);
+            let install = Invocation::deno_install_lockfile_only(self.manifest_dir);
+            let update = filters
+                .as_ref()
+                .map(|filters| Invocation::deno_update_lockfile_only(self.manifest_dir, filters));
+            return self
+                .run_with_exact_pins(ExactPinRun {
+                    tool: Program::Deno,
+                    lockfile: &located,
+                    manifest: self.target.manifest_path,
+                    install: &install,
+                    update: update.as_ref(),
+                    relax: Relax::Rekey(DescriptorLock::Deno),
+                    siblings: &[],
+                })
+                .await;
+        }
         let lockfile_only = self.lockfile_only_args(DenoFilter::parse)?;
 
         self.capture(&[&located])?;

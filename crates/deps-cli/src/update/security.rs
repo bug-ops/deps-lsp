@@ -444,35 +444,25 @@ fn classify_vulnerable_dependency(
             ignore_rule_overridden,
         ),
         // #1566 S1: `NoOpRewrite` here no longer safely implies "the literal already reads as
-        // the fix." `plan_verified_fix` only reaches `NoOpRewrite` after `bounded_requirement_already_resolves_to`
-        // has already returned `false` above (a `true` answer would have hit
-        // `RequirementAlreadyResolves` instead), so the historical assumption — no
-        // `compile_bounded_requirement` comparator exists (e.g. GitHub Actions/GitLab CI tag pins), and
-        // the declared literal happens to already spell the fix text verbatim — no longer holds
-        // once an ecosystem's formatter can deliberately echo `current` back unchanged for a
-        // requirement shape it has no safe single-value rewrite for (Cargo's compound
-        // comma-separated requirements, #1566).
+        // the fix." `plan_verified_fix` only reaches `NoOpRewrite` after
+        // `bounded_requirement_already_resolves_to` has already returned `false` above, so the
+        // historical assumption — no `compile_bounded_requirement` comparator exists (e.g. GitHub
+        // Actions/GitLab CI tag pins), and the declared literal already spells the fix text — no
+        // longer holds once a formatter deliberately echoes `current` back unchanged for a shape
+        // it has no safe single-value rewrite for (Cargo's compound requirements, #1566).
         //
-        // Code review regression: checking only `compile_bounded_requirement(..).is_some()` (a matcher
-        // *exists*) is not enough, because `bounded_requirement_already_resolves_to` can diverge from
-        // the raw matcher's verdict — `NuGetFormatter` overrides it to always report `false`
-        // for a bare/open-ended-minimum floor requirement regardless of what the matcher itself
-        // says (floor semantics: leaving the manifest unedited restores the floor version, even
-        // when the floor mathematically admits the fix), and `Pep440Matcher::matches` can
-        // return `None` (indeterminate — the compared version failed to parse) rather than a
-        // confirmed `Some(false)`. Neither case means the requirement was *confirmed* to
-        // exclude the fix, so re-deriving the verdict from the underlying matcher directly —
-        // not `bounded_requirement_already_resolves_to`, which those two overrides deliberately bend
-        // away from the matcher's plain answer — and requiring exactly `Some(false)` is the
-        // only way to tell "confirmed excluded" apart from "unknown"/"overridden for other
-        // reasons". Only a confirmed exclusion is a real gap; anything else falls back to the
-        // legacy "assume already fixed" reading, preserving pre-#1566 behavior.
+        // A decisive matcher verdict (`Some(_)`) with `already_resolves_to == false` means the
+        // requirement does not resolve to the fix: either it excludes it (`Some(false)`) or the
+        // ecosystem resolves below it (NuGet bounded ranges resolve to their lower bound,
+        // #2101), so a lock-only update cannot help. An indeterminate matcher (`None`, e.g.
+        // `Pep440Matcher` on an unparseable comparison) or no matcher keeps the legacy "assume
+        // already fixed" reading.
         Err(VulnFixSkip::NoOpRewrite) => {
             let fix_concrete = deps_core::ConcreteVersion::new(version_native.as_str());
-            let confirmed_excluded = formatter
+            let decisive_verdict = formatter
                 .compile_requirement(version_req)
-                .is_some_and(|matcher| matcher.matches(&fix_concrete) == Some(false));
-            if confirmed_excluded {
+                .is_some_and(|matcher| matcher.matches(&fix_concrete).is_some());
+            if decisive_verdict {
                 unfixable_item(
                     dep,
                     current,
@@ -978,16 +968,13 @@ mod tests {
         }
     }
 
-    /// Code review regression (S1 fix): mirrors `NuGetFormatter::bounded_requirement_already_resolves_to`'s
-    /// real bare-floor override — the raw matcher mathematically admits the fix (`Some(true)`),
-    /// but the ecosystem overrides `bounded_requirement_already_resolves_to` to always report `false`
-    /// for a floor shape (floor semantics: leaving the manifest unedited keeps restoring the
-    /// declared floor). `format_version_replacing` echoes `current` back unchanged, so
-    /// `plan_verified_fix` reaches `NoOpRewrite` — but the raw matcher's `Some(true)` must never
-    /// be read as "confirmed excluded".
-    struct FloorLikeFormatter;
-    impl PackageNaming for FloorLikeFormatter {}
-    impl PackageRendering for FloorLikeFormatter {
+    /// Mirrors `NuGetFormatter::bounded_requirement_already_resolves_to` for a bounded range —
+    /// the raw matcher admits the fix (`Some(true)`), but the ecosystem resolves to the lower
+    /// bound and reports `false` (#2101). `format_version_replacing` echoes `current` back
+    /// unchanged, so `plan_verified_fix` reaches `NoOpRewrite`.
+    struct BoundedRangeLikeFormatter;
+    impl PackageNaming for BoundedRangeLikeFormatter {}
+    impl PackageRendering for BoundedRangeLikeFormatter {
         fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
             v.to_string()
         }
@@ -1002,7 +989,7 @@ mod tests {
             current.to_string()
         }
     }
-    impl RequirementResolution for FloorLikeFormatter {
+    impl RequirementResolution for BoundedRangeLikeFormatter {
         fn compile_bounded_requirement(
             &self,
             _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
@@ -1017,11 +1004,11 @@ mod tests {
             false
         }
     }
-    impl DiagnosticMessages for FloorLikeFormatter {}
-    impl DiagnosticPolicy for FloorLikeFormatter {}
-    impl SourcePolicy for FloorLikeFormatter {}
-    impl OsvNaming for FloorLikeFormatter {}
-    impl DependencyFormatter for FloorLikeFormatter {
+    impl DiagnosticMessages for BoundedRangeLikeFormatter {}
+    impl DiagnosticPolicy for BoundedRangeLikeFormatter {}
+    impl SourcePolicy for BoundedRangeLikeFormatter {}
+    impl OsvNaming for BoundedRangeLikeFormatter {}
+    impl DependencyFormatter for BoundedRangeLikeFormatter {
         type Dep = MockDep;
     }
 
@@ -1416,15 +1403,12 @@ mod tests {
         );
     }
 
-    /// Code review regression (S1 fix): a bare/open-ended-minimum floor requirement (like
-    /// NuGet's), whose raw matcher mathematically admits the fix (`Some(true)`) but whose
-    /// `bounded_requirement_already_resolves_to` override always reports `false` for floor shapes, must
-    /// still be `RequiresLockfileUpdate` — the matcher's `Some(true)` is not a confirmed
-    /// exclusion, so `NoOpRewrite` here means the declared floor already spells the fix
-    /// version, not that the shape is unsupported.
+    /// #2101: a requirement whose raw matcher admits the fix (`Some(true)`) but whose
+    /// `bounded_requirement_already_resolves_to` override reports `false` (NuGet bounded ranges
+    /// resolve to their lower bound, below the fix) is `Unfixable`, not `RequiresLockfileUpdate`:
+    /// no lock-only update can reach the fix.
     #[test]
-    fn test_classify_floor_requirement_matching_matcher_is_requires_lockfile_update_not_unfixable()
-    {
+    fn test_classify_requirement_admitted_but_resolving_below_the_fix_is_unfixable() {
         let dep = dep("foo", "1.5.2");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
@@ -1434,14 +1418,14 @@ mod tests {
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            FloorLikeFormatter,
+            BoundedRangeLikeFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
         assert_matches!(
             item.outcome,
-            Outcome::RequiresLockfileUpdate { .. },
-            "expected RequiresLockfileUpdate, got {:?}",
+            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. }),
+            "expected Unfixable(UnsupportedRequirementShape), got {:?}",
             item.outcome
         );
     }

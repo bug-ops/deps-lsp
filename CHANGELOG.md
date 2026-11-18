@@ -31,9 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `DependencyKind` enum, `Dependency::kind()` (defaults to `None`), `star_glob`, `fs_probe::{read_capped_no_follow, write_atomic_bytes}` and `osv::{OsvEndpoint, OsvEndpointError}` (#2072, #2074, #2096)
 - **behavior**: `update --lockfile regenerate` now runs `uv`, `bundle` and `deno` for `uv.lock`, `Gemfile.lock` and `deno.lock`, and npm or pnpm workspace members and Go workspaces no longer report `unsupported` (#2046, #2047, #2096)
 
-- **deps-cli**: report JSON tokens `ecosystem-deferred`, `npm-client-deferred` and `go-vendored` and the `ecosystem`/`client` detail values are removed, with `UnsupportedReason::{EcosystemDeferred, NpmClientDeferred, GoVendored}`, `LockfileSupport::Deferred`, `PrError::UnsupportedEcosystem`, `Program::Pipenv` and `ClientToken` (#2076, #2078, #2081-#2086, #2106)
+- **deps-cli**: report JSON tokens `ecosystem-deferred`, `npm-client-deferred` and `go-vendored` and the `ecosystem`/`client` detail values are removed, with `UnsupportedReason::{EcosystemDeferred, NpmClientDeferred, GoVendored}`, `LockfileSupport::Deferred`, `PrError::UnsupportedEcosystem` and `ClientToken` (#2076, #2078, #2081-#2086, #2106)
 - **deps-cli**: `pr::restore` and `regenerate_lockfile_unlistened` take the run and the repository root, `PullRequestText::publishable_paths` becomes `scope`, and `SupersedeReport::listing_full` becomes `coverage` (#2088, #2079, #2090, #2106)
 - **deps-core, ecosystem crates**: `EcosystemFormatter` gains a defaulted `compare_versions` (#2093, #2106)
+- **deps-cli**: new public `RegenerationError::{Io, FallbackPinNotKept}`, `IoOperation`, `RekeyRefusal`, `FailureKind::{Io, FallbackPinNotKept}` (wire kinds `io`, `fallback-pin-not-kept`), `ToolToken::Pipenv` and `UnsupportedReason::SavedVirtualenv` (wire token `saved-virtualenv`) (#2114)
+- **deps-cli**: `UnsupportedReason::PythonLockerDeferred`, the `python-locker-deferred` token, `UnsupportedDetail::Locker` and `LockerToken` are removed (#2114)
+- **behavior**: NuGet bounded ranges (e.g. `[1.0,2.0)`) under `--security-only` move from `requires-lockfile-update` to `unfixable` unless the fix is the range's inclusive lower bound (#2101, #2114)
+- **behavior**: `update --lockfile regenerate` reports file-operation failures as `io` instead of `manifest-changed` or `spawn`, and a failed manifest write-back restores the lock snapshot (#2104, #2105, #2114)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
@@ -64,9 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `update --open-pr --close-superseded` closes earlier deps-cli pull requests that the new one supersedes (#2073, #2096)
 - **deps-core, deps-cli**: `DEPS_OSV_BASE_URL` points OSV queries at an operator-chosen server, a testing aid read only from the environment (#2074, #2096)
 
-- **deps-cli**: `update --lockfile regenerate` runs Poetry, PDM, Composer, Dart and Flutter, NuGet, Gradle, SwiftPM, Bun, Yarn Berry workspace members and Go vendored modules; Yarn Classic and Pipenv stay refused (#2076, #2078, #2080-#2086, #2106)
+- **deps-cli**: `update --lockfile regenerate` runs Poetry, PDM, Composer, Dart and Flutter, NuGet, Gradle, SwiftPM, Bun, Yarn Berry workspace members and Go vendored modules; Yarn Classic stays refused (#2076, #2078, #2080-#2086, #2106)
 - **deps-cli**: `update --open-pr` publishes npm and pnpm workspace members and stages the real lock file of Cargo members (#2079, #2088, #2106)
 - **deps-cli**: cooldown-fallback targets are pinned exactly for npm, pnpm, Bun and Bundler, and Cargo reports a typed `fallback-pin-rejected` failure (#2077, #2087, #2106)
+- **deps-cli**: `update --lockfile regenerate` pins cooldown-fallback targets for Yarn Berry and Deno by re-keying the lock before the second install (#2097, #2114)
+- **deps-cli**: `update --lockfile regenerate` applies lock-file-only fixes for Bun (`bun update --lockfile-only`, `package.json` restored, then `bun install --lockfile-only`) (#2098, #2114)
+- **deps-cli**: `update --lockfile regenerate` regenerates `Pipfile.lock` with `pipenv upgrade --lock-only`, leaving the `Pipfile` untouched (#2099, #2114)
 
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
@@ -79,6 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: `release.yml` and `live-registry-tests.yml` use `dtolnay/rust-toolchain` and `Swatinem/rust-cache` with main-only saves instead of `moonrepo/setup-rust` (#2058, #2061)
 - **ci**: Windows doctests run on shard 1 for PRs, and `release.yml` honors the `workflow_dispatch` `tag` input for checkout, version and release tag (#2059, #2060, #2063)
 - **workspace**: removed 64 redundant tests (cross-crate duplicates of deps-core, constructor-only and derive-only tests) (#2064)
+- **deps-cli**: NuGet regeneration of a mixed plan restores only the edit pins and leaves lock-file-only pins untouched; the per-package lock-only mechanism is not part of this change (#2100, #2114)
+- **deps-cli**: `update --open-pr --close-superseded` comments on a superseded GitLab merge request through `glab api` instead of the deprecated `glab mr note` (#2103, #2114)
 
 ### Documentation
 - **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)

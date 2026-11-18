@@ -350,22 +350,23 @@ impl RequirementResolution for NuGetFormatter {
     /// (`compile_bounded_requirement(..).matches(target)`, true for any version at or above the
     /// floor) would wrongly say "no edit needed" for exactly the shape that needs one, since
     /// leaving the manifest unedited keeps restoring the vulnerable floor version (#1344 C1).
-    /// Every other shape (exact pins, bounded/maximum ranges, floating patterns like `1.1.*`)
-    /// already expresses a genuine forward-compatibility window, so those keep the base
-    /// default via `compile_bounded_requirement`.
+    /// A bounded or maximum range (`[1.0,2.0)`) resolves the same way (#2101): restore picks its
+    /// lowest admissible member, so any non-floating requirement resolves to `target` only when
+    /// `target` is an exact pin or the inclusive lower bound (a floor equal to `target` already
+    /// spells the fix). Floating patterns (`1.1.*`) genuinely follow forward and keep the
+    /// matcher's answer.
     fn bounded_requirement_already_resolves_to(
         &self,
         requirement: BoundedVersionReq<'_>,
         target: &ConcreteVersion,
     ) -> bool {
         let requirement_str = requirement.as_str();
-        let is_floor = !requirement_str.contains('*')
-            && crate::version::compare_minimum_floor(requirement_str, target.as_str()).is_some();
-        if is_floor {
-            return false;
+        if requirement_str.contains('*') {
+            return self
+                .compile_bounded_requirement(requirement)
+                .is_some_and(|matcher| matcher.matches(target) == Some(true));
         }
-        self.compile_bounded_requirement(requirement)
-            .is_some_and(|matcher| matcher.matches(target) == Some(true))
+        crate::version::inclusive_lower_bound_equals(requirement_str, target.as_str())
     }
 }
 
@@ -1077,12 +1078,16 @@ mod tests {
     }
 
     #[test]
-    fn test_requirement_already_resolves_to_bounded_range_admitting_target_is_true() {
+    fn test_requirement_already_resolves_to_bounded_range_only_at_its_inclusive_lower_bound() {
         let f = NuGetFormatter;
-        // A bounded range genuinely expresses a forward-compatibility window — the resolver
-        // can pick the fix target from within it without any manifest edit.
-        assert!(f.requirement_already_resolves_to(
+        // #2101: restore picks the lowest admissible member, so a target above the lower bound
+        // is not reached without a manifest edit.
+        assert!(!f.requirement_already_resolves_to(
             &VersionReq::new("[1.0.0,2.0.0)"),
+            &ConcreteVersion::new("1.0.2")
+        ));
+        assert!(f.requirement_already_resolves_to(
+            &VersionReq::new("[1.0.2,2.0.0)"),
             &ConcreteVersion::new("1.0.2")
         ));
     }

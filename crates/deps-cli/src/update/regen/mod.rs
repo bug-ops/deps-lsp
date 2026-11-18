@@ -23,6 +23,7 @@ mod nuget;
 #[cfg(all(test, unix))]
 mod process_group_tests;
 mod python;
+mod rekey;
 mod run;
 mod swift;
 #[cfg(test)]
@@ -48,6 +49,7 @@ use url::Url;
 use command::{ArgComponent, Invocation, NpmPackageArg};
 pub use command::{NpmClient, Program, PythonLocker};
 pub(in crate::update) use interrupt::Interrupts;
+pub use rekey::RekeyRefusal;
 pub(in crate::update) use run::{ChildGuard, ProcessGroup};
 use run::{SearchPath, ToolRunner};
 
@@ -211,10 +213,11 @@ pub enum UnsupportedReason {
     LockfileSymlink,
     /// The project uses Yarn Classic (1.x), which has no lockfile-only mode.
     YarnClassic,
-    /// The lockfile belongs to Pipenv, which is not supported yet.
-    PythonLockerDeferred,
     /// The lock file or a companion path resolves outside the repository.
     LockfileOutsideRepository,
+    /// A `.venv` file or symlink in the project directory would select a repository-chosen
+    /// interpreter for the tool to run.
+    SavedVirtualenv,
     /// The project uses a legacy lock layout the tool cannot update safely.
     LegacyLockLayout,
     /// The project centralizes package versions outside the edited manifest.
@@ -228,6 +231,36 @@ pub enum UnsupportedReason {
     /// Other dependencies of the project have floating or range requirements the tool would
     /// re-resolve as a side effect of the run.
     OtherFloatingRequirements,
+}
+
+/// A file operation of a regeneration run, named as a verb phrase for error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoOperation {
+    /// Writing the manifest with exact pins for the cooldown-fallback targets.
+    WriteExactPinManifest,
+    /// Writing the declared requirements back into the manifest.
+    WriteBackManifest,
+    /// Rewriting the lock file.
+    RewriteLockfile,
+    /// Creating the scratch directory for a vendor refresh.
+    CreateScratchDirectory,
+    /// Moving the vendor directory aside.
+    MoveVendorAside,
+    /// Moving the refreshed vendor directory into place.
+    MoveVendorIntoPlace,
+}
+
+impl fmt::Display for IoOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::WriteExactPinManifest => "write the exact-pin manifest",
+            Self::WriteBackManifest => "write back the manifest",
+            Self::RewriteLockfile => "rewrite the lock file",
+            Self::CreateScratchDirectory => "create a scratch directory in",
+            Self::MoveVendorAside => "move aside the vendor directory",
+            Self::MoveVendorIntoPlace => "move the refreshed vendor directory into place at",
+        })
+    }
 }
 
 /// Why a regeneration that started did not produce a verified lockfile.
@@ -347,6 +380,33 @@ pub enum RegenerationError {
         /// The manifest's display path.
         path: PathBuf,
     },
+    /// A file operation of the run failed.
+    #[error("could not {operation} {}: {source}", path.display())]
+    Io {
+        /// The operation that failed.
+        operation: IoOperation,
+        /// The display path the operation addressed.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// A cooldown-fallback pin could not be kept in the lock file after the manifest write-back.
+    #[error(
+        "{} could not be kept at the cooldown-fallback target {} in {}: {reason}",
+        package.as_str(),
+        target.as_str(),
+        path.display()
+    )]
+    FallbackPinNotKept {
+        /// The package whose pin was not kept.
+        package: PackageName,
+        /// The cooldown-fallback target.
+        target: ConcreteVersion,
+        /// The lock file's display path.
+        path: PathBuf,
+        /// Why the lock file could not be re-keyed.
+        reason: RekeyRefusal,
+    },
 }
 
 impl RegenerationError {
@@ -437,9 +497,9 @@ ancestor declares a workspace, or the workspace directory is set through the env
             Self::YarnClassic => f.write_str(
                 "Yarn Classic (1.x) has no lockfile-only mode; only Yarn 2+ is supported",
             ),
-            Self::PythonLockerDeferred => {
-                f.write_str("regeneration is not supported for pipenv yet")
-            }
+            Self::SavedVirtualenv => f.write_str(
+                "the project directory has a .venv file or symlink that would select an interpreter to run",
+            ),
             Self::LockfileOutsideRepository => {
                 f.write_str("the lockfile or a file the tool writes is outside the repository")
             }
@@ -551,7 +611,7 @@ pub(super) fn supported_tools_text() -> String {
             Strategy::Cargo => ["Cargo"].as_slice(),
             Strategy::NpmFamily => ["npm", "pnpm", "Yarn 2+", "Bun"].as_slice(),
             Strategy::Go => ["Go"].as_slice(),
-            Strategy::Pypi => ["uv", "Poetry", "PDM"].as_slice(),
+            Strategy::Pypi => ["uv", "Poetry", "PDM", "Pipenv"].as_slice(),
             Strategy::Bundler => ["Bundler"].as_slice(),
             Strategy::Deno => ["Deno"].as_slice(),
             Strategy::Composer => ["Composer"].as_slice(),
@@ -593,6 +653,7 @@ enum PinOrigin {
 }
 
 /// One update to verify, deduplicated by `(normalized, target)`.
+#[derive(Clone)]
 struct LockPin {
     package: PackageName,
     normalized: NormalizedName,
@@ -902,7 +963,9 @@ const fn restore_after(error: &RegenerationError) -> bool {
         | RegenerationError::LockfileUnreadable { .. }
         | RegenerationError::VersionMismatch { .. }
         | RegenerationError::FallbackPinRejected { .. }
-        | RegenerationError::ManifestChanged { .. } => true,
+        | RegenerationError::ManifestChanged { .. }
+        | RegenerationError::Io { .. }
+        | RegenerationError::FallbackPinNotKept { .. } => true,
         RegenerationError::SnapshotFailed { .. } | RegenerationError::RestoreFailed { .. } => false,
     }
 }
@@ -1116,27 +1179,43 @@ impl Session<'_> {
         })
     }
 
-    async fn verify_pins(
-        &self,
-        check: PinCheck,
-        lockfile: &DisplayLockPath,
-    ) -> Result<Vec<PinReport>, RegenerationError> {
-        let reparse_failed = || RegenerationError::ManifestReparseFailed {
+    fn reparse_failed(&self) -> RegenerationError {
+        RegenerationError::ManifestReparseFailed {
             path: self.target.display_path.to_path_buf(),
-        };
-        let content = deps_core::fs_probe::read_to_string_capped_no_follow(
+        }
+    }
+
+    /// Reads the manifest with the size cap and without following symlinks.
+    fn read_manifest_text(&self) -> Result<String, RegenerationError> {
+        deps_core::fs_probe::read_to_string_capped_no_follow(
             self.target.manifest_path,
             crate::MAX_MANIFEST_FILE_SIZE,
         )
         .ok()
         .flatten()
-        .ok_or_else(reparse_failed)?;
-        let parsed = deps_core::ecosystem::parse_manifest_now(
-            self.target.ecosystem,
-            &content,
-            self.target.uri,
-        )
-        .ok_or_else(reparse_failed)?;
+        .ok_or_else(|| self.reparse_failed())
+    }
+
+    /// Parses manifest `text` with the target's ecosystem.
+    fn parse_manifest_text(
+        &self,
+        text: &str,
+    ) -> Result<Box<dyn deps_core::ParsedManifest>, RegenerationError> {
+        deps_core::ecosystem::parse_manifest_now(self.target.ecosystem, text, self.target.uri)
+            .ok_or_else(|| self.reparse_failed())
+    }
+
+    /// Reads and parses the manifest as it is on disk now.
+    fn reparse_manifest(&self) -> Result<Box<dyn deps_core::ParsedManifest>, RegenerationError> {
+        self.parse_manifest_text(&self.read_manifest_text()?)
+    }
+
+    async fn verify_pins(
+        &self,
+        check: PinCheck,
+        lockfile: &DisplayLockPath,
+    ) -> Result<Vec<PinReport>, RegenerationError> {
+        let parsed = self.reparse_manifest()?;
 
         let load = load_resolved_versions(
             self.target.uri,

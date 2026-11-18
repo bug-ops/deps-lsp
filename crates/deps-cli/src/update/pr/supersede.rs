@@ -544,10 +544,12 @@ impl Host<'_> {
             PrHost::Gitlab => (
                 vec!["mr".to_owned(), "close".to_owned(), id.clone()],
                 vec![
-                    "mr".to_owned(),
-                    "note".to_owned(),
-                    id,
-                    format!("--message={comment}"),
+                    "api".to_owned(),
+                    "--method".to_owned(),
+                    "POST".to_owned(),
+                    format!("projects/:id/merge_requests/{id}/notes"),
+                    "-f".to_owned(),
+                    format!("body={comment}"),
                 ],
             ),
         };

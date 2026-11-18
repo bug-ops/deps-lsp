@@ -1,5 +1,5 @@
 //! #2071 / #2046 / #2047 / #2088: JSON wire tokens of the lockfile section for the refusal and
-//! failure kinds (`yarn-classic`, `python-locker-deferred`, `snapshot-failed`, `restore-failed`,
+//! failure kinds (`yarn-classic`, `snapshot-failed`, `restore-failed`,
 //! the containment, lock-set and lock-only refusals, and the fallback and manifest failures).
 //! The token spellings are a public contract, so they are pinned. Values are compared as
 //! `serde_json::Value`, because key order depends on serde_json's `preserve_order` feature, which
@@ -42,17 +42,17 @@ fn yarn_classic_token() {
 }
 
 #[test]
-fn python_locker_deferred_token() {
+fn saved_virtualenv_token() {
     assert_eq!(
         lockfile_json(LockfileOutcome::Unsupported {
             lockfile: None,
-            reason: UnsupportedReason::PythonLockerDeferred,
+            reason: UnsupportedReason::SavedVirtualenv,
         }),
         json!({
             "status": "unsupported",
-            "reason": "python-locker-deferred",
+            "reason": "saved-virtualenv",
             "path": null,
-            "detail": "pipenv"
+            "detail": null
         })
     );
 }

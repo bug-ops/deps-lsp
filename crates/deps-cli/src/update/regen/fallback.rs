@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use deps_core::NormalizeName;
 use deps_core::edit::{ManifestEdit, apply_edits};
 
+use super::rekey::{self, LockRekey};
 use super::{
-    Invocation, LockfileOutcome, PinCheck, Program, RegenerationError, Session, UnsupportedReason,
-    unsafe_argument, unsupported,
+    Invocation, IoOperation, LockfileOutcome, PinCheck, Program, RegenerationError, Session,
+    UnsupportedReason, unsafe_argument, unsupported,
 };
 
 /// A manifest as it was before the first writing spawn.
@@ -53,6 +54,34 @@ pub(super) struct ExactPinRun<'a> {
     pub(super) install: &'a Invocation,
     /// Moves lockfile-only pins that are not cooldown fallbacks, when there are any.
     pub(super) update: Option<&'a Invocation>,
+    /// How the lock file follows the manifest back to its declared requirements.
+    pub(super) relax: Relax,
+    /// Other manifests the tool may re-serialize, captured before the first writing spawn.
+    pub(super) siblings: &'a [CapturedManifest],
+}
+
+/// How the lock file is brought back in line with the declared requirements.
+#[derive(Clone, Copy)]
+pub(super) enum Relax {
+    /// The second install re-resolves the declared range to the pinned version on its own.
+    Reinstall,
+    /// The lock is keyed by requirement, so its pinned keys are renamed before the second install.
+    Rekey(DescriptorLock),
+}
+
+/// A lock file format keyed by the declared requirement.
+#[derive(Clone, Copy)]
+pub(super) enum DescriptorLock {
+    /// Yarn Berry's `yarn.lock` entry headers.
+    YarnBerry,
+    /// Deno's `deno.lock` specifiers.
+    Deno,
+}
+
+/// The exact-pin manifest text and the lock keys to rename back once it is restored.
+struct ExactPins {
+    text: String,
+    rekeys: Vec<LockRekey>,
 }
 
 impl Session<'_> {
@@ -146,7 +175,7 @@ impl Session<'_> {
         self.capture(&[run.lockfile, run.manifest])?;
         let original = self.read_manifest(run.manifest)?;
 
-        let Some(pinned) = self.exact_pinned_text(&original.bytes)? else {
+        let Some(pinned) = self.exact_pinned_text(&original.bytes, run.relax)? else {
             return Ok(unsupported(
                 Some(self.display_lock_path(run.lockfile)),
                 UnsupportedReason::CooldownFallbackTarget,
@@ -157,47 +186,104 @@ impl Session<'_> {
             manifest: &original,
             armed: true,
         };
-        deps_core::fs_probe::write_atomic_bytes(&original.path, pinned.as_bytes()).map_err(
-            |_| RegenerationError::ManifestChanged {
-                path: original.display.clone(),
-            },
-        )?;
-        self.runner.run(run.install, self.deadline).await?;
-        if let Some(update) = run.update {
-            self.runner.run(update, self.deadline).await?;
-        }
-        deps_core::fs_probe::write_atomic_bytes(&original.path, &original.bytes).map_err(
-            |source| RegenerationError::RestoreFailed {
-                cause: Box::new(RegenerationError::ManifestChanged {
-                    path: original.display.clone(),
-                }),
+        deps_core::fs_probe::write_atomic_bytes(&original.path, pinned.text.as_bytes()).map_err(
+            |source| RegenerationError::Io {
+                operation: IoOperation::WriteExactPinManifest,
                 path: original.display.clone(),
                 source,
             },
         )?;
+        // Lockfile-only pins that are not fallbacks move through `update` alone.
+        if self
+            .pins
+            .iter()
+            .any(|pin| !pin.is_lockfile_only() || pin.cooldown_fallback)
+        {
+            self.runner.run(run.install, self.deadline).await?;
+        }
+        if let Some(update) = run.update {
+            self.runner.run(update, self.deadline).await?;
+        }
+        deps_core::fs_probe::write_atomic_bytes(&original.path, &original.bytes).map_err(
+            |source| RegenerationError::Io {
+                operation: IoOperation::WriteBackManifest,
+                path: original.display.clone(),
+                source,
+            },
+        )?;
+        if let Relax::Rekey(lock) = run.relax {
+            self.rekey_lock(lock, run.lockfile, &pinned.rekeys)?;
+        }
         self.runner.run(run.install, self.deadline).await?;
-        self.restore_formatting(std::iter::once(&original))?;
+        self.restore_formatting(std::iter::once(&original).chain(run.siblings))?;
         guard.armed = false;
         self.verified(run.tool, run.lockfile, PinCheck::SatisfiesInLock)
             .await
     }
 
-    /// The manifest text with every cooldown-fallback package's single declaration rewritten to
-    /// an exact pin; `None` when one has no declaration, several, or no exact rendering.
-    fn exact_pinned_text(&self, bytes: &[u8]) -> Result<Option<String>, RegenerationError> {
-        let reparse_failed = || RegenerationError::ManifestReparseFailed {
-            path: self.target.display_path.to_path_buf(),
-        };
-        let content = std::str::from_utf8(bytes).map_err(|_| reparse_failed())?;
-        let parsed = deps_core::ecosystem::parse_manifest_now(
-            self.target.ecosystem,
-            content,
-            self.target.uri,
+    /// Renames the pinned keys of the lock file back to the declared requirements.
+    ///
+    /// # Errors
+    ///
+    /// [`RegenerationError::FallbackPinNotKept`] for the first pin the lock does not hold in a
+    /// renameable form, and [`RegenerationError::Io`] when the lock file cannot be rewritten.
+    fn rekey_lock(
+        &self,
+        lock: DescriptorLock,
+        lockfile: &Path,
+        rekeys: &[LockRekey],
+    ) -> Result<(), RegenerationError> {
+        if rekeys.is_empty() {
+            return Ok(());
+        }
+        let display = self.display_lock_path(lockfile).shown;
+        let text = deps_core::fs_probe::read_to_string_capped_no_follow(
+            lockfile,
+            deps_core::lockfile::MAX_LOCKFILE_BYTES,
         )
-        .ok_or_else(reparse_failed)?;
+        .ok()
+        .flatten()
+        .ok_or_else(|| RegenerationError::LockfileUnreadable {
+            path: display.clone(),
+        })?;
+        let mut renamed = text;
+        for rekey in rekeys {
+            let one = std::slice::from_ref(rekey);
+            renamed = match lock {
+                DescriptorLock::YarnBerry => rekey::yarn(&renamed, one),
+                DescriptorLock::Deno => rekey::deno(&renamed, one),
+            }
+            .map_err(|reason| RegenerationError::FallbackPinNotKept {
+                package: rekey.package.clone(),
+                target: rekey.pinned.clone(),
+                path: display.clone(),
+                reason,
+            })?;
+        }
+        deps_core::fs_probe::write_atomic_bytes(lockfile, renamed.as_bytes()).map_err(|source| {
+            RegenerationError::Io {
+                operation: IoOperation::RewriteLockfile,
+                path: display,
+                source,
+            }
+        })
+    }
+
+    /// The manifest text with every cooldown-fallback package's single declaration rewritten to
+    /// an exact pin, and the lock keys to rename back when `relax` re-keys; `None` when one has no
+    /// declaration, several, no exact rendering, or (when re-keying) a declared requirement
+    /// that is not a plain range.
+    fn exact_pinned_text(
+        &self,
+        bytes: &[u8],
+        relax: Relax,
+    ) -> Result<Option<ExactPins>, RegenerationError> {
+        let content = std::str::from_utf8(bytes).map_err(|_| self.reparse_failed())?;
+        let parsed = self.parse_manifest_text(content)?;
         let formatter = self.target.ecosystem.formatter();
 
         let mut edits = Vec::new();
+        let mut rekeys = Vec::new();
         for pin in self.pins.iter().filter(|pin| pin.cooldown_fallback) {
             if !pin.target.as_str().chars().all(is_version_char) {
                 return Err(unsafe_argument(pin));
@@ -222,8 +308,23 @@ impl Session<'_> {
                 return Ok(None);
             };
             edits.push(ManifestEdit { range, new_text });
+            if matches!(relax, Relax::Rekey(_)) {
+                if !rekey::is_plain_range(current.as_str()) {
+                    return Ok(None);
+                }
+                if current.as_str() != pin.target.as_str() {
+                    rekeys.push(LockRekey {
+                        package: pin.package.clone(),
+                        pinned: pin.target.clone(),
+                        declared: current.clone(),
+                    });
+                }
+            }
         }
-        Ok(Some(apply_edits(content, &edits)))
+        Ok(Some(ExactPins {
+            text: apply_edits(content, &edits),
+            rekeys,
+        }))
     }
 }
 

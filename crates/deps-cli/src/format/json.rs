@@ -9,8 +9,8 @@
 use super::DryRun;
 use crate::report::{Category, CheckReport};
 use crate::update::regen::{
-    LockfileOutcome, NotApplicableReason, PinResolution, Program, PythonLocker, RegenerationError,
-    SkipCause, UnsupportedReason,
+    LockfileOutcome, NotApplicableReason, PinResolution, Program, RegenerationError, SkipCause,
+    UnsupportedReason,
 };
 use deps_core::EcosystemId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -356,6 +356,8 @@ pub enum ToolToken {
     Poetry,
     /// `pdm`.
     Pdm,
+    /// `pipenv`.
+    Pipenv,
     /// `composer`.
     Composer,
     /// `dart`.
@@ -384,6 +386,7 @@ impl From<Program> for ToolToken {
             Program::Bun => Self::Bun,
             Program::Poetry => Self::Poetry,
             Program::Pdm => Self::Pdm,
+            Program::Pipenv => Self::Pipenv,
             Program::Composer => Self::Composer,
             Program::Dart => Self::Dart,
             Program::Flutter => Self::Flutter,
@@ -457,10 +460,10 @@ pub enum UnsupportedToken {
     LockfileSymlink,
     /// The project uses Yarn Classic (1.x).
     YarnClassic,
-    /// The Python locker is not supported yet.
-    PythonLockerDeferred,
     /// The lock file resolves outside the repository.
     LockfileOutsideRepository,
+    /// A `.venv` file or symlink in the project directory selects an interpreter to run.
+    SavedVirtualenv,
     /// The project uses a legacy lock layout the tool cannot update safely.
     LegacyLockLayout,
     /// The project centralizes package versions outside the edited manifest.
@@ -509,6 +512,10 @@ pub enum FailureKind {
     FallbackPinRejected,
     /// The manifest changed during the run in a way the run did not make.
     ManifestChanged,
+    /// A file operation of the run failed.
+    Io,
+    /// A cooldown-fallback pin could not be kept in the lock file after the manifest write-back.
+    FallbackPinNotKept,
 }
 
 impl From<&RegenerationError> for FailureKind {
@@ -529,44 +536,16 @@ impl From<&RegenerationError> for FailureKind {
             RegenerationError::RestoreFailed { .. } => Self::RestoreFailed,
             RegenerationError::FallbackPinRejected { .. } => Self::FallbackPinRejected,
             RegenerationError::ManifestChanged { .. } => Self::ManifestChanged,
+            RegenerationError::Io { .. } => Self::Io,
+            RegenerationError::FallbackPinNotKept { .. } => Self::FallbackPinNotKept,
         }
     }
 }
 
-/// The Python locker an `unsupported` report refers to, as a JSON token.
-#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LockerToken {
-    /// uv.
-    Uv,
-    /// Poetry.
-    Poetry,
-    /// PDM.
-    Pdm,
-    /// Pipenv.
-    Pipenv,
-}
-
-impl From<PythonLocker> for LockerToken {
-    fn from(locker: PythonLocker) -> Self {
-        match locker {
-            PythonLocker::Uv => Self::Uv,
-            PythonLocker::Poetry => Self::Poetry,
-            PythonLocker::Pdm => Self::Pdm,
-            PythonLocker::Pipenv => Self::Pipenv,
-        }
-    }
-}
-
-/// What an `unsupported` reason refers to; every shape is a bare string on the wire.
-///
-/// The token sets overlap (`"poetry"`, `"uv"`, ...), so an untagged string deserializes as the
-/// earlier variant. This is harmless: the `reason` token beside `detail` says which one it is.
+/// What an `unsupported` reason refers to; it is a bare string on the wire.
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum UnsupportedDetail {
-    /// The Python locker whose regeneration is deferred.
-    Locker(LockerToken),
     /// The tool a lock-only or version refusal names.
     ///
     /// The `reason` token beside `detail` says which namespace it belongs to, so the overlapping
@@ -676,10 +655,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     }
                     UnsupportedReason::LockfileSymlink => (UnsupportedToken::LockfileSymlink, None),
                     UnsupportedReason::YarnClassic => (UnsupportedToken::YarnClassic, None),
-                    UnsupportedReason::PythonLockerDeferred => (
-                        UnsupportedToken::PythonLockerDeferred,
-                        Some(UnsupportedDetail::Locker(LockerToken::Pipenv)),
-                    ),
+                    UnsupportedReason::SavedVirtualenv => (UnsupportedToken::SavedVirtualenv, None),
                     UnsupportedReason::LockfileOutsideRepository => {
                         (UnsupportedToken::LockfileOutsideRepository, None)
                     }
@@ -734,7 +710,9 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::SnapshotFailed { .. }
                     | RegenerationError::RestoreFailed { .. }
                     | RegenerationError::FallbackPinRejected { .. }
-                    | RegenerationError::ManifestChanged { .. } => (None, None, None),
+                    | RegenerationError::ManifestChanged { .. }
+                    | RegenerationError::Io { .. }
+                    | RegenerationError::FallbackPinNotKept { .. } => (None, None, None),
                 };
                 Self::Failed {
                     kind: error.into(),

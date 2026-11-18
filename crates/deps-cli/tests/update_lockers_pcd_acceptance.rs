@@ -299,24 +299,21 @@ fn pdm_cooldown_fallback_target_is_refused_before_any_spawn() {
 }
 
 #[test]
-fn pipenv_stays_a_deferred_locker_without_a_spawn() {
+fn pipenv_with_a_venv_file_is_refused_before_any_spawn() {
     let ran = run(&case(
         "pypi",
         "Pipfile",
         vec![
             ("Pipfile", "[packages]\nrequests = \">=2.0\"\n"),
             ("Pipfile.lock", "{}"),
+            (".venv", "evilvenv"),
         ],
         vec![("pipenv", "exit 0")],
         "edit",
         "requests|requests|>=2.0|>=2.31.0|2.0.0|2.31.0",
     ));
 
-    assert!(
-        ran.outcome.contains("PythonLockerDeferred"),
-        "{}",
-        ran.outcome
-    );
+    assert!(ran.outcome.contains("SavedVirtualenv"), "{}", ran.outcome);
     assert!(ran.calls.is_empty(), "{:?}", ran.calls);
 }
 

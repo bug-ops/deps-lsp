@@ -671,20 +671,6 @@ fn bun_manifest_edit_runs_the_lockfile_only_install_with_scripts_disabled() {
 }
 
 #[test]
-fn bun_lockfile_only_pin_is_refused_without_a_spawn() {
-    let body = bun_body();
-
-    let ran = run(&bun_case(&body, "lockonly", MINIMIST_LOCK_ONLY));
-
-    assert!(
-        ran.outcome.contains("LockfileOnlyUpdateUnsupported(Bun)"),
-        "{}",
-        ran.outcome
-    );
-    assert!(ran.calls.is_empty(), "{:?}", ran.calls);
-}
-
-#[test]
 fn bun_workspace_member_is_refused_without_a_spawn() {
     let body = bun_body();
 
@@ -867,23 +853,4 @@ fn bun_fallback_pin_installs_twice_around_the_exact_pin() {
     let log = seen(&ran);
     assert!(log.contains("\"minimist\": \"1.2.8\""), "{log}");
     assert!(ran.outcome.starts_with("Regenerated"), "{}", ran.outcome);
-}
-
-#[test]
-fn yarn_keeps_refusing_a_cooldown_fallback_target_without_a_spawn() {
-    let yarn = run(&fallback(yarn_member_case(
-        "exit 0",
-        "lockonly",
-        MINIMIST_LOCK_ONLY,
-    )));
-    assert!(
-        yarn.outcome.contains("CooldownFallbackTarget"),
-        "{}",
-        yarn.outcome
-    );
-    assert!(
-        writing_calls(&yarn, "yarn", YARN_PROBES).is_empty(),
-        "{:?}",
-        yarn.calls
-    );
 }

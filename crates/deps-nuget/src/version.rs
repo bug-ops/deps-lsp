@@ -256,6 +256,27 @@ pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering
     }
 }
 
+/// Whether restoring `range` lands exactly on `version`: `range` is an exact pin of it, or an
+/// interval whose *inclusive* lower bound equals it under NuGet normalization (`1.2` == `1.2.0`).
+///
+/// NuGet restore picks the lowest applicable version, so only these shapes resolve to `version`
+/// without a manifest edit. Fail-safe: a version above the lower bound is never reported, even
+/// when the interval admits it. Returns `false` for unparseable input and floating patterns.
+pub(crate) fn inclusive_lower_bound_equals(range: &str, version: &str) -> bool {
+    if range.contains('*') {
+        return false;
+    }
+    let wanted = ParsedVersion::parse(version);
+    match parse_range(range) {
+        Some(VersionRange::Exact(v)) => compare_parsed(&v, &wanted) == Ordering::Equal,
+        Some(VersionRange::Interval(iv)) => matches!(
+            iv.lower(),
+            Bound::Included(v) if compare_parsed(v, &wanted) == Ordering::Equal
+        ),
+        Some(VersionRange::Empty) | None => false,
+    }
+}
+
 /// Whether `version` falls inside an already-parsed NuGet interval `range`.
 pub(crate) fn range_contains(version: &str, range: &VersionRange) -> bool {
     range_contains_parsed(&ParsedVersion::parse(version), range)
@@ -556,6 +577,16 @@ mod tests {
         assert!(satisfies("1.0.0", "1.0"));
         assert!(satisfies("2.0.0", "1.0"));
         assert!(!satisfies("0.9.0", "1.0"));
+    }
+
+    #[test]
+    fn test_inclusive_lower_bound_equals() {
+        assert!(inclusive_lower_bound_equals("[1.0,2.0)", "1.0.0"));
+        assert!(inclusive_lower_bound_equals("[1.0.2]", "1.0.2"));
+        assert!(!inclusive_lower_bound_equals("[1.0,2.0)", "1.5.0"));
+        assert!(!inclusive_lower_bound_equals("(1.0,2.0)", "1.0.0"));
+        assert!(!inclusive_lower_bound_equals("1.0.*", "1.0.0"));
+        assert!(!inclusive_lower_bound_equals("not a range", "1.0.0"));
     }
 
     #[test]

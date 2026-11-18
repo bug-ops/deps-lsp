@@ -16,16 +16,7 @@ impl Session<'_> {
             Located::Beside(path) => path,
             Located::Stop(outcome) => return Ok(outcome),
         };
-        let reparse_failed = || RegenerationError::ManifestReparseFailed {
-            path: self.target.display_path.to_path_buf(),
-        };
-        let text = deps_core::fs_probe::read_to_string_capped_no_follow(
-            self.target.manifest_path,
-            crate::MAX_MANIFEST_FILE_SIZE,
-        )
-        .ok()
-        .flatten()
-        .ok_or_else(reparse_failed)?;
+        let text = self.read_manifest_text()?;
         if declares_workspace_resolution(&text) {
             return Ok(unsupported(
                 Some(self.display_lock_path(&located)),
@@ -45,9 +36,7 @@ impl Session<'_> {
                 NotApplicableReason::NothingApplied,
             ));
         }
-        let parsed =
-            deps_core::ecosystem::parse_manifest_now(self.target.ecosystem, &text, self.target.uri)
-                .ok_or_else(reparse_failed)?;
+        let parsed = self.parse_manifest_text(&text)?;
         let tool = if parsed.dependencies().iter().any(
             |dependency| matches!(dependency.source(), DependencySource::Sdk { sdk } if sdk == "flutter"),
         ) {

@@ -38,7 +38,11 @@ hand-rolls its own comparator (the same pattern `deps-maven` uses for Maven's ow
 An update keeps a stable floating version's wildcard and precision: `3.*` with a latest of
 5.0.0 becomes `5.*` and `1.1.*` becomes `1.2.*`. A bounded interval such as `[2.0.0,3.0.0)` has
 no update edit, so its diagnostic reads `Newer version outside the declared range (edit the
-bounds manually)` instead of promising a quick fix.
+bounds manually)` instead of promising a quick fix. Under `deps-cli update --security-only`, a bounded
+interval resolves to the fix only at its inclusive lower bound (`[1.5.2,)` with target `1.5.2`); any
+other bounded range is reported `unfixable` rather than `requires-lockfile-update`. With
+`--lockfile regenerate`, a plan that mixes manifest edits and lock-file-only pins regenerates for the
+edit pins and leaves the others untouched (see the CLI chapter).
 
 ## Private/Custom Feeds
 

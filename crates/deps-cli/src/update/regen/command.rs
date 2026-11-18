@@ -46,6 +46,8 @@ pub enum Program {
     Poetry,
     /// `pdm`.
     Pdm,
+    /// `pipenv`.
+    Pipenv,
     /// `composer` (`composer.bat` on Windows).
     Composer,
     /// `dart`.
@@ -76,6 +78,7 @@ impl Program {
             Self::Bun => "bun",
             Self::Poetry => "poetry",
             Self::Pdm => "pdm",
+            Self::Pipenv => "pipenv",
             Self::Composer => "composer",
             Self::Dart => "dart",
             Self::Flutter => "flutter",
@@ -95,6 +98,7 @@ impl Program {
             | Self::Bun
             | Self::Poetry
             | Self::Pdm
+            | Self::Pipenv
             | Self::Dart
             | Self::Dotnet
             | Self::Swift => self.as_str(),
@@ -193,7 +197,7 @@ pub enum PythonLocker {
     Poetry,
     /// PDM (`pdm.lock`).
     Pdm,
-    /// Pipenv (`Pipfile.lock`); regeneration is deferred.
+    /// Pipenv (`Pipfile.lock`).
     Pipenv,
 }
 
