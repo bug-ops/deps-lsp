@@ -22,6 +22,7 @@ pub mod lockfile;
 pub mod parser;
 pub mod range;
 pub mod types;
+pub mod version;
 
 pub use ecosystem::GradleEcosystem;
 pub use formatter::GradleFormatter;

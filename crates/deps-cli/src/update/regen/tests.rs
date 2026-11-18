@@ -36,9 +36,9 @@ use url::Url;
 use super::command::{ArgComponent, NpmClient, Program, compat_class};
 use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
-    LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, PinResolution,
-    RegenerationError, RegenerationGate, SkipCause, Strategy, UnsupportedReason,
-    regenerate_lockfile_with, strategy,
+    LockfileMode, LockfileOutcome, LockfileScope, ManifestTarget, NotApplicableReason,
+    PinResolution, RegenerationError, RegenerationGate, SkipCause, Strategy, UnsupportedReason,
+    regenerate_lockfile_with, regenerate_until, strategy,
 };
 use crate::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
@@ -208,6 +208,34 @@ async fn regenerate(
         uri: &uri,
     };
     regenerate_lockfile_with(plan, &target, gate, runner).await
+}
+
+/// Like [`regenerate`], but only for lock files inside `root`, as `--open-pr` runs.
+async fn regenerate_within(
+    id: EcosystemId,
+    manifest: &Path,
+    plan: &UpdatePlan,
+    runner: &ToolRunner,
+    root: &Path,
+) -> LockfileOutcome {
+    let ecosystem = ecosystem(id);
+    let uri = Url::from_file_path(manifest).expect("file url");
+    let display_path = PathBuf::from("Cargo.toml");
+    let target = ManifestTarget {
+        ecosystem: &ecosystem,
+        manifest_path: manifest,
+        display_path: &display_path,
+        uri: &uri,
+    };
+    regenerate_until(
+        plan,
+        &target,
+        run_gate(),
+        runner,
+        LockfileScope::Within(root),
+        std::future::pending(),
+    )
+    .await
 }
 
 fn pin_rows(outcome: &LockfileOutcome) -> Vec<(String, String, PinResolution)> {
@@ -447,7 +475,7 @@ fn test_update_exit_code_only_failed_lockfile_raises_to_execution_error() {
         LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
         LockfileOutcome::Unsupported {
             lockfile: None,
-            reason: UnsupportedReason::GoVendored,
+            reason: UnsupportedReason::CooldownFallbackTarget,
         },
     ] {
         assert_eq!(run(UpdatePlan::default(), lockfile), EXIT_CLEAN);
@@ -630,11 +658,9 @@ fn test_reason_display_texts_are_distinct_and_non_empty() {
     let unsupported = [
         UnsupportedReason::WorkspaceMemberLockfile,
         UnsupportedReason::LockfileOwnershipMismatch,
-        UnsupportedReason::GoVendored,
         UnsupportedReason::CooldownFallbackTarget,
         UnsupportedReason::LockfileSymlink,
-        UnsupportedReason::EcosystemDeferred(EcosystemId::Pypi),
-        UnsupportedReason::NpmClientDeferred(NpmClient::Yarn),
+        UnsupportedReason::PythonLockerDeferred,
     ]
     .map(|reason| reason.to_string());
     for group in [&skips[..], &not_applicable[..], &unsupported[..]] {
@@ -792,6 +818,73 @@ mod cargo_real {
         assert!(!project.path("m/Cargo.lock").exists());
     }
 
+    fn member_plan(member: &str) -> UpdatePlan {
+        plan_of(
+            member,
+            &[Bump::new(
+                "stuba", "stuba = ", "1.0.0", "1.0.1", "1.0.0", "1.0.1",
+            )],
+        )
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_within_the_repository_reports_the_members_root_lock_as_real() {
+        let project = project();
+        project.write("Cargo.toml", "[workspace]\nmembers = [\"m\"]\n");
+        let member = "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstuba = \"1.0.0\"\n";
+        project.write("m/src/lib.rs", "");
+        lock_then_restore_root(&project, member);
+        let manifest = project.path("m/Cargo.toml");
+        let plan = member_plan(member);
+        apply_plan(&plan, &manifest, member, DryRun::No).expect("apply the plan");
+
+        let outcome = regenerate_within(
+            EcosystemId::Cargo,
+            &manifest,
+            &plan,
+            &inherit_runner(),
+            &project.root,
+        )
+        .await;
+
+        let LockfileOutcome::Regenerated { lockfile, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(lockfile.real_path(), project.path("Cargo.lock"));
+        assert!(lock_has(&project.read("Cargo.lock"), "stuba", "1.0.1"));
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_within_a_root_below_the_workspace_refuses_without_writing() {
+        let project = project();
+        project.write("Cargo.toml", "[workspace]\nmembers = [\"m\"]\n");
+        let member = "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstuba = \"1.0.0\"\n";
+        project.write("m/src/lib.rs", "");
+        lock_then_restore_root(&project, member);
+        let manifest = project.path("m/Cargo.toml");
+        let before = project.read("Cargo.lock");
+        let plan = member_plan(member);
+        apply_plan(&plan, &manifest, member, DryRun::No).expect("apply the plan");
+
+        let outcome = regenerate_within(
+            EcosystemId::Cargo,
+            &manifest,
+            &plan,
+            &inherit_runner(),
+            &project.path("m"),
+        )
+        .await;
+
+        assert_matches!(
+            outcome,
+            LockfileOutcome::Unsupported {
+                reason: UnsupportedReason::LockfileOutsideRepository,
+                ..
+            }
+        );
+        assert_eq!(project.read("Cargo.lock"), before);
+    }
+
     fn lock_then_restore_root(project: &Project, member: &str) {
         project.write("m/Cargo.toml", &member.replace("\"1.0.0\"", "\"=1.0.0\""));
         generate_lock(&project.path("Cargo.toml"));
@@ -927,6 +1020,40 @@ mod cargo_real {
         let lock = project.read("Cargo.lock");
         assert!(!lock_has(&lock, "stuba", "1.0.2"));
         assert!(lock_has(&lock, "stuba", "1.0.0"));
+    }
+
+    /// The same failure for a cooldown-fallback pin is a typed rejection; the manifest keeps its
+    /// edit and the lock stays at its pre-run bytes (#2087).
+    #[tokio::test]
+    async fn test_regenerate_lockfile_cargo_fallback_pin_below_requirement_floor_is_rejected() {
+        let project = project();
+        let manifest = lock_then_restore(&project, "Cargo.toml", CARGO_TOML);
+        let lock_before = project.read("Cargo.lock");
+        let mut bump = [Bump::new(
+            "stuba", "stuba = ", "1.0.0", "1.0.2", "1.0.0", "1.0.1",
+        )];
+        bump[0].cooldown_fallback = true;
+
+        let outcome = apply_and_regenerate(
+            EcosystemId::Cargo,
+            &manifest,
+            "Cargo.toml",
+            CARGO_TOML,
+            &bump,
+            run_gate(),
+            &inherit_runner(),
+        )
+        .await;
+
+        assert_matches!(
+            outcome,
+            LockfileOutcome::Failed(RegenerationError::FallbackPinRejected {
+                code: Some(101),
+                ..
+            })
+        );
+        assert_eq!(project.read("Cargo.lock"), lock_before);
+        assert!(project.read("Cargo.toml").contains("\"1.0.2\""));
     }
 }
 
@@ -1917,7 +2044,7 @@ mod fake_tools {
         }
 
         #[tokio::test]
-        async fn test_regenerate_lockfile_bun_lockfile_is_deferred_without_spawning() {
+        async fn test_regenerate_lockfile_bun_lockfile_runs_the_lockfile_only_install() {
             let project = Project::new();
             let content = package_json(&[LODASH_EXACT], |d| d.from);
             let manifest = project.write("package.json", &content);
@@ -1936,18 +2063,17 @@ mod fake_tools {
             )
             .await;
 
-            assert_matches!(
-                outcome,
-                LockfileOutcome::Unsupported {
-                    reason: UnsupportedReason::NpmClientDeferred(NpmClient::Bun),
-                    ..
-                }
+            assert_matches!(outcome, LockfileOutcome::Failed(_));
+            let calls = bin.calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(
+                calls[0].starts_with("install --lockfile-only --ignore-scripts|"),
+                "{calls:?}"
             );
-            assert!(bin.calls().is_empty());
         }
 
         #[tokio::test]
-        async fn test_regenerate_lockfile_npm_cooldown_fallback_target_is_unsupported() {
+        async fn test_regenerate_lockfile_npm_cooldown_fallback_target_not_held_exactly_fails() {
             let project = Project::new();
             let content = package_json(&[LODASH_EXACT], |d| d.from);
             let manifest = project.write("package.json", &content);
@@ -1973,12 +2099,16 @@ mod fake_tools {
 
             assert_matches!(
                 outcome,
-                LockfileOutcome::Unsupported {
-                    reason: UnsupportedReason::CooldownFallbackTarget,
-                    ..
-                }
+                LockfileOutcome::Failed(RegenerationError::VersionMismatch { .. })
             );
-            assert!(bin.calls().is_empty());
+            let calls = bin.calls();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| call.starts_with("install --package-lock-only ")),
+                "{calls:?}"
+            );
         }
 
         #[tokio::test]
@@ -2210,15 +2340,15 @@ mod fake_tools {
             );
             let unsupported = lockfile_json(LockfileOutcome::Unsupported {
                 lockfile: None,
-                reason: UnsupportedReason::EcosystemDeferred(EcosystemId::Pypi),
+                reason: UnsupportedReason::PythonLockerDeferred,
             });
             assert_eq!(
                 unsupported,
                 serde_json::json!({
                     "status": "unsupported",
-                    "reason": "ecosystem-deferred",
+                    "reason": "python-locker-deferred",
                     "path": null,
-                    "detail": "pypi",
+                    "detail": "pipenv",
                 })
             );
             let failed = lockfile_json(LockfileOutcome::Failed(RegenerationError::ToolFailed {
@@ -2291,13 +2421,10 @@ mod fake_tools {
         }
 
         /// `gowork` is what `go env GOWORK` prints; `sum_after` what `go get` leaves in go.sum.
-        async fn run_go(gowork: &str, sum_after: &str, vendored: bool) -> GoRun {
+        async fn run_go(gowork: &str, sum_after: &str) -> GoRun {
             let project = Project::new();
             let manifest = project.write("go.mod", GO_MOD);
             project.write("go.sum", OLD_SUM);
-            if vendored {
-                project.write("vendor/modules.txt", "# golang.org/x/text v0.30.0\n");
-            }
             let bin = FakeBin::new();
             bin.install(
                 "go",
@@ -2325,7 +2452,7 @@ mod fake_tools {
         #[tokio::test]
         async fn test_regenerate_lockfile_go_content_checksum_for_target_is_exact() {
             let sum = "golang.org/x/text v0.30.0 h1:old=\ngolang.org/x/text v0.31.0 h1:new=\ngolang.org/x/text v0.31.0/go.mod h1:newmod=\n";
-            let run = run_go("", sum, false).await;
+            let run = run_go("", sum).await;
 
             assert_eq!(
                 run.calls,
@@ -2355,7 +2482,7 @@ mod fake_tools {
         async fn test_regenerate_lockfile_go_only_go_mod_checksum_for_target_is_version_mismatch() {
             let sum =
                 "golang.org/x/text v0.30.0 h1:old=\ngolang.org/x/text v0.31.0/go.mod h1:newmod=\n";
-            let run = run_go("off", sum, false).await;
+            let run = run_go("off", sum).await;
 
             assert_eq!(
                 mismatch(&run.outcome),
@@ -2369,7 +2496,7 @@ mod fake_tools {
 
         #[tokio::test]
         async fn test_regenerate_lockfile_go_workspace_probe_path_runs_get_with_gowork_off() {
-            let run = run_go("/ws/go.work", "", false).await;
+            let run = run_go("/ws/go.work", "").await;
 
             assert_eq!(
                 run.calls,
@@ -2380,18 +2507,189 @@ mod fake_tools {
             );
         }
 
-        #[tokio::test]
-        async fn test_regenerate_lockfile_go_vendored_is_unsupported_without_spawning() {
-            let run = run_go("", "", true).await;
+        struct VendoredRun {
+            outcome: LockfileOutcome,
+            calls: Vec<String>,
+            flags: Vec<String>,
+            project: Project,
+        }
 
+        /// A fake `go` whose `mod vendor -o <dir>` records `vendored_version` in `modules.txt`.
+        async fn run_vendored_go(vendored_version: &str) -> VendoredRun {
+            let project = Project::new();
+            let manifest = project.write("go.mod", GO_MOD);
+            project.write("go.sum", OLD_SUM);
+            project.write("vendor/modules.txt", "# golang.org/x/text v0.30.0\n");
+            project.write("vendor/old.go", "package old\n");
+            let bin = FakeBin::new();
+            bin.install(
+                "go",
+                &format!(
+                    "if [ \"$1\" = env ]; then echo; exit 0; fi\n\
+                     echo \"$GOFLAGS\" >> \"$(dirname \"$0\")/flags.log\"\n\
+                     if [ \"$1\" = mod ]; then\n\
+                     printf '# golang.org/x/text {vendored_version}\\n' > \"$4/modules.txt\"\n\
+                     echo new > \"$4/new.go\"\n\
+                     else printf 'golang.org/x/text v0.31.0 h1:new=\\ngolang.org/x/text v0.31.0/go.mod h1:m=\\n' > go.sum; fi"
+                ),
+            );
+            let outcome = apply_and_regenerate(
+                EcosystemId::Go,
+                &manifest,
+                "go.mod",
+                GO_MOD,
+                &bump(),
+                run_gate(),
+                &bin.runner(secs(30)),
+            )
+            .await;
+            let flags = std::fs::read_to_string(bin.dir.path().join("flags.log"))
+                .map(|log| log.lines().map(str::to_string).collect())
+                .unwrap_or_default();
+            VendoredRun {
+                outcome,
+                calls: bin.calls(),
+                flags,
+                project,
+            }
+        }
+
+        fn scratch_residue(root: &Path) -> Vec<String> {
+            std::fs::read_dir(root)
+                .expect("read project dir")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| name.starts_with(".deps-cli-vendor-"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_regenerate_lockfile_go_vendored_swaps_in_the_rebuilt_tree() {
+            let run = run_vendored_go("v0.31.0").await;
+
+            let root = &run.project.root;
+            assert_eq!(run.calls.len(), 3, "{:?}", run.calls);
+            assert!(run.calls[1].starts_with("get -- golang.org/x/text@v0.31.0|"));
+            assert!(
+                run.calls[2].starts_with("mod vendor -o "),
+                "{:?}",
+                run.calls
+            );
+            assert_eq!(run.flags, vec!["-mod=mod", "-mod=mod"]);
+            assert_matches!(
+                &run.outcome,
+                LockfileOutcome::Regenerated { companions, .. }
+                    if companions.len() == 1
+                        && matches!(&companions[0], crate::update::regen::Companion::Tree(tree) if *tree == root.join("vendor"))
+            );
+            assert!(run.project.read("vendor/modules.txt").contains("v0.31.0"));
+            assert!(root.join("vendor/new.go").is_file());
+            assert!(!root.join("vendor/old.go").exists());
+            assert_eq!(scratch_residue(root), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn test_regenerate_lockfile_go_vendored_mismatch_keeps_the_old_tree_and_restores_the_module_files()
+         {
+            let run = run_vendored_go("v0.30.0").await;
+
+            let root = &run.project.root;
             assert_matches!(
                 run.outcome,
+                LockfileOutcome::Failed(RegenerationError::VersionMismatch { .. })
+            );
+            assert!(root.join("vendor/old.go").is_file());
+            assert!(!root.join("vendor/new.go").exists());
+            assert_eq!(run.project.read("go.sum"), OLD_SUM);
+            assert_eq!(scratch_residue(root), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn test_regenerate_lockfile_go_symlinked_module_files_are_refused_without_spawning() {
+            for linked in ["go.sum", "go.mod"] {
+                let project = Project::new();
+                project.write("real", if linked == "go.sum" { OLD_SUM } else { GO_MOD });
+                let other = if linked == "go.sum" {
+                    "go.mod"
+                } else {
+                    "go.sum"
+                };
+                let manifest =
+                    project.write(other, if linked == "go.sum" { GO_MOD } else { OLD_SUM });
+                std::os::unix::fs::symlink(project.path("real"), project.path(linked))
+                    .expect("symlink module file");
+                let manifest = if linked == "go.mod" {
+                    project.path("go.mod")
+                } else {
+                    manifest
+                };
+                let bin = FakeBin::new();
+                bin.install("go", "echo");
+
+                let plan = plan_of(GO_MOD, &bump());
+                let outcome = regenerate(
+                    EcosystemId::Go,
+                    &manifest,
+                    "go.mod",
+                    &plan,
+                    run_gate(),
+                    &bin.runner(secs(30)),
+                )
+                .await;
+
+                assert_matches!(
+                    outcome,
+                    LockfileOutcome::Unsupported {
+                        reason: UnsupportedReason::LockfileSymlink,
+                        ..
+                    },
+                    "{linked}"
+                );
+                assert!(
+                    bin.calls()
+                        .iter()
+                        .all(|call| call.starts_with("env GOWORK")),
+                    "{linked}: {:?}",
+                    bin.calls()
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_regenerate_lockfile_go_vendored_symlinked_tree_is_refused_without_spawning() {
+            let project = Project::new();
+            let manifest = project.write("go.mod", GO_MOD);
+            project.write("go.sum", OLD_SUM);
+            project.write("real/modules.txt", "# golang.org/x/text v0.30.0\n");
+            std::os::unix::fs::symlink(project.path("real"), project.path("vendor"))
+                .expect("symlink vendor");
+            let bin = FakeBin::new();
+            bin.install("go", "exit 0");
+
+            let outcome = apply_and_regenerate(
+                EcosystemId::Go,
+                &manifest,
+                "go.mod",
+                GO_MOD,
+                &bump(),
+                run_gate(),
+                &bin.runner(secs(30)),
+            )
+            .await;
+
+            assert_matches!(
+                outcome,
                 LockfileOutcome::Unsupported {
-                    reason: UnsupportedReason::GoVendored,
+                    reason: UnsupportedReason::LockfileSymlink,
                     ..
                 }
             );
-            assert!(run.calls.is_empty(), "{:?}", run.calls);
+            assert!(bin.calls().is_empty(), "{:?}", bin.calls());
         }
     }
 }
@@ -2416,10 +2714,56 @@ async fn test_interrupts_recv_resolves_on_sigterm_instead_of_killing_the_process
         .expect("SIGTERM was delivered to the handler");
 }
 
+#[cfg(feature = "npm")]
+#[tokio::test]
+async fn test_regenerate_until_refuses_a_lockfile_outside_the_scope_without_spawning() {
+    use crate::update::regen::{LockfileScope, regenerate_until};
+
+    let project = Project::new();
+    let content =
+        "{\"name\":\"a\",\"version\":\"1.0.0\",\"dependencies\":{\"lodash\":\"^4.17.0\"}}";
+    let manifest = project.write("package.json", content);
+    project.write("package-lock.json", "{}");
+    let elsewhere = Project::new();
+    let plan = plan_of(
+        content,
+        &[Bump::new(
+            "lodash", "lodash", "^4.17.0", "^4.17.21", "4.17.20", "4.17.21",
+        )],
+    );
+    let ecosystem = ecosystem(EcosystemId::Npm);
+    let uri = Url::from_file_path(&manifest).expect("file url");
+    let display = PathBuf::from("package.json");
+    let target = ManifestTarget {
+        ecosystem: &ecosystem,
+        manifest_path: &manifest,
+        display_path: &display,
+        uri: &uri,
+    };
+
+    let outcome = regenerate_until(
+        &plan,
+        &target,
+        run_gate(),
+        &inherit_runner(),
+        LockfileScope::Within(&elsewhere.root),
+        std::future::pending(),
+    )
+    .await;
+
+    assert_matches!(
+        outcome,
+        LockfileOutcome::Unsupported {
+            reason: UnsupportedReason::LockfileOutsideRepository,
+            ..
+        }
+    );
+}
+
 #[cfg(all(unix, feature = "npm"))]
 mod interrupted {
     use super::*;
-    use crate::update::regen::{WorkspaceMembers, regenerate_until};
+    use crate::update::regen::{LockfileScope, regenerate_until};
     use std::os::unix::fs::PermissionsExt;
 
     fn alive(pid: u32) -> bool {
@@ -2494,7 +2838,7 @@ mod interrupted {
             &target,
             run_gate(),
             &runner,
-            WorkspaceMembers::Allowed,
+            LockfileScope::Unrestricted,
             interrupt,
         )
         .await;

@@ -316,7 +316,7 @@ async fn fixture(setup: Setup) -> Fixture {
     .await
     .expect("load settles");
 
-    Fixture {
+    let fx = Fixture {
         state,
         config,
         client,
@@ -328,10 +328,26 @@ async fn fixture(setup: Setup) -> Fixture {
         _dir: dir,
         _osv: osv,
         _mocks: mocks,
+    };
+    if vulnerabilities {
+        fx.wait_for_advisory().await;
     }
+    fx
 }
 
 impl Fixture {
+    /// OSV phase B commits after the document reports `Loaded`, so diagnostics read straight
+    /// after the open can predate the advisory (#2094); poll, bounded, until it is published.
+    async fn wait_for_advisory(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while advisory_diagnostics(&self.diagnostics().await).is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the OSV advisory diagnostic is published");
+    }
+
     async fn hover(&self) -> String {
         let params = serde_json::from_value(json!({
             "textDocument": {"uri": self.uri.as_str()},

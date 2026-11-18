@@ -51,8 +51,17 @@ impl Session<'_> {
                 )
                 .await?;
         }
-        for update in &updates {
-            self.runner.run(update, self.deadline).await?;
+        for (pin, update) in self.pins.iter().zip(&updates) {
+            match self.runner.run(update, self.deadline).await {
+                Err(RegenerationError::ToolFailed { code, .. }) if pin.cooldown_fallback => {
+                    return Err(RegenerationError::FallbackPinRejected {
+                        package: pin.package.clone(),
+                        target: pin.target.clone(),
+                        code,
+                    });
+                }
+                other => other?,
+            }
         }
         self.verified(Program::Cargo, &owned, PinCheck::ExactInLock)
             .await

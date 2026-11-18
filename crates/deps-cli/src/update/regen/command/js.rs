@@ -84,13 +84,6 @@ impl Invocation {
         invocation
     }
 
-    /// `npm prefix`: the directory npm treats as the workspace root of `cwd`.
-    pub(in crate::update::regen) fn npm_prefix(cwd: &Path) -> Self {
-        let mut invocation = Self::new(Program::Npm, cwd, Self::strs(&["prefix"]));
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
     /// `pnpm root -w`: the `node_modules` directory of the workspace root.
     pub(in crate::update::regen) fn pnpm_workspace_root(cwd: &Path) -> Self {
         let mut invocation = Self::new(Program::Pnpm, cwd, Self::strs(&["root", "-w"]));
@@ -123,6 +116,27 @@ impl Invocation {
         let mut invocation = Self::new(Program::Yarn, cwd, Self::strs(&["--version"]));
         invocation.env = COREPACK_ENV;
         invocation
+    }
+
+    /// `yarn workspaces list --json` (Yarn 2+): one `{"location","name"}` line per workspace,
+    /// the root (`.`) included.
+    pub(in crate::update::regen) fn yarn_workspaces_list(cwd: &Path) -> Self {
+        let mut invocation = Self::new(
+            Program::Yarn,
+            cwd,
+            Self::strs(&["workspaces", "list", "--json"]),
+        );
+        invocation.env = YARN_ENV;
+        invocation
+    }
+
+    /// `bun install --lockfile-only --ignore-scripts`: re-resolves `bun.lock` without installing.
+    pub(in crate::update::regen) fn bun_lock(cwd: &Path) -> Self {
+        Self::new(
+            Program::Bun,
+            cwd,
+            Self::strs(&["install", "--lockfile-only", "--ignore-scripts"]),
+        )
     }
 
     /// `yarn install --mode=update-lockfile` (Yarn 2+): resolves without linking or scripts.

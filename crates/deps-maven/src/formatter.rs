@@ -245,6 +245,14 @@ impl PackageRendering for MavenFormatter {
 }
 
 impl RequirementResolution for MavenFormatter {
+    fn compare_versions(
+        &self,
+        a: &ConcreteVersion,
+        b: &ConcreteVersion,
+    ) -> Option<std::cmp::Ordering> {
+        crate::version::try_compare_versions(a.as_str(), b.as_str())
+    }
+
     /// A pre-release qualifier on the bare version, or on an interval's lower or exact bound
     /// (`[1.0-beta,)`, `[2.0-RC1]`); upper bounds never opt in.
     fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {

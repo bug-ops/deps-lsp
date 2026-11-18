@@ -12,7 +12,7 @@ use serde_json::json;
 use super::acceptance_tests::{Fixture, plan};
 use super::{
     BODY_MAX_BYTES, BaseBranch, OpenedRequest, PrHost, RepoContext, RequestMarker, RequestUrl,
-    RunMode, SupersedeReport, close_superseded,
+    RunMode, SupersedeReport, SweepCoverage, close_superseded,
 };
 
 const NEW_URL: &str = "https://example.test/pr/9";
@@ -129,15 +129,17 @@ fn body_with(marker: &RequestMarker) -> String {
 }
 
 fn github<'a>(fx: &'a Fixture, new_author: (&str, bool), candidates: &[Candidate]) -> Shim<'a> {
-    let meta = |number: u64, head: &str, author: (&str, bool), cross: bool, commits: usize| {
-        json!({
-            "number": number,
-            "author": {"login": author.0, "is_bot": author.1},
-            "headRefName": head,
-            "isCrossRepository": cross,
-            "commits": commits,
-        })
-    };
+    let meta =
+        |number: u64, head: &str, author: (&str, bool), cross: bool, commits: usize, body: &str| {
+            json!({
+                "number": number,
+                "author": {"login": author.0, "is_bot": author.1},
+                "headRefName": head,
+                "isCrossRepository": cross,
+                "commits": commits,
+                "body": body,
+            })
+        };
     let listed: Vec<_> = candidates
         .iter()
         .map(|c| json!({"number": c.number, "headRefName": c.head}))
@@ -151,17 +153,13 @@ fn github<'a>(fx: &'a Fixture, new_author: (&str, bool), candidates: &[Candidate
                 new_author,
                 false,
                 1,
+                "",
             ),
         )
-        .reply(&format!("pr view {NEW_URL} --json body"), "")
         .reply("pr list ", json!(listed));
     for c in candidates {
         let number = c.number;
         shim = shim
-            .reply(
-                &format!("pr view {number} --json body"),
-                c.body.clone().unwrap_or_default(),
-            )
             .reply(
                 &format!("pr view {number} --json number"),
                 meta(
@@ -170,6 +168,7 @@ fn github<'a>(fx: &'a Fixture, new_author: (&str, bool), candidates: &[Candidate
                     (c.author, c.bot),
                     c.cross_repository,
                     c.commits,
+                    c.body.as_deref().unwrap_or_default(),
                 ),
             )
             .reply(&format!("pr close {number}"), "")
@@ -400,13 +399,12 @@ async fn test_a_full_listing_is_flagged_as_possibly_partial() {
             json!({"number": 9, "author": {"login": "octo", "is_bot": false},
                    "headRefName": "deps-cli/cargo/x", "isCrossRepository": false, "commits": 1}),
         )
-        .reply(&format!("pr view {NEW_URL} --json body"), "")
         .reply("pr list ", json!(rows))
         .install();
 
     let report = sweep(PrHost::Github, &new, &ctx).await;
 
-    assert!(report.listing_full);
+    assert_eq!(report.coverage, SweepCoverage::ListingFull);
     assert!(report.closed.is_empty());
 }
 
@@ -504,7 +502,7 @@ async fn test_with_marker_keeps_the_marker_and_the_body_limit_for_a_huge_body() 
         title: "t".to_owned(),
         body: "x".repeat(BODY_MAX_BYTES),
         commit_body: String::new(),
-        publishable_paths: Vec::new(),
+        scope: super::PublishScope::default(),
     };
     text = text.with_marker(&new);
 
@@ -513,24 +511,64 @@ async fn test_with_marker_keeps_the_marker_and_the_body_limit_for_a_huge_body() 
 }
 
 #[tokio::test]
-async fn test_an_ecosystem_without_a_sound_ordering_never_calls_the_host() {
+async fn test_an_ecosystem_without_a_version_ordering_never_calls_the_host() {
     let fx = Fixture::new();
     let ctx = fx.ctx("Cargo.toml").await;
-    let go = RequestMarker::new(
+    let actions = RequestMarker::new(
         &ctx,
-        EcosystemId::Go,
+        EcosystemId::GithubActions,
         RunMode::Default,
-        &plan(&[("example.com/x", "v1.0.0", "v1.2.0")]),
+        &plan(&[("actions/checkout", "v3", "v4")]),
         &CargoFormatter,
         None,
     );
     github(&fx, ("octo", false), &[Candidate::covered(&ctx, 7)]).install();
 
-    let report = sweep(PrHost::Github, &go, &ctx).await;
+    let report = sweep(PrHost::Github, &actions, &ctx).await;
 
     assert_eq!(report.failures.len(), 1);
     assert!(report.closed.is_empty());
     assert!(calls(&fx, "gh").is_empty());
+}
+
+#[tokio::test]
+async fn test_a_go_request_is_closed_through_the_native_ordering() {
+    let go_marker = |ctx: &RepoContext, target: &str| {
+        RequestMarker::new(
+            ctx,
+            EcosystemId::Go,
+            RunMode::Default,
+            &plan(&[("example.com/x", "v1.2.0", target)]),
+            &deps_engine::setup::GoFormatter,
+            None,
+        )
+    };
+    let fx = Fixture::new();
+    let ctx = fx.ctx("Cargo.toml").await;
+    let new = go_marker(&ctx, "v1.2.10");
+    let mut older = Candidate::covered(&ctx, 7);
+    older.head = "deps-cli/go/x-v1.2.9-00000007".to_owned();
+    older.body = Some(body_with(&go_marker(&ctx, "v1.2.9")));
+    let mut newer = Candidate::covered(&ctx, 8);
+    newer.head = "deps-cli/go/x-v1.3.0-00000008".to_owned();
+    newer.body = Some(body_with(&go_marker(&ctx, "v1.3.0")));
+    github(&fx, ("octo", false), &[older, newer]).install();
+
+    let report = close_superseded(
+        &ctx,
+        PrHost::Github,
+        &opened(),
+        &new,
+        &deps_engine::setup::GoFormatter,
+    )
+    .await;
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        closes(&fx, "gh"),
+        ["pr close 7"],
+        "v1.2.9 < v1.2.10 closes; v1.3.0 stays"
+    );
 }
 
 #[tokio::test]
@@ -545,7 +583,7 @@ async fn test_with_marker_cuts_on_a_line_so_an_open_code_fence_cannot_swallow_it
             "line of fenced text\n".repeat(BODY_MAX_BYTES / 10)
         ),
         commit_body: String::new(),
-        publishable_paths: Vec::new(),
+        scope: super::PublishScope::default(),
     };
 
     let body = text.with_marker(&new).body;
@@ -556,4 +594,97 @@ async fn test_with_marker_cuts_on_a_line_so_an_open_code_fence_cannot_swallow_it
         .expect("blank line before the marker");
     assert!(before.ends_with("fenced text"), "cut on a whole line");
     assert_eq!(RequestMarker::from_body(marker_line), Some(new));
+}
+
+#[tokio::test]
+async fn test_each_candidate_is_read_with_one_view_call() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("Cargo.toml").await;
+    let new = marker(&ctx, &[("serde", "1.0.0", "1.2.0")]);
+    github(&fx, ("octo", false), &[Candidate::covered(&ctx, 7)]).install();
+
+    let report = sweep(PrHost::Github, &new, &ctx).await;
+
+    assert_eq!(report.closed.len(), 1, "{:?}", report.failures);
+    let views = calls(&fx, "gh")
+        .into_iter()
+        .filter(|call| call.starts_with("pr view 7 "))
+        .count();
+    assert_eq!(views, 1);
+}
+
+#[tokio::test]
+async fn test_candidates_are_read_oldest_first_up_to_the_cap() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("Cargo.toml").await;
+    let new = marker(&ctx, &[("serde", "1.0.0", "1.2.0")]);
+    let candidates: Vec<_> = (100..160)
+        .rev()
+        .map(|number| Candidate::covered(&ctx, number))
+        .collect();
+    github(&fx, ("octo", false), &candidates).install();
+
+    let report = sweep(PrHost::Github, &new, &ctx).await;
+
+    assert_eq!(report.coverage, SweepCoverage::CandidateCapReached);
+    let expected: Vec<String> = (100..150).map(|n| format!("pr close {n}")).collect();
+    assert_eq!(closes(&fx, "gh"), expected);
+    let read = calls(&fx, "gh")
+        .iter()
+        .filter(|call| call.starts_with("pr view ") && !call.contains(NEW_URL))
+        .count();
+    assert_eq!(read, 50);
+}
+
+#[tokio::test]
+async fn test_candidates_are_filtered_by_the_manifest_directory_part() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    let new = marker(&ctx, &[("serde", "1.0.0", "1.2.0")]);
+    let mut inside = Candidate::covered(&ctx, 7);
+    inside.head = "deps-cli/cargo/app/serde-1.1.0-00000007".to_owned();
+    let mut elsewhere = Candidate::covered(&ctx, 8);
+    elsewhere.head = "deps-cli/cargo/other/serde-1.1.0-00000008".to_owned();
+    let root_level = Candidate::covered(&ctx, 6);
+    github(&fx, ("octo", false), &[inside, elsewhere, root_level]).install();
+
+    let report = sweep(PrHost::Github, &new, &ctx).await;
+
+    assert_eq!(report.coverage, SweepCoverage::Complete);
+    assert_eq!(closes(&fx, "gh"), ["pr close 7"]);
+    assert!(
+        !calls(&fx, "gh")
+            .iter()
+            .any(|call| call.starts_with("pr view 8 ") || call.starts_with("pr view 6 ")),
+        "branches outside the directory part are never read"
+    );
+}
+
+#[tokio::test]
+async fn test_gitlab_listing_beyond_the_default_capture_cap_is_read_whole() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("Cargo.toml").await;
+    let new = marker(&ctx, &[("serde", "1.0.0", "1.2.0")]);
+    let rows: Vec<_> = (100..190)
+        .map(|iid| {
+            json!({
+                "iid": iid,
+                "source_branch": "feature/other",
+                "description": "d".repeat(2048),
+            })
+        })
+        .collect();
+    Shim::new(&fx, "glab")
+        .reply(
+            &format!("mr view {NEW_URL} "),
+            gitlab_mr(9, "octo", 1, 1, ""),
+        )
+        .reply("mr list ", json!(rows))
+        .reply("api ", json!([{"id": "a"}]))
+        .install();
+
+    let report = sweep(PrHost::Gitlab, &new, &ctx).await;
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.coverage, SweepCoverage::Complete);
 }

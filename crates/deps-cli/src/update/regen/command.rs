@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 
 use deps_core::ConcreteVersion;
 
-mod composer;
-mod dart;
-mod dotnet;
-mod gradle;
+pub(super) mod composer;
+pub(super) mod dart;
+pub(super) mod dotnet;
+pub(super) mod gradle;
 mod js;
 pub(super) mod lockers;
-mod python;
-mod swift;
+pub(super) mod python;
+pub(super) mod swift;
 
 /// An external tool `deps-cli` may spawn to regenerate a lockfile.
 ///
@@ -46,8 +46,6 @@ pub enum Program {
     Poetry,
     /// `pdm`.
     Pdm,
-    /// `pipenv`.
-    Pipenv,
     /// `composer` (`composer.bat` on Windows).
     Composer,
     /// `dart`.
@@ -78,7 +76,6 @@ impl Program {
             Self::Bun => "bun",
             Self::Poetry => "poetry",
             Self::Pdm => "pdm",
-            Self::Pipenv => "pipenv",
             Self::Composer => "composer",
             Self::Dart => "dart",
             Self::Flutter => "flutter",
@@ -98,7 +95,6 @@ impl Program {
             | Self::Bun
             | Self::Poetry
             | Self::Pdm
-            | Self::Pipenv
             | Self::Dart
             | Self::Dotnet
             | Self::Swift => self.as_str(),
@@ -157,9 +153,9 @@ pub enum NpmClient {
     Npm,
     /// pnpm (`pnpm-lock.yaml`).
     Pnpm,
-    /// Yarn (`yarn.lock`); regeneration is deferred.
+    /// Yarn (`yarn.lock`).
     Yarn,
-    /// Bun (`bun.lock`); regeneration is deferred.
+    /// Bun (`bun.lock`).
     Bun,
 }
 
@@ -193,9 +189,9 @@ impl NpmClient {
 pub enum PythonLocker {
     /// uv (`uv.lock`).
     Uv,
-    /// Poetry (`poetry.lock`); regeneration is deferred.
+    /// Poetry (`poetry.lock`).
     Poetry,
-    /// PDM (`pdm.lock`); regeneration is deferred.
+    /// PDM (`pdm.lock`).
     Pdm,
     /// Pipenv (`Pipfile.lock`); regeneration is deferred.
     Pipenv,
@@ -233,6 +229,16 @@ pub(super) enum GoWork {
     Inherit,
     /// `GOWORK=off`: the module resolves on its own `go.mod`/`go.sum`.
     Off,
+}
+
+/// How a `go` invocation resolves modules relative to a `vendor/` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoModuleMode {
+    /// The inherited `GOFLAGS` decide.
+    Inherit,
+    /// `GOFLAGS=-mod=mod`, replacing any inherited value: an inherited `-mod=vendor` would make
+    /// `go get` refuse to change `go.mod`.
+    ModuleCache,
 }
 
 /// A rejected [`ArgComponent`] candidate.
@@ -386,7 +392,14 @@ pub(super) struct Invocation {
     env: &'static [(&'static str, &'static str)],
 }
 
-const GOWORK_OFF_ENV: &[(&str, &str)] = &[("GOWORK", "off")];
+const fn go_env(work: GoWork, mode: GoModuleMode) -> &'static [(&'static str, &'static str)] {
+    match (work, mode) {
+        (GoWork::Inherit, GoModuleMode::Inherit) => &[],
+        (GoWork::Off, GoModuleMode::Inherit) => &[("GOWORK", "off")],
+        (GoWork::Inherit, GoModuleMode::ModuleCache) => &[("GOFLAGS", "-mod=mod")],
+        (GoWork::Off, GoModuleMode::ModuleCache) => &[("GOWORK", "off"), ("GOFLAGS", "-mod=mod")],
+    }
+}
 
 impl Invocation {
     fn new(program: Program, cwd: &Path, args: Vec<OsString>) -> Self {
@@ -463,6 +476,7 @@ impl Invocation {
         cwd: &Path,
         modules: &[(ArgComponent, ArgComponent)],
         work: GoWork,
+        mode: GoModuleMode,
     ) -> Self {
         let mut args = Self::strs(&["get", "--"]);
         args.extend(
@@ -471,9 +485,16 @@ impl Invocation {
             }),
         );
         let mut invocation = Self::new(Program::Go, cwd, args);
-        if work == GoWork::Off {
-            invocation.env = GOWORK_OFF_ENV;
-        }
+        invocation.env = go_env(work, mode);
+        invocation
+    }
+
+    /// `go mod vendor -o <out>`: writes the vendor tree to `out` instead of `vendor/`.
+    pub(super) fn go_mod_vendor(cwd: &Path, out: &Path, work: GoWork, mode: GoModuleMode) -> Self {
+        let mut args = Self::strs(&["mod", "vendor", "-o"]);
+        args.push(out.into());
+        let mut invocation = Self::new(Program::Go, cwd, args);
+        invocation.env = go_env(work, mode);
         invocation
     }
 }

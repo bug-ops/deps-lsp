@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use super::command::NonEmpty;
 use super::command::lockers::DenoFilter;
+use super::fallback::ExactPinRun;
 use super::{
     ArgComponent, Invocation, LockfileOutcome, NotApplicableReason, NpmClient, PinCheck, Program,
     RegenerationError, Session, UnsupportedReason, declares_workspace, same_file, unsupported,
@@ -58,13 +59,26 @@ impl Session<'_> {
             Located::Beside(path) => path,
             Located::Stop(outcome) => return Ok(outcome),
         };
-        if let Some(outcome) = self.cooldown_refusal(&located) {
-            return Ok(outcome);
-        }
         if let Some(outcome) = self.placement_refusal(&located) {
             return Ok(outcome);
         }
 
+        if self.has_fallback_pins() {
+            let names = NonEmpty::new(self.update_only_args(ArgComponent::parse)?);
+            let install = Invocation::bundle_lock(self.manifest_dir);
+            let update = names
+                .as_ref()
+                .map(|names| Invocation::bundle_lock_update(self.manifest_dir, names));
+            return self
+                .run_with_exact_pins(ExactPinRun {
+                    tool: Program::Bundle,
+                    lockfile: &located,
+                    manifest: self.target.manifest_path,
+                    install: &install,
+                    update: update.as_ref(),
+                })
+                .await;
+        }
         let lockfile_only = self.lockfile_only_args(ArgComponent::parse)?;
 
         self.capture(&[&located])?;
@@ -101,6 +115,8 @@ impl Session<'_> {
                 UnsupportedReason::WorkspaceMemberLockfile,
             ));
         }
+        // Deno keys the lock file by specifier, so relaxing an exact fallback pin back to the
+        // declared range would re-resolve to the withheld release.
         if let Some(outcome) = self.cooldown_refusal(&located) {
             return Ok(outcome);
         }

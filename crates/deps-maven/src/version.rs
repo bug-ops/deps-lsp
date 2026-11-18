@@ -65,6 +65,27 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     Ordering::Equal
 }
 
+/// Orders two Maven versions, or `None` when the two comparators disagree.
+///
+/// The total comparison ([`compare_versions`]) and the range comparison
+/// (`compare_versions_for_range`) disagree when the answer depends on
+/// which of the two Maven's resolver would apply (`1.0` vs `1.0.0`, `1.0` vs `1.0.0.0`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_maven::version::try_compare_versions;
+/// use std::cmp::Ordering;
+///
+/// assert_eq!(try_compare_versions("1.10.0", "1.9.0"), Some(Ordering::Greater));
+/// assert_eq!(try_compare_versions("1.0", "1.0.0"), None);
+/// ```
+#[must_use]
+pub fn try_compare_versions(a: &str, b: &str) -> Option<Ordering> {
+    let total = compare_versions(a, b);
+    (total == compare_versions_for_range(a, b)).then_some(total)
+}
+
 /// Compares two Maven version strings for range/interval bound matching only.
 ///
 /// Unlike [`compare_versions`], a missing trailing segment (the shorter version ran out of
@@ -811,5 +832,16 @@ mod tests {
         let base = ["0.0-ga", "0.0", "0.0-0ga", "1.0-ga", "1.0", "1.0-0ga"];
         let mut versions: Vec<&str> = base.iter().copied().cycle().take(36).collect();
         versions.sort_by(|a, b| compare_versions(b, a));
+    }
+
+    #[test]
+    fn test_try_compare_versions_is_none_where_total_and_range_orders_disagree() {
+        assert_eq!(
+            try_compare_versions("1.10.0", "1.9.0"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(try_compare_versions("1.0", "1.0.0"), None);
+        assert_eq!(try_compare_versions("1.0.0", "1.0"), None);
+        assert_eq!(try_compare_versions("1.0.0.0", "1.0"), None);
     }
 }

@@ -55,7 +55,7 @@ related:
 - Updating, rebasing or closing earlier deps-cli pull requests (a superseded pull request stays open).
 - Several pull requests from one run, or runs over several manifests.
 - A direct GitHub/GitLab REST client, configurable remote (`origin` is fixed), branch prefix, commit-message prefix, labels, reviewers, assignees.
-- `--open-pr` for ecosystems whose lock file regeneration is deferred (PyPI, Bundler, Dart, Composer, Gradle, Swift, NuGet, Deno).
+- `--open-pr` for lock file formats whose regeneration is refused (Pipenv, Yarn Classic; lock-file-only pins for Bun and NuGet).
 - Group rules by dependency type (dev-dependencies) or by wildcard pattern; groups under `--security-only`.
 - Windows-specific testing (the code path has no shell and is expected to work; acceptance tests are unix-only).
 
@@ -90,7 +90,7 @@ related:
 |----|------|-------------|----------|
 | FR-001 | O | WHERE `--open-pr <github\|gitlab>` is given THE SYSTEM SHALL require `--lockfile regenerate` and reject `--dry-run` and `--offline`; a violation exits 2 before any analysis | must |
 | FR-002 | E | WHEN `--open-pr` is given THE SYSTEM SHALL, before walking the manifest, verify: the manifest is inside a git work tree; `HEAD` is a named branch not starting with `deps-cli/` or `-`; a committer identity is configured (`git var GIT_COMMITTER_IDENT`); `git status --porcelain --untracked-files=no` is empty. Any failure exits 2 with a reason naming the check; a `HEAD` branch starting with `-` is its own error (`UnsafeBaseBranch`), distinct from one starting with `deps-cli/` (`OnUpdateBranch`) | must |
-| FR-003 | E | WHEN `--open-pr` is given and the manifest's ecosystem has deferred lock file regeneration THE SYSTEM SHALL exit 2 before analysis and before any write, naming the supported ecosystems | must |
+| FR-003 | E | WHEN `--open-pr` is given and the manifest's lock file regeneration is refused (`unsupported`, for example Pipenv or Yarn Classic) THE SYSTEM SHALL restore the manifest edit (FR-007) and exit 2, naming the reason; only a Go module whose `vendor` tree is not tracked in `HEAD` is refused before analysis | must |
 | FR-004 | E | WHEN planning finishes THE SYSTEM SHALL derive the branch name (§5) from the proposed items (outcome `applied` or `requires-lockfile-update` after dedup and group demotion); with no proposed item THE SYSTEM SHALL open nothing and continue as `update` does today | must |
 | FR-005 | E | WHEN the branch exists on `origin` THE SYSTEM SHALL write nothing, skip lock file regeneration, render the report as a dry run, print `already proposed on <branch>` on stderr and exit with the code `update` computes for that report | must |
 | FR-006 | E | WHEN the branch exists locally but not on `origin` THE SYSTEM SHALL exit 2 before any write, naming the branch to delete | must |
@@ -170,13 +170,15 @@ The pull request body is a Markdown table (package, from, to, kind) plus a line 
 | No proposed item, or nothing to commit | as `update` |
 | Already proposed (FR-005) | as `update` for the dry-run report |
 | No update settled (FR-020) | as `update` for the dry-run report (1 in practice) |
-| Flag violation, preflight failure, deferred ecosystem, stale local branch, lock file not regenerated, changed paths outside the publishable set, git/`gh`/`glab` failure or timeout (including a failed switch-back after the request was created), interrupt in any phase | 2 |
+| Flag violation, preflight failure, untracked Go vendor tree, stale local branch, lock file not regenerated, changed paths outside the publishable set, git/`gh`/`glab` failure or timeout (including a failed switch-back after the request was created), interrupt in any phase | 2 |
 
 ## 6. Edge Cases and Error Handling
 
 | Case | Behavior |
 |---|---|
-| Lock file `unsupported` for a supported ecosystem (Cargo workspace member, symlinked lock file, vendored Go) | FR-007: restore, exit 2 |
+| Lock file `unsupported` (symlinked lock file, a lock file outside the repository root, Pipenv, Yarn Classic) | FR-007: restore, exit 2 |
+| Workspace member whose lock file is in the workspace root, inside the repository | allowed: the root lock file is published with the manifest |
+| Go module with `vendor/modules.txt` | regenerated; `vendor` must be tracked in `HEAD` and is published and restored as a tree |
 | Pull request creation fails after the push | exit 2; the remote branch exists, so the next run reports "already proposed": the message says to open the pull request manually or delete the remote branch |
 | Run interrupted after the branch switch | exit 2; the next run refuses in FR-002 (`HEAD` on `deps-cli/...`) with the cleanup commands, which include deleting the remote branch when the push may have happened |
 | A tracked file outside the manifest and its lock file changes during the run (editor, formatter, another tool) | FR-009: exit 2 naming it; nothing is committed or pushed |

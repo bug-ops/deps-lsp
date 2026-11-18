@@ -165,6 +165,21 @@ impl PackageRendering for SwiftFormatter {
 }
 
 impl RequirementResolution for SwiftFormatter {
+    /// `SwiftPM` orders versions by `major.minor.patch` and pre-release; build metadata is ignored.
+    fn compare_versions(
+        &self,
+        a: &ConcreteVersion,
+        b: &ConcreteVersion,
+    ) -> Option<std::cmp::Ordering> {
+        let parse = |version: &ConcreteVersion| {
+            let text = version.as_str();
+            let mut parsed = semver::Version::parse(text.strip_prefix('v').unwrap_or(text)).ok()?;
+            parsed.build = semver::BuildMetadata::EMPTY;
+            Some(parsed)
+        };
+        Some(parse(a)?.cmp(&parse(b)?))
+    }
+
     /// #1354 hardening: an unresolved requirement (see [`Self::bounded_requirement_is_unresolved`])
     /// returns `true` (treated as satisfied) rather than falling into `semver::VersionReq`
     /// parsing, which already fails closed for this shape but without the explicit
@@ -1069,5 +1084,18 @@ mod tests {
             "the real SwiftFormatter must suppress the fix for #1390's unexpanded ap_version \
              template placeholder, got {planned:?}"
         );
+    }
+
+    #[test]
+    fn test_compare_versions_orders_semver_and_ignores_build_metadata() {
+        use std::cmp::Ordering;
+        let order = |a: &str, b: &str| {
+            SwiftFormatter.compare_versions(&ConcreteVersion::new(a), &ConcreteVersion::new(b))
+        };
+        assert_eq!(order("1.10.0", "1.9.0"), Some(Ordering::Greater));
+        assert_eq!(order("v1.0.0-rc.1", "1.0.0"), Some(Ordering::Less));
+        assert_eq!(order("1.0.0+a", "1.0.0+b"), Some(Ordering::Equal));
+        assert_eq!(order("1.0", "1.0.0"), None);
+        assert_eq!(order("main", "1.0.0"), None);
     }
 }

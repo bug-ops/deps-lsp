@@ -196,6 +196,34 @@ pub fn compare_versions(v1: &str, v2: &str) -> Ordering {
     }
 }
 
+/// Orders two Go module versions by SemVer precedence, or `None` when either is not a
+/// canonical `vMAJOR.MINOR.PATCH[-pre]` version (optionally with `+incompatible`).
+///
+/// Unlike [`compare_versions`], it never falls back to a string comparison and never drops
+/// the pre-release, so `v1.0.0-rc.1 < v1.0.0`. Pseudo-versions parse as pre-releases, which is
+/// how Go orders them.
+///
+/// # Examples
+///
+/// ```
+/// use deps_go::version::try_compare_versions;
+/// use std::cmp::Ordering;
+///
+/// assert_eq!(try_compare_versions("v1.2.10", "v1.2.9"), Some(Ordering::Greater));
+/// assert_eq!(try_compare_versions("v1.2", "v1.2.9"), None);
+/// ```
+#[must_use]
+pub fn try_compare_versions(a: &str, b: &str) -> Option<Ordering> {
+    Some(strict_semver(a)?.cmp(&strict_semver(b)?))
+}
+
+fn strict_semver(version: &str) -> Option<semver::Version> {
+    let core = version.strip_suffix("+incompatible").unwrap_or(version);
+    semver::Version::parse(core.strip_prefix('v')?)
+        .ok()
+        .filter(|parsed| parsed.build.is_empty())
+}
+
 fn parse_semver(version: &str) -> Result<semver::Version> {
     let cleaned = version.trim_start_matches('v');
 
@@ -208,6 +236,32 @@ fn parse_semver(version: &str) -> Result<semver::Version> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_try_compare_versions_orders_by_precedence() {
+        let order = |a, b| try_compare_versions(a, b);
+        assert_eq!(order("v1.2.10", "v1.2.9"), Some(Ordering::Greater));
+        assert_eq!(order("v1.0.0-rc.1", "v1.0.0"), Some(Ordering::Less));
+        assert_eq!(
+            order("v2.0.0+incompatible", "v2.0.0"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            order(
+                "v0.0.0-20191109021931-daa7c04131f5",
+                "v0.0.0-20200101000000-aaaaaaaaaaaa"
+            ),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn test_try_compare_versions_rejects_non_canonical_input() {
+        for bad in ["1.2.3", "v1.2", "v1.2.3+meta", "latest", ""] {
+            assert_eq!(try_compare_versions(bad, "v1.0.0"), None, "{bad}");
+            assert_eq!(try_compare_versions("v1.0.0", bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn test_escape_module_path() {

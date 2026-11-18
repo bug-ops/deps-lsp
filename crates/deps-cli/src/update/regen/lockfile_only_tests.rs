@@ -37,7 +37,7 @@ use url::Url;
 
 #[cfg(unix)]
 use super::PinResolution;
-use super::command::NpmPackageArg;
+use super::command::{NpmPackageArg, Program};
 use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, RegenerationGate,
@@ -345,7 +345,7 @@ async fn test_regenerate_lockfile_bun_lock_stays_requires_lockfile_update() {
     assert_matches!(
         run.lockfile,
         LockfileOutcome::Unsupported {
-            reason: UnsupportedReason::NpmClientDeferred(_),
+            reason: UnsupportedReason::LockfileOnlyUpdateUnsupported(Program::Bun),
             ..
         }
     );
@@ -358,7 +358,7 @@ async fn test_regenerate_lockfile_bun_lock_stays_requires_lockfile_update() {
 
 #[cfg(feature = "pypi")]
 #[tokio::test]
-async fn test_regenerate_lockfile_deferred_ecosystem_keeps_requires_lockfile_update() {
+async fn test_regenerate_lockfile_without_a_lock_file_keeps_requires_lockfile_update() {
     let project = Project::new();
     let manifest = project.write("pyproject.toml", "[project]\nname = \"x\"\n");
     let ecosystem = ecosystem(EcosystemId::Pypi);

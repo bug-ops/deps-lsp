@@ -304,6 +304,14 @@ impl PackageRendering for GradleFormatter {
 }
 
 impl RequirementResolution for GradleFormatter {
+    fn compare_versions(
+        &self,
+        a: &ConcreteVersion,
+        b: &ConcreteVersion,
+    ) -> Option<std::cmp::Ordering> {
+        crate::version::try_compare_versions(a.as_str(), b.as_str())
+    }
+
     fn version_satisfies_bounded_requirement(
         &self,
         version: &ConcreteVersion,

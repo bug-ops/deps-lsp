@@ -32,6 +32,13 @@ use crate::update::group_tests::{applied, group_from, item, skipped};
 use crate::update::regen::{LockfileOutcome, NotApplicableReason, ProcessGroup};
 use crate::update::{CurrentVersion, Outcome, SkipReason, UpdatePlan, UpdateRun};
 
+fn no_run() -> UpdateRun {
+    UpdateRun {
+        plan: UpdatePlan::default(),
+        lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::NoLockfilePresent),
+    }
+}
+
 pub(super) const STUB_FORMATTER: deps_core::test_util::StubFormatter =
     deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 pub(super) const URL: &str = "https://example.test/pr/1";
@@ -671,7 +678,7 @@ async fn test_restore_reverts_only_files_directly_inside_the_manifest_directory(
     git(&fx.root, &["add", "app/Cargo.lock"]);
     fx.write("app/untracked.txt", "keep me\n");
 
-    restore(&ctx).await.expect("restore");
+    restore(&ctx, &no_run()).await.expect("restore");
 
     assert_eq!(fx.read("app/Cargo.toml"), "initial app/Cargo.toml\n");
     assert_eq!(fx.read("app/Cargo.lock"), "initial app/Cargo.lock\n");
@@ -696,7 +703,7 @@ async fn test_restore_at_the_repository_root_leaves_subdirectories_alone() {
         fx.write(file, "edited\n");
     }
 
-    restore(&ctx).await.expect("restore");
+    restore(&ctx, &no_run()).await.expect("restore");
 
     assert_eq!(fx.status(), [" M app/Cargo.toml", " M other/file.txt"]);
 }

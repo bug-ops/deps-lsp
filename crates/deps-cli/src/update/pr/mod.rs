@@ -12,7 +12,7 @@ mod supersede;
 
 pub use supersede::{
     RequestMarker, RequestNumber, RunMode, SupersedeError, SupersedeReport, SupersededPolicy,
-    close_superseded,
+    SweepCoverage, close_superseded,
 };
 
 #[cfg(all(test, unix))]
@@ -34,7 +34,7 @@ use deps_core::{ConcreteVersion, PackageName};
 
 use self::git::{Runner, Step, Tool};
 use super::group::UpdateGroup;
-use super::regen::{Interrupts, LockfileOutcome, LockfileSupport, ProcessGroup, lockfile_support};
+use super::regen::{Companion, Interrupts, LockfileOutcome, ProcessGroup};
 use super::{Outcome, UpdatePlan, UpdateRun};
 
 const BRANCH_PREFIX: &str = "deps-cli/";
@@ -44,6 +44,8 @@ const TITLE_NAME_MAX_CHARS: usize = 80;
 const BODY_NAME_MAX_CHARS: usize = 200;
 const BODY_MAX_ROWS: usize = 50;
 const BODY_MAX_BYTES: usize = 60_000;
+/// Bound on the bytes of every file-list argv, under Windows' 32,767-character command line.
+const PUBLISH_ARGV_MAX_BYTES: usize = 24_000;
 
 /// The hosting service whose CLI creates the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -77,6 +79,84 @@ impl RepoRelativeDir {
     }
 }
 
+/// A `/`-separated path below the repository root, never empty or absolute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoPath(String);
+
+impl RepoPath {
+    /// The route from `root` to `path`, both canonicalized; `None` when `path` is not below
+    /// `root` or is not UTF-8.
+    fn below(root: &Path, path: &Path) -> Option<Self> {
+        let root = std::fs::canonicalize(root).ok()?;
+        let path = std::fs::canonicalize(path).ok()?;
+        let parts = path
+            .strip_prefix(root)
+            .ok()?
+            .components()
+            .map(|component| match component {
+                std::path::Component::Normal(part) => part.to_str(),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!parts.is_empty()).then(|| Self(parts.join("/")))
+    }
+
+    /// The pathspec that names exactly this path, whatever the working directory.
+    fn literal(&self) -> String {
+        format!(":(top,literal){}", self.0)
+    }
+}
+
+/// Everything one run may write that `--open-pr` publishes or restores.
+#[derive(Debug, Default)]
+struct PublishScope {
+    files: Vec<RepoPath>,
+    trees: Vec<RepoPath>,
+}
+
+impl PublishScope {
+    /// The manifest, plus the regenerated lock file and its companions when `lockfile` holds them.
+    ///
+    /// A path that cannot be placed below the repository root is left out, so a change to it
+    /// fails closed as an unexpected change.
+    fn of(ctx: &RepoContext, lockfile: &LockfileOutcome) -> Self {
+        let mut scope = Self {
+            files: vec![RepoPath(ctx.manifest_path())],
+            trees: Vec::new(),
+        };
+        if let LockfileOutcome::Regenerated {
+            lockfile,
+            companions,
+            ..
+        } = lockfile
+        {
+            scope
+                .files
+                .extend(RepoPath::below(&ctx.root, lockfile.real_path()));
+            for companion in companions {
+                match companion {
+                    Companion::File(path) => scope.files.extend(RepoPath::below(&ctx.root, path)),
+                    Companion::Tree(path) => scope.trees.extend(RepoPath::below(&ctx.root, path)),
+                }
+            }
+        }
+        scope
+    }
+
+    fn check_bound(&self) -> Result<(), PrError> {
+        let bytes: usize = self
+            .files
+            .iter()
+            .chain(&self.trees)
+            .map(|path| path.0.len())
+            .sum();
+        if bytes > PUBLISH_ARGV_MAX_BYTES {
+            return Err(PrError::PublishSetTooLarge);
+        }
+        Ok(())
+    }
+}
+
 /// The branch `HEAD` was on when the run started; never one deps-cli created and never one
 /// a command line could read as an option.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +187,12 @@ pub struct RepoContext {
 }
 
 impl RepoContext {
+    /// The work-tree root, as `git rev-parse --show-toplevel` printed it.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn runner(&self) -> Runner {
         Runner {
             group: self.group,
@@ -151,8 +237,8 @@ pub struct PullRequestText {
     title: String,
     body: String,
     commit_body: String,
-    /// Repo-relative files the commit may contain: the manifest and a regenerated lock file.
-    publishable_paths: Vec<String>,
+    /// What the commit may contain: the manifest, the regenerated lock file and its companions.
+    scope: PublishScope,
 }
 
 impl PullRequestText {
@@ -298,12 +384,18 @@ pub enum PrError {
          directory>`)"
     )]
     DirtyWorkingTree,
-    /// The ecosystem cannot regenerate its lock file yet.
+    /// A directory the run replaces is not tracked in `HEAD`.
     #[error(
-        "--open-pr does not support {0} yet; supported ecosystems: {supported}",
-        supported = supported_ecosystems()
+        "--open-pr needs {path} to be tracked in git (it is untracked or ignored); commit it or \
+         run without --open-pr"
     )]
-    UnsupportedEcosystem(EcosystemId),
+    UntrackedTree {
+        /// The directory, relative to the repository root.
+        path: String,
+    },
+    /// The files to publish do not fit one command line.
+    #[error("the set of files to publish is too large for one command line, so nothing was staged")]
+    PublishSetTooLarge,
     /// A local branch with this name exists but the remote has none.
     #[error(
         "the local branch {branch} already exists but is not on origin; delete it with \
@@ -375,15 +467,6 @@ pub enum PrError {
         /// The step.
         step: Step,
     },
-}
-
-fn supported_ecosystems() -> String {
-    EcosystemId::ALL
-        .iter()
-        .filter(|id| lockfile_support(**id) != LockfileSupport::Deferred)
-        .map(|id| id.id())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn exit_text(code: Option<i32>) -> String {
@@ -693,15 +776,20 @@ pub fn branch_for(
         (None, true) => sanitize_part(&format!("{}-{}", first.0, first.1)),
         (None, false) => "all".to_owned(),
     };
-    let dir = if ctx.manifest_dir.is_root() {
+    Some(BranchName(format!(
+        "{BRANCH_PREFIX}{}/{}{label}-{hash}",
+        ecosystem.id(),
+        branch_dir_segment(ctx)
+    )))
+}
+
+/// The manifest-directory part of an update branch: empty for a root manifest, else `<dir>/`.
+fn branch_dir_segment(ctx: &RepoContext) -> String {
+    if ctx.manifest_dir.is_root() {
         String::new()
     } else {
         format!("{}/", sanitize_part(&ctx.manifest_dir.0))
-    };
-    Some(BranchName(format!(
-        "{BRANCH_PREFIX}{}/{dir}{label}-{hash}",
-        ecosystem.id()
-    )))
+    }
 }
 
 /// Looks the branch up on `origin` and locally.
@@ -804,37 +892,107 @@ pub fn readiness(run: &UpdateRun) -> Readiness<'_> {
     }
 }
 
-/// Reverts the tracked files directly inside the manifest's directory (the manifest and any
-/// lock file a regeneration may have written) to `HEAD`, in the index and the work tree.
+/// The tracked files among `files`, as `git ls-files` lists them.
+async fn tracked_among(
+    runner: &Runner,
+    ctx: &RepoContext,
+    files: &[RepoPath],
+) -> Result<Vec<RepoPath>, PrError> {
+    let mut args = vec!["ls-files".to_owned(), "-z".to_owned(), "--".to_owned()];
+    args.extend(files.iter().map(RepoPath::literal));
+    let listed = runner
+        .run(Tool::Git, Step::ListFiles, &ctx.root, args)
+        .await?;
+    if listed.code != Some(0) {
+        return Err(PrError::ToolFailed {
+            tool: Tool::Git,
+            step: Step::ListFiles,
+            code: listed.code,
+        });
+    }
+    Ok(listed
+        .raw
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| RepoPath(String::from_utf8_lossy(path).into_owned()))
+        .collect())
+}
+
+/// Reverts what the run may have written to `HEAD`, in the index and the work tree.
 ///
-/// Edits elsewhere in the repository and untracked files are left alone; an edit made beside
-/// the manifest while the run was going is reverted too.
+/// That is the tracked files directly inside the manifest's directory, the tracked regenerated
+/// lock file and companion files of `run` (a workspace member's lock file lives elsewhere), and
+/// the contents of its companion trees, where untracked residue is removed too.
+///
+/// Edits elsewhere in the repository and untracked files outside the trees are left alone; an
+/// edit made beside the manifest while the run was going is reverted too.
 ///
 /// # Errors
 ///
-/// A failed git step.
-pub async fn restore(ctx: &RepoContext) -> Result<(), PrError> {
-    let pathspec = if ctx.manifest_dir.is_root() {
+/// [`PrError::PublishSetTooLarge`] or a failed git step.
+pub async fn restore(ctx: &RepoContext, run: &UpdateRun) -> Result<(), PrError> {
+    let scope = PublishScope::of(ctx, &run.lockfile);
+    scope.check_bound()?;
+    let runner = ctx.runner();
+    let tracked = tracked_among(&runner, ctx, &scope.files).await?;
+
+    let glob = if ctx.manifest_dir.is_root() {
         ":(top,glob)*".to_owned()
     } else {
         format!(":(top,glob){}/*", escape_glob(&ctx.manifest_dir.0))
     };
-    ctx.runner()
+    let mut args = vec![
+        "restore".to_owned(),
+        "--source=HEAD".to_owned(),
+        "--staged".to_owned(),
+        "--worktree".to_owned(),
+        "--".to_owned(),
+        glob,
+    ];
+    args.extend(tracked.iter().chain(&scope.trees).map(RepoPath::literal));
+    runner
+        .succeed(Tool::Git, Step::Restore, &ctx.root, args)
+        .await?;
+
+    for tree in &scope.trees {
+        runner
+            .succeed(
+                Tool::Git,
+                Step::Restore,
+                &ctx.root,
+                ["clean", "-f", "-d", "-q", "--", tree.literal().as_str()],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Checks that `tree`, a directory a run will replace wholesale, is tracked in `HEAD`.
+///
+/// Run before regeneration so that every companion tree reaching [`describe`] or [`restore`] is
+/// tracked: an untracked or ignored tree could be neither reverted nor reviewed in the commit.
+///
+/// # Errors
+///
+/// [`PrError::UntrackedTree`] when `HEAD` has no tree object there, or a failed git step.
+pub async fn require_tracked_tree(ctx: &RepoContext, tree: &Path) -> Result<(), PrError> {
+    let untracked = || PrError::UntrackedTree {
+        path: tree.display().to_string(),
+    };
+    let relative = RepoPath::below(&ctx.root, tree).ok_or_else(untracked)?;
+    let listed = ctx
+        .runner()
         .succeed(
             Tool::Git,
-            Step::Restore,
+            Step::ListFiles,
             &ctx.root,
-            [
-                "restore",
-                "--source=HEAD",
-                "--staged",
-                "--worktree",
-                "--",
-                pathspec.as_str(),
-            ],
+            ["ls-tree", "-d", "HEAD", "--", relative.literal().as_str()],
         )
-        .await
-        .map(drop)
+        .await?;
+    if listed.is_empty() {
+        return Err(PrError::UntrackedTree { path: relative.0 });
+    }
+    Ok(())
 }
 
 /// One applied dependency as shown in the request text.
@@ -1025,17 +1183,11 @@ pub fn describe(
 ) -> PullRequestText {
     let run = run.0;
     let bumps = applied_bumps(run);
-    let mut publishable_paths = vec![ctx.manifest_path()];
-    if let LockfileOutcome::Regenerated { lockfile, .. } = &run.lockfile
-        && let Some(name) = lockfile.file_name()
-    {
-        publishable_paths.push(ctx.manifest_dir.join(&name.to_string_lossy()));
-    }
     PullRequestText {
         title: title_for(ctx, &bumps, group),
         body: body_for(run, &bumps),
         commit_body: commit_body_for(&bumps),
-        publishable_paths,
+        scope: PublishScope::of(ctx, &run.lockfile),
     }
 }
 
@@ -1047,14 +1199,16 @@ async fn changed_publishable_paths(
 ) -> Result<Vec<String>, PrError> {
     const LISTED: usize = 10;
 
-    let diff = runner
-        .run(
-            Tool::Git,
-            Step::Diff,
-            &ctx.root,
-            ["diff", "--name-only", "-z", "HEAD"],
-        )
-        .await?;
+    let mut args = ["diff", "--name-only", "-z", "HEAD", "--", "."]
+        .map(str::to_owned)
+        .to_vec();
+    args.extend(
+        text.scope
+            .trees
+            .iter()
+            .map(|tree| format!(":(exclude,top,literal){}", tree.0)),
+    );
+    let diff = runner.run(Tool::Git, Step::Diff, &ctx.root, args).await?;
     if diff.code != Some(0) {
         return Err(PrError::ToolFailed {
             tool: Tool::Git,
@@ -1070,7 +1224,7 @@ async fn changed_publishable_paths(
         .collect();
     let (publishable, foreign): (Vec<String>, Vec<String>) = changed
         .into_iter()
-        .partition(|path| text.publishable_paths.contains(path));
+        .partition(|path| text.scope.files.iter().any(|file| file.0 == *path));
     if diff.truncated || !foreign.is_empty() {
         return Err(PrError::UnexpectedChanges {
             more: foreign.len().saturating_sub(LISTED),
@@ -1102,6 +1256,7 @@ pub async fn open(
     let root = ctx.root.as_path();
     let name = branch.0.as_str();
 
+    text.scope.check_bound()?;
     let paths = changed_publishable_paths(&runner, ctx, text).await?;
     if paths.is_empty() {
         return Ok(PrOutcome::NothingToCommit);
@@ -1114,8 +1269,20 @@ pub async fn open(
     )
     .await?;
     let mut stage = vec!["add".to_owned(), "--".to_owned()];
-    stage.extend(paths);
+    stage.extend(paths.into_iter().map(|path| RepoPath(path).literal()));
     git(Step::Stage, stage).await?;
+    for tree in &text.scope.trees {
+        git(
+            Step::Stage,
+            vec![
+                "add".to_owned(),
+                "-A".to_owned(),
+                "--".to_owned(),
+                tree.literal(),
+            ],
+        )
+        .await?;
+    }
     git(
         Step::Commit,
         vec![

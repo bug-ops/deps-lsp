@@ -144,36 +144,35 @@ fn test_update_open_pr_outside_a_git_repository_exits_2() {
     assert_refused(&output, "refusal");
 }
 
-#[cfg(feature = "composer")]
+#[cfg(feature = "go")]
 #[test]
-fn test_update_open_pr_for_a_deferred_ecosystem_exits_2_naming_the_supported_ones() {
-    let repo = repository(
-        "composer.json",
-        "{\"require\": {\"monolog/monolog\": \"1.0.0\"}}\n",
-    );
+fn test_update_open_pr_for_a_module_with_an_ignored_vendor_tree_exits_2_and_writes_nothing() {
+    const GO_MOD: &str = "module example.com/app\n\ngo 1.21\n\nrequire golang.org/x/text v0.3.0\n";
+    let repo = repository("go.mod", GO_MOD);
+    std::fs::write(repo.path().join(".gitignore"), "vendor/\n").expect("write gitignore");
+    git(repo.path(), &["add", "--all"]);
+    git(repo.path(), &["commit", "--message=ignore vendor"]);
+    std::fs::create_dir(repo.path().join("vendor")).expect("create vendor");
+    std::fs::write(
+        repo.path().join("vendor/modules.txt"),
+        "# golang.org/x/text v0.3.0\n",
+    )
+    .expect("write modules.txt");
 
     let output = run(
         repo.path(),
-        &[
-            "--open-pr",
-            "github",
-            "--lockfile",
-            "regenerate",
-            "composer.json",
-        ],
+        &["--open-pr", "github", "--lockfile", "regenerate", "go.mod"],
     );
 
-    assert_refused(&output, "deferred ecosystem");
+    assert_refused(&output, "untracked vendor tree");
     let stderr = stderr(&output);
-    for supported in ["cargo", "npm", "go"] {
-        assert!(
-            stderr.contains(supported),
-            "{supported} not named in: {stderr}"
-        );
-    }
+    assert!(
+        stderr.contains("vendor") && stderr.contains("tracked"),
+        "{stderr}"
+    );
     assert_eq!(
-        std::fs::read_to_string(repo.path().join("composer.json")).expect("read"),
-        "{\"require\": {\"monolog/monolog\": \"1.0.0\"}}\n"
+        std::fs::read_to_string(repo.path().join("go.mod")).expect("read"),
+        GO_MOD
     );
 }
 

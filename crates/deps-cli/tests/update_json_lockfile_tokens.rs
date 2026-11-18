@@ -11,9 +11,7 @@ use std::path::PathBuf;
 
 use deps_cli::format::DryRun;
 use deps_cli::format::json::update_to_document;
-use deps_cli::update::regen::{
-    LockfileOutcome, Program, PythonLocker, RegenerationError, UnsupportedReason,
-};
+use deps_cli::update::regen::{LockfileOutcome, Program, RegenerationError, UnsupportedReason};
 use deps_cli::update::{UpdatePlan, UpdateRun};
 use deps_core::{ConcreteVersion, PackageName};
 use serde_json::json;
@@ -48,13 +46,13 @@ fn python_locker_deferred_token() {
     assert_eq!(
         lockfile_json(LockfileOutcome::Unsupported {
             lockfile: None,
-            reason: UnsupportedReason::PythonLockerDeferred(PythonLocker::Poetry),
+            reason: UnsupportedReason::PythonLockerDeferred,
         }),
         json!({
             "status": "unsupported",
             "reason": "python-locker-deferred",
             "path": null,
-            "detail": "poetry"
+            "detail": "pipenv"
         })
     );
 }
@@ -130,6 +128,11 @@ fn new_unsupported_reasons_serialize_their_wire_tokens() {
             UnsupportedReason::ToolTooOld(Program::Poetry),
             "tool-too-old",
             json!("poetry"),
+        ),
+        (
+            UnsupportedReason::OtherFloatingRequirements,
+            "other-floating-requirements",
+            json!(null),
         ),
     ] {
         assert_eq!(

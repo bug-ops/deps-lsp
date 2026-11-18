@@ -142,10 +142,10 @@ impl DisplayLockPath {
 
     /// Builds a display path for fixtures that stand in for a regeneration result.
     #[cfg(all(test, unix))]
-    pub(in crate::update) fn for_test(path: &str) -> Self {
+    pub(in crate::update) fn for_test(shown: &str, real: &Path) -> Self {
         Self {
-            shown: PathBuf::from(path),
-            real: PathBuf::from(path),
+            shown: PathBuf::from(shown),
+            real: real.to_path_buf(),
         }
     }
 }
@@ -200,25 +200,19 @@ pub enum NotApplicableReason {
 /// Why regeneration is not supported for this manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedReason {
-    /// The ecosystem has a lockfile but regeneration is not implemented for it yet.
-    EcosystemDeferred(EcosystemId),
-    /// The lockfile belongs to a JavaScript client that is not supported yet.
-    NpmClientDeferred(NpmClient),
     /// The manifest may be a workspace member: its lockfile is in an ancestor directory, an
     /// ancestor declares a workspace, or the pnpm workspace directory is set via the environment.
     WorkspaceMemberLockfile,
     /// The located lockfile is not the one the tool would update.
     LockfileOwnershipMismatch,
-    /// The Go module vendors its dependencies.
-    GoVendored,
     /// A target chosen by the cooldown fallback cannot be pinned by range resolution.
     CooldownFallbackTarget,
     /// The lockfile is a symlink or not a regular file, so the tool would rewrite elsewhere.
     LockfileSymlink,
     /// The project uses Yarn Classic (1.x), which has no lockfile-only mode.
     YarnClassic,
-    /// The lockfile belongs to a Python locker other than uv, which is not supported yet.
-    PythonLockerDeferred(PythonLocker),
+    /// The lockfile belongs to Pipenv, which is not supported yet.
+    PythonLockerDeferred,
     /// The lock file or a companion path resolves outside the repository.
     LockfileOutsideRepository,
     /// The project uses a legacy lock layout the tool cannot update safely.
@@ -231,6 +225,9 @@ pub enum UnsupportedReason {
     LockfileOnlyUpdateUnsupported(Program),
     /// The installed tool is older than the first version the run supports.
     ToolTooOld(Program),
+    /// Other dependencies of the project have floating or range requirements the tool would
+    /// re-resolve as a side effect of the run.
+    OtherFloatingRequirements,
 }
 
 /// Why a regeneration that started did not produce a verified lockfile.
@@ -424,16 +421,6 @@ impl fmt::Display for NotApplicableReason {
 impl fmt::Display for UnsupportedReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EcosystemDeferred(id) => {
-                write!(f, "regeneration is not supported for {} yet", id.id())
-            }
-            Self::NpmClientDeferred(client) => {
-                write!(
-                    f,
-                    "regeneration is not supported for {} yet",
-                    client.as_str()
-                )
-            }
             Self::WorkspaceMemberLockfile => {
                 f.write_str(
                     "the manifest may belong to a workspace (the lockfile is in an ancestor directory, an \
@@ -443,7 +430,6 @@ ancestor declares a workspace, or the workspace directory is set through the env
             Self::LockfileOwnershipMismatch => {
                 f.write_str("the lockfile is not the one the tool would update")
             }
-            Self::GoVendored => f.write_str("the Go module vendors its dependencies"),
             Self::CooldownFallbackTarget => {
                 f.write_str("a cooldown-fallback target cannot be pinned by range resolution")
             }
@@ -451,12 +437,8 @@ ancestor declares a workspace, or the workspace directory is set through the env
             Self::YarnClassic => f.write_str(
                 "Yarn Classic (1.x) has no lockfile-only mode; only Yarn 2+ is supported",
             ),
-            Self::PythonLockerDeferred(locker) => {
-                write!(
-                    f,
-                    "regeneration is not supported for {} yet",
-                    locker.as_str()
-                )
+            Self::PythonLockerDeferred => {
+                f.write_str("regeneration is not supported for pipenv yet")
             }
             Self::LockfileOutsideRepository => {
                 f.write_str("the lockfile or a file the tool writes is outside the repository")
@@ -477,6 +459,9 @@ ancestor declares a workspace, or the workspace directory is set through the env
             Self::ToolTooOld(program) => {
                 write!(f, "the installed {program} is too old for lockfile regeneration")
             }
+            Self::OtherFloatingRequirements => f.write_str(
+                "other dependencies have floating or range requirements the restore would re-resolve",
+            ),
         }
     }
 }
@@ -521,12 +506,10 @@ const fn strategy(id: EcosystemId) -> Strategy {
 /// Whether regeneration is implemented for an ecosystem, decided from its identity alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockfileSupport {
-    /// A tool regenerates the lock file (Cargo, npm family, Go, uv, Bundler, Deno).
+    /// A tool regenerates the lock file.
     Regenerates,
     /// The ecosystem has no lock file format, so there is nothing to regenerate.
     NoLockfileFormat,
-    /// The ecosystem has a lock file but regeneration is not implemented for it yet.
-    Deferred,
 }
 
 /// How [`regenerate_lockfile`] treats `id`, known before anything is analyzed or written.
@@ -544,37 +527,38 @@ pub enum LockfileSupport {
 #[must_use]
 pub const fn lockfile_support(id: EcosystemId) -> LockfileSupport {
     match strategy(id) {
-        Strategy::Cargo | Strategy::Go | Strategy::Bundler | Strategy::Deno => {
-            LockfileSupport::Regenerates
-        }
-        Strategy::NpmFamily => js::SUPPORT,
-        Strategy::Pypi => python::SUPPORT,
-        Strategy::Composer => composer::SUPPORT,
-        Strategy::Dart => dart::SUPPORT,
-        Strategy::NuGet => nuget::SUPPORT,
-        Strategy::Gradle => gradle::SUPPORT,
-        Strategy::Swift => swift::SUPPORT,
+        Strategy::Cargo
+        | Strategy::NpmFamily
+        | Strategy::Go
+        | Strategy::Pypi
+        | Strategy::Bundler
+        | Strategy::Deno
+        | Strategy::Composer
+        | Strategy::Dart
+        | Strategy::NuGet
+        | Strategy::Gradle
+        | Strategy::Swift => LockfileSupport::Regenerates,
         Strategy::NoLockfileFormat => LockfileSupport::NoLockfileFormat,
     }
 }
 
-/// The tools `--lockfile regenerate` drives, as prose (`Cargo, npm, pnpm, Yarn 2+, Go, uv,
-/// Bundler and Deno`), derived from [`strategy`] so it cannot drift from the support set.
+/// The tools `--lockfile regenerate` drives, as prose (`Cargo, npm, pnpm, Yarn 2+, Bun, Go, ...`),
+/// derived from [`strategy`] so it cannot drift from the support set.
 pub(super) fn supported_tools_text() -> String {
     let mut tools: Vec<&str> = EcosystemId::ALL
         .iter()
         .flat_map(|id| match strategy(*id) {
             Strategy::Cargo => ["Cargo"].as_slice(),
-            Strategy::NpmFamily => js::TOOLS,
+            Strategy::NpmFamily => ["npm", "pnpm", "Yarn 2+", "Bun"].as_slice(),
             Strategy::Go => ["Go"].as_slice(),
-            Strategy::Pypi => python::TOOLS,
+            Strategy::Pypi => ["uv", "Poetry", "PDM"].as_slice(),
             Strategy::Bundler => ["Bundler"].as_slice(),
             Strategy::Deno => ["Deno"].as_slice(),
-            Strategy::Composer => composer::TOOLS,
-            Strategy::Dart => dart::TOOLS,
-            Strategy::NuGet => nuget::TOOLS,
-            Strategy::Gradle => gradle::TOOLS,
-            Strategy::Swift => swift::TOOLS,
+            Strategy::Composer => ["Composer"].as_slice(),
+            Strategy::Dart => ["Dart", "Flutter"].as_slice(),
+            Strategy::NuGet => ["NuGet"].as_slice(),
+            Strategy::Gradle => ["Gradle"].as_slice(),
+            Strategy::Swift => ["SwiftPM"].as_slice(),
             Strategy::NoLockfileFormat => [].as_slice(),
         })
         .copied()
@@ -686,7 +670,7 @@ pub async fn regenerate_lockfile(
     gate: RegenerationGate,
 ) -> UpdateRun {
     let interrupt = interrupt_listener(&plan, target, gate);
-    regenerate_with_interrupt(plan, target, gate, WorkspaceMembers::Allowed, interrupt).await
+    regenerate_with_interrupt(plan, target, gate, LockfileScope::Unrestricted, interrupt).await
 }
 
 /// Like [`regenerate_lockfile`], but installs no signal listener of its own.
@@ -695,16 +679,21 @@ pub async fn regenerate_lockfile(
 /// [`PrSignals`](super::pr::PrSignals)): two competing listeners would make an interrupt end
 /// either as a dropped phase or as a `failed` lock file outcome, depending on which fired first.
 /// The dropped future still terminates the tool's process tree through the child guards.
+///
+/// `repo_root` is the work-tree root: no lock file or companion path may resolve outside it, or
+/// the run ends `Unsupported(LockfileOutsideRepository)` before anything is spawned. Workspace
+/// members are allowed; their lock file is published from wherever it lives inside the root.
 pub async fn regenerate_lockfile_unlistened(
     plan: UpdatePlan,
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
+    repo_root: &Path,
 ) -> UpdateRun {
     regenerate_with_interrupt(
         plan,
         target,
         gate,
-        WorkspaceMembers::Refused,
+        LockfileScope::Within(repo_root),
         std::future::pending(),
     )
     .await
@@ -714,7 +703,7 @@ async fn regenerate_with_interrupt(
     plan: UpdatePlan,
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
-    members: WorkspaceMembers,
+    scope: LockfileScope<'_>,
     interrupt: impl Future<Output = ()>,
 ) -> UpdateRun {
     let runner = ToolRunner {
@@ -722,7 +711,7 @@ async fn regenerate_with_interrupt(
         search_path: SearchPath::Inherit,
         group: ProcessGroup::detect(),
     };
-    let lockfile = regenerate_until(&plan, target, gate, &runner, members, interrupt).await;
+    let lockfile = regenerate_until(&plan, target, gate, &runner, scope, interrupt).await;
     let mut plan = plan;
     settle_lockfile_only(&mut plan, &lockfile, target.ecosystem.formatter());
     UpdateRun { plan, lockfile }
@@ -732,8 +721,8 @@ async fn regenerate_with_interrupt(
 /// is at least one pin.
 ///
 /// This is decided before the strategy is known, so handlers are also installed for runs that
-/// end up spawning nothing (deferred ecosystems, a missing lock file); the signals are then
-/// swallowed for the rest of the short-lived process. Under `--open-pr`,
+/// end up spawning nothing (an ecosystem without a lock file format, a missing lock file); the
+/// signals are then swallowed for the rest of the short-lived process. Under `--open-pr`,
 /// [`PrSignals`](super::pr::PrSignals) owns the only listener and regeneration runs through
 /// [`regenerate_lockfile_unlistened`].
 ///
@@ -835,20 +824,20 @@ async fn regenerate_lockfile_with(
         target,
         gate,
         runner,
-        WorkspaceMembers::Allowed,
+        LockfileScope::Unrestricted,
         std::future::pending(),
     )
     .await
 }
 
-/// Regenerates like [`regenerate_lockfile`], but abandons the run when `interrupt` resolves: dropping
-/// the session fires every child guard, so the tool's process tree is killed.
+/// Regenerates like [`regenerate_lockfile`], but abandons the run when `interrupt` resolves:
+/// dropping the session fires every child guard, so the tool's process tree is killed.
 async fn regenerate_until(
     plan: &UpdatePlan,
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
     runner: &ToolRunner,
-    members: WorkspaceMembers,
+    scope: LockfileScope<'_>,
     interrupt: impl Future<Output = ()>,
 ) -> LockfileOutcome {
     let pins = collect_pins(plan, target.ecosystem.formatter());
@@ -869,7 +858,7 @@ async fn regenerate_until(
             .parent()
             .unwrap_or_else(|| Path::new("")),
         snapshot: &snapshot,
-        members,
+        scope,
     };
     let outcome = {
         tokio::select! {
@@ -950,14 +939,12 @@ fn restore_snapshot(
     error
 }
 
-/// Whether a manifest below its lockfile's directory (a workspace member) may be regenerated.
-///
-/// Member runs write the workspace root's lockfile, which `--open-pr` neither stages nor
-/// restores, so that entry point refuses them.
+/// Where a regeneration may write: anywhere the tool puts its lock file, or only inside the
+/// work tree `--open-pr` publishes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspaceMembers {
-    Allowed,
-    Refused,
+enum LockfileScope<'a> {
+    Unrestricted,
+    Within(&'a Path),
 }
 
 /// The state of one regeneration: the target, the shared deadline and the pins to verify.
@@ -968,7 +955,7 @@ struct Session<'a> {
     pins: &'a [LockPin],
     manifest_dir: &'a Path,
     snapshot: &'a OnceLock<LockSnapshot>,
-    members: WorkspaceMembers,
+    scope: LockfileScope<'a>,
 }
 
 impl Session<'_> {
@@ -984,11 +971,11 @@ impl Session<'_> {
             Strategy::Pypi => self.pypi().await,
             Strategy::Bundler => self.bundler().await,
             Strategy::Deno => self.deno().await,
-            Strategy::Composer => self.composer(id),
-            Strategy::Dart => self.dart(id),
-            Strategy::NuGet => self.nuget(id),
-            Strategy::Gradle => self.gradle(id),
-            Strategy::Swift => self.swift(id),
+            Strategy::Composer => self.composer().await,
+            Strategy::Dart => self.dart().await,
+            Strategy::NuGet => self.nuget().await,
+            Strategy::Gradle => self.gradle().await,
+            Strategy::Swift => self.swift().await,
         }
     }
 
@@ -1075,22 +1062,30 @@ impl Session<'_> {
         )))
     }
 
-    /// Whether a manifest below its lockfile's directory (a workspace member) may be regenerated.
-    fn members_allowed(&self) -> bool {
-        self.members == WorkspaceMembers::Allowed
+    /// Whether `path` resolves inside the scope; an uncanonicalizable path is outside.
+    fn within_scope(&self, path: &Path) -> bool {
+        match self.scope {
+            LockfileScope::Unrestricted => true,
+            LockfileScope::Within(root) => std::fs::canonicalize(root)
+                .ok()
+                .zip(std::fs::canonicalize(path).ok())
+                .is_some_and(|(root, path)| path.starts_with(root)),
+        }
     }
 
-    /// Refuses a lockfile whose final component is a symlink or not a regular file: the tool
-    /// would rewrite the link's target, or replace the link, outside the manifest's tree.
+    /// Refuses a lockfile that is a symlink or not a regular file (the tool would rewrite the
+    /// link's target, or replace the link, elsewhere) or that resolves outside the scope.
     fn placement_refusal(&self, lockfile: &Path) -> Option<LockfileOutcome> {
         let plain = std::fs::symlink_metadata(lockfile)
             .is_ok_and(|metadata| metadata.file_type().is_file());
-        (!plain).then(|| {
-            unsupported(
-                Some(self.display_lock_path(lockfile)),
-                UnsupportedReason::LockfileSymlink,
-            )
-        })
+        let reason = if !plain {
+            UnsupportedReason::LockfileSymlink
+        } else if !self.within_scope(lockfile) {
+            UnsupportedReason::LockfileOutsideRepository
+        } else {
+            return None;
+        };
+        Some(unsupported(Some(self.display_lock_path(lockfile)), reason))
     }
 
     /// Verifies every pin against a freshly read lockfile and builds the final outcome.

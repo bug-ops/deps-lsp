@@ -18,7 +18,7 @@ use deps_cli::update;
 use deps_cli::update::group::UpdateGroup;
 use deps_cli::update::ignore::IgnoreRules;
 use deps_cli::update::pr;
-use deps_cli::update::regen::{LockfileMode, LockfileOutcome, LockfileSupport, lockfile_support};
+use deps_cli::update::regen::{LockfileMode, LockfileOutcome};
 use deps_cli::{format, walk};
 use deps_core::net_policy::{EnvSource, ProcessEnv, RegistryEnvironment};
 use deps_core::osv::{OSV_BASE_URL_ENV, OsvClient, OsvEndpoint};
@@ -665,14 +665,14 @@ async fn run_update_flow(
             pr::Readiness::LockfileNotRegenerated => {
                 dry_run = true;
                 let reason = pr::PrError::LockfileNotRegenerated;
-                failure = Some(match pr::restore(repo).await {
+                failure = Some(match pr::restore(repo, &run).await {
                     Ok(()) => reason.to_string(),
                     Err(error) => format!("{reason}; restoring the manifest also failed: {error}"),
                 });
             }
             pr::Readiness::NothingSettled => {
                 dry_run = true;
-                match pr::restore(repo).await {
+                match pr::restore(repo, &run).await {
                     Ok(()) => eprintln!(
                         "deps-cli: no update was settled; no pull request opened (the manifest and \
                          the regenerated lock file were reverted)"
@@ -761,11 +761,16 @@ fn print_supersede_report(report: &pr::SupersedeReport) {
     for number in &report.closed {
         eprintln!("deps-cli: closed superseded request {number}");
     }
-    if report.listing_full {
-        eprintln!(
+    match report.coverage {
+        pr::SweepCoverage::Complete => {}
+        pr::SweepCoverage::ListingFull => eprintln!(
             "deps-cli: notice: the listing of open requests was full, so older superseded \
              requests may remain open"
-        );
+        ),
+        pr::SweepCoverage::CandidateCapReached => eprintln!(
+            "deps-cli: notice: more open requests matched than were read in one run, so newer \
+             superseded requests may remain open"
+        ),
     }
     for failure in &report.failures {
         eprintln!("deps-cli: warning: closing superseded requests: {failure}");
@@ -912,9 +917,9 @@ fn read_update_manifest(manifest: &walk::DiscoveredManifest) -> Result<String, S
 /// [`IgnoreRules::empty`] once the manifest's ecosystem (and therefore its
 /// `normalize_package_name`) is known.
 ///
-/// `group_rule` is the `--group` selection; `repo` is `Some` under `--open-pr`, which refuses a
-/// deferred ecosystem before analysis (spec 104 FR-003), derives the update branch after
-/// planning and runs as a dry run when that branch is already on the remote.
+/// `group_rule` is the `--group` selection; `repo` is `Some` under `--open-pr`, which checks that a
+/// vendored Go tree is tracked before analysis, derives the update branch after planning and runs
+/// as a dry run when that branch is already on the remote.
 async fn run_update<'a>(
     args: &UpdateArgs,
     policy: PolicyConfig,
@@ -951,8 +956,13 @@ async fn run_update<'a>(
     };
 
     let ecosystem_id = manifest.ecosystem.ecosystem_id();
-    if repo.is_some() && lockfile_support(ecosystem_id) == LockfileSupport::Deferred {
-        return Err(pr::PrError::UnsupportedEcosystem(ecosystem_id).to_string());
+    if let Some(repo) = repo
+        && ecosystem_id == deps_core::EcosystemId::Go
+        && let Some(vendor) = vendored_go_tree(&manifest.path)
+    {
+        pr::require_tracked_tree(repo, &vendor)
+            .await
+            .map_err(|error| error.to_string())?;
     }
 
     // N1 (critic re-review): spec §8's Never clause forbids reading manifest content before
@@ -1109,7 +1119,7 @@ async fn run_update<'a>(
         display_path: &manifest.display_path,
         uri: &analysis.uri,
     };
-    let run = regenerate(plan, &target, gate, repo.is_some()).await;
+    let run = regenerate(plan, &target, gate, repo.map(pr::RepoContext::root)).await;
     Ok(UpdateOutput {
         run,
         group,
@@ -1117,18 +1127,26 @@ async fn run_update<'a>(
     })
 }
 
-/// Regenerates the lock file; under `--open-pr` the caller's `PrSignals` owns the only signal
-/// listener (spec 104 FR-012), so the regeneration installs none.
+/// The `vendor` directory beside a Go manifest, when the module vendors its dependencies.
+fn vendored_go_tree(manifest: &Path) -> Option<PathBuf> {
+    let vendor = manifest.parent()?.join("vendor");
+    vendor.join("modules.txt").is_file().then_some(vendor)
+}
+
+/// Regenerates the lock file; under `--open-pr` (`repo_root` is set) the caller's `PrSignals`
+/// owns the only signal listener (spec 104 FR-012), so the regeneration installs none and may
+/// write only inside the work tree.
 async fn regenerate(
     plan: update::UpdatePlan,
     target: &deps_cli::update::regen::ManifestTarget<'_>,
     gate: deps_cli::update::regen::RegenerationGate,
-    under_open_pr: bool,
+    repo_root: Option<&Path>,
 ) -> update::UpdateRun {
-    if under_open_pr {
-        deps_cli::update::regen::regenerate_lockfile_unlistened(plan, target, gate).await
-    } else {
-        deps_cli::update::regen::regenerate_lockfile(plan, target, gate).await
+    match repo_root {
+        Some(root) => {
+            deps_cli::update::regen::regenerate_lockfile_unlistened(plan, target, gate, root).await
+        }
+        None => deps_cli::update::regen::regenerate_lockfile(plan, target, gate).await,
     }
 }
 

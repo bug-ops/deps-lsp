@@ -131,6 +131,50 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
     compare_parsed(&ParsedVersion::parse(a), &ParsedVersion::parse(b))
 }
 
+/// Orders two NuGet versions, or `None` unless both are strictly well formed.
+///
+/// Well formed means one to four numeric core segments, an optional `-prerelease` and an
+/// optional `+metadata`, each made of non-empty dot-separated `[0-9A-Za-z-]` identifiers.
+///
+/// [`compare_versions`] never fails (an unparsable segment counts as 0), so it is only sound
+/// after this validation.
+///
+/// # Examples
+///
+/// ```
+/// use deps_nuget::version::try_compare_versions;
+/// use std::cmp::Ordering;
+///
+/// assert_eq!(try_compare_versions("1.1.0", "1.0.9"), Some(Ordering::Greater));
+/// assert_eq!(try_compare_versions("1.x", "1.0"), None);
+/// ```
+#[must_use]
+pub fn try_compare_versions(a: &str, b: &str) -> Option<Ordering> {
+    (is_strict_version(a) && is_strict_version(b)).then(|| compare_versions(a, b))
+}
+
+fn is_strict_version(version: &str) -> bool {
+    let identifiers_ok = |text: &str| {
+        text.split('.')
+            .all(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    };
+    let (rest, metadata) = match version.split_once('+') {
+        Some((rest, metadata)) => (rest, Some(metadata)),
+        None => (version, None),
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let segments: Vec<&str> = core.split('.').collect();
+    (1..=4).contains(&segments.len())
+        && segments
+            .iter()
+            .all(|s| s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok())
+        && pre.is_none_or(identifiers_ok)
+        && metadata.is_none_or(identifiers_ok)
+}
+
 /// Detects whether a NuGet version string is a prerelease version.
 ///
 /// NuGet's rule is **structural**, not keyword-based: any version with a `-` suffix after
@@ -671,6 +715,46 @@ mod tests {
                 !satisfies("1.5.0", malformed),
                 "expected {malformed:?} to never satisfy any candidate"
             );
+        }
+    }
+
+    #[test]
+    fn test_try_compare_versions_orders_strict_versions() {
+        assert_eq!(try_compare_versions("1.0.9", "1.1.0"), Some(Ordering::Less));
+        assert_eq!(
+            try_compare_versions("1.0.0-beta.2", "1.0.0-beta.10"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            try_compare_versions("1.0.0+a", "1.0.0+b"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            try_compare_versions("1.2.3.4", "1.2.3"),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn test_try_compare_versions_rejects_malformed_versions() {
+        for bad in [
+            "",
+            "1.x",
+            "1..2",
+            "1.2.3.4.5",
+            "a",
+            "1.0-",
+            "1.0-be ta",
+            "1.0+",
+            "-1.0",
+            "99999999999999999999999.0",
+            "1.0-a..b",
+            "*",
+            "1.*",
+            "[1.0,2.0)",
+        ] {
+            assert_eq!(try_compare_versions(bad, "1.0"), None, "{bad}");
+            assert_eq!(try_compare_versions("1.0", bad), None, "{bad}");
         }
     }
 }
