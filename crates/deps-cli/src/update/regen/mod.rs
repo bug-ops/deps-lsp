@@ -5,7 +5,9 @@
 //! verifies the fresh lockfile against the applied pins. Every outcome, failures included, is
 //! a [`LockfileOutcome`] value so the plan report is always printed.
 
+mod cargo;
 mod command;
+mod go;
 mod interrupt;
 mod js;
 #[cfg(all(test, unix))]
@@ -15,6 +17,7 @@ mod lockers;
 mod lockfile_only_tests;
 #[cfg(all(test, unix))]
 mod process_group_tests;
+mod python;
 mod run;
 #[cfg(test)]
 mod tests;
@@ -36,7 +39,7 @@ use deps_engine::classify::resolved::{LockfileLoad, load_resolved_versions};
 use tokio::time::Instant;
 use url::Url;
 
-use command::{ArgComponent, GoWork, Invocation, NpmPackageArg, compat_class};
+use command::{ArgComponent, Invocation, NpmPackageArg};
 pub use command::{NpmClient, Program, PythonLocker};
 pub(in crate::update) use interrupt::Interrupts;
 pub(in crate::update) use run::{ChildGuard, ProcessGroup};
@@ -914,94 +917,6 @@ impl Session<'_> {
         // A second capture in one run keeps the first: the earliest state is the one to restore.
         let _ = self.snapshot.set(LockSnapshot { files });
         Ok(())
-    }
-
-    async fn cargo(&self) -> Result<LockfileOutcome, RegenerationError> {
-        let manifest = self.target.manifest_path;
-        let probe = Invocation::cargo_locate_workspace(self.manifest_dir, manifest);
-        let root_manifest = self.runner.probe(&probe, self.deadline).await?;
-        let root_dir = (!root_manifest.is_empty())
-            .then(|| self.manifest_dir.join(&root_manifest))
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .ok_or(RegenerationError::UnexpectedProbeOutput {
-                program: Program::Cargo,
-            })?;
-        let owned = root_dir.join("Cargo.lock");
-        if !owned.is_file() {
-            return Ok(LockfileOutcome::NotApplicable(
-                NotApplicableReason::NoLockfilePresent,
-            ));
-        }
-        if let Some(outcome) = self.ownership_refusal(&owned).await? {
-            return Ok(outcome);
-        }
-
-        let mut updates = Vec::with_capacity(self.pins.len());
-        for pin in self.pins {
-            let class = compat_class(pin.compat_basis()).ok_or_else(|| unsafe_argument(pin))?;
-            let (name, version) = arg_pair(pin)?;
-            updates.push(Invocation::cargo_update_precise(
-                self.manifest_dir,
-                manifest,
-                &name,
-                &class,
-                &version,
-            ));
-        }
-
-        self.capture(&[&owned])?;
-        if self.pins.iter().any(|pin| !pin.is_lockfile_only()) {
-            self.runner
-                .run(
-                    &Invocation::cargo_update_workspace(self.manifest_dir, manifest),
-                    self.deadline,
-                )
-                .await?;
-        }
-        for update in &updates {
-            self.runner.run(update, self.deadline).await?;
-        }
-        self.verified(Program::Cargo, &owned, PinCheck::ExactInLock)
-            .await
-    }
-
-    async fn go(&self) -> Result<LockfileOutcome, RegenerationError> {
-        if self.manifest_dir.join("vendor/modules.txt").is_file() {
-            return Ok(unsupported(None, UnsupportedReason::GoVendored));
-        }
-        let workspace = self
-            .runner
-            .probe(&Invocation::go_env_gowork(self.manifest_dir), self.deadline)
-            .await?;
-        let work = if workspace.is_empty() || workspace == "off" {
-            GoWork::Inherit
-        } else {
-            GoWork::Off
-        };
-        let owned = self.manifest_dir.join("go.sum");
-        if !owned.is_file() {
-            return Ok(LockfileOutcome::NotApplicable(
-                NotApplicableReason::NoLockfilePresent,
-            ));
-        }
-        if let Some(outcome) = self.ownership_refusal(&owned).await? {
-            return Ok(outcome);
-        }
-
-        let modules = self
-            .pins
-            .iter()
-            .map(arg_pair)
-            .collect::<Result<Vec<_>, _>>()?;
-        self.capture(&[&self.manifest_dir.join("go.mod"), &owned])?;
-        self.runner
-            .run(
-                &Invocation::go_get(self.manifest_dir, &modules, work),
-                self.deadline,
-            )
-            .await?;
-        self.verified(Program::Go, &owned, PinCheck::ExactInLock)
-            .await
     }
 
     /// The lockfile the ecosystem's own provider associates with the manifest.

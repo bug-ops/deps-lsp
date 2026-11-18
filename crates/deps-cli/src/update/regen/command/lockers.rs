@@ -1,25 +1,9 @@
-//! Invocation shapes of the uv, Bundler and Deno lockers (#2046).
+//! Invocation shapes of the Bundler and Deno lockers (#2046).
 
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::{ArgComponent, Invocation, Program, UnsafeArgument};
-
-/// A list proven to hold at least one element, so a command that must name its targets can never
-/// be built with none (`bundle lock --update` with no names would update every gem).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::update::regen) struct NonEmpty<T>(Vec<T>);
-
-impl<T> NonEmpty<T> {
-    /// `None` for an empty list.
-    pub(in crate::update::regen) fn new(items: Vec<T>) -> Option<Self> {
-        (!items.is_empty()).then_some(Self(items))
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, T> {
-        self.0.iter()
-    }
-}
+use super::{ArgComponent, Invocation, NonEmpty, Program, UnsafeArgument};
 
 /// A `deno update` filter proven safe for argv: the bare package name (`chalk`, `@std/fs`),
 /// never a flag, glob or path traversal. The `npm:`/`jsr:` scheme is stripped because
@@ -60,20 +44,6 @@ impl DenoFilter {
 const DENO_LOCK_FLAG: &str = "--lock=./deno.lock";
 
 impl Invocation {
-    /// `uv lock --no-build --no-python-downloads` with one `--upgrade-package <name>==<version>`
-    /// per pin: no sdist build, no interpreter download, exact versions only.
-    pub(in crate::update::regen) fn uv_lock(
-        cwd: &Path,
-        pins: &NonEmpty<(ArgComponent, ArgComponent)>,
-    ) -> Self {
-        let mut args = Self::strs(&["lock", "--no-build", "--no-python-downloads"]);
-        for (name, version) in pins.iter() {
-            args.push("--upgrade-package".into());
-            args.push(format!("{}=={}", name.as_str(), version.as_str()).into());
-        }
-        Self::new(Program::Uv, cwd, args)
-    }
-
     /// `bundle lock`: re-resolves against the edited Gemfile.
     pub(in crate::update::regen) fn bundle_lock(cwd: &Path) -> Self {
         Self::new(Program::Bundle, cwd, Self::strs(&["lock"]))
@@ -118,12 +88,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_empty_rejects_an_empty_list() {
-        assert!(NonEmpty::<u8>::new(Vec::new()).is_none());
-        assert!(NonEmpty::new(vec![1_u8]).is_some());
-    }
-
-    #[test]
     fn deno_filter_strips_the_scheme() {
         for (name, bare) in [
             ("chalk", "chalk"),
@@ -142,34 +106,5 @@ mod tests {
         ] {
             assert!(DenoFilter::parse(name).is_err(), "{name}");
         }
-    }
-
-    #[test]
-    fn uv_lock_emits_one_upgrade_flag_per_pin() {
-        let pin = |n: &str, v: &str| {
-            (
-                ArgComponent::parse(n).expect("name"),
-                ArgComponent::parse(v).expect("version"),
-            )
-        };
-        let pins = NonEmpty::new(vec![pin("a", "1.0.0"), pin("b", "2.0.0")]).expect("non-empty");
-        let invocation = Invocation::uv_lock(Path::new("."), &pins);
-        let args: Vec<_> = invocation
-            .args()
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect();
-        assert_eq!(
-            args,
-            [
-                "lock",
-                "--no-build",
-                "--no-python-downloads",
-                "--upgrade-package",
-                "a==1.0.0",
-                "--upgrade-package",
-                "b==2.0.0"
-            ]
-        );
     }
 }

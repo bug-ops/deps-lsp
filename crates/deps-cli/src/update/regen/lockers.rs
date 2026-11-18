@@ -1,18 +1,18 @@
-//! Regeneration for the uv, Bundler and Deno lockers (#2046).
+//! Regeneration for the Bundler and Deno lockers (#2046).
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::command::lockers::{DenoFilter, NonEmpty};
+use super::command::NonEmpty;
+use super::command::lockers::DenoFilter;
 use super::{
     ArgComponent, Invocation, LockfileOutcome, NotApplicableReason, NpmClient, PinCheck, Program,
-    PythonLocker, RegenerationError, Session, UnsupportedReason, arg_pair, declares_workspace,
-    same_file, unsupported,
+    RegenerationError, Session, UnsupportedReason, declares_workspace, same_file, unsupported,
 };
 
 /// The lock file beside the manifest, or the outcome that ends the run before any spawn.
-enum Located {
+pub(super) enum Located {
     Beside(PathBuf),
     Stop(LockfileOutcome),
 }
@@ -21,7 +21,7 @@ impl Session<'_> {
     /// The ecosystem provider's lock file when it sits in the manifest's own directory; a lock
     /// file in an ancestor means the manifest is a member of a workspace the tool would lock
     /// from its root.
-    async fn lockfile_beside_manifest(&self) -> Result<Located, RegenerationError> {
+    pub(super) async fn lockfile_beside_manifest(&self) -> Result<Located, RegenerationError> {
         let Some(located) = self.locate().await? else {
             return Ok(Located::Stop(LockfileOutcome::NotApplicable(
                 NotApplicableReason::NoLockfilePresent,
@@ -41,7 +41,7 @@ impl Session<'_> {
     ///
     /// Fails closed: a manifest directory that cannot be canonicalized, or an ancestor chain
     /// longer than the config-walk depth cap, counts as declaring.
-    fn ancestor_declares(&self, declares: impl Fn(&Path) -> bool) -> bool {
+    pub(super) fn ancestor_declares(&self, declares: impl Fn(&Path) -> bool) -> bool {
         let Ok(physical) = std::fs::canonicalize(self.manifest_dir) else {
             return true;
         };
@@ -51,65 +51,6 @@ impl Session<'_> {
         let depth_exhausted = ancestors.len() + 1 == deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH
             && ancestors.last().is_some_and(|dir| dir.parent().is_some());
         depth_exhausted || ancestors.into_iter().any(declares)
-    }
-
-    pub(super) async fn pypi(&self) -> Result<LockfileOutcome, RegenerationError> {
-        let located = match self.lockfile_beside_manifest().await? {
-            Located::Beside(path) => path,
-            Located::Stop(outcome) => return Ok(outcome),
-        };
-        let display = self.display_lock_path(&located);
-        let locker = located
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .and_then(PythonLocker::from_lockfile_name);
-        match locker {
-            Some(PythonLocker::Uv) => {}
-            Some(deferred @ (PythonLocker::Poetry | PythonLocker::Pdm | PythonLocker::Pipenv)) => {
-                return Ok(unsupported(
-                    Some(display),
-                    UnsupportedReason::PythonLockerDeferred(deferred),
-                ));
-            }
-            None => return Err(RegenerationError::UnrecognizedLockfile { path: display.0 }),
-        }
-        if self.target.manifest_path.file_name() != Some(std::ffi::OsStr::new("pyproject.toml")) {
-            return Ok(unsupported(
-                Some(display),
-                UnsupportedReason::LockfileOwnershipMismatch,
-            ));
-        }
-        if self.ancestor_declares(|dir| file_declares(dir, "pyproject.toml", declares_uv_workspace))
-        {
-            return Ok(unsupported(
-                Some(display),
-                UnsupportedReason::WorkspaceMemberLockfile,
-            ));
-        }
-        if let Some(outcome) = self.symlink_refusal(&located) {
-            return Ok(outcome);
-        }
-
-        let pins = self
-            .pins
-            .iter()
-            .map(arg_pair)
-            .collect::<Result<Vec<_>, _>>()?;
-        let Some(pins) = NonEmpty::new(pins) else {
-            return Ok(LockfileOutcome::NotApplicable(
-                NotApplicableReason::NothingApplied,
-            ));
-        };
-
-        self.capture(&[&located])?;
-        self.runner
-            .run(
-                &Invocation::uv_lock(self.manifest_dir, &pins),
-                self.deadline,
-            )
-            .await?;
-        self.verified(Program::Uv, &located, PinCheck::ExactInLock)
-            .await
     }
 
     pub(super) async fn bundler(&self) -> Result<LockfileOutcome, RegenerationError> {
@@ -193,7 +134,7 @@ impl Session<'_> {
 
 /// Whether `dir/name` makes `declares` true; an unreadable, oversized or symlinked file counts
 /// as declaring, a missing one does not.
-fn file_declares(dir: &Path, name: &str, declares: impl Fn(&str) -> bool) -> bool {
+pub(super) fn file_declares(dir: &Path, name: &str, declares: impl Fn(&str) -> bool) -> bool {
     match deps_core::fs_probe::read_to_string_capped_no_follow(
         &dir.join(name),
         crate::MAX_MANIFEST_FILE_SIZE,
@@ -202,31 +143,6 @@ fn file_declares(dir: &Path, name: &str, declares: impl Fn(&str) -> bool) -> boo
         Ok(None) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
-}
-
-#[derive(Deserialize)]
-struct PyProject {
-    tool: Option<PyProjectTool>,
-}
-
-#[derive(Deserialize)]
-struct PyProjectTool {
-    uv: Option<PyProjectUv>,
-}
-
-#[derive(Deserialize)]
-struct PyProjectUv {
-    workspace: Option<serde::de::IgnoredAny>,
-}
-
-/// Whether a `pyproject.toml` declares `[tool.uv.workspace]`; unparsable text counts as yes.
-fn declares_uv_workspace(text: &str) -> bool {
-    deps_core::parser::deserialize_toml_checked::<PyProject>(text).map_or(true, |project| {
-        project
-            .tool
-            .and_then(|tool| tool.uv)
-            .is_some_and(|uv| uv.workspace.is_some())
-    })
 }
 
 #[derive(Deserialize)]
