@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `DependencyKind` enum, `Dependency::kind()` (defaults to `None`), `star_glob`, `fs_probe::{read_capped_no_follow, write_atomic_bytes}` and `osv::{OsvEndpoint, OsvEndpointError}` (#2072, #2074, #2096)
 - **behavior**: `update --lockfile regenerate` now runs `uv`, `bundle` and `deno` for `uv.lock`, `Gemfile.lock` and `deno.lock`, and npm or pnpm workspace members and Go workspaces no longer report `unsupported` (#2046, #2047, #2096)
 
+- **deps-cli**: report JSON tokens `ecosystem-deferred`, `npm-client-deferred` and `go-vendored` and the `ecosystem`/`client` detail values are removed, with `UnsupportedReason::{EcosystemDeferred, NpmClientDeferred, GoVendored}`, `LockfileSupport::Deferred`, `PrError::UnsupportedEcosystem`, `Program::Pipenv` and `ClientToken` (#2076, #2078, #2081-#2086, #2106)
+- **deps-cli**: `pr::restore` and `regenerate_lockfile_unlistened` take the run and the repository root, `PullRequestText::publishable_paths` becomes `scope`, and `SupersedeReport::listing_full` becomes `coverage` (#2088, #2079, #2090, #2106)
+- **deps-core, ecosystem crates**: `EcosystemFormatter` gains a defaulted `compare_versions` (#2093, #2106)
+
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
 - **deps-pypi**: `Pipfile` is a PyPI manifest (`[packages]`, `[dev-packages]`, primary `[[source]]` and per-package `index`) (#2035, #2040)
@@ -60,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `update --open-pr --close-superseded` closes earlier deps-cli pull requests that the new one supersedes (#2073, #2096)
 - **deps-core, deps-cli**: `DEPS_OSV_BASE_URL` points OSV queries at an operator-chosen server, a testing aid read only from the environment (#2074, #2096)
 
+- **deps-cli**: `update --lockfile regenerate` runs Poetry, PDM, Composer, Dart and Flutter, NuGet, Gradle, SwiftPM, Bun, Yarn Berry workspace members and Go vendored modules; Yarn Classic and Pipenv stay refused (#2076, #2078, #2080-#2086, #2106)
+- **deps-cli**: `update --open-pr` publishes npm and pnpm workspace members and stages the real lock file of Cargo members (#2079, #2088, #2106)
+- **deps-cli**: cooldown-fallback targets are pinned exactly for npm, pnpm, Bun and Bundler, and Cargo reports a typed `fallback-pin-rejected` failure (#2077, #2087, #2106)
+
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
 - **workspace**: unified crate manifests (homepage, keywords, categories, readme, explicit `publish` for every crate), enforced `clippy::cargo_common_metadata`, dropped unused workspace dependencies flagged by Rust 1.100 (#2037)
@@ -79,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **specs**: spec 099 Phase 1 shipped explain-only; steering past a held version is not needed, the fix target is annotated and never moved (#2043)
 
 ### Fixed
+- **deps-cli**: npm workspace member ownership no longer depends on `npm prefix`, and a compact Yarn Berry `package.json` is no longer rewritten by a lock-only update (#2089, #2091, #2106)
+- **deps-cli**: `update --close-superseded` orders Go, Maven, Gradle and NuGet versions natively, bounds candidate reads and caps glab output per step (#2090, #2092, #2093, #2106)
+- **deps-lsp**: `native_cooldown_surfaces` waits for the advisory diagnostic instead of racing the OSV fetch (#2094, #2106)
 - **deps-core**: the OSV record cache is keyed per package and ecosystem, so a second package covered by the same advisory no longer shows the first package's fix target (#2065, #2075)
 - **deps-cli**: a lockfile regeneration tool group gets SIGTERM and a 2-second grace before SIGKILL on timeout or interrupt (#2066, #2075)
 - **deps-cli**: a failed or interrupted `update --lockfile regenerate` restores the lock file, `go.mod` and `go.sum` byte for byte (#2071, #2096)
