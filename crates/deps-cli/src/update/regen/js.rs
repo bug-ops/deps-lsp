@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 
 use super::command::WorkspaceMember;
 use super::{
-    Invocation, LockfileOutcome, NotApplicableReason, NpmClient, NpmPackageArg, PinCheck, Program,
-    RegenerationError, Session, UnsupportedReason, WorkspaceMembers, declares_workspace,
+    Invocation, LockfileOutcome, LockfileSupport, NotApplicableReason, NpmClient, NpmPackageArg,
+    PinCheck, Program, RegenerationError, Session, UnsupportedReason, declares_workspace,
     inside_workspace, same_file, unsupported, workspace_dir_env_set,
 };
+
+pub(super) const SUPPORT: LockfileSupport = LockfileSupport::Regenerates;
+pub(super) const TOOLS: &[&str] = &["npm", "pnpm", "Yarn 2+"];
 
 /// Where a JavaScript tool has to run to update the located lockfile.
 enum Layout {
@@ -43,7 +46,9 @@ impl Session<'_> {
                 Some(display),
                 UnsupportedReason::NpmClientDeferred(deferred),
             )),
-            None => Err(RegenerationError::UnrecognizedLockfile { path: display.0 }),
+            None => Err(RegenerationError::UnrecognizedLockfile {
+                path: display.shown,
+            }),
         }
     }
 
@@ -61,7 +66,7 @@ impl Session<'_> {
         if let Some(outcome) = self.cooldown_refusal(located) {
             return Ok(outcome);
         }
-        if let Some(outcome) = self.symlink_refusal(located) {
+        if let Some(outcome) = self.placement_refusal(located) {
             return Ok(outcome);
         }
 
@@ -107,7 +112,7 @@ impl Session<'_> {
             );
         }
         let member_of_lock_dir = lock_dir.is_some_and(|dir| {
-            self.members == WorkspaceMembers::Allowed
+            self.members_allowed()
                 && !workspace_dir_env_set(client, |name| std::env::var_os(name))
                 && declares_workspace(dir, client)
                 && std::fs::canonicalize(self.manifest_dir)
@@ -200,7 +205,7 @@ impl Session<'_> {
         if let Some(outcome) = self.cooldown_refusal(located) {
             return Ok(outcome);
         }
-        if let Some(outcome) = self.symlink_refusal(located) {
+        if let Some(outcome) = self.placement_refusal(located) {
             return Ok(outcome);
         }
         let names = self.lockfile_only_args(NpmPackageArg::parse)?;

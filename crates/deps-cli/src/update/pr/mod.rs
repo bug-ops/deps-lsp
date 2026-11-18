@@ -418,6 +418,7 @@ fn cleanup_hint(step: Step) -> &'static str {
         | Step::LocalBranch
         | Step::Restore
         | Step::Diff
+        | Step::ListFiles
         | Step::Switch
         | Step::ListRequests
         | Step::ReadRequest

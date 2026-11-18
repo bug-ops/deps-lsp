@@ -8,6 +8,7 @@ use super::{Invocation, NpmPackageArg, Program, WorkspaceMember};
 const COREPACK_ENV: &[(&str, &str)] = &[("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")];
 const YARN_ENV: &[(&str, &str)] = &[
     ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
+    ("COREPACK_ENABLE_AUTO_PIN", "0"),
     ("YARN_ENABLE_IMMUTABLE_INSTALLS", "false"),
     ("YARN_ENABLE_SCRIPTS", "false"),
 ];

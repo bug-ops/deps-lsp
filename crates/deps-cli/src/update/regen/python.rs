@@ -5,9 +5,12 @@ use serde::Deserialize;
 use super::command::NonEmpty;
 use super::lockers::{Located, file_declares};
 use super::{
-    Invocation, LockfileOutcome, NotApplicableReason, PinCheck, Program, PythonLocker,
-    RegenerationError, Session, UnsupportedReason, arg_pair, unsupported,
+    Invocation, LockfileOutcome, LockfileSupport, NotApplicableReason, PinCheck, Program,
+    PythonLocker, RegenerationError, Session, UnsupportedReason, arg_pair, unsupported,
 };
+
+pub(super) const SUPPORT: LockfileSupport = LockfileSupport::Regenerates;
+pub(super) const TOOLS: &[&str] = &["uv"];
 
 impl Session<'_> {
     pub(super) async fn pypi(&self) -> Result<LockfileOutcome, RegenerationError> {
@@ -28,7 +31,11 @@ impl Session<'_> {
                     UnsupportedReason::PythonLockerDeferred(deferred),
                 ));
             }
-            None => return Err(RegenerationError::UnrecognizedLockfile { path: display.0 }),
+            None => {
+                return Err(RegenerationError::UnrecognizedLockfile {
+                    path: display.shown,
+                });
+            }
         }
         if self.target.manifest_path.file_name() != Some(std::ffi::OsStr::new("pyproject.toml")) {
             return Ok(unsupported(
@@ -43,7 +50,7 @@ impl Session<'_> {
                 UnsupportedReason::WorkspaceMemberLockfile,
             ));
         }
-        if let Some(outcome) = self.symlink_refusal(&located) {
+        if let Some(outcome) = self.placement_refusal(&located) {
             return Ok(outcome);
         }
 

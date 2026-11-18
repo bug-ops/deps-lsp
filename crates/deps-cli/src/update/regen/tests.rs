@@ -364,11 +364,11 @@ fn test_strategy_is_decided_for_every_ecosystem() {
             EcosystemId::Pypi => "pypi",
             EcosystemId::Bundler => "bundler",
             EcosystemId::Deno => "deno",
-            EcosystemId::Dart
-            | EcosystemId::Composer
-            | EcosystemId::Gradle
-            | EcosystemId::Swift
-            | EcosystemId::NuGet => "deferred",
+            EcosystemId::Dart => "dart",
+            EcosystemId::Composer => "composer",
+            EcosystemId::Gradle => "gradle",
+            EcosystemId::Swift => "swift",
+            EcosystemId::NuGet => "nuget",
         };
         let actual = match strategy(*id) {
             Strategy::NoLockfileFormat => "no-format",
@@ -378,7 +378,11 @@ fn test_strategy_is_decided_for_every_ecosystem() {
             Strategy::Pypi => "pypi",
             Strategy::Bundler => "bundler",
             Strategy::Deno => "deno",
-            Strategy::Deferred => "deferred",
+            Strategy::Composer => "composer",
+            Strategy::Dart => "dart",
+            Strategy::Gradle => "gradle",
+            Strategy::Swift => "swift",
+            Strategy::NuGet => "nuget",
         };
         assert_eq!(actual, expected, "{id:?}");
     }

@@ -86,6 +86,7 @@ fn regenerated(lock: &str) -> LockfileOutcome {
         lockfile: DisplayLockPath::for_test(lock),
         tool: Program::Cargo,
         pins: Vec::new(),
+        companions: Vec::new(),
     }
 }
 

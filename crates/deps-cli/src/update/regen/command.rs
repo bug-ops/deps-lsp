@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 
 use deps_core::ConcreteVersion;
 
+mod composer;
+mod dart;
+mod dotnet;
+mod gradle;
 mod js;
 pub(super) mod lockers;
 mod python;
+mod swift;
 
 /// An external tool `deps-cli` may spawn to regenerate a lockfile.
 ///
@@ -35,6 +40,26 @@ pub enum Program {
     Bundle,
     /// `deno`.
     Deno,
+    /// `bun`.
+    Bun,
+    /// `poetry`.
+    Poetry,
+    /// `pdm`.
+    Pdm,
+    /// `pipenv`.
+    Pipenv,
+    /// `composer` (`composer.bat` on Windows).
+    Composer,
+    /// `dart`.
+    Dart,
+    /// `flutter` (`flutter.bat` on Windows).
+    Flutter,
+    /// `dotnet`.
+    Dotnet,
+    /// `gradle` (`gradle.bat` on Windows).
+    Gradle,
+    /// `swift`.
+    Swift,
 }
 
 impl Program {
@@ -50,13 +75,33 @@ impl Program {
             Self::Uv => "uv",
             Self::Bundle => "bundle",
             Self::Deno => "deno",
+            Self::Bun => "bun",
+            Self::Poetry => "poetry",
+            Self::Pdm => "pdm",
+            Self::Pipenv => "pipenv",
+            Self::Composer => "composer",
+            Self::Dart => "dart",
+            Self::Flutter => "flutter",
+            Self::Dotnet => "dotnet",
+            Self::Gradle => "gradle",
+            Self::Swift => "swift",
         }
     }
 
     /// The executable file name looked up on `PATH`.
     pub(super) const fn executable(self) -> &'static str {
         match self {
-            Self::Cargo | Self::Go | Self::Uv | Self::Deno => self.as_str(),
+            Self::Cargo
+            | Self::Go
+            | Self::Uv
+            | Self::Deno
+            | Self::Bun
+            | Self::Poetry
+            | Self::Pdm
+            | Self::Pipenv
+            | Self::Dart
+            | Self::Dotnet
+            | Self::Swift => self.as_str(),
             #[cfg(windows)]
             Self::Npm => "npm.cmd",
             #[cfg(windows)]
@@ -65,8 +110,20 @@ impl Program {
             Self::Yarn => "yarn.cmd",
             #[cfg(windows)]
             Self::Bundle => "bundle.bat",
+            #[cfg(windows)]
+            Self::Composer => "composer.bat",
+            #[cfg(windows)]
+            Self::Gradle => "gradle.bat",
+            #[cfg(windows)]
+            Self::Flutter => "flutter.bat",
             #[cfg(not(windows))]
-            Self::Npm | Self::Pnpm | Self::Yarn | Self::Bundle => self.as_str(),
+            Self::Npm
+            | Self::Pnpm
+            | Self::Yarn
+            | Self::Bundle
+            | Self::Composer
+            | Self::Gradle
+            | Self::Flutter => self.as_str(),
         }
     }
 }

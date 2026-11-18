@@ -7,7 +7,11 @@
 
 mod cargo;
 mod command;
+mod composer;
+mod dart;
+mod fallback;
 mod go;
+mod gradle;
 mod interrupt;
 mod js;
 #[cfg(all(test, unix))]
@@ -15,10 +19,12 @@ mod leader_state_tests;
 mod lockers;
 #[cfg(test)]
 mod lockfile_only_tests;
+mod nuget;
 #[cfg(all(test, unix))]
 mod process_group_tests;
 mod python;
 mod run;
+mod swift;
 #[cfg(test)]
 mod tests;
 
@@ -113,7 +119,10 @@ pub struct ManifestTarget<'a> {
 /// The lockfile path as shown to the user, relative to the manifest's display directory
 /// (`Cargo.lock`, `../Cargo.lock`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisplayLockPath(PathBuf);
+pub struct DisplayLockPath {
+    shown: PathBuf,
+    real: PathBuf,
+}
 
 impl DisplayLockPath {
     /// The lock file's own name (`Cargo.lock`), without any directory part.
@@ -122,20 +131,39 @@ impl DisplayLockPath {
     /// file under the manifest's directory by this name.
     #[must_use]
     pub fn file_name(&self) -> Option<&std::ffi::OsStr> {
-        self.0.file_name()
+        self.shown.file_name()
+    }
+
+    /// The canonical absolute path of the regenerated lock file, never a symlink.
+    #[must_use]
+    pub fn real_path(&self) -> &Path {
+        &self.real
     }
 
     /// Builds a display path for fixtures that stand in for a regeneration result.
     #[cfg(all(test, unix))]
     pub(in crate::update) fn for_test(path: &str) -> Self {
-        Self(PathBuf::from(path))
+        Self {
+            shown: PathBuf::from(path),
+            real: PathBuf::from(path),
+        }
     }
 }
 
 impl fmt::Display for DisplayLockPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.display().fmt(f)
+        self.shown.display().fmt(f)
     }
+}
+
+/// A path besides the lock file that a regeneration writes and `--open-pr` must publish or
+/// restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Companion {
+    /// One file.
+    File(PathBuf),
+    /// A directory tree, tracked in `HEAD` when it reaches publishing.
+    Tree(PathBuf),
 }
 
 /// How a pin's target compares with the version the regenerated lockfile holds.
@@ -191,6 +219,18 @@ pub enum UnsupportedReason {
     YarnClassic,
     /// The lockfile belongs to a Python locker other than uv, which is not supported yet.
     PythonLockerDeferred(PythonLocker),
+    /// The lock file or a companion path resolves outside the repository.
+    LockfileOutsideRepository,
+    /// The project uses a legacy lock layout the tool cannot update safely.
+    LegacyLockLayout,
+    /// The project centralizes package versions outside the edited manifest.
+    CentralPackageVersions,
+    /// The project has more lock files than one run handles.
+    LockfileSetTooLarge,
+    /// The tool has no lock-only update mode that leaves unrelated pins alone.
+    LockfileOnlyUpdateUnsupported(Program),
+    /// The installed tool is older than the first version the run supports.
+    ToolTooOld(Program),
 }
 
 /// Why a regeneration that started did not produce a verified lockfile.
@@ -287,6 +327,29 @@ pub enum RegenerationError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// The tool could not pin a cooldown-fallback target.
+    ///
+    /// Either a dependent requires a newer version, or the version or registry is unavailable.
+    #[error(
+        "{} could not be pinned to the cooldown-fallback target {} (tool {}): a dependent may require a newer version, or the version or registry is unavailable",
+        package.as_str(),
+        target.as_str(),
+        exit_description(*code)
+    )]
+    FallbackPinRejected {
+        /// The package whose pin was rejected.
+        package: PackageName,
+        /// The cooldown-fallback target.
+        target: ConcreteVersion,
+        /// The tool's exit code, `None` when killed by a signal.
+        code: Option<i32>,
+    },
+    /// The manifest changed during the run in a way the run did not make.
+    #[error("{} changed during regeneration", path.display())]
+    ManifestChanged {
+        /// The manifest's display path.
+        path: PathBuf,
+    },
 }
 
 impl RegenerationError {
@@ -320,6 +383,8 @@ pub enum LockfileOutcome {
         tool: Program,
         /// One entry per applied pin.
         pins: Vec<PinReport>,
+        /// Every other path the run wrote besides the lock file.
+        companions: Vec<Companion>,
     },
     /// Regeneration was gated off.
     Skipped(SkipCause),
@@ -393,6 +458,25 @@ ancestor declares a workspace, or the workspace directory is set through the env
                     locker.as_str()
                 )
             }
+            Self::LockfileOutsideRepository => {
+                f.write_str("the lockfile or a file the tool writes is outside the repository")
+            }
+            Self::LegacyLockLayout => {
+                f.write_str("the project uses a legacy lock file layout")
+            }
+            Self::CentralPackageVersions => f.write_str(
+                "package versions are centralized in Directory.Packages.props, which is not the edited manifest",
+            ),
+            Self::LockfileSetTooLarge => {
+                f.write_str("the project has more lock files than one run handles")
+            }
+            Self::LockfileOnlyUpdateUnsupported(program) => write!(
+                f,
+                "{program} has no lockfile-only update mode that leaves unrelated pins alone"
+            ),
+            Self::ToolTooOld(program) => {
+                write!(f, "the installed {program} is too old for lockfile regeneration")
+            }
         }
     }
 }
@@ -407,7 +491,11 @@ enum Strategy {
     Pypi,
     Bundler,
     Deno,
-    Deferred,
+    Composer,
+    Dart,
+    NuGet,
+    Gradle,
+    Swift,
 }
 
 const fn strategy(id: EcosystemId) -> Strategy {
@@ -422,11 +510,11 @@ const fn strategy(id: EcosystemId) -> Strategy {
         EcosystemId::Pypi => Strategy::Pypi,
         EcosystemId::Bundler => Strategy::Bundler,
         EcosystemId::Deno => Strategy::Deno,
-        EcosystemId::Dart
-        | EcosystemId::Composer
-        | EcosystemId::Gradle
-        | EcosystemId::Swift
-        | EcosystemId::NuGet => Strategy::Deferred,
+        EcosystemId::Composer => Strategy::Composer,
+        EcosystemId::Dart => Strategy::Dart,
+        EcosystemId::Gradle => Strategy::Gradle,
+        EcosystemId::Swift => Strategy::Swift,
+        EcosystemId::NuGet => Strategy::NuGet,
     }
 }
 
@@ -451,19 +539,22 @@ pub enum LockfileSupport {
 ///
 /// assert_eq!(lockfile_support(EcosystemId::Cargo), LockfileSupport::Regenerates);
 /// assert_eq!(lockfile_support(EcosystemId::Pypi), LockfileSupport::Regenerates);
-/// assert_eq!(lockfile_support(EcosystemId::Dart), LockfileSupport::Deferred);
+/// assert_eq!(lockfile_support(EcosystemId::Maven), LockfileSupport::NoLockfileFormat);
 /// ```
 #[must_use]
 pub const fn lockfile_support(id: EcosystemId) -> LockfileSupport {
     match strategy(id) {
-        Strategy::Cargo
-        | Strategy::NpmFamily
-        | Strategy::Go
-        | Strategy::Pypi
-        | Strategy::Bundler
-        | Strategy::Deno => LockfileSupport::Regenerates,
+        Strategy::Cargo | Strategy::Go | Strategy::Bundler | Strategy::Deno => {
+            LockfileSupport::Regenerates
+        }
+        Strategy::NpmFamily => js::SUPPORT,
+        Strategy::Pypi => python::SUPPORT,
+        Strategy::Composer => composer::SUPPORT,
+        Strategy::Dart => dart::SUPPORT,
+        Strategy::NuGet => nuget::SUPPORT,
+        Strategy::Gradle => gradle::SUPPORT,
+        Strategy::Swift => swift::SUPPORT,
         Strategy::NoLockfileFormat => LockfileSupport::NoLockfileFormat,
-        Strategy::Deferred => LockfileSupport::Deferred,
     }
 }
 
@@ -474,12 +565,17 @@ pub(super) fn supported_tools_text() -> String {
         .iter()
         .flat_map(|id| match strategy(*id) {
             Strategy::Cargo => ["Cargo"].as_slice(),
-            Strategy::NpmFamily => ["npm", "pnpm", "Yarn 2+"].as_slice(),
+            Strategy::NpmFamily => js::TOOLS,
             Strategy::Go => ["Go"].as_slice(),
-            Strategy::Pypi => ["uv"].as_slice(),
+            Strategy::Pypi => python::TOOLS,
             Strategy::Bundler => ["Bundler"].as_slice(),
             Strategy::Deno => ["Deno"].as_slice(),
-            Strategy::NoLockfileFormat | Strategy::Deferred => [].as_slice(),
+            Strategy::Composer => composer::TOOLS,
+            Strategy::Dart => dart::TOOLS,
+            Strategy::NuGet => nuget::TOOLS,
+            Strategy::Gradle => gradle::TOOLS,
+            Strategy::Swift => swift::TOOLS,
+            Strategy::NoLockfileFormat => [].as_slice(),
         })
         .copied()
         .collect();
@@ -582,7 +678,8 @@ fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<Lo
 /// and settles every `RequiresLockfileUpdate` item the regenerated lockfile now satisfies into
 /// `AppliedViaLockfile`.
 ///
-/// Never panics and never writes a file itself; a failure is a [`LockfileOutcome`] variant.
+/// Never panics; writes only the snapshot restore and, for #2077, a temporary exact-pin
+/// manifest. A failure is a [`LockfileOutcome`] variant.
 pub async fn regenerate_lockfile(
     plan: UpdatePlan,
     target: &ManifestTarget<'_>,
@@ -814,7 +911,9 @@ const fn restore_after(error: &RegenerationError) -> bool {
         | RegenerationError::UnrecognizedLockfile { .. }
         | RegenerationError::ManifestReparseFailed { .. }
         | RegenerationError::LockfileUnreadable { .. }
-        | RegenerationError::VersionMismatch { .. } => true,
+        | RegenerationError::VersionMismatch { .. }
+        | RegenerationError::FallbackPinRejected { .. }
+        | RegenerationError::ManifestChanged { .. } => true,
         RegenerationError::SnapshotFailed { .. } | RegenerationError::RestoreFailed { .. } => false,
     }
 }
@@ -879,13 +978,17 @@ impl Session<'_> {
             Strategy::NoLockfileFormat => Ok(LockfileOutcome::NotApplicable(
                 NotApplicableReason::NoLockfileFormat,
             )),
-            Strategy::Deferred => Ok(unsupported(None, UnsupportedReason::EcosystemDeferred(id))),
             Strategy::Cargo => self.cargo().await,
             Strategy::NpmFamily => self.npm_family().await,
             Strategy::Go => self.go().await,
             Strategy::Pypi => self.pypi().await,
             Strategy::Bundler => self.bundler().await,
             Strategy::Deno => self.deno().await,
+            Strategy::Composer => self.composer(id),
+            Strategy::Dart => self.dart(id),
+            Strategy::NuGet => self.nuget(id),
+            Strategy::Gradle => self.gradle(id),
+            Strategy::Swift => self.swift(id),
         }
     }
 
@@ -899,7 +1002,7 @@ impl Session<'_> {
         let files = paths
             .iter()
             .map(|path| {
-                let display = self.display_lock_path(path).0;
+                let display = self.display_lock_path(path).shown;
                 deps_core::fs_probe::read_capped_no_follow(
                     path,
                     deps_core::lockfile::MAX_LOCKFILE_BYTES,
@@ -963,7 +1066,7 @@ impl Session<'_> {
     ) -> Result<Option<LockfileOutcome>, RegenerationError> {
         let located = self.locate().await?;
         if same_file(located.as_deref(), Some(owned)) {
-            return Ok(self.symlink_refusal(owned));
+            return Ok(self.placement_refusal(owned));
         }
         let display = located.as_deref().map(|path| self.display_lock_path(path));
         Ok(Some(unsupported(
@@ -972,9 +1075,14 @@ impl Session<'_> {
         )))
     }
 
+    /// Whether a manifest below its lockfile's directory (a workspace member) may be regenerated.
+    fn members_allowed(&self) -> bool {
+        self.members == WorkspaceMembers::Allowed
+    }
+
     /// Refuses a lockfile whose final component is a symlink or not a regular file: the tool
     /// would rewrite the link's target, or replace the link, outside the manifest's tree.
-    fn symlink_refusal(&self, lockfile: &Path) -> Option<LockfileOutcome> {
+    fn placement_refusal(&self, lockfile: &Path) -> Option<LockfileOutcome> {
         let plain = std::fs::symlink_metadata(lockfile)
             .is_ok_and(|metadata| metadata.file_type().is_file());
         (!plain).then(|| {
@@ -992,12 +1100,24 @@ impl Session<'_> {
         lockfile: &Path,
         check: PinCheck,
     ) -> Result<LockfileOutcome, RegenerationError> {
+        self.verified_with(tool, lockfile, Vec::new(), check).await
+    }
+
+    /// Like [`Self::verified`], recording the other paths the run wrote.
+    async fn verified_with(
+        &self,
+        tool: Program,
+        lockfile: &Path,
+        companions: Vec<Companion>,
+        check: PinCheck,
+    ) -> Result<LockfileOutcome, RegenerationError> {
         let lockfile = self.display_lock_path(lockfile);
         let pins = self.verify_pins(check, &lockfile).await?;
         Ok(LockfileOutcome::Regenerated {
             lockfile,
             tool,
             pins,
+            companions,
         })
     }
 
@@ -1035,7 +1155,7 @@ impl Session<'_> {
         } = load
         else {
             return Err(RegenerationError::LockfileUnreadable {
-                path: lockfile.0.clone(),
+                path: lockfile.shown.clone(),
             });
         };
 
@@ -1053,10 +1173,16 @@ impl Session<'_> {
                             .flat_map(|found| found.versions()),
                     )
                     .collect();
-                let resolution = match check {
-                    PinCheck::ExactInLock => evidence
+                let exact = || {
+                    evidence
                         .contains(&&pin.target)
-                        .then_some(PinResolution::Exact),
+                        .then_some(PinResolution::Exact)
+                };
+                let resolution = match check {
+                    PinCheck::ExactInLock => exact(),
+                    // A cooldown-fallback target is deliberately below the newest release, so a
+                    // newer satisfying version would be the very release the cooldown excludes.
+                    PinCheck::SatisfiesInLock if pin.cooldown_fallback => exact(),
                     PinCheck::SatisfiesInLock => {
                         let requirements: Vec<&VersionReq> = parsed
                             .dependencies()
@@ -1103,7 +1229,10 @@ impl Session<'_> {
             .display_path
             .parent()
             .unwrap_or_else(|| Path::new(""));
-        DisplayLockPath(display_dir.join(relative_route(&from, &to)))
+        DisplayLockPath {
+            shown: display_dir.join(relative_route(&from, &to)),
+            real: to,
+        }
     }
 }
 

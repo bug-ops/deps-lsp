@@ -74,6 +74,8 @@ pub enum Step {
     Restore,
     /// `git diff --name-only -z HEAD`.
     Diff,
+    /// `git ls-files` or `git ls-tree` over the published paths.
+    ListFiles,
     /// `git switch --create`.
     Switch,
     /// `git add -- <paths>`.
@@ -106,6 +108,7 @@ impl fmt::Display for Step {
             Self::LocalBranch => "looking up the local branch",
             Self::Restore => "restoring the manifest directory",
             Self::Diff => "listing changed files",
+            Self::ListFiles => "listing tracked files",
             Self::Switch => "creating the update branch",
             Self::Stage => "staging the changes",
             Self::Commit => "committing",

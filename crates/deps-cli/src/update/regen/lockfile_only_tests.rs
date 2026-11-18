@@ -1315,9 +1315,13 @@ mod newer_in_range {
             resolution: PinResolution::Newer(ConcreteVersion::from(version)),
         };
         let outcome = LockfileOutcome::Regenerated {
-            lockfile: super::super::DisplayLockPath(PathBuf::from("package-lock.json")),
+            lockfile: super::super::DisplayLockPath {
+                shown: PathBuf::from("package-lock.json"),
+                real: PathBuf::from("package-lock.json"),
+            },
             tool: super::super::Program::Npm,
             pins: vec![newer("4.18.1")],
+            companions: Vec::new(),
         };
 
         super::super::settle_lockfile_only(

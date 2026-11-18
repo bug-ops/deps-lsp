@@ -61,7 +61,7 @@ impl Session<'_> {
         if let Some(outcome) = self.cooldown_refusal(&located) {
             return Ok(outcome);
         }
-        if let Some(outcome) = self.symlink_refusal(&located) {
+        if let Some(outcome) = self.placement_refusal(&located) {
             return Ok(outcome);
         }
 
@@ -104,7 +104,7 @@ impl Session<'_> {
         if let Some(outcome) = self.cooldown_refusal(&located) {
             return Ok(outcome);
         }
-        if let Some(outcome) = self.symlink_refusal(&located) {
+        if let Some(outcome) = self.placement_refusal(&located) {
             return Ok(outcome);
         }
 

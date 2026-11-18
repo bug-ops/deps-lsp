@@ -1694,6 +1694,34 @@ pub trait RequirementResolution: Send + Sync {
         BuildMetadataPolicy::Ignored
     }
 
+    /// Orders two concrete versions by this ecosystem's own precedence rules.
+    ///
+    /// `Some` only when both versions parse and the answer agrees with the ecosystem's resolver;
+    /// `None` means "not covered", never "equal".
+    ///
+    /// Default: `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::ConcreteVersion;
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// let (a, b) = (ConcreteVersion::new("1.0.0"), ConcreteVersion::new("2.0.0"));
+    /// assert_eq!(DefaultFormatter.compare_versions(&a, &b), None);
+    /// ```
+    fn compare_versions(
+        &self,
+        a: &ConcreteVersion,
+        b: &ConcreteVersion,
+    ) -> Option<std::cmp::Ordering> {
+        let _ = (a, b);
+        None
+    }
+
     /// Whether `requirement` opts in to pre-releases through this ecosystem's own grammar:
     /// a pre-release named on an exact or lower bound, or a stability flag. Lets the REFACTOR
     /// "Update to X" items keep offering pre-releases for shapes the shared SemVer-text

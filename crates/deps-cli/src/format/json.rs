@@ -350,6 +350,26 @@ pub enum ToolToken {
     Bundle,
     /// `deno`.
     Deno,
+    /// `bun`.
+    Bun,
+    /// `poetry`.
+    Poetry,
+    /// `pdm`.
+    Pdm,
+    /// `pipenv`.
+    Pipenv,
+    /// `composer`.
+    Composer,
+    /// `dart`.
+    Dart,
+    /// `flutter`.
+    Flutter,
+    /// `dotnet`.
+    Dotnet,
+    /// `gradle`.
+    Gradle,
+    /// `swift`.
+    Swift,
 }
 
 impl From<Program> for ToolToken {
@@ -363,6 +383,16 @@ impl From<Program> for ToolToken {
             Program::Uv => Self::Uv,
             Program::Bundle => Self::Bundle,
             Program::Deno => Self::Deno,
+            Program::Bun => Self::Bun,
+            Program::Poetry => Self::Poetry,
+            Program::Pdm => Self::Pdm,
+            Program::Pipenv => Self::Pipenv,
+            Program::Composer => Self::Composer,
+            Program::Dart => Self::Dart,
+            Program::Flutter => Self::Flutter,
+            Program::Dotnet => Self::Dotnet,
+            Program::Gradle => Self::Gradle,
+            Program::Swift => Self::Swift,
         }
     }
 }
@@ -438,6 +468,18 @@ pub enum UnsupportedToken {
     YarnClassic,
     /// The Python locker is not supported yet.
     PythonLockerDeferred,
+    /// The lock file resolves outside the repository.
+    LockfileOutsideRepository,
+    /// The project uses a legacy lock layout the tool cannot update safely.
+    LegacyLockLayout,
+    /// The project centralizes package versions outside the edited manifest.
+    CentralPackageVersions,
+    /// The project has more lock files than one run handles.
+    LockfileSetTooLarge,
+    /// The tool has no lock-only update mode that leaves unrelated pins alone.
+    LockfileOnlyUpdateUnsupported,
+    /// The installed tool is older than the first version the run supports.
+    ToolTooOld,
 }
 
 /// The kind of a failed regeneration, as a JSON token.
@@ -470,6 +512,10 @@ pub enum FailureKind {
     SnapshotFailed,
     /// The lock file could not be restored after a failure.
     RestoreFailed,
+    /// The tool could not pin a cooldown-fallback target.
+    FallbackPinRejected,
+    /// The manifest changed during the run in a way the run did not make.
+    ManifestChanged,
 }
 
 impl From<&RegenerationError> for FailureKind {
@@ -488,6 +534,8 @@ impl From<&RegenerationError> for FailureKind {
             RegenerationError::VersionMismatch { .. } => Self::VersionMismatch,
             RegenerationError::SnapshotFailed { .. } => Self::SnapshotFailed,
             RegenerationError::RestoreFailed { .. } => Self::RestoreFailed,
+            RegenerationError::FallbackPinRejected { .. } => Self::FallbackPinRejected,
+            RegenerationError::ManifestChanged { .. } => Self::ManifestChanged,
         }
     }
 }
@@ -556,6 +604,11 @@ pub enum UnsupportedDetail {
     Client(ClientToken),
     /// The Python locker whose regeneration is deferred.
     Locker(LockerToken),
+    /// The tool a lock-only or version refusal names.
+    ///
+    /// The `reason` token beside `detail` says which namespace it belongs to, so the overlapping
+    /// strings (`"npm"`, `"uv"`, ...) are never ambiguous for a reader of the full document.
+    Tool(ToolToken),
 }
 
 /// The lockfile step of an `update` run, tagged by `status`.
@@ -613,6 +666,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                 lockfile,
                 tool,
                 pins,
+                ..
             } => Self::Regenerated {
                 path: clean(&lockfile.to_string()),
                 tool: (*tool).into(),
@@ -672,6 +726,26 @@ impl From<&LockfileOutcome> for LockfileDocument {
                         UnsupportedToken::PythonLockerDeferred,
                         Some(UnsupportedDetail::Locker(LockerToken::from(*locker))),
                     ),
+                    UnsupportedReason::LockfileOutsideRepository => {
+                        (UnsupportedToken::LockfileOutsideRepository, None)
+                    }
+                    UnsupportedReason::LegacyLockLayout => {
+                        (UnsupportedToken::LegacyLockLayout, None)
+                    }
+                    UnsupportedReason::CentralPackageVersions => {
+                        (UnsupportedToken::CentralPackageVersions, None)
+                    }
+                    UnsupportedReason::LockfileSetTooLarge => {
+                        (UnsupportedToken::LockfileSetTooLarge, None)
+                    }
+                    UnsupportedReason::LockfileOnlyUpdateUnsupported(program) => (
+                        UnsupportedToken::LockfileOnlyUpdateUnsupported,
+                        Some(UnsupportedDetail::Tool(ToolToken::from(*program))),
+                    ),
+                    UnsupportedReason::ToolTooOld(program) => (
+                        UnsupportedToken::ToolTooOld,
+                        Some(UnsupportedDetail::Tool(ToolToken::from(*program))),
+                    ),
                 };
                 Self::Unsupported {
                     reason: token,
@@ -701,7 +775,9 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::ManifestReparseFailed { .. }
                     | RegenerationError::LockfileUnreadable { .. }
                     | RegenerationError::SnapshotFailed { .. }
-                    | RegenerationError::RestoreFailed { .. } => (None, None, None),
+                    | RegenerationError::RestoreFailed { .. }
+                    | RegenerationError::FallbackPinRejected { .. }
+                    | RegenerationError::ManifestChanged { .. } => (None, None, None),
                 };
                 Self::Failed {
                     kind: error.into(),
