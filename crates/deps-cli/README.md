@@ -244,7 +244,8 @@ deps-cli update --lockfile regenerate Cargo.toml
 
 Flags: `--package <NAME>` (repeatable), `--security-only`, `--dry-run`, `--format
 table|json`, `--config <PATH>`, `--offline`, `--lockfile skip|regenerate` (default `skip`), and
-`--cooldown <DURATION>` (`--cooldown` has no effect under `--security-only`).
+`--cooldown <DURATION>` (`--cooldown` has no effect under `--security-only`), `--open-pr
+github|gitlab` and `--group <NAME>`.
 
 - **Default mode** honors the freshness cooldown (default 3 days) even with no flags: a
   version published inside the window is replaced by the newest already-cooled-down, OSV-verified
@@ -265,8 +266,18 @@ table|json`, `--config <PATH>`, `--offline`, `--lockfile skip|regenerate` (defau
   carries a `lockfile` object. It does nothing under `--dry-run` or `--offline`, never creates a
   lockfile, and reports `unsupported` for Yarn, Bun, workspace members and the other ecosystems.
   The tool runs with the repository's own configuration and your full environment. On unix a
-  timeout, SIGINT or SIGTERM kills the tool's whole process group (exit `2`, see the mdBook for
-  the limits).
+  timeout, SIGINT or SIGTERM sends SIGTERM to the tool's process group, waits 2 seconds, then
+  kills the group (exit `2`, see the mdBook for the limits); `cargo` and `go` can still leave a
+  truncated lock file, so check `git diff` after a failed run.
+- **`--open-pr github|gitlab`** (with `--lockfile regenerate`; not with `--dry-run` or `--offline`)
+  commits the manifest and lock file change on a `deps-cli/...` branch, pushes it to `origin` and
+  opens a pull request with `gh` or a merge request with `glab`. The same update set maps to the
+  same branch, so a re-run while it is open writes nothing. The working tree must be clean;
+  deps-cli never reads a token. Cargo, npm, pnpm, Go and ecosystems without a lock file are
+  supported; see the mdBook for the full contract.
+- **`--group <NAME>`** (needs `--config`, not with `--security-only`) keeps only the updates of one
+  `[update.groups.<name>]` rule (`dependencies`, `update_types`); the rest are reported
+  `skipped (outside the selected --group)`.
 - **Exit codes**: `0` all selected updates applied or deliberately skipped, `1` at least one
   wanted fix could not be applied, `2` execution error (including a failed lockfile
   regeneration). A non-zero exit does not imply the

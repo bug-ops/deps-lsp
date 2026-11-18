@@ -15,7 +15,10 @@ use deps_cli::config::{self, CliConfig};
 use deps_cli::exit::{ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, CoverageGate, FailOnPolicy, check_manifest};
 use deps_cli::update;
+use deps_cli::update::group::UpdateGroup;
 use deps_cli::update::ignore::IgnoreRules;
+use deps_cli::update::pr;
+use deps_cli::update::regen::{LockfileMode, LockfileOutcome, LockfileSupport, lockfile_support};
 use deps_cli::{format, walk};
 use deps_core::net_policy::{EnvSource, ProcessEnv, RegistryEnvironment};
 use deps_core::osv::OsvClient;
@@ -537,35 +540,265 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
         .is_some()
         .then(|| cli_config.update.ignore.clone());
 
-    match runtime.block_on(run_update(args, policy, ignore_config)) {
-        Ok(run) => {
-            if let deps_cli::update::regen::LockfileOutcome::Unsupported { reason, .. } =
-                &run.lockfile
-            {
-                eprintln!("deps-cli: warning: lockfile not regenerated: {reason}");
+    // Spec 104 FR-016: an undefined group is refused before anything is analyzed.
+    let group_rule = match &args.group {
+        Some(name) => match cli_config.update.groups.get(name) {
+            Some(rule) => Some((name.clone(), rule.clone())),
+            None => {
+                eprintln!(
+                    "deps-cli: error: group {} is not defined under [update.groups] in the config",
+                    name.as_str()
+                );
+                return ExitCode::from(2);
             }
-            let rendered = match args.format {
-                UpdateOutputFormat::Table => {
-                    format::table::render_update(&run, format::DryRun::from_flag(args.dry_run))
-                }
-                UpdateOutputFormat::Json => {
-                    match format::json::render_update(&run, format::DryRun::from_flag(args.dry_run))
-                    {
-                        Ok(json) => json,
-                        Err(error) => {
-                            eprintln!("deps-cli: failed to render JSON report: {error}");
-                            return ExitCode::from(2);
-                        }
-                    }
-                }
-            };
-            print!("{rendered}");
-            ExitCode::from(u8::try_from(deps_cli::exit::update_exit_code(&run)).unwrap_or(2))
+        },
+        None => None,
+    };
+    // Spec 104 FR-001: `--dry-run`/`--offline` conflicts are clap's; the lock file mode is not.
+    if args.open_pr.is_some() && args.lockfile != LockfileMode::Regenerate {
+        eprintln!("deps-cli: error: --open-pr requires --lockfile regenerate");
+        return ExitCode::from(2);
+    }
+
+    runtime.block_on(run_update_flow(args, policy, ignore_config, group_rule))
+}
+
+/// Runs one `update` end to end: the optional `--open-pr` preflight, the update itself, the
+/// report and the optional publish phase, each guarded by one interrupt listener when
+/// `--open-pr` is set (spec 104 FR-012).
+async fn run_update_flow(
+    args: &UpdateArgs,
+    policy: PolicyConfig,
+    ignore_config: Option<Vec<config::IgnoreRule>>,
+    group_rule: Option<(config::GroupName, config::GroupRule)>,
+) -> ExitCode {
+    let mut signals = args.open_pr.map(|_| pr::PrSignals::install());
+    let repo = match args.open_pr {
+        Some(_) => {
+            let preflight = in_phase(
+                signals.as_mut(),
+                pr::PrPhase::Preflight,
+                pr::preflight(&args.manifest),
+            )
+            .await
+            .flatten();
+            match preflight {
+                Ok(repo) => Some(repo),
+                Err(error) => return fail(&error),
+            }
         }
-        Err(message) => {
-            eprintln!("deps-cli: error: {message}");
-            ExitCode::from(2)
+        None => None,
+    };
+
+    let update = in_phase(
+        signals.as_mut(),
+        pr::PrPhase::Update,
+        Box::pin(run_update(
+            args,
+            policy,
+            ignore_config,
+            group_rule,
+            repo.as_ref(),
+        )),
+    )
+    .await;
+    let UpdateOutput {
+        run,
+        group,
+        publish,
+    } = match update {
+        Ok(Ok(output)) => output,
+        Ok(Err(message)) => return fail(&message),
+        Err(error) => return fail(&error),
+    };
+
+    let mut dry_run = args.dry_run;
+    let mut failure = None;
+    let mut ready = None;
+    match publish {
+        Publish::AlreadyProposed(branch) => {
+            dry_run = true;
+            eprintln!("deps-cli: already proposed on {}", branch.as_str());
         }
+        Publish::Propose { repo, branch } => match pr::readiness(&run) {
+            pr::Readiness::Ready(publishable) => ready = Some((repo, branch, publishable)),
+            pr::Readiness::LockfileNotRegenerated => {
+                dry_run = true;
+                let reason = pr::PrError::LockfileNotRegenerated;
+                failure = Some(match pr::restore(repo).await {
+                    Ok(()) => reason.to_string(),
+                    Err(error) => format!("{reason}; restoring the manifest also failed: {error}"),
+                });
+            }
+            pr::Readiness::NothingSettled => {
+                dry_run = true;
+                match pr::restore(repo).await {
+                    Ok(()) => eprintln!(
+                        "deps-cli: no update was settled; no pull request opened (the manifest and \
+                         the regenerated lock file were reverted)"
+                    ),
+                    Err(error) => failure = Some(format!("restoring the manifest failed: {error}")),
+                }
+            }
+        },
+        Publish::NotRequested | Publish::NoUpdates => {}
+    }
+
+    if let LockfileOutcome::Unsupported { reason, .. } = &run.lockfile {
+        eprintln!("deps-cli: warning: lockfile not regenerated: {reason}");
+    }
+    let rendered = match args.format {
+        UpdateOutputFormat::Table => {
+            format::table::render_update(&run, format::DryRun::from_flag(dry_run))
+        }
+        UpdateOutputFormat::Json => {
+            match format::json::render_update(&run, format::DryRun::from_flag(dry_run)) {
+                Ok(json) => json,
+                Err(error) => {
+                    eprintln!("deps-cli: failed to render JSON report: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+    print!("{rendered}");
+
+    if let Some(message) = failure {
+        return fail(&message);
+    }
+    if let (Some((repo, branch, publishable)), Some(host), Some(signals)) =
+        (ready, args.open_pr, signals.as_mut())
+    {
+        let text = pr::describe(repo, &publishable, group.as_ref());
+        let published = signals
+            .guard(
+                pr::PrPhase::Publish,
+                publish_request(repo, host, branch, &text),
+            )
+            .await
+            .flatten();
+        if let Err(error) = published {
+            return fail(&error);
+        }
+    }
+    ExitCode::from(u8::try_from(deps_cli::exit::update_exit_code(&run)).unwrap_or(2))
+}
+
+/// Opens the request, prints its URL and only then switches back to the base branch, so a
+/// failed switch-back never hides the URL of a request that exists.
+async fn publish_request(
+    repo: &pr::RepoContext,
+    host: pr::PrHost,
+    branch: pr::FreeBranch,
+    text: &pr::PullRequestText,
+) -> Result<(), pr::PrError> {
+    match pr::open(repo, host, branch, text).await? {
+        pr::PrOutcome::Opened(request) => {
+            eprintln!("deps-cli: opened {}", request.url());
+            request.switch_back(repo).await
+        }
+        pr::PrOutcome::NothingToCommit => {
+            eprintln!("deps-cli: nothing to commit");
+            Ok(())
+        }
+    }
+}
+
+/// Runs `future` as `phase` under `signals`; without a listener it just runs.
+async fn in_phase<T>(
+    signals: Option<&mut pr::PrSignals>,
+    phase: pr::PrPhase,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, pr::PrError> {
+    match signals {
+        Some(signals) => signals.guard(phase, future).await,
+        None => Ok(future.await),
+    }
+}
+
+fn fail(message: &impl std::fmt::Display) -> ExitCode {
+    eprintln!("deps-cli: error: {message}");
+    ExitCode::from(2)
+}
+
+/// What the publish phase has to do after the update.
+enum Publish<'a> {
+    /// `--open-pr` was not given.
+    NotRequested,
+    /// `--open-pr` was given but the plan proposes no change.
+    NoUpdates,
+    /// The remote already has the branch for this update set.
+    AlreadyProposed(pr::BranchName),
+    /// The update was written and may be committed on this branch.
+    Propose {
+        repo: &'a pr::RepoContext,
+        branch: pr::FreeBranch,
+    },
+}
+
+/// The result of [`run_update`].
+struct UpdateOutput<'a> {
+    run: update::UpdateRun,
+    group: Option<UpdateGroup>,
+    publish: Publish<'a>,
+}
+
+/// Warns when default mode wrote `latest` versions that were never checked against OSV.dev.
+fn warn_if_latest_unchecked(
+    args: &UpdateArgs,
+    analysis: &deps_cli::analyze::ManifestAnalysis,
+    plan: &update::UpdatePlan,
+    offline: bool,
+    display_path: &Path,
+) {
+    // Issue #1517 critique S3: `analysis.latest_status.is_none()` means the OSV latest-check
+    // did not run at all for this manifest — a *deliberate* offline/disabled skip (see
+    // `analyze_manifest`'s `run_latest_check` gate), not a transient per-dependency failure
+    // (those still fail closed via `has_unverified_latest_check`/`collect_update_candidates`'s
+    // own gate above and below). `latest_verdict` degrades that to `NotApplicable`, so default
+    // mode still writes the cached `latest` — silently, unless warned here. `--security-only`
+    // never reads a cached `latest` at all (its fix targets come from advisories), so this
+    // warning is default-mode only.
+    if !args.security_only
+        && analysis.latest_status.is_none()
+        && plan
+            .items
+            .iter()
+            .any(|item| matches!(item.outcome, update::Outcome::Applied { .. }))
+    {
+        let reason = if offline {
+            "network.offline is set"
+        } else {
+            "diagnostics.vulnerabilities_enabled is disabled"
+        };
+        eprintln!(
+            "deps-cli: warning: the latest version(s) applied to {} were not checked against \
+             OSV.dev ({reason}); this update proceeded on unverified data",
+            display_path.display()
+        );
+    }
+}
+
+/// Derives the update branch and checks it against the repository (spec 104 FR-004 to FR-006).
+async fn decide_publish<'a>(
+    repo: Option<&'a pr::RepoContext>,
+    ecosystem: deps_core::EcosystemId,
+    plan: &update::UpdatePlan,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    group: Option<&UpdateGroup>,
+) -> Result<Publish<'a>, String> {
+    let Some(repo) = repo else {
+        return Ok(Publish::NotRequested);
+    };
+    let Some(branch) = pr::branch_for(repo, ecosystem, plan, formatter, group) else {
+        return Ok(Publish::NoUpdates);
+    };
+    match pr::check_branch(repo, branch)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        pr::BranchCheck::Free(branch) => Ok(Publish::Propose { repo, branch }),
+        pr::BranchCheck::AlreadyProposed(branch) => Ok(Publish::AlreadyProposed(branch)),
     }
 }
 
@@ -575,11 +808,17 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
 /// rules (FR-007) — `None` means no rules were loaded at all, resolving to
 /// [`IgnoreRules::empty`] once the manifest's ecosystem (and therefore its
 /// `normalize_package_name`) is known.
-async fn run_update(
+///
+/// `group_rule` is the `--group` selection; `repo` is `Some` under `--open-pr`, which refuses a
+/// deferred ecosystem before analysis (spec 104 FR-003), derives the update branch after
+/// planning and runs as a dry run when that branch is already on the remote.
+async fn run_update<'a>(
     args: &UpdateArgs,
     policy: PolicyConfig,
-    ignore_config: Option<Vec<deps_cli::config::IgnoreRule>>,
-) -> Result<deps_cli::update::UpdateRun, String> {
+    ignore_config: Option<Vec<config::IgnoreRule>>,
+    group_rule: Option<(config::GroupName, config::GroupRule)>,
+    repo: Option<&'a pr::RepoContext>,
+) -> Result<UpdateOutput<'a>, String> {
     let handles = build_runtime_handles(&policy, &ProcessEnv);
     let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
 
@@ -606,6 +845,11 @@ async fn run_update(
             args.manifest.display()
         ));
     };
+
+    let ecosystem_id = manifest.ecosystem.ecosystem_id();
+    if repo.is_some() && lockfile_support(ecosystem_id) == LockfileSupport::Deferred {
+        return Err(pr::PrError::UnsupportedEcosystem(ecosystem_id).to_string());
+    }
 
     // N1 (critic re-review): spec §8's Never clause forbids reading manifest content before
     // FR-017's symlink refusal passes — `write_atomic`'s own refusal only fires at write time,
@@ -743,45 +987,29 @@ async fn run_update(
     // `apply_plan`'s own dedup pass to `Skipped(OverlapsAnotherEdit)` first, so a reported
     // `applied` outcome always matches what actually gets written.
     update::dedup_applied_items(&mut plan.items);
-
-    // Issue #1517 critique S3: `analysis.latest_status.is_none()` means the OSV latest-check
-    // did not run at all for this manifest — a *deliberate* offline/disabled skip (see
-    // `analyze_manifest`'s `run_latest_check` gate), not a transient per-dependency failure
-    // (those still fail closed via `has_unverified_latest_check`/`collect_update_candidates`'s
-    // own gate above and below). `latest_verdict` degrades that to `NotApplicable`, so default
-    // mode still writes the cached `latest` — silently, unless warned here. `--security-only`
-    // never reads a cached `latest` at all (its fix targets come from advisories), so this
-    // warning is default-mode only.
-    if !args.security_only
-        && analysis.latest_status.is_none()
-        && plan
-            .items
-            .iter()
-            .any(|item| matches!(item.outcome, update::Outcome::Applied { .. }))
-    {
-        let reason = if ctx.policy.network.offline {
-            "network.offline is set"
-        } else {
-            "diagnostics.vulnerabilities_enabled is disabled"
-        };
-        eprintln!(
-            "deps-cli: warning: the latest version(s) applied to {} were not checked against \
-             OSV.dev ({reason}); this update proceeded on unverified data",
-            manifest.display_path.display()
-        );
+    // Spec 104 FR-017: demote after dedup and before anything is written or branched on.
+    let group = group_rule.map(|(name, rule)| UpdateGroup::new(name, rule, formatter));
+    if let Some(group) = &group {
+        update::group::demote_outside_group(&mut plan.items, group, formatter);
     }
+    let publish = decide_publish(repo, ecosystem_id, &plan, formatter, group.as_ref()).await?;
+    let dry_run =
+        format::DryRun::from_flag(args.dry_run || matches!(publish, Publish::AlreadyProposed(_)));
 
-    update::apply_plan(
+    warn_if_latest_unchecked(
+        args,
+        &analysis,
         &plan,
-        &manifest.path,
-        &content,
-        format::DryRun::from_flag(args.dry_run),
-    )
-    .map_err(|error| error.to_string())?;
+        ctx.policy.network.offline,
+        &manifest.display_path,
+    );
+
+    update::apply_plan(&plan, &manifest.path, &content, dry_run)
+        .map_err(|error| error.to_string())?;
 
     let gate = deps_cli::update::regen::RegenerationGate::new(
         args.lockfile,
-        format::DryRun::from_flag(args.dry_run),
+        dry_run,
         ctx.policy.network.mode(),
     );
     let target = deps_cli::update::regen::ManifestTarget {
@@ -790,7 +1018,27 @@ async fn run_update(
         display_path: &manifest.display_path,
         uri: &analysis.uri,
     };
-    Ok(deps_cli::update::regen::regenerate_lockfile(plan, &target, gate).await)
+    let run = regenerate(plan, &target, gate, repo.is_some()).await;
+    Ok(UpdateOutput {
+        run,
+        group,
+        publish,
+    })
+}
+
+/// Regenerates the lock file; under `--open-pr` the caller's `PrSignals` owns the only signal
+/// listener (spec 104 FR-012), so the regeneration installs none.
+async fn regenerate(
+    plan: update::UpdatePlan,
+    target: &deps_cli::update::regen::ManifestTarget<'_>,
+    gate: deps_cli::update::regen::RegenerationGate,
+    under_open_pr: bool,
+) -> update::UpdateRun {
+    if under_open_pr {
+        deps_cli::update::regen::regenerate_lockfile_unlistened(plan, target, gate).await
+    } else {
+        deps_cli::update::regen::regenerate_lockfile(plan, target, gate).await
+    }
 }
 
 #[cfg(test)]

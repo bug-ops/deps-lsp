@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: new `Outcome::AppliedViaLockfile` and `RegenerationError::Interrupted` variants, `regenerate_lockfile` takes an `UpdatePlan`, and `PlannedUpdateItem` gains `lockfile_fix` (#2049, #2048, #2068)
 - **behavior**: `update --security-only` without `--lockfile` reports the lockfile as `skipped`/`not-enabled` (#2049, #2068)
 - **deps-core**: new `NativeCooldownSource` variants for Yarn and uv index windows, `GateOrigin`, and defaulted `LockFileProvider::{parse_lock_set, companion_listing_dir}` (#2051, #2052, #2054, #2068)
+- **deps-cli**: `UpdateArgs` gains public `open_pr` and `group` fields, and the exhaustive `SkipReason` gains `NotInGroup` (#1117, #1118, #2075)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
@@ -49,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `osv::AffectedRanges`, `osv::AffectsVersion` and `Advisory::affected_ranges_for` check a version against an advisory's affected ranges (#2049, #2068)
 - **deps-npm**: Yarn `npmMinimalAgeGate` (with `npmScopes` overrides) is honoured as a native release-age gate (#2051, #2068)
 - **deps-pypi**: uv per-index `exclude-newer` under `[[tool.uv.index]]` is honoured with package, index, global precedence (#2052, #2068)
+- **deps-cli**: `update --open-pr github|gitlab` commits the manifest and lockfile change to a content-addressed branch and opens one PR through `git` and `gh`/`glab` (#1117, #2075)
+- **deps-cli**: `[update.groups.<name>]` config and `update --group <name>` batch selected updates into one run and PR (#1118, #2075)
 
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
@@ -69,6 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **specs**: spec 099 Phase 1 shipped explain-only; steering past a held version is not needed, the fix target is annotated and never moved (#2043)
 
 ### Fixed
+- **deps-core**: the OSV record cache is keyed per package and ecosystem, so a second package covered by the same advisory no longer shows the first package's fix target (#2065, #2075)
+- **deps-cli**: a lockfile regeneration tool group gets SIGTERM and a 2-second grace before SIGKILL on timeout or interrupt (#2066, #2075)
 - **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves the GHCR `latest`/major/minor tags or the `action.yml` digest pin, and SARIF is attributed to the tag (#2067)
 - **deps-cli**: SIGTERM, SIGINT and timeout now kill the whole process group of a lockfile regeneration tool instead of leaving it running (#2048, #2068)
 - **deps-core, deps-gradle**: the legacy lock-set directory is listed once while parsing and stat-ed only for symlinks, with the directory stamped before the listing (#2054, #2068)

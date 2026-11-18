@@ -7,6 +7,8 @@
 
 mod command;
 mod interrupt;
+#[cfg(all(test, unix))]
+mod leader_state_tests;
 #[cfg(test)]
 mod lockfile_only_tests;
 #[cfg(all(test, unix))]
@@ -34,8 +36,9 @@ use url::Url;
 
 use command::{ArgComponent, Invocation, NpmPackageArg, compat_class};
 pub use command::{NpmClient, Program};
-use interrupt::Interrupts;
-use run::{ProcessGroup, SearchPath, ToolRunner};
+pub(in crate::update) use interrupt::Interrupts;
+pub(in crate::update) use run::{ChildGuard, ProcessGroup};
+use run::{SearchPath, ToolRunner};
 
 use super::{CooldownFallbackNote, CurrentVersion, LockfileState, Outcome, UpdatePlan, UpdateRun};
 use crate::format::DryRun;
@@ -106,6 +109,23 @@ pub struct ManifestTarget<'a> {
 /// (`Cargo.lock`, `../Cargo.lock`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayLockPath(PathBuf);
+
+impl DisplayLockPath {
+    /// The lock file's own name (`Cargo.lock`), without any directory part.
+    ///
+    /// A regeneration only runs for a lock file beside the manifest, so `--open-pr` stages the
+    /// file under the manifest's directory by this name.
+    #[must_use]
+    pub fn file_name(&self) -> Option<&std::ffi::OsStr> {
+        self.0.file_name()
+    }
+
+    /// Builds a display path for fixtures that stand in for a regeneration result.
+    #[cfg(all(test, unix))]
+    pub(in crate::update) fn for_test(path: &str) -> Self {
+        Self(PathBuf::from(path))
+    }
+}
 
 impl fmt::Display for DisplayLockPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -362,6 +382,37 @@ const fn strategy(id: EcosystemId) -> Strategy {
     }
 }
 
+/// Whether regeneration is implemented for an ecosystem, decided from its identity alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockfileSupport {
+    /// A tool regenerates the lock file (Cargo, npm family, Go).
+    Regenerates,
+    /// The ecosystem has no lock file format, so there is nothing to regenerate.
+    NoLockfileFormat,
+    /// The ecosystem has a lock file but regeneration is not implemented for it yet.
+    Deferred,
+}
+
+/// How [`regenerate_lockfile`] treats `id`, known before anything is analyzed or written.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::update::regen::{LockfileSupport, lockfile_support};
+/// use deps_core::EcosystemId;
+///
+/// assert_eq!(lockfile_support(EcosystemId::Cargo), LockfileSupport::Regenerates);
+/// assert_eq!(lockfile_support(EcosystemId::Pypi), LockfileSupport::Deferred);
+/// ```
+#[must_use]
+pub const fn lockfile_support(id: EcosystemId) -> LockfileSupport {
+    match strategy(id) {
+        Strategy::Cargo | Strategy::NpmFamily | Strategy::Go => LockfileSupport::Regenerates,
+        Strategy::NoLockfileFormat => LockfileSupport::NoLockfileFormat,
+        Strategy::Deferred => LockfileSupport::Deferred,
+    }
+}
+
 /// How a pin is proven against the regenerated lockfile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PinCheck {
@@ -460,12 +511,35 @@ pub async fn regenerate_lockfile(
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
 ) -> UpdateRun {
+    let interrupt = interrupt_listener(&plan, target, gate);
+    regenerate_with_interrupt(plan, target, gate, interrupt).await
+}
+
+/// Like [`regenerate_lockfile`], but installs no signal listener of its own.
+///
+/// For a caller that already drops this future on SIGINT/SIGTERM (`--open-pr`'s
+/// [`PrSignals`](super::pr::PrSignals)): two competing listeners would make an interrupt end
+/// either as a dropped phase or as a `failed` lock file outcome, depending on which fired first.
+/// The dropped future still terminates the tool's process tree through the child guards.
+pub async fn regenerate_lockfile_unlistened(
+    plan: UpdatePlan,
+    target: &ManifestTarget<'_>,
+    gate: RegenerationGate,
+) -> UpdateRun {
+    regenerate_with_interrupt(plan, target, gate, std::future::pending()).await
+}
+
+async fn regenerate_with_interrupt(
+    plan: UpdatePlan,
+    target: &ManifestTarget<'_>,
+    gate: RegenerationGate,
+    interrupt: impl Future<Output = ()>,
+) -> UpdateRun {
     let runner = ToolRunner {
         deadline: TOOL_BUDGET,
         search_path: SearchPath::Inherit,
         group: ProcessGroup::detect(),
     };
-    let interrupt = interrupt_listener(&plan, target, gate);
     let lockfile = regenerate_until(&plan, target, gate, &runner, interrupt).await;
     let mut plan = plan;
     settle_lockfile_only(&mut plan, &lockfile, target.ecosystem.formatter());
@@ -477,7 +551,9 @@ pub async fn regenerate_lockfile(
 ///
 /// This is decided before the strategy is known, so handlers are also installed for runs that
 /// end up spawning nothing (deferred ecosystems, a missing lock file); the signals are then
-/// swallowed for the rest of the short-lived process.
+/// swallowed for the rest of the short-lived process. Under `--open-pr`,
+/// [`PrSignals`](super::pr::PrSignals) owns the only listener and regeneration runs through
+/// [`regenerate_lockfile_unlistened`].
 ///
 /// The returned future resolves on the first SIGINT/SIGTERM and never when no handler could be
 /// installed (the previous behaviour: the signal kills deps-cli itself).
@@ -485,7 +561,7 @@ fn interrupt_listener(
     plan: &UpdatePlan,
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
-) -> impl Future<Output = ()> {
+) -> impl Future<Output = ()> + use<> {
     let will_spawn = gate == RegenerationGate::Run
         && !collect_pins(plan, target.ecosystem.formatter()).is_empty();
     let interrupts = will_spawn

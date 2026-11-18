@@ -1,8 +1,10 @@
 //! Exit-code mapping (FR-011, FR-012): 0 clean, 1 policy violation, 2 execution error.
 
 use crate::report::{CheckReport, FailOnPolicy, OsvCoverage};
+use crate::update::UpdateRun;
 use crate::update::regen::LockfileOutcome;
-use crate::update::{Outcome, SkipReason, UpdateRun};
+#[cfg(any(doc, test))]
+use crate::update::{Outcome, SkipReason};
 use deps_core::policy_config::OsvChecks;
 
 /// The process exited cleanly: no finding matched the `--fail-on` policy.
@@ -119,7 +121,9 @@ pub fn exit_code(
 /// — the surviving edit at the same span already achieves the write (spec 075 fix-cycle
 /// finding: [`crate::update::plan_updates`] now calls `dedup_applied_items` on itself, per
 /// FR-015, making this variant reachable from default-mode `update` for the first time; leaving
-/// it out of this exemption list regressed a scenario that exited clean before that change).
+/// it out of this exemption list regressed a scenario that exited clean before that change) —
+/// or [`Outcome::Skipped`] with reason [`SkipReason::NotInGroup`], an update `--group` left out
+/// on purpose.
 /// `1` if at least one item is
 /// [`Outcome::Skipped`] with reason [`SkipReason::NotSafelyEditable`],
 /// [`Outcome::RequiresLockfileUpdate`], or [`Outcome::Unfixable`] — these represent something
@@ -155,21 +159,11 @@ pub fn update_exit_code(run: &UpdateRun) -> i32 {
     if matches!(run.lockfile, LockfileOutcome::Failed(_)) {
         return EXIT_EXECUTION_ERROR;
     }
-    let has_unresolved_item = run.plan.items.iter().any(|item| {
-        !matches!(
-            item.outcome,
-            Outcome::Applied { .. }
-                | Outcome::AppliedViaLockfile { .. }
-                | Outcome::Skipped {
-                    reason: SkipReason::NotRequested
-                        | SkipReason::IgnoreRule
-                        | SkipReason::WithinFreshnessCooldown
-                        | SkipReason::WithinNativeCooldown
-                        | SkipReason::OverlapsAnotherEdit,
-                    ..
-                }
-        )
-    });
+    let has_unresolved_item = run
+        .plan
+        .items
+        .iter()
+        .any(crate::update::PlannedUpdateItem::is_unresolved);
     if has_unresolved_item {
         EXIT_POLICY_VIOLATION
     } else {

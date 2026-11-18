@@ -3,9 +3,14 @@
 //! Also hosts the shared plan/outcome types both planners (this module's [`plan_updates`]
 //! and [`security`]'s `plan_security_updates`) produce (spec 068, #1329).
 
+pub mod group;
 pub mod ignore;
+pub mod pr;
 pub mod regen;
 pub mod security;
+
+#[cfg(test)]
+mod group_tests;
 
 use deps_core::ConcreteVersion;
 use deps_core::NormalizeName;
@@ -350,6 +355,9 @@ pub enum SkipReason {
     /// The package manager's own publish-age window holds back `latest` (spec 099 Phase 1):
     /// explained and skipped, never an error (exit 0).
     WithinNativeCooldown,
+    /// `--group <name>` selected a group and this update falls outside it (spec 104 FR-017):
+    /// a deliberate exclusion, exit-neutral.
+    NotInGroup,
 }
 
 /// Why a `--security-only` candidate could not be fixed.
@@ -505,6 +513,26 @@ impl PlannedUpdateItem {
         self.outcome.target()
     }
 
+    /// Whether this item is something the run wanted to fix but could not (exit `1`), as opposed
+    /// to applied, or deliberately left alone: the single source for the exit code and for the
+    /// pull request body's "could not be updated" count.
+    #[must_use]
+    pub const fn is_unresolved(&self) -> bool {
+        match &self.outcome {
+            Outcome::Applied { .. } | Outcome::AppliedViaLockfile { .. } => false,
+            Outcome::Skipped { reason, .. } => match reason {
+                SkipReason::NotRequested
+                | SkipReason::IgnoreRule
+                | SkipReason::WithinFreshnessCooldown
+                | SkipReason::WithinNativeCooldown
+                | SkipReason::OverlapsAnotherEdit
+                | SkipReason::NotInGroup => false,
+                SkipReason::NotSafelyEditable(_) => true,
+            },
+            Outcome::RequiresLockfileUpdate { .. } | Outcome::Unfixable(_) => true,
+        }
+    }
+
     /// A one-line human-readable reason for [`Self::outcome`] (FR-021's `reason` field).
     #[must_use]
     pub fn reason(&self) -> String {
@@ -592,6 +620,10 @@ impl PlannedUpdateItem {
                     ),
                 ..
             } => "the latest version is held back by the package manager's own publish-age window",
+            Outcome::Skipped {
+                reason: SkipReason::NotInGroup,
+                ..
+            } => "outside the selected --group",
             Outcome::RequiresLockfileUpdate { .. } => {
                 "declared requirement already admits the fix target, but the lock file still resolves a vulnerable version; update the lock file (deps-cli can do it with --lockfile regenerate for Cargo, npm, pnpm and Go)"
             }

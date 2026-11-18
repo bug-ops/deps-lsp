@@ -8,7 +8,7 @@ use std::io;
 
 /// Listens for the process-level interrupt signals; handlers stay installed until exit.
 #[derive(Debug)]
-pub(super) struct Interrupts {
+pub(in crate::update) struct Interrupts {
     #[cfg(unix)]
     sigint: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -22,7 +22,7 @@ impl Interrupts {
     ///
     /// The OS refused to register a handler.
     #[cfg(unix)]
-    pub(super) fn install() -> io::Result<Self> {
+    pub(in crate::update) fn install() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
             sigint: signal(SignalKind::interrupt())?,
@@ -37,13 +37,13 @@ impl Interrupts {
     /// Never fails on Windows.
     #[cfg(not(unix))]
     #[allow(clippy::unnecessary_wraps)]
-    pub(super) fn install() -> io::Result<Self> {
+    pub(in crate::update) fn install() -> io::Result<Self> {
         Ok(Self {})
     }
 
     /// Resolves on the first interrupt signal.
     #[cfg(unix)]
-    pub(super) async fn recv(&mut self) {
+    pub(in crate::update) async fn recv(&mut self) {
         tokio::select! {
             _ = self.sigint.recv() => {}
             _ = self.sigterm.recv() => {}
@@ -52,7 +52,9 @@ impl Interrupts {
 
     /// Resolves on the first Ctrl-C; never resolves if the handler cannot be registered.
     #[cfg(not(unix))]
-    pub(super) async fn recv(&mut self) {
+    // Keeps the `&mut self` signature of the unix version, which polls its signal streams.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(in crate::update) async fn recv(&mut self) {
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;
         }

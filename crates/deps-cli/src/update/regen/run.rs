@@ -22,6 +22,14 @@ use super::command::{Invocation, Program};
 /// Largest probe stdout accepted; anything longer is not a path or a one-word answer.
 const PROBE_OUTPUT_CAP: u64 = 4096;
 
+/// How long a tool gets to exit after SIGTERM before it is killed with SIGKILL.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(in crate::update) const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+/// How often the grace period checks whether the tool's leader has exited.
+#[cfg(unix)]
+const TERMINATION_POLL: Duration = Duration::from_millis(20);
+
 /// Where child processes find their executables.
 #[derive(Debug, Clone)]
 pub(super) enum SearchPath {
@@ -39,7 +47,7 @@ pub(super) enum SearchPath {
 
 /// Whether a spawned tool leads its own process group or stays in deps-cli's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProcessGroup {
+pub(in crate::update) enum ProcessGroup {
     /// The tool leads a new group, so a timeout or interrupt kills its whole process tree.
     Own,
     /// The tool stays in deps-cli's group. Chosen only for a foreground terminal run, where a
@@ -53,7 +61,7 @@ impl ProcessGroup {
     /// Picks the policy for one regeneration: [`Self::Inherit`] only when deps-cli is in its
     /// controlling terminal's foreground group.
     #[cfg(unix)]
-    pub(super) fn detect() -> Self {
+    pub(in crate::update) fn detect() -> Self {
         let foreground = std::fs::File::open("/dev/tty")
             .ok()
             .and_then(|tty| rustix::termios::tcgetpgrp(&tty).ok())
@@ -66,14 +74,14 @@ impl ProcessGroup {
 
     /// Without process groups the tool is a plain child.
     #[cfg(not(unix))]
-    pub(super) const fn detect() -> Self {
+    pub(in crate::update) const fn detect() -> Self {
         Self::Own
     }
 
     /// The pure decision: `foreground` is the terminal's foreground group when `/dev/tty` opened
     /// and answered, `own` is deps-cli's group.
     #[cfg(any(unix, test))]
-    pub(super) const fn choose(foreground: Option<i32>, own: i32) -> Self {
+    pub(in crate::update) const fn choose(foreground: Option<i32>, own: i32) -> Self {
         match foreground {
             Some(pgid) if pgid == own => Self::Inherit,
             Some(_) | None => Self::Own,
@@ -81,15 +89,59 @@ impl ProcessGroup {
     }
 }
 
-/// A spawned tool that is killed, with its process group when it leads one, on drop.
+/// A spawned tool that is terminated, with its process group when it leads one, on drop.
 ///
-/// Gating on [`Child::id`] is the "not yet reaped" proof: tokio returns `None` once the child
-/// was waited for, and until then the leader still holds the group id, so the group cannot have
-/// been recycled for an unrelated process.
-struct ChildGuard {
+/// Dropping sends SIGTERM, gives the leader up to [`TERMINATION_GRACE`] to exit, then sends
+/// SIGKILL to the same target even when the leader has exited, so descendants that ignored
+/// SIGTERM do not outlive it. The leader is never reaped during the grace period: gating on
+/// [`Child::id`] is the "not yet reaped" proof, because tokio returns `None` once the child was
+/// waited for, and until then the leader still holds the group id, so the group cannot have been
+/// recycled for an unrelated process.
+pub(in crate::update) struct ChildGuard {
     child: Child,
     #[cfg_attr(not(unix), allow(dead_code))]
     group: ProcessGroup,
+}
+
+impl ChildGuard {
+    /// Spawns `command` under `group`'s policy and terminates it when the guard is dropped.
+    ///
+    /// With [`ProcessGroup::Own`] on unix the tool leads a new process group, so the drop
+    /// terminates its whole process tree; with [`ProcessGroup::Inherit`] only the tool itself is
+    /// signalled.
+    ///
+    /// # Errors
+    ///
+    /// The [`std::io::Error`] from spawning the process.
+    pub(in crate::update) fn spawn(
+        command: &mut Command,
+        group: ProcessGroup,
+    ) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        if group == ProcessGroup::Own {
+            command.process_group(0);
+        }
+        command.kill_on_drop(true);
+        Ok(Self {
+            child: command.spawn()?,
+            group,
+        })
+    }
+
+    #[cfg(unix)]
+    fn signal(&self, leader: rustix::process::Pid, signal: rustix::process::Signal) {
+        use rustix::io::Errno;
+        use rustix::process::{kill_process, kill_process_group};
+
+        let result = match self.group {
+            ProcessGroup::Own => kill_process_group(leader, signal),
+            ProcessGroup::Inherit => kill_process(leader, signal),
+        };
+        match result {
+            Ok(()) | Err(Errno::SRCH) => {}
+            Err(error) => tracing::debug!(%error, ?signal, "could not signal the tool"),
+        }
+    }
 }
 
 impl std::ops::Deref for ChildGuard {
@@ -109,12 +161,8 @@ impl std::ops::DerefMut for ChildGuard {
 #[cfg(unix)]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        use rustix::io::Errno;
-        use rustix::process::{Pid, Signal, kill_process_group};
+        use rustix::process::{Pid, Signal};
 
-        if self.group != ProcessGroup::Own {
-            return;
-        }
         let Some(leader) = self
             .child
             .id()
@@ -123,11 +171,109 @@ impl Drop for ChildGuard {
         else {
             return;
         };
-        match kill_process_group(leader, Signal::KILL) {
-            Ok(()) | Err(Errno::SRCH) => {}
-            Err(error) => tracing::debug!(%error, "could not kill the tool's process group"),
+        if poll_leader(leader) == LeaderState::Gone {
+            return;
+        }
+        self.signal(leader, Signal::TERM);
+        if wait_for_leader_exit(leader, TERMINATION_GRACE) != LeaderState::Gone {
+            self.signal(leader, Signal::KILL);
         }
     }
+}
+
+/// What a `waitid` poll learned about the tool's leader.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeaderState {
+    /// Still running.
+    Running,
+    /// Exited but not reaped: its pid and group id are still reserved for it.
+    Exited,
+    /// Not our child any more (`ECHILD`): the pid may already belong to an unrelated process, so
+    /// nothing may be signalled.
+    Gone,
+    /// The poll failed for another reason, so the leader's state is not observable.
+    Unknown,
+}
+
+/// Classifies a `waitid(EXITED | NOHANG | NOWAIT)` result.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+pub(super) fn leader_state<T>(result: rustix::io::Result<Option<T>>) -> LeaderState {
+    match result {
+        Ok(None) => LeaderState::Running,
+        Ok(Some(_)) => LeaderState::Exited,
+        Err(rustix::io::Errno::CHILD) => LeaderState::Gone,
+        Err(_) => LeaderState::Unknown,
+    }
+}
+
+/// Blocks until `leader` has exited or `grace` has passed, and returns the last observed state
+/// (`Running` when the grace expired). An unobservable leader sleeps out the whole grace.
+/// `Drop` cannot await, and a short block in this teardown path of a short-lived CLI is cheaper
+/// than threading cancellation through the runner.
+#[cfg(unix)]
+fn wait_for_leader_exit(leader: rustix::process::Pid, grace: Duration) -> LeaderState {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        let state = poll_leader(leader);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match state {
+            LeaderState::Exited | LeaderState::Gone => return state,
+            LeaderState::Unknown => {
+                std::thread::sleep(remaining);
+                return state;
+            }
+            LeaderState::Running if remaining.is_zero() => return state,
+            LeaderState::Running => std::thread::sleep(remaining.min(TERMINATION_POLL)),
+        }
+    }
+}
+
+/// Polls `leader` without reaping it: `WNOWAIT` leaves the zombie in place so tokio still owns
+/// the exit status and the group id stays reserved for the final SIGKILL.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+fn poll_leader(leader: rustix::process::Pid) -> LeaderState {
+    use rustix::io::Errno;
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    match waitid(WaitId::Pid(leader), options) {
+        Err(Errno::INTR) => LeaderState::Running,
+        result => leader_state(result),
+    }
+}
+
+/// Without `waitid` the exit cannot be observed without reaping, so the full grace is waited.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    )
+))]
+const fn poll_leader(_leader: rustix::process::Pid) -> LeaderState {
+    LeaderState::Unknown
 }
 
 /// Spawns the regeneration tools under one shared time budget.
@@ -159,15 +305,10 @@ impl ToolRunner {
                 command
             }
         };
-        #[cfg(unix)]
-        if self.group == ProcessGroup::Own {
-            command.process_group(0);
-        }
         command
             .args(invocation.args())
             .current_dir(invocation.cwd())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+            .stdin(Stdio::null());
         if let Some((key, value)) = invocation.env() {
             command.env(key, value);
         }
@@ -246,13 +387,7 @@ impl ToolRunner {
         command: &mut Command,
         program: Program,
     ) -> Result<ChildGuard, RegenerationError> {
-        let child = command
-            .spawn()
-            .map_err(|source| spawn_error(program, source))?;
-        Ok(ChildGuard {
-            child,
-            group: self.group,
-        })
+        ChildGuard::spawn(command, self.group).map_err(|source| spawn_error(program, source))
     }
 
     const fn timed_out(&self) -> RegenerationError {

@@ -253,6 +253,15 @@ pub struct UpdateArgs {
     /// edit (`skip` leaves it alone).
     #[arg(long, value_enum, default_value_t)]
     pub lockfile: crate::update::regen::LockfileMode,
+
+    /// Commits the update on a `deps-cli/...` branch, pushes it and opens a pull or merge
+    /// request with `gh` or `glab`. Requires `--lockfile regenerate`.
+    #[arg(long, value_enum, conflicts_with_all = ["dry_run", "offline"])]
+    pub open_pr: Option<crate::update::pr::PrHost>,
+
+    /// Restricts the update to the named `[update.groups.<name>]` group of `--config`.
+    #[arg(long, requires = "config", conflicts_with = "security_only")]
+    pub group: Option<crate::config::GroupName>,
 }
 
 /// Parses a `--cooldown` value into a clamped second count.
