@@ -1365,6 +1365,9 @@ fn log_scan_summary(outcomes: &VulnerabilityMap) {
 }
 
 #[cfg(test)]
+mod record_cache_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn osv_query_wire_json_carries_plain_package_name() {

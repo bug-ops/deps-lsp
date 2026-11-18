@@ -22,6 +22,10 @@ use super::command::{Invocation, Program};
 /// Largest probe stdout accepted; anything longer is not a path or a one-word answer.
 const PROBE_OUTPUT_CAP: u64 = 4096;
 
+/// How long a tool gets to exit after SIGTERM before its process group is killed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::update) const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
 /// Where child processes find their executables.
 #[derive(Debug, Clone)]
 pub(super) enum SearchPath {
@@ -39,7 +43,7 @@ pub(super) enum SearchPath {
 
 /// Whether a spawned tool leads its own process group or stays in deps-cli's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProcessGroup {
+pub(in crate::update) enum ProcessGroup {
     /// The tool leads a new group, so a timeout or interrupt kills its whole process tree.
     Own,
     /// The tool stays in deps-cli's group. Chosen only for a foreground terminal run, where a
@@ -53,7 +57,7 @@ impl ProcessGroup {
     /// Picks the policy for one regeneration: [`Self::Inherit`] only when deps-cli is in its
     /// controlling terminal's foreground group.
     #[cfg(unix)]
-    pub(super) fn detect() -> Self {
+    pub(in crate::update) fn detect() -> Self {
         let foreground = std::fs::File::open("/dev/tty")
             .ok()
             .and_then(|tty| rustix::termios::tcgetpgrp(&tty).ok())
@@ -66,14 +70,14 @@ impl ProcessGroup {
 
     /// Without process groups the tool is a plain child.
     #[cfg(not(unix))]
-    pub(super) const fn detect() -> Self {
+    pub(in crate::update) const fn detect() -> Self {
         Self::Own
     }
 
     /// The pure decision: `foreground` is the terminal's foreground group when `/dev/tty` opened
     /// and answered, `own` is deps-cli's group.
     #[cfg(any(unix, test))]
-    pub(super) const fn choose(foreground: Option<i32>, own: i32) -> Self {
+    pub(in crate::update) const fn choose(foreground: Option<i32>, own: i32) -> Self {
         match foreground {
             Some(pgid) if pgid == own => Self::Inherit,
             Some(_) | None => Self::Own,

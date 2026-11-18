@@ -8,6 +8,7 @@ use deps_core::policy_config::{
     DiagnosticsConfig, KeychainCredentials, PolicyConfig, RegistriesConfig,
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Default config file name looked up relative to the current working directory when
@@ -58,6 +59,57 @@ pub struct UpdateConfig {
     /// should skip.
     #[serde(default)]
     pub ignore: Vec<IgnoreRule>,
+    /// Named dependency groups `deps-cli update --group <name>` selects from.
+    #[serde(default)]
+    pub groups: BTreeMap<GroupName, GroupRule>,
+}
+
+/// A validated `[update.groups.<name>]` key: 1 to 64 characters of lowercase ASCII letters,
+/// digits and `-`, neither starting nor ending with `-`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct GroupName(String);
+
+/// A group name outside the [`GroupName`] grammar.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid group name")]
+pub struct InvalidGroupName;
+
+impl std::str::FromStr for GroupName {
+    type Err = InvalidGroupName;
+
+    fn from_str(_text: &str) -> Result<Self, Self::Err> {
+        todo!()
+    }
+}
+
+impl TryFrom<String> for GroupName {
+    type Error = InvalidGroupName;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        text.parse()
+    }
+}
+
+impl GroupName {
+    /// The name as written in the config file and on the command line.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One `[update.groups.<name>]` table: which dependencies and update kinds belong to the group.
+#[non_exhaustive]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupRule {
+    /// Dependency names in the group; `None` admits every name.
+    #[serde(default)]
+    pub dependencies: Option<Vec<String>>,
+    /// Update kinds in the group; `None` admits every kind.
+    #[serde(default)]
+    pub update_types: Option<Vec<UpdateTypeToken>>,
 }
 
 /// One `[update].ignore` entry: a dependency name, optionally scoped to specific update

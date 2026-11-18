@@ -165,7 +165,8 @@ pub fn update_exit_code(run: &UpdateRun) -> i32 {
                         | SkipReason::IgnoreRule
                         | SkipReason::WithinFreshnessCooldown
                         | SkipReason::WithinNativeCooldown
-                        | SkipReason::OverlapsAnotherEdit,
+                        | SkipReason::OverlapsAnotherEdit
+                        | SkipReason::NotInGroup,
                     ..
                 }
         )

@@ -3,9 +3,14 @@
 //! Also hosts the shared plan/outcome types both planners (this module's [`plan_updates`]
 //! and [`security`]'s `plan_security_updates`) produce (spec 068, #1329).
 
+pub mod group;
 pub mod ignore;
+pub mod pr;
 pub mod regen;
 pub mod security;
+
+#[cfg(test)]
+mod group_tests;
 
 use deps_core::ConcreteVersion;
 use deps_core::NormalizeName;
@@ -350,6 +355,9 @@ pub enum SkipReason {
     /// The package manager's own publish-age window holds back `latest` (spec 099 Phase 1):
     /// explained and skipped, never an error (exit 0).
     WithinNativeCooldown,
+    /// `--group <name>` selected a group and this update falls outside it (spec 104 FR-017):
+    /// a deliberate exclusion, exit-neutral.
+    NotInGroup,
 }
 
 /// Why a `--security-only` candidate could not be fixed.
@@ -592,6 +600,10 @@ impl PlannedUpdateItem {
                     ),
                 ..
             } => "the latest version is held back by the package manager's own publish-age window",
+            Outcome::Skipped {
+                reason: SkipReason::NotInGroup,
+                ..
+            } => "outside the selected --group",
             Outcome::RequiresLockfileUpdate { .. } => {
                 "declared requirement already admits the fix target, but the lock file still resolves a vulnerable version; update the lock file (deps-cli can do it with --lockfile regenerate for Cargo, npm, pnpm and Go)"
             }

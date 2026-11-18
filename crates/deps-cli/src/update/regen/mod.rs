@@ -34,8 +34,9 @@ use url::Url;
 
 use command::{ArgComponent, Invocation, NpmPackageArg, compat_class};
 pub use command::{NpmClient, Program};
-use interrupt::Interrupts;
-use run::{ProcessGroup, SearchPath, ToolRunner};
+pub(in crate::update) use interrupt::Interrupts;
+pub(in crate::update) use run::ProcessGroup;
+use run::{SearchPath, ToolRunner};
 
 use super::{CooldownFallbackNote, CurrentVersion, LockfileState, Outcome, UpdatePlan, UpdateRun};
 use crate::format::DryRun;
