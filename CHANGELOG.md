@@ -62,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **specs**: spec 099 Phase 1 shipped explain-only; steering past a held version is not needed, the fix target is annotated and never moved (#2043)
 
 ### Fixed
-- **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves the GHCR `latest`/major/minor tags or the `action.yml` digest pin, and SARIF is attributed to the tag (#PR)
+- **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves the GHCR `latest`/major/minor tags or the `action.yml` digest pin, and SARIF is attributed to the tag (#2067)
 - **deps-lsp**: a `didClose` during the first parse of a `didOpen` no longer brings the closed document back, and a cold-start load no longer replaces an open still parsing (#2036, #2040)
 - **deps-core, deps-lsp**: inlay hints, the vulnerability quick fix and hover honour operator advisory exemptions (#2030, #2040)
 - **deps-lsp**: initialize wiring of the advisory exemption file is covered by tests through an injected config dir (#2031, #2040)
