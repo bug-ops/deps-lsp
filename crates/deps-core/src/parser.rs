@@ -2480,40 +2480,6 @@ dev_dependencies:
     }
 
     #[test]
-    fn test_dependency_source_clone() {
-        let source1 = DependencySource::Git {
-            url: "https://example.com/repo".into(),
-            rev: Some("v1.0".into()),
-        };
-        let source2 = source1.clone();
-
-        assert_eq!(source1, source2);
-    }
-
-    #[test]
-    fn test_dependency_source_equality() {
-        let reg1 = DependencySource::Registry;
-        let reg2 = DependencySource::Registry;
-        assert_eq!(reg1, reg2);
-
-        let git1 = DependencySource::Git {
-            url: "https://example.com".into(),
-            rev: None,
-        };
-        let git2 = DependencySource::Git {
-            url: "https://example.com".into(),
-            rev: None,
-        };
-        assert_eq!(git1, git2);
-
-        let git3 = DependencySource::Git {
-            url: "https://different.com".into(),
-            rev: None,
-        };
-        assert_ne!(git1, git3);
-    }
-
-    #[test]
     fn test_check_json_nesting_depth_shallow_accepted() {
         let content = br#"{"a":[1,2,{"b":3}],"c":"[not{real}nesting]"}"#;
         assert_eq!(check_json_nesting_depth(content, 4), Ok(()));
@@ -2655,19 +2621,6 @@ dev_dependencies:
     #[test]
     fn test_loading_state_default() {
         assert_eq!(LoadingState::default(), LoadingState::Idle);
-    }
-
-    #[test]
-    fn test_loading_state_copy() {
-        let state = LoadingState::Loading;
-        let copied = state;
-        assert_eq!(state, copied);
-    }
-
-    #[test]
-    fn test_loading_state_debug() {
-        let debug_str = format!("{:?}", LoadingState::Loading);
-        assert_eq!(debug_str, "Loading");
     }
 
     #[test]

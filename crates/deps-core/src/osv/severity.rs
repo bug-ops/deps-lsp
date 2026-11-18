@@ -260,21 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn cvss_vector_only_record_is_unknown() {
-        assert_eq!(
-            classify(
-                "RUSTSEC-2020-0071",
-                &[],
-                None,
-                &[],
-                &pkg_name(),
-                PKG_OSV_ECO
-            ),
-            VulnSeverity::Unknown
-        );
-    }
-
-    #[test]
     fn no_severity_at_all_is_unknown() {
         assert_eq!(
             classify(

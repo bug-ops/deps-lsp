@@ -802,54 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn test_line_offset_table() {
-        let content = "line0\nline1\nline2";
-        let table = LineOffsetTable::new(content);
-
-        let pos0 = table.byte_offset_to_position(content, 0);
-        assert_eq!(pos0.line, 0);
-        assert_eq!(pos0.character, 0);
-
-        let pos6 = table.byte_offset_to_position(content, 6);
-        assert_eq!(pos6.line, 1);
-        assert_eq!(pos6.character, 0);
-
-        let pos12 = table.byte_offset_to_position(content, 12);
-        assert_eq!(pos12.line, 2);
-        assert_eq!(pos12.character, 0);
-    }
-
-    #[test]
-    fn test_line_offset_table_utf16() {
-        // UTF-16 character counting (LSP requirement), with multi-byte "世界".
-        let content = "hello 世界\nworld";
-        let table = LineOffsetTable::new(content);
-
-        let world_offset = content.find("world").unwrap();
-        let pos = table.byte_offset_to_position(content, world_offset);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-
-        let world_char_offset = content.find('世').unwrap();
-        let pos = table.byte_offset_to_position(content, world_char_offset);
-        assert_eq!(pos.line, 0);
-        assert_eq!(pos.character, 6); // "hello " = 6 UTF-16 code units
-    }
-
-    #[test]
-    fn test_line_offset_table_emoji() {
-        // Emoji: 4-byte UTF-8, 2 UTF-16 code units.
-        let content = "test 🚀 rocket\nline2";
-        let table = LineOffsetTable::new(content);
-
-        let rocket_offset = content.find("rocket").unwrap();
-        let pos = table.byte_offset_to_position(content, rocket_offset);
-        assert_eq!(pos.line, 0);
-        // "test " = 5, "🚀" = 2 UTF-16 code units, " " = 1 => total 8
-        assert_eq!(pos.character, 8);
-    }
-
-    #[test]
     fn test_dependency_with_git_url() {
         let json = r#"{
   "dependencies": {

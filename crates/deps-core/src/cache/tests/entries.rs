@@ -26,21 +26,6 @@ fn test_cache_clear() {
 }
 
 #[test]
-fn test_cached_response_clone() {
-    let response = CachedResponse {
-        body: Bytes::from_static(&[1, 2, 3]),
-        etag: Some("test".into()),
-        last_modified: Some("date".into()),
-        link: None,
-        fetched_at: Instant::now(),
-    };
-    let cloned = response.clone();
-    // Bytes clone is cheap (reference counting)
-    assert_eq!(response.body, cloned.body);
-    assert_eq!(response.etag, cloned.etag);
-}
-
-#[test]
 fn test_cache_len() {
     let cache = HttpCache::new();
     assert_eq!(cache.len(), 0);

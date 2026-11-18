@@ -2506,11 +2506,6 @@ mod tests {
         let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
     }
 
-    #[tokio::test]
-    async fn test_initialize_without_options() {
-        let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
-    }
-
     #[test]
     fn test_server_capabilities_text_document_sync() {
         let caps = Backend::server_capabilities();

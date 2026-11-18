@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: faster PR checks: `Swatinem/rust-cache` with main-only saves replaces `moonrepo/setup-rust`, fuzz/coverage/beta/aarch64 and build-only cross legs leave the PR path, feature-matrix check and Windows tests are sharded (#2056, #2057)
 - **ci**: `release.yml` and `live-registry-tests.yml` use `dtolnay/rust-toolchain` and `Swatinem/rust-cache` with main-only saves instead of `moonrepo/setup-rust` (#2058, #2061)
 - **ci**: Windows doctests run on shard 1 for PRs, and `release.yml` honors the `workflow_dispatch` `tag` input for checkout, version and release tag (#2059, #2060, #2063)
+- **workspace**: removed 64 redundant tests (cross-crate duplicates of deps-core, constructor-only and derive-only tests) (#2064)
 
 ### Documentation
 - **book**: fix the Neovim setup snippet (`vim.lsp.config`/`vim.lsp.enable`, Neovim 0.11+) and complete the filetype lists (#2029)

@@ -426,21 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_version_creation() {
-        let version = CargoVersion {
-            num: "1.0.0".into(),
-            yanked: false,
-            features: HashMap::new(),
-            published_at: None,
-        };
-
-        assert_eq!(version.num, "1.0.0");
-        assert!(!version.yanked);
-        assert!(version.features.is_empty());
-        assert!(version.published_at.is_none());
-    }
-
-    #[test]
     fn test_cargo_version_is_prerelease() {
         use deps_core::Version;
 

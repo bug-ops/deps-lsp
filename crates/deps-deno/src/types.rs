@@ -329,24 +329,7 @@ impl deps_core::lsp_helpers::ProbeDependency for DenoDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::position::Position;
     use deps_core::{Metadata, Version};
-
-    #[test]
-    fn test_deno_dependency_creation() {
-        let dep = DenoDependency {
-            name: "jsr:@std/fs".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
-            version_req: Some("^1.0".into()),
-            version_range: Some(Range::new(Position::new(0, 13), Position::new(0, 17))),
-            section: DenoDependencySection::Imports,
-            source: deps_core::parser::DependencySource::Registry,
-            registry_entry: None,
-        };
-
-        assert_eq!(dep.name, "jsr:@std/fs");
-        assert_eq!(dep.version_req, Some("^1.0".into()));
-    }
 
     #[test]
     fn test_jsr_version_trait() {

@@ -811,30 +811,8 @@ impl deps_core::lsp_helpers::ProbeDependency for NpmDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::Position;
     use deps_core::{Metadata, Version};
     use std::assert_matches;
-
-    #[test]
-    fn test_npm_dependency_creation() {
-        let dep = NpmDependency {
-            name: "react".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            version_req: Some("^18.0.0".into()),
-            version_range: Some(Range::new(Position::new(0, 8), Position::new(0, 16))),
-            origin: NpmDependencyOrigin::Manifest {
-                section: NpmDependencySection::Dependencies,
-                catalog_ref: None,
-            },
-            source: deps_core::parser::DependencySource::Registry,
-            registry_entry: None,
-            native_cooldown: None,
-            package: None,
-        };
-
-        assert_eq!(dep.name, "react");
-        assert_eq!(dep.version_req, Some("^18.0.0".into()));
-    }
 
     #[test]
     fn test_dependency_section_variants() {
@@ -847,18 +825,6 @@ mod tests {
         assert_matches!(dev_deps, NpmDependencySection::DevDependencies);
         assert_matches!(peer_deps, NpmDependencySection::PeerDependencies);
         assert_matches!(opt_deps, NpmDependencySection::OptionalDependencies);
-    }
-
-    #[test]
-    fn test_npm_version_creation() {
-        let version = NpmVersion {
-            version: "1.0.0".into(),
-            deprecation: NpmDeprecation::Active,
-            published_at: None,
-        };
-
-        assert_eq!(version.version, "1.0.0");
-        assert!(!version.deprecation.is_deprecated());
     }
 
     #[test]
@@ -942,20 +908,6 @@ mod tests {
         assert!(stable.is_stable());
         assert!(prerelease.is_prerelease());
         assert!(!prerelease.is_stable());
-    }
-
-    #[test]
-    fn test_npm_package_creation() {
-        let pkg = NpmPackage {
-            name: "lodash".into(),
-            description: Some("Lodash utility library".into()),
-            homepage: Some("https://lodash.com/".into()),
-            repository: Some("lodash/lodash".into()),
-            latest_version: "4.17.21".into(),
-        };
-
-        assert_eq!(pkg.name, "lodash");
-        assert_eq!(pkg.latest_version, "4.17.21");
     }
 
     #[test]

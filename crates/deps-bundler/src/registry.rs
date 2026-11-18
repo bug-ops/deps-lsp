@@ -720,12 +720,6 @@ mod tests {
         assert!(info.licenses.contains(&"Apache-2.0".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_registry_creation() {
-        let cache = Arc::new(HttpCache::new());
-        let _registry = RubyGemsRegistry::new(cache);
-    }
-
     /// #349: `foo?callback=evil` must not inject a query string into the
     /// `versions.json` request URL — the raw `?` has to be percent-encoded, not left to
     /// reach the request as a literal query separator. Asserted on the *parsed* URL

@@ -2144,25 +2144,6 @@ cc = "1.0"
     }
 
     #[test]
-    fn test_line_offset_table() {
-        let content = "abc\ndef";
-        let table = LineOffsetTable::new(content);
-        let pos = table.byte_offset_to_position(content, 4);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-    }
-
-    #[test]
-    fn test_line_offset_table_unicode() {
-        let content = "hello 世界\nworld";
-        let table = LineOffsetTable::new(content);
-        let world_offset = content.find("world").unwrap();
-        let pos = table.byte_offset_to_position(content, world_offset);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-    }
-
-    #[test]
     fn test_malformed_toml() {
         // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();

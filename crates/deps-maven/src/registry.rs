@@ -2084,12 +2084,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn test_registry_creation() {
-        let cache = Arc::new(HttpCache::new());
-        let _registry = MavenCentralRegistry::new(cache);
-    }
-
     // `select_latest_matching`'s contract is "index 0 of a `get_versions`-shaped list
     // is latest" — `get_versions` is what puts the right entry at index 0 (via
     // `move_release_to_front`), not `select_latest_matching` itself. #794 impl-critic

@@ -4,7 +4,7 @@
 //! transitions to final hint display across all ecosystems.
 
 use deps_core::EcosystemId;
-use deps_lsp::config::{DepsConfig, LoadingIndicatorConfig};
+use deps_lsp::config::DepsConfig;
 use deps_lsp::document::{DocumentState, LoadingState, ServerState};
 // Only the cargo-gated tests below wrap `ServerState` in an `Arc`.
 #[cfg(feature = "cargo")]
@@ -232,32 +232,6 @@ fn test_set_loading_resets_timer() {
     doc.set_loaded();
     assert_eq!(doc.loading_state(), LoadingState::Loaded);
     assert!(doc.loading_started_at().is_none());
-}
-
-/// Test loading indicator config defaults.
-#[test]
-fn test_loading_indicator_config_defaults() {
-    let config = LoadingIndicatorConfig::default();
-
-    assert!(config.enabled);
-    assert!(config.fallback_to_hints);
-    assert_eq!(config.loading_text, "⏳");
-}
-
-/// Test partial loading indicator config deserialization.
-#[test]
-fn test_partial_loading_indicator_config() {
-    let config_json = r#"{
-        "loading_indicator": {
-            "enabled": false
-        }
-    }"#;
-
-    let config: DepsConfig = serde_json::from_str(config_json).unwrap();
-
-    assert!(!config.loading_indicator.enabled);
-    assert!(config.loading_indicator.fallback_to_hints);
-    assert_eq!(config.loading_indicator.loading_text, "⏳");
 }
 
 /// Test loading text truncation to prevent abuse.
