@@ -8,6 +8,7 @@
 
 #![allow(clippy::expect_used)]
 
+use std::assert_matches;
 use std::str::FromStr;
 
 use deps_cli::config::GroupName;
@@ -207,19 +208,16 @@ fn demote_outside_group_uses_each_items_dependency_kind() {
 
     demote_outside_group(&mut items, &group, &FORMATTER);
 
-    assert!(matches!(items[0].outcome, Outcome::Applied { .. }));
+    assert_matches!(items[0].outcome, Outcome::Applied { .. });
     for item in &items[1..] {
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotInGroup,
-                    ..
-                }
-            ),
-            "{}: {:?}",
-            item.name,
-            item.outcome
+        assert_matches!(
+            item.outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotInGroup,
+                ..
+            },
+            "{}",
+            item.name
         );
     }
 }

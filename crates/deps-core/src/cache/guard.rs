@@ -158,6 +158,8 @@ impl AddrGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::net_policy::MapEnv;
     use crate::osv::{OSV_BASE_URL_ENV, OsvEndpoint};
@@ -180,11 +182,9 @@ mod tests {
             "http://192.168.0.1/v1/query",
             "http://example.com/v1/query",
         ] {
-            assert!(
-                matches!(
-                    ensure_scheme(other, rule),
-                    Err(DepsError::InsecureScheme { .. })
-                ),
+            assert_matches!(
+                ensure_scheme(other, rule),
+                Err(DepsError::InsecureScheme { .. }),
                 "{other}"
             );
         }
