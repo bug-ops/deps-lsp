@@ -28,13 +28,14 @@ use super::git::{Step, Tool};
 use super::{
     BaseBranch, BranchCheck, PrError, PrHost, PrOutcome, PrPhase, PrSignals, PullRequestText,
     Readiness, RepoContext, branch_for, check_branch, describe, open, preflight, readiness,
+    require_tracked_tree, restore,
 };
 use crate::exit::{EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
 use crate::update::group_tests::{applied, item, skipped};
 use crate::update::regen::{
-    DisplayLockPath, LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, Program,
-    RegenerationError, RegenerationGate, SkipCause, UnsupportedReason,
+    Companion, DisplayLockPath, LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason,
+    Program, RegenerationError, RegenerationGate, SkipCause, UnsupportedReason,
     regenerate_lockfile_unlistened,
 };
 use crate::update::{
@@ -81,11 +82,23 @@ fn run_with(items: Vec<PlannedUpdateItem>, lockfile: LockfileOutcome) -> UpdateR
     }
 }
 
-fn regenerated(lock: &str) -> LockfileOutcome {
+fn regenerated(fx: &Fixture, lock: &str) -> LockfileOutcome {
     LockfileOutcome::Regenerated {
-        lockfile: DisplayLockPath::for_test(lock),
+        lockfile: DisplayLockPath::for_test(lock, &fx.root.join(lock)),
         tool: Program::Cargo,
         pins: Vec::new(),
+        companions: Vec::new(),
+    }
+}
+
+/// A regenerated lock file whose real path is not under any fixture: for runs that are never
+/// described or restored.
+fn regenerated_unplaced(lock: &str) -> LockfileOutcome {
+    LockfileOutcome::Regenerated {
+        lockfile: DisplayLockPath::for_test(lock, Path::new(lock)),
+        tool: Program::Cargo,
+        pins: Vec::new(),
+        companions: Vec::new(),
     }
 }
 
@@ -105,6 +118,14 @@ fn requires_lockfile_item(name: &str) -> PlannedUpdateItem {
             target: ConcreteVersion::from("1.0.5"),
         },
     )
+}
+
+fn scope_files(text: &PullRequestText) -> Vec<&str> {
+    text.scope
+        .files
+        .iter()
+        .map(|file| file.0.as_str())
+        .collect()
 }
 
 fn text_of(ctx: &RepoContext, run: &UpdateRun) -> PullRequestText {
@@ -139,7 +160,7 @@ fn plan_of_names(names: &[String], from: &str, to: &str) -> UpdateRun {
             .iter()
             .map(|name| item(name, from, applied(to)))
             .collect(),
-        regenerated("Cargo.lock"),
+        regenerated_unplaced("Cargo.lock"),
     )
 }
 
@@ -150,7 +171,7 @@ fn test_readiness_only_requires_lockfile_update_after_a_regeneration_is_nothing_
     // The impl-critic's reproducer: the lock moved but no item was proven fixed.
     let run = run_with(
         vec![requires_lockfile_item("foo")],
-        regenerated("Cargo.lock"),
+        regenerated_unplaced("Cargo.lock"),
     );
 
     assert_matches!(readiness(&run), Readiness::NothingSettled);
@@ -177,10 +198,10 @@ fn test_readiness_applied_or_applied_via_lockfile_is_ready() {
         },
     );
 
-    let applied_run = settled_run(regenerated("Cargo.lock"));
+    let applied_run = settled_run(regenerated_unplaced("Cargo.lock"));
     let mixed = run_with(
         vec![requires_lockfile_item("foo"), via_lockfile],
-        regenerated("Cargo.lock"),
+        regenerated_unplaced("Cargo.lock"),
     );
 
     assert_matches!(readiness(&applied_run), Readiness::Ready(_));
@@ -193,7 +214,7 @@ fn test_readiness_lockfile_not_regenerated_wins_over_settled_items() {
         LockfileOutcome::Skipped(SkipCause::DryRun),
         LockfileOutcome::Unsupported {
             lockfile: None,
-            reason: UnsupportedReason::EcosystemDeferred(EcosystemId::Pypi),
+            reason: UnsupportedReason::WorkspaceMemberLockfile,
         },
         LockfileOutcome::Failed(RegenerationError::TimedOut {
             after: Duration::from_secs(1),
@@ -217,7 +238,7 @@ async fn test_open_tracked_edit_outside_the_publishable_files_is_refused_with_no
     fx.write("other/file.txt", "edited by someone else\n");
     gh_shim(&fx, URL);
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     assert_matches!(
         error(result),
@@ -253,7 +274,7 @@ async fn test_open_lists_at_most_ten_unexpected_paths_and_counts_the_rest() {
     }
     gh_shim(&fx, URL);
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     assert_matches!(
         error(result),
@@ -270,7 +291,7 @@ async fn test_open_commits_the_manifest_and_the_regenerated_lock_file_only() {
     fx.write("untracked.txt", "never committed\n");
     gh_shim(&fx, URL);
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     let Ok(PrOutcome::Opened(opened)) = result else {
         panic!("the request must be opened");
@@ -291,7 +312,7 @@ async fn test_open_ignored_lock_file_is_not_committed_and_the_manifest_is() {
     fx.write("Cargo.lock", "relocked\n");
     gh_shim(&fx, URL);
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     assert_matches!(result, Ok(PrOutcome::Opened(_)));
     assert_eq!(
@@ -322,7 +343,7 @@ async fn test_open_without_a_change_in_a_publishable_file_is_nothing_to_commit()
     let ctx = fx.ctx("Cargo.toml").await;
     gh_shim(&fx, URL);
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     assert_matches!(result, Ok(PrOutcome::NothingToCommit));
     assert_eq!(git(&fx.root, &["branch", "--list"]), "* main");
@@ -338,7 +359,7 @@ async fn test_open_returns_the_url_with_head_on_the_update_branch_and_switch_bac
     fx.write("Cargo.toml", "bumped\n");
     gh_shim(&fx, URL);
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     let Ok(PrOutcome::Opened(opened)) = result else {
         panic!("the request must be opened");
@@ -356,7 +377,7 @@ async fn test_switch_back_failure_names_the_step_and_the_url_was_already_availab
     fx.write("Cargo.toml", "bumped\n");
     gh_shim(&fx, URL);
     let Ok(PrOutcome::Opened(opened)) =
-        publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await
+        publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await
     else {
         panic!("the request must be opened");
     };
@@ -387,7 +408,7 @@ async fn test_request_url_has_control_characters_removed() {
     fx.write("Cargo.toml", "bumped\n");
     gh_shim(&fx, "https://exam\\033ple.test/\\007pr/1\\r");
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     let Ok(PrOutcome::Opened(opened)) = result else {
         panic!("the request must be opened");
@@ -402,7 +423,7 @@ async fn test_request_url_is_capped_at_2048_characters() {
     fx.write("Cargo.toml", "bumped\n");
     gh_shim(&fx, &format!("https://example.test/{}", "a".repeat(3000)));
 
-    let result = publish(&ctx, &settled_run(regenerated("Cargo.lock"))).await;
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
 
     let Ok(PrOutcome::Opened(opened)) = result else {
         panic!("the request must be opened");
@@ -441,7 +462,7 @@ async fn test_describe_title_is_plain_text_while_the_body_uses_code_spans() {
     let ctx = fx.ctx("Cargo.toml").await;
     let run = run_with(
         vec![item("x|y", "1.0.0", applied("1.1.0"))],
-        regenerated("Cargo.lock"),
+        regenerated(&fx, "Cargo.lock"),
     );
 
     let text = text_of(&ctx, &run);
@@ -456,7 +477,7 @@ async fn test_describe_title_and_commit_body_drop_backticks_and_control_characte
     let ctx = fx.ctx("Cargo.toml").await;
     let run = run_with(
         vec![item("a`b\nc", "1.0.0", applied("1.1.0"))],
-        regenerated("Cargo.lock"),
+        regenerated(&fx, "Cargo.lock"),
     );
 
     let text = text_of(&ctx, &run);
@@ -494,11 +515,11 @@ async fn test_describe_publishable_paths_are_the_manifest_and_a_regenerated_lock
     let fx = Fixture::new();
     let ctx = fx.ctx("Cargo.toml").await;
 
-    let with = text_of(&ctx, &settled_run(regenerated("Cargo.lock")));
+    let with = text_of(&ctx, &settled_run(regenerated(&fx, "Cargo.lock")));
     let without = text_of(&ctx, &settled_run(no_lock()));
 
-    assert_eq!(with.publishable_paths, ["Cargo.toml", "Cargo.lock"]);
-    assert_eq!(without.publishable_paths, ["Cargo.toml"]);
+    assert_eq!(scope_files(&with), ["Cargo.toml", "Cargo.lock"]);
+    assert_eq!(scope_files(&without), ["Cargo.toml"]);
 }
 
 #[tokio::test]
@@ -539,7 +560,7 @@ async fn test_describe_title_of_exactly_250_bytes_is_kept_and_251_is_cut_with_an
         let name = "n".repeat(80);
         let run = run_with(
             vec![item(&name, &"1".repeat(from_len), applied(&"2".repeat(80)))],
-            regenerated("Cargo.lock"),
+            regenerated(&fx, "Cargo.lock"),
         );
         text_of(&ctx, &run).title
     };
@@ -566,7 +587,7 @@ async fn test_describe_body_rows_carry_the_update_kind() {
             item("c", "1.0.0", applied("1.0.1")),
             unknown,
         ],
-        regenerated("Cargo.lock"),
+        regenerated(&fx, "Cargo.lock"),
     );
 
     let body = text_of(&ctx, &run).body;
@@ -603,13 +624,16 @@ async fn test_describe_body_counts_the_items_that_could_not_be_updated() {
 
     let none = text_of(
         &ctx,
-        &run_with(vec![applied_item(), ignored], regenerated("Cargo.lock")),
+        &run_with(
+            vec![applied_item(), ignored],
+            regenerated(&fx, "Cargo.lock"),
+        ),
     );
     let one = text_of(
         &ctx,
         &run_with(
             vec![applied_item(), unsafe_latest()],
-            regenerated("Cargo.lock"),
+            regenerated(&fx, "Cargo.lock"),
         ),
     );
     let two = text_of(
@@ -620,7 +644,7 @@ async fn test_describe_body_counts_the_items_that_could_not_be_updated() {
                 unsafe_latest(),
                 requires_lockfile_item("lock-only"),
             ],
-            regenerated("Cargo.lock"),
+            regenerated(&fx, "Cargo.lock"),
         ),
     );
 
@@ -730,7 +754,7 @@ async fn test_open_without_the_host_cli_after_the_push_names_the_remote_branch_c
         let ctx = fx.ctx("Cargo.toml").await;
         fx.write("Cargo.toml", "bumped\n");
 
-        let result = publish_to(&ctx, &settled_run(regenerated("Cargo.lock")), host).await;
+        let result = publish_to(&ctx, &settled_run(regenerated(&fx, "Cargo.lock")), host).await;
 
         let failure = error(result);
         assert_matches!(&failure, PrError::ToolMissing { tool: found } if *found == tool);
@@ -836,7 +860,7 @@ async fn interrupt_the_update_phase_repeatedly(shim_dir: &Path) {
         let _ = std::fs::remove_file(&pid_file);
         let guarded = signals.guard(
             PrPhase::Update,
-            regenerate_lockfile_unlistened(plan.clone(), &target, gate),
+            regenerate_lockfile_unlistened(plan.clone(), &target, gate, project.path()),
         );
         let interrupter = async {
             let mut sleeper = None;
@@ -872,4 +896,181 @@ async fn interrupt_the_update_phase_repeatedly(shim_dir: &Path) {
             .stderr(std::process::Stdio::null())
             .status();
     }
+}
+
+// --- member lock files and companion trees ---
+
+fn regenerated_with(fx: &Fixture, lock: &str, companions: Vec<Companion>) -> LockfileOutcome {
+    LockfileOutcome::Regenerated {
+        lockfile: DisplayLockPath::for_test(lock, &fx.root.join(lock)),
+        tool: Program::Cargo,
+        pins: Vec::new(),
+        companions,
+    }
+}
+
+fn vendor_tree(fx: &Fixture) {
+    fx.write("app/vendor/a.txt", "initial\n");
+    fx.write("app/vendor/modules.txt", "initial\n");
+    commit_all(fx, "vendor");
+    git(&fx.root, &["push", "origin", "main"]);
+}
+
+fn vendored_run(fx: &Fixture) -> UpdateRun {
+    settled_run(regenerated_with(
+        fx,
+        "app/Cargo.lock",
+        vec![Companion::Tree(fx.root.join("app/vendor"))],
+    ))
+}
+
+fn committed_files(fx: &Fixture) -> Vec<String> {
+    git(&fx.root, &["show", "--name-only", "--format=", "HEAD"])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_describe_a_member_run_publishes_the_root_lock_file() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("app/Cargo.toml").await;
+
+    let text = text_of(&ctx, &settled_run(regenerated(&fx, "Cargo.lock")));
+
+    assert_eq!(scope_files(&text), ["app/Cargo.toml", "Cargo.lock"]);
+}
+
+#[tokio::test]
+async fn test_open_commits_a_member_manifest_with_the_root_lock_file() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    fx.write("app/Cargo.toml", "bumped\n");
+    fx.write("Cargo.lock", "relocked\n");
+    gh_shim(&fx, URL);
+
+    let result = publish(&ctx, &settled_run(regenerated(&fx, "Cargo.lock"))).await;
+
+    assert_matches!(result, Ok(PrOutcome::Opened(_)));
+    assert_eq!(committed_files(&fx), ["Cargo.lock", "app/Cargo.toml"]);
+}
+
+#[tokio::test]
+async fn test_restore_reverts_a_members_root_lock_file_and_nothing_else() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    fx.write("app/Cargo.toml", "bumped\n");
+    fx.write("Cargo.lock", "relocked\n");
+    fx.write("other/file.txt", "edited by someone else\n");
+    let run = run_with(
+        vec![requires_lockfile_item("foo")],
+        regenerated(&fx, "Cargo.lock"),
+    );
+
+    restore(&ctx, &run).await.expect("restore");
+
+    assert_eq!(fx.status(), [" M other/file.txt"]);
+}
+
+#[tokio::test]
+async fn test_restore_leaves_an_untracked_lock_file_alone() {
+    let fx = Fixture::new();
+    ignore_lock(&fx);
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    fx.write("app/Cargo.toml", "bumped\n");
+    fx.write("Cargo.lock", "relocked\n");
+    let run = run_with(
+        vec![requires_lockfile_item("foo")],
+        regenerated(&fx, "Cargo.lock"),
+    );
+
+    restore(&ctx, &run).await.expect("restore");
+
+    assert_eq!(fx.status(), Vec::<String>::new());
+    assert_eq!(fx.read("Cargo.lock"), "relocked\n");
+}
+
+#[tokio::test]
+async fn test_open_stages_a_companion_tree_whole_and_never_lists_its_contents() {
+    let fx = Fixture::new();
+    vendor_tree(&fx);
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    fx.write("app/Cargo.toml", "bumped\n");
+    fx.write("app/Cargo.lock", "relocked\n");
+    fx.write("app/vendor/a.txt", "revendored\n");
+    fx.write("app/vendor/new.txt", "added\n");
+    fx.write("app/untracked.txt", "never committed\n");
+    gh_shim(&fx, URL);
+
+    let result = publish(&ctx, &vendored_run(&fx)).await;
+
+    assert_matches!(result, Ok(PrOutcome::Opened(_)));
+    assert_eq!(
+        committed_files(&fx),
+        [
+            "app/Cargo.lock",
+            "app/Cargo.toml",
+            "app/vendor/a.txt",
+            "app/vendor/new.txt"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_restore_reverts_a_companion_tree_and_removes_its_untracked_residue() {
+    let fx = Fixture::new();
+    vendor_tree(&fx);
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    fx.write("app/Cargo.toml", "bumped\n");
+    fx.write("app/vendor/a.txt", "revendored\n");
+    fx.write("app/vendor/new.txt", "added\n");
+    fx.write("app/untracked.txt", "keep me\n");
+
+    restore(&ctx, &vendored_run(&fx)).await.expect("restore");
+
+    assert_eq!(fx.status(), Vec::<String>::new());
+    assert!(!fx.root.join("app/vendor/new.txt").exists());
+    assert_eq!(fx.read("app/untracked.txt"), "keep me\n");
+}
+
+#[tokio::test]
+async fn test_require_tracked_tree_accepts_a_tracked_directory_only() {
+    let fx = Fixture::new();
+    vendor_tree(&fx);
+    fx.write("loose/file.txt", "untracked\n");
+    let ctx = fx.ctx("app/Cargo.toml").await;
+
+    assert_matches!(
+        require_tracked_tree(&ctx, &fx.root.join("app/vendor")).await,
+        Ok(())
+    );
+    for tree in ["loose", "missing"] {
+        assert_matches!(
+            require_tracked_tree(&ctx, &fx.root.join(tree)).await,
+            Err(PrError::UntrackedTree { .. }),
+            "{tree}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_open_refuses_a_publish_set_too_large_for_one_command_line_before_staging() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("app/Cargo.toml").await;
+    fx.write("app/Cargo.toml", "bumped\n");
+    let companions = (0..300)
+        .map(|index| {
+            let name = format!("big/{}{index}.txt", "x".repeat(90));
+            fx.write(&name, "generated\n");
+            Companion::File(fx.root.join(name))
+        })
+        .collect();
+    let run = settled_run(regenerated_with(&fx, "Cargo.lock", companions));
+    gh_shim(&fx, URL);
+
+    let result = publish(&ctx, &run).await;
+
+    assert_matches!(error(result), PrError::PublishSetTooLarge);
+    assert_eq!(fx.head(), "main");
+    assert_eq!(git(&fx.root, &["diff", "--cached", "--name-only"]), "");
 }

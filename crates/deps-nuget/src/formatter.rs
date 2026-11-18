@@ -199,6 +199,14 @@ impl PackageRendering for NuGetFormatter {
 }
 
 impl RequirementResolution for NuGetFormatter {
+    fn compare_versions(
+        &self,
+        a: &ConcreteVersion,
+        b: &ConcreteVersion,
+    ) -> Option<std::cmp::Ordering> {
+        crate::version::try_compare_versions(a.as_str(), b.as_str())
+    }
+
     /// A pre-release label on the bare version, or on an interval's lower or exact bound
     /// (`[1.0.0-beta,)`); upper bounds never opt in.
     fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {

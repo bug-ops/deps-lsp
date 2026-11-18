@@ -256,17 +256,18 @@ github|gitlab`, `--close-superseded` (needs `--open-pr`) and `--group <NAME>`.
   against OSV, and classifies every vulnerable dependency as `applied`,
   `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule. When the
   declared requirement already admits the fix, `--lockfile regenerate` moves only the lock file
-  (Cargo, npm, pnpm, Yarn Berry, Go, uv, Bundler, Deno): the item becomes `applied` (exit `0`) once the lock file holds the fix
+  (Cargo, npm, pnpm, Yarn Berry, Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle, SwiftPM): the item becomes `applied` (exit `0`) once the lock file holds the fix
   or, for npm and pnpm, a newer in-range version that every advisory affecting the locked
   version places outside its affected ranges; otherwise it stays `requires-lockfile-update`.
 - **`[update].ignore`** (`{ name = "tokio", update_types = ["major"] }`) is honored only from
   an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
-- **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm`, `yarn` (Berry), `go`, `uv`, `bundle` or
-  `deno` in the manifest's directory after the write and verifies that the lockfile holds every
+- **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm`, `yarn` (Berry), `bun`, `go`, `uv`,
+  `poetry`, `pdm`, `bundle`, `deno`, `composer`, `dart`/`flutter`, `dotnet`, `gradle` or `swift`
+  in the manifest's directory after the write and verifies that the lockfile holds every
   applied version; the JSON report always carries a `lockfile` object. It does nothing under
   `--dry-run` or `--offline`, never creates a lockfile, and reports `unsupported` for Yarn Classic,
-  Bun, non-uv Python lockers and the other ecosystems. npm and pnpm workspace members are regenerated
-  in plain runs. Run it only on repositories you trust: the tool executes repository files such as
+  Pipenv, Maven, lock-file-only pins for Bun and NuGet, and the other refusals listed in the mdBook.
+  npm, pnpm and Yarn Berry workspace members are regenerated. Run it only on repositories you trust: the tool executes repository files such as
   `.pnpmfile.cjs`, a `Gemfile` or `.cargo/config.toml`, with your full environment. On unix a
   timeout, SIGINT or SIGTERM sends SIGTERM to the tool's process group, waits 2 seconds, then
   kills the group (exit `2`, see the mdBook for the limits). Lock files are snapshotted first and
@@ -276,9 +277,9 @@ github|gitlab`, `--close-superseded` (needs `--open-pr`) and `--group <NAME>`.
   opens a pull request with `gh` or a merge request with `glab`. The same update set maps to the
   same branch, so a re-run while it is open writes nothing. The working tree must be clean;
   deps-cli never reads a token. Ecosystems with regeneration (see above) and ecosystems without a
-  lock file are supported; npm and pnpm workspace members are not. `--close-superseded` then closes
-  your earlier `deps-cli` requests the new one supersedes (Cargo, npm, PyPI, Bundler, Dart, Composer
-  and Deno only); see the mdBook for the full contract.
+  lock file are supported, including workspace members whose lock file lies inside the repository. `--close-superseded` then closes
+  your earlier `deps-cli` requests the new one supersedes (every ecosystem with a comparable version
+  ordering; not GitHub Actions, GitLab CI or pre-commit); see the mdBook for the full contract.
 - **`--group <NAME>`** (needs `--config`, not with `--security-only`) keeps only the updates of one
   `[update.groups.<name>]` rule (`dependencies`, `patterns`, `update_types`, `dependency_type`);
   the rest are reported `skipped (outside the selected --group)`.

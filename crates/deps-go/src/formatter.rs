@@ -114,6 +114,14 @@ impl RequirementResolution for GoFormatter {
         go_version_matches(version.as_str(), requirement.as_str())
     }
 
+    fn compare_versions(
+        &self,
+        a: &ConcreteVersion,
+        b: &ConcreteVersion,
+    ) -> Option<std::cmp::Ordering> {
+        crate::version::try_compare_versions(a.as_str(), b.as_str())
+    }
+
     /// A one-entry `available` list is the `/@latest` fallback of a proxy that serves no
     /// `/@v/list` (see `GoRegistry::get_versions_with_latest_fallback`), so it cannot show that
     /// a pin is unpublished.
@@ -603,5 +611,15 @@ mod tests {
         let formatter = GoFormatter;
         let too_long = "a".repeat(501);
         assert!(formatter.validate_package_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn test_compare_versions_uses_semver_precedence() {
+        use std::cmp::Ordering;
+        let order = |a: &str, b: &str| {
+            GoFormatter.compare_versions(&ConcreteVersion::new(a), &ConcreteVersion::new(b))
+        };
+        assert_eq!(order("v1.2.10", "v1.2.9"), Some(Ordering::Greater));
+        assert_eq!(order("v1.2.3", "latest"), None);
     }
 }

@@ -274,7 +274,7 @@ pub(crate) async fn regen_child_main() {
     };
     let gate = RegenerationGate::new(LockfileMode::Regenerate, DryRun::No, NetworkMode::Online);
     let run = if env("REGEN_UNLISTENED") == "1" {
-        regenerate_lockfile_unlistened(plan, &target, gate).await
+        regenerate_lockfile_unlistened(plan, &target, gate, &root).await
     } else {
         regenerate_lockfile(plan, &target, gate).await
     };

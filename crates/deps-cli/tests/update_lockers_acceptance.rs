@@ -132,28 +132,6 @@ fn bundler_lock_only_pin_passes_conservative_before_update_and_names_last() {
 }
 
 #[test]
-fn bundler_cooldown_fallback_target_is_refused_without_a_spawn() {
-    let mut case = case(
-        "bundler",
-        "Gemfile",
-        vec![("Gemfile", GEMFILE), ("Gemfile.lock", LOCK_OLD)],
-        vec![("bundle", "exit 0")],
-        "lockonly",
-        RAKE_LOCK_ONLY,
-    );
-    case.cooldown_fallback = true;
-
-    let ran = run(&case);
-
-    assert!(
-        ran.outcome.contains("CooldownFallbackTarget"),
-        "{}",
-        ran.outcome
-    );
-    assert!(ran.calls.is_empty(), "{:?}", ran.calls);
-}
-
-#[test]
 fn bundler_lock_in_an_ancestor_directory_is_a_workspace_member_refusal() {
     let ran = run(&case(
         "bundler",
@@ -206,12 +184,12 @@ fn uv_uses_one_upgrade_package_flag_per_pin_and_verifies_exact_versions() {
 }
 
 #[test]
-fn uv_poetry_lock_is_a_deferred_locker_without_a_spawn() {
+fn pipenv_lock_is_a_deferred_locker_without_a_spawn() {
     let ran = run(&case(
         "pypi",
         "pyproject.toml",
-        vec![("pyproject.toml", PYPROJECT), ("poetry.lock", "# poetry\n")],
-        vec![("uv", "exit 0"), ("poetry", "exit 0")],
+        vec![("pyproject.toml", PYPROJECT), ("Pipfile.lock", "{}")],
+        vec![("uv", "exit 0"), ("pipenv", "exit 0")],
         "edit",
         UV_BUMPS,
     ));
@@ -424,7 +402,7 @@ const ROOT_PACKAGE: &str =
 const MEMBER_PACKAGE: &str = "{\n  \"name\": \"a\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"minimist\": \"^1.2.0\"\n  }\n}\n";
 const ROOT_LOCK: &str = "{\n  \"name\": \"root\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": { \"name\": \"root\", \"workspaces\": [\"packages/*\"] },\n    \"packages/a\": { \"name\": \"a\", \"version\": \"1.0.0\", \"dependencies\": { \"minimist\": \"^1.2.0\" } }\n  }\n}\n";
 
-fn member_case<'a>(prefix_body: &'a str, mode: &'a str, bumps: &'a str) -> Case<'a> {
+fn member_case<'a>(npm_body: &'a str, mode: &'a str, bumps: &'a str) -> Case<'a> {
     case(
         "npm",
         "packages/a/package.json",
@@ -433,19 +411,19 @@ fn member_case<'a>(prefix_body: &'a str, mode: &'a str, bumps: &'a str) -> Case<
             ("packages/a/package.json", MEMBER_PACKAGE),
             ("package-lock.json", ROOT_LOCK),
         ],
-        vec![("npm", prefix_body)],
+        vec![("npm", npm_body)],
         mode,
         bumps,
     )
 }
 
-const PREFIX_ROOT: &str = "if [ \"$1\" = prefix ]; then echo 'ROOT'; exit 0; fi\nexit 0\n";
+const NPM_NOOP: &str = "exit 0\n";
 
 #[test]
 fn npm_member_manifest_edit_installs_at_the_workspace_root_without_auto_pin() {
-    let ran = run(&member_case(PREFIX_ROOT, "edit", MINIMIST_EDIT));
+    let ran = run(&member_case(NPM_NOOP, "edit", MINIMIST_EDIT));
 
-    let calls = writing_calls(&ran, "npm", &["prefix"]);
+    let calls = ran.calls_of("npm");
     assert_eq!(calls.len(), 1, "{:?}", ran.calls);
     assert!(calls[0].starts_with("npm install "), "{}", calls[0]);
     assert_eq!(cwd_of(calls[0]), ran.root.display().to_string());
@@ -458,9 +436,9 @@ fn npm_member_manifest_edit_installs_at_the_workspace_root_without_auto_pin() {
 
 #[test]
 fn npm_member_lock_only_pin_updates_with_the_workspace_flag_at_the_root() {
-    let ran = run(&member_case(PREFIX_ROOT, "lockonly", MINIMIST_LOCK_ONLY));
+    let ran = run(&member_case(NPM_NOOP, "lockonly", MINIMIST_LOCK_ONLY));
 
-    let calls = writing_calls(&ran, "npm", &["prefix"]);
+    let calls = ran.calls_of("npm");
     assert_eq!(calls.len(), 1, "{:?}", ran.calls);
     assert!(calls[0].starts_with("npm update "), "{}", calls[0]);
     assert!(
@@ -473,36 +451,21 @@ fn npm_member_lock_only_pin_updates_with_the_workspace_flag_at_the_root() {
 }
 
 #[test]
-fn npm_member_whose_tool_root_differs_from_the_lock_dir_is_an_ownership_mismatch() {
-    let body = "if [ \"$1\" = prefix ]; then echo 'ROOT/packages/a'; exit 0; fi\nexit 0\n";
-
-    let ran = run(&member_case(body, "edit", MINIMIST_EDIT));
-
-    assert!(
-        ran.outcome.contains("LockfileOwnershipMismatch"),
-        "{}",
-        ran.outcome
-    );
-    assert!(
-        writing_calls(&ran, "npm", &["prefix"]).is_empty(),
-        "{:?}",
-        ran.calls
-    );
-}
-
-#[test]
-fn npm_member_under_the_unlistened_entry_point_is_refused_with_zero_spawns() {
-    let mut case = member_case(PREFIX_ROOT, "edit", MINIMIST_EDIT);
+fn npm_member_under_the_unlistened_entry_point_is_regenerated_at_the_workspace_root() {
+    let mut case = member_case(NPM_NOOP, "edit", MINIMIST_EDIT);
     case.unlistened = true;
 
     let ran = run(&case);
 
+    let calls = ran.calls_of("npm");
+    assert_eq!(calls.len(), 1, "{:?}", ran.calls);
+    assert!(calls[0].starts_with("npm install "), "{}", calls[0]);
+    assert_eq!(cwd_of(calls[0]), ran.root.display().to_string());
     assert!(
-        ran.outcome.contains("WorkspaceMemberLockfile"),
+        !ran.outcome.contains("WorkspaceMemberLockfile"),
         "{}",
         ran.outcome
     );
-    assert!(ran.calls.is_empty(), "{:?}", ran.calls);
 }
 
 // --- Go workspace ---

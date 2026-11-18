@@ -30,6 +30,15 @@ pub(in crate::update) const TERMINATION_GRACE: Duration = Duration::from_secs(2)
 #[cfg(unix)]
 const TERMINATION_POLL: Duration = Duration::from_millis(20);
 
+/// What a capped probe read.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Probed {
+    /// The trimmed stdout.
+    Text(String),
+    /// More output than the cap allows; none of it is returned.
+    OverCap,
+}
+
 /// Where child processes find their executables.
 #[derive(Debug, Clone)]
 pub(super) enum SearchPath {
@@ -348,6 +357,26 @@ impl ToolRunner {
         invocation: &Invocation,
         deadline: Instant,
     ) -> Result<String, RegenerationError> {
+        match self
+            .probe_capped(invocation, deadline, PROBE_OUTPUT_CAP)
+            .await?
+        {
+            Probed::Text(text) => Ok(text),
+            Probed::OverCap => Err(RegenerationError::UnexpectedProbeOutput {
+                program: invocation.program(),
+            }),
+        }
+    }
+
+    /// [`Self::probe`] with an explicit output cap of `cap` bytes, for a listing that is
+    /// legitimately longer than a path or a one-word answer. Output over `cap` is reported as
+    /// [`Probed::OverCap`] and never read further; non-UTF-8 output is an error.
+    pub(super) async fn probe_capped(
+        &self,
+        invocation: &Invocation,
+        deadline: Instant,
+        cap: u64,
+    ) -> Result<Probed, RegenerationError> {
         let program = invocation.program();
         let mut child = self.spawn(self.command(invocation).stdout(Stdio::piped()), program)?;
         let mut stdout = child
@@ -359,15 +388,13 @@ impl ToolRunner {
         // One byte past the cap tells an over-long answer from one that exactly fits.
         timeout_at(
             deadline,
-            (&mut stdout)
-                .take(PROBE_OUTPUT_CAP + 1)
-                .read_to_end(&mut buffer),
+            (&mut stdout).take(cap + 1).read_to_end(&mut buffer),
         )
         .await
         .map_err(|_| self.timed_out())?
         .map_err(|source| spawn_error(program, source))?;
-        if buffer.len() as u64 > PROBE_OUTPUT_CAP {
-            return Err(RegenerationError::UnexpectedProbeOutput { program });
+        if buffer.len() as u64 > cap {
+            return Ok(Probed::OverCap);
         }
 
         let status = timeout_at(deadline, child.wait())
@@ -376,7 +403,7 @@ impl ToolRunner {
             .map_err(|source| spawn_error(program, source))?;
         check_status(program, status)?;
         String::from_utf8(buffer)
-            .map(|text| text.trim().to_owned())
+            .map(|text| Probed::Text(text.trim().to_owned()))
             .map_err(|_| RegenerationError::UnexpectedProbeOutput { program })
     }
 

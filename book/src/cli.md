@@ -448,12 +448,13 @@ explicit choice.
   is not rewritten to the deprecated version. Every vulnerable dependency is classified into
   exactly one of three outcomes:
   - `applied` — the fix was written to the manifest, or (with `--lockfile regenerate` for
-    Cargo, npm, pnpm, Yarn Berry, Go, uv, Bundler and Deno) the lock file was moved to the fix target because the declared
+    Cargo, npm, pnpm, Yarn Berry, Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle and SwiftPM) the lock file was moved to the fix target because the declared
     requirement already admits it; the report's reason tells the two apart.
   - `requires-lockfile-update` — the declared requirement already admits the fix, so there
     is nothing to rewrite at the manifest level, and the lock file still resolves a vulnerable
     version. Pass `--lockfile regenerate` to let `update` move the lock file (Cargo, npm, pnpm,
-    Yarn Berry, Go, uv, Bundler and Deno); for other ecosystems and for Yarn Classic and Bun,
+    Yarn Berry, Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle and SwiftPM); for Maven,
+    Pipenv, Yarn Classic and a lock-file-only pin in Bun or NuGet,
     update the lock file yourself.
   - `unfixable` — no independently-verified fix target exists, the registry fetch for that
     dependency failed, the fix target is itself yanked, the declared requirement's syntax has
@@ -522,12 +523,81 @@ the fresh lockfile against every applied version:
 | PyPI (`uv.lock`) | `uv lock --no-build --no-python-downloads --upgrade-package <name>==<version>` per update | the lockfile holds exactly the target |
 | Bundler (`Gemfile.lock`) | `bundle lock` (manifest edits), then `bundle lock --conservative --update <names>` (lock-file-only fixes) | a locked version satisfies the declared requirement and is at least the target |
 | Deno (`deno.lock`) | `deno install --lockfile-only --lock=./deno.lock` (manifest edits), then `deno update --compatible --lockfile-only --lock=./deno.lock <names>` (lock-file-only fixes) | same as Bundler |
+| Bun (`bun.lock`) | `bun install --lockfile-only --ignore-scripts` (manifest edits only) | same as npm |
+| PyPI (`poetry.lock`) | `poetry lock` (`poetry lock --no-update` on Poetry 1.x), then `poetry update --lock <names>` (lock-file-only fixes), with `--no-interaction --no-plugins` | a locked version satisfies the declared requirement and is at least the target |
+| PyPI (`pdm.lock`) | `pdm lock --update-reuse` (manifest edits), then `pdm update --no-sync <names>` (lock-file-only fixes) | same as Poetry |
+| Composer (`composer.lock`) | `composer update <vendor/name...> --no-install --no-scripts --no-plugins --no-interaction` with `COMPOSER=composer.json` | same as Poetry |
+| Dart / Flutter (`pubspec.lock`) | `dart pub get --no-example` (manifest edits), then `dart pub upgrade --no-example <names>` (lock-file-only fixes); `flutter pub` instead when a dependency comes from the Flutter SDK | same as Poetry |
+| NuGet (`packages.lock.json`) | `dotnet restore <project> --use-lock-file --no-dependencies --disable-build-servers` | same as Poetry |
+| Gradle (`gradle.lockfile`, `*.lockfile`) | `gradle --no-daemon --console=plain :<path>:dependencies ... --update-locks <group:artifact,...>` at the build root, one task per project directory that owns a lock file | the lockfile holds exactly the target |
+| SwiftPM (`Package.resolved`) | `swift package resolve` (manifest edits), then `swift package update <identity>` (lock-file-only fixes) | same as Poetry |
 
-For PyPI, Bundler and Deno the lock file must sit beside the manifest, and for PyPI only `uv.lock`
-beside a `pyproject.toml` is regenerated: `poetry.lock`, `pdm.lock` and `Pipfile.lock` report
-`unsupported`. `--no-build` means a dependency that exists only as a source distribution fails the
-run (the lock file is restored, see below). Bundler and Deno never use a cooldown-fallback version
-(the item reports `unsupported`); uv accepts it.
+For PyPI, Bundler, Deno, Composer, Dart and Swift the lock file must sit beside the manifest, and for
+PyPI the lock file (`uv.lock`, `poetry.lock` or `pdm.lock`) must sit beside a `pyproject.toml`;
+`Pipfile.lock` reports `unsupported` (`python-locker-deferred`). `--no-build` means a dependency that
+exists only as a source distribution fails a uv run (the lock file is restored, see below). Poetry and
+PDM may build source distributions to read their metadata, and Poetry can prompt for a keyring in a
+headless session. Poetry 1.x runs `lock --no-update`. The version is probed with
+`poetry --no-plugins --version`; a Poetry older than 1.2 (which rejects `--no-plugins`) reports
+`unsupported` with the reason `tool-too-old` and nothing is written. A failing probe is reported the
+same way, including a Poetry that is broken for another reason, and is never retried without
+`--no-plugins`, since a plain probe would load plugins the repository controls. PDM runs with `--skip=:all` (its `pre_lock`/`post_lock` hooks are skipped) and
+`PDM_IGNORE_SAVED_PYTHON=1` (a committed `.pdm-python` interpreter is not used), but PDM has no flag
+that disables plugins. When no environment exists, PDM creates `.pdm-python`, and `.venv` unless `PDM_USE_VENV=0` is set, in the
+manifest's directory: untracked residue, or a rewritten tracked `.pdm-python`, which the `--open-pr`
+gate then refuses. Composer runs with
+`--no-plugins` and `--no-scripts` but its audit step is not disabled, and without `-w`/`-W`: a conflict
+that needs an unnamed package makes it exit non-zero, reported as `tool-failed` with the lock file
+restored. Composer's own release-age or blocking settings may also refuse a target, which ends the
+same way. A Dart project that declares a
+pub workspace (a top-level `resolution:` key, or a lock file in an ancestor directory) reports
+`unsupported`; a Flutter run may also write generated platform files, which `--open-pr` refuses if
+they are tracked. Dart and Flutter are chosen by the dependencies' SDK source, not by
+`environment.flutter`.
+
+A cooldown-fallback version is pinned exactly in the manifest for the run: uv, npm, pnpm, Bun and
+Bundler accept it (npm, pnpm, Bun and Bundler write the exact pin, run the tool, restore the
+declaration and re-run it so the lock file keeps the pinned resolution, then check the result).
+Yarn Berry and Deno report `unsupported` with the reason `cooldown-fallback-target` because relaxing
+the pin makes them re-resolve to the newest release; Poetry, PDM, Composer, Dart, Swift, NuGet and
+Gradle refuse it too.
+
+**Refusals by ecosystem.**
+- **Bun:** only manifest edits run, and only for a standalone project; a lock-file-only pin reports
+  `unsupported` with the reason `lockfile-only-update-unsupported`, since `bun update --lockfile-only`
+  rewrites `package.json`. A Bun workspace member reports `workspace-member-lockfile`.
+- **NuGet:** a lock-file-only pin reports `lockfile-only-update-unsupported` before any tool runs
+  (NuGet resolves the lowest applicable version, and only `--force-evaluate` would move it, which
+  bypasses the cooldown); a project using `Directory.Packages.props` reports
+  `central-package-versions`; `packages.config` has no regeneration (`no-lockfile-present`). A
+  manifest edit makes `dotnet restore` re-resolve every floating dependency of the project. That
+  bypasses the release-age window, so a project with any other `*` requirement or bounded range is
+  refused as `other-floating-requirements`. Pin those dependencies to exact versions to enable
+  regeneration.
+- **Gradle:** the lock files of the build are found by a bounded walk from the build root (the nearest
+  ancestor with `settings.gradle[.kts]`, otherwise the project directory); under `--open-pr` the
+  build root must lie inside the repository (an outer `settings.gradle` reports
+  `lockfile-outside-repository`). A build with more than 512 lock files reports
+  `lockfile-set-too-large`. A build with locks in `buildSrc/` or in an included build is refused
+  (`lockfile-ownership-mismatch`): Gradle applies `--update-locks` to the buildSrc build as well, so
+  the lock set cannot be updated consistently. Run the regeneration inside that build instead. The legacy layout
+  (`gradle/dependency-locks`) reports `legacy-lock-layout`. The tool is the `gradle` on `PATH`; the
+  Gradle wrapper is never used, so a build pinned to a wrapper version needs a compatible `gradle` on
+  `PATH`. The tool runs once at the build root with one `:<path>:dependencies` task per distinct
+  project directory that owns a lock file (the root project is `:dependencies`). The project path is
+  derived from the lock file's directory relative to the build root and may contain only
+  `A-Za-z0-9-_.` components, otherwise the run is refused; the directory name is assumed to be the
+  project name, so a build that remaps `projectDir` in `settings.gradle` fails verification and the
+  lock files are restored. Every lock file of the build is snapshotted and, with `--open-pr`,
+  published. Verification is exact: the lock file must hold exactly the target, so a version raised by
+  conflict resolution, or a lock-file-only dynamic requirement (`32.+`) that resolves newer than the
+  target, fails with `version-mismatch` and the lock files are restored. `--update-locks` creates a
+  `gradle.lockfile` for a locked project that had none. Such files are outside the snapshot and are
+  not removed on failure.
+- **Yarn Classic:** always `unsupported` (`yarn-classic`).
+- **Pipenv:** `unsupported` (`python-locker-deferred`).
+- **Any ecosystem:** a lock file that is a symlink reports `lockfile-symlink`, and one whose real path
+  is outside the repository root reports `lockfile-outside-repository`.
 
 A `--security-only` fix whose declared requirement already admits the target (a caret range,
 say) needs no manifest edit: with `--lockfile regenerate` only the lock file moves, and the item
@@ -546,25 +616,46 @@ refused with exit `2`). `go get` may also raise the module's `require` line in `
 lock file sits in the workspace root, a plain run regenerates that root lock file with the member
 selected (`--workspace=./<member>` for npm, `--filter=./<member>` for pnpm). For pnpm the member must
 be listed by the workspace (probed before anything is written), otherwise the report is `unsupported` with the reason
-`workspace-member-lockfile`. The tool's own root
-(`npm prefix`, `pnpm root -w`) must equal the directory holding the lock file; otherwise the report is
-`unsupported` with the reason `lockfile-ownership-mismatch`. `--open-pr` refuses members, because the
-root lock file is outside the manifest's directory.
+`workspace-member-lockfile`. Ownership of the lock file must be proven, otherwise the report is
+`unsupported` with the reason `lockfile-ownership-mismatch`. For pnpm the workspace root reported by
+`pnpm root -w` must equal the directory holding the lock file. For npm no tool is asked (`npm prefix`
+is not used); ownership is read from the lock file: the root `package.json` declares
+`workspaces`, no outer workspace contains it, a lock file version 2 or 3 lists the member under
+`packages`, and a workspace pattern matches the member (a `!`, `..`, absolute, empty or invalid
+pattern fails the whole set). `--open-pr` accepts members: the root lock file is published with the
+manifest, provided it lies inside the repository.
 
 **Go workspaces.** A `go.work` no longer blocks regeneration: `go get` runs with `GOWORK=off`, so
 only the module's own `go.mod` and `go.sum` change.
 
 **Yarn.** Yarn Berry (2 and later) is regenerated. The version is probed first with
-`yarn --version`; Yarn Classic (1.x) reports `unsupported` with the reason `yarn-classic`.
+`yarn --version`; Yarn Classic (1.x) reports `unsupported` with the reason `yarn-classic`. Workspace
+members and standalone roots that declare workspaces are found with `yarn workspaces list --json` at
+the root (the member must be listed exactly once, with no outer root); the tool runs at the root.
+Yarn re-serializes the `package.json` of every workspace on `install` and `up`, so all workspace
+manifests are captured first and written back byte for byte when their JSON content is unchanged;
+otherwise the report says `manifest-changed` and everything is restored. A listing too large for the
+probe reports `lockfile-set-too-large`.
+
+**Go vendored modules.** A module with `vendor/modules.txt` is regenerated: `go get` and
+`go mod vendor -o <scratch>` run with `GOFLAGS=-mod=mod` (replacing an inherited `GOFLAGS` for these
+two commands only). The `vendor` tree is not part of the lock-file snapshot. deps-cli builds the new
+tree in a scratch directory next to `vendor/`, checks `go.sum` and `vendor/modules.txt` against the
+applied versions, and only then replaces `vendor/` with two renames, so a failed or interrupted run
+leaves the previous `vendor/` untouched; `go.mod` and `go.sum` are restored from the snapshot. Under
+`--open-pr`, `vendor/` must be tracked in `HEAD`, and a failed publish restores it from git. A run
+killed with SIGKILL between the two renames can leave a `.deps-cli-vendor-*` directory beside
+`vendor/`. A `vendor` that is a symlink or not a directory reports
+`lockfile-symlink`; one outside the repository reports `lockfile-outside-repository`.
 
 The JSON report always has a `lockfile` object tagged by `status` (`regenerated`, `skipped`,
 `not-applicable`, `unsupported`, `failed`). A failed regeneration prints the full report and
 exits `2`; the manifest edit stays on disk, and the lock files the run touched are restored (see
-below). Nothing runs under `--dry-run` or `--offline`. Bun, Yarn Classic, Dart, Composer, Gradle,
-Swift, NuGet and Maven report `unsupported`, as do a symlinked lockfile, Go vendored modules, a
+below). Nothing runs under `--dry-run` or `--offline`. Maven (which has no lock file format), Yarn Classic
+and Pipenv report `unsupported`, as do a symlinked lockfile, a lockfile outside the repository, a
 lockfile in an ancestor directory for PyPI, Bundler and Deno (workspace members; for Deno also any
-ancestor `deno.jsonc`, a `deno.json` with `workspace`, or a `package.json` with `workspaces`), a non-uv Python locker, and updates chosen
-by the cooldown fallback for npm, pnpm, Bundler and Deno. A binary `bun.lockb` is not recognized as a lockfile, so a Bun project
+ancestor `deno.jsonc`, a `deno.json` with `workspace`, or a `package.json` with `workspaces`), and the
+refusals listed above. A binary `bun.lockb` is not recognized as a lockfile, so a Bun project
 with only that file reports `no-lockfile-present`.
 
 **Check-then-spawn window.** Workspace, ownership and symlink checks run before the tool starts, so
@@ -578,17 +669,25 @@ configuration (`rust-toolchain.toml`, `.npmrc`, the `go.mod` toolchain directive
 traffic is not subject to deps-cli's registry policy, child processes inherit the full environment
 (so tokens in it are readable by those files), and corepack may download a package manager silently.
 Bundler has no version override and may switch to the Bundler version recorded in `Gemfile.lock`.
+The newer tools run repository code too: Gradle executes the build's settings and build scripts,
+`dotnet restore` evaluates MSBuild files (`Directory.Build.*` and custom targets), SwiftPM evaluates
+`Package.swift` of the project and its dependencies (not sandboxed on Linux), PDM may load plugins
+(its hooks and a saved interpreter are disabled, see above), and Composer can fetch from the `vcs`
+repositories the manifest declares (its scripts and plugins are disabled). Poetry runs with plugins
+disabled.
 
 **Known limits.** `go get` may raise indirect requirements and the `go` directive in `go.mod`, and
 download a newer toolchain to satisfy it. Deno always reads and writes `./deno.lock` beside the
 manifest (`--lock=./deno.lock` overrides a `lock` key in `deno.json`). `deno update` receives names
 without the `npm:` or `jsr:` scheme, so an `npm:x` and a `jsr:x` of the same name in one manifest
 both move; the result is still checked against the lock file. A Cargo cooldown-fallback pin below a sibling's new minimum fails the `--precise` step: the
-run ends `failed` with the lock file restored (the fallback itself is not yet fixed).
+run ends `failed` with the reason `fallback-pin-rejected`; the manifest keeps its edit and the lock
+file stays at its state from before the run.
 
 **Lock file restore.** Before the first tool starts, `update` snapshots the lock files it may change
-(Cargo: `Cargo.lock`; Go: `go.mod` and `go.sum`; npm, pnpm and Yarn: the located lock file; PyPI:
-`uv.lock`; Bundler: `Gemfile.lock`; Deno: `deno.lock`). When the
+(Cargo: `Cargo.lock`; Go: `go.mod` and `go.sum`; npm, pnpm, Yarn and Bun: the
+located lock file, plus every workspace `package.json` for Yarn; PyPI: the lock file; Bundler:
+`Gemfile.lock`; Deno: `deno.lock`; Composer, Dart, NuGet, Gradle and Swift: their lock files). When the
 regeneration fails, files whose bytes changed are written back and unchanged files are not touched.
 If writing back fails, the report says `restore-failed` and names the file. After a timeout or an
 interrupt the restore runs on unix only: on Windows a `.cmd` shim's child may still be writing after
@@ -664,9 +763,13 @@ deps-cli update --lockfile regenerate --open-pr gitlab --config deps.toml --grou
 pushes it to `origin` and opens a pull request with `gh` (GitHub) or a merge request with `glab`
 (GitLab). It requires `--lockfile regenerate`, conflicts with `--dry-run` and `--offline`, and
 supports the ecosystems whose lock file regeneration is implemented (Cargo, npm, pnpm, Yarn Berry,
-Go, PyPI with `uv.lock`, Bundler, Deno) plus those without a lock file format (GitHub Actions, GitLab
-CI/CD, pre-commit, Maven); the others (Dart, Composer, Gradle, Swift, NuGet) exit `2` before any
-analysis.
+Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle, SwiftPM) plus those without a lock file
+format (GitHub Actions, GitLab CI/CD, pre-commit, Maven). For Pipenv and Yarn Classic the analysis and
+the manifest edit run first; the lock file regeneration is then refused (`unsupported`), the manifest
+edit is restored from `HEAD`, the report is printed as a dry run and the run exits `2`. A workspace member whose lock file lies in the workspace root is allowed; a lock file outside
+the repository root is refused (`lockfile-outside-repository`). A Go module with a `vendor` directory
+requires that directory to be tracked in `HEAD`; otherwise the run exits `2` with
+`--open-pr needs <path> to be tracked in git` before regeneration starts.
 
 deps-cli never reads, logs or passes a token: `git`, `gh` and `glab` use their own credentials, and
 every process runs without a shell, without stdin and with `GIT_TERMINAL_PROMPT=0` and
@@ -700,11 +803,13 @@ before any write; delete it. A pull request closed without merging keeps its bra
 update set is not proposed again until the branch is deleted. Superseded pull requests stay open
 unless you pass `--close-superseded`.
 
-Publishing first lists the tracked files that differ from `HEAD`. Only the manifest and the lock
-file a `regenerated` outcome names may differ: any other changed tracked file (an editor autosave,
+Publishing first lists the tracked files that differ from `HEAD`. Only the manifest, the lock file a
+`regenerated` outcome names (its real path, even when it lies above the manifest's directory) and the
+companion files and directories it reports (Gradle's other lock files and a Go `vendor` tree, whose
+contents are not listed) may differ: any other changed tracked file (an editor autosave,
 a formatter, another tool running during the update) stops the run with exit `2` naming up to 10 of
 them, with nothing committed or pushed. Otherwise the run creates the branch, stages exactly those
-files (an untracked or ignored lock file is never added), commits, pushes with upstream, creates
+files and trees (an untracked or ignored lock file is never added), commits, pushes with upstream, creates
 the request against the branch `HEAD` was on, prints its URL on stderr and only then switches back.
 
 The title is `Bump <name> from <a> to <b>`, `Bump <n> dependencies in <manifest>` or
@@ -720,9 +825,10 @@ reverted)`, renders the report as a dry run and exits with the
 code `update` computes (`1` in practice).
 
 If the lock file could not be regenerated (`failed`, `unsupported` or `skipped`), the tracked files
-directly inside the manifest's directory are restored to `HEAD` (including the index), the report is
-printed as a dry run and the run exits `2`; edits elsewhere are untouched, but an edit made beside
-the manifest while the run was going is reverted too.
+directly inside the manifest's directory, the tracked published lock files and companions, and the
+published trees are restored to `HEAD` (including the index; a tree is also cleaned of untracked
+files), the report is printed as a dry run and the run exits `2`; other edits are untouched, but an
+edit made beside the manifest while the run was going is reverted too.
 
 The manifest name is compared with git's spelling, so on a case-insensitive file system a manifest
 given as `cargo.toml` for `Cargo.toml` is refused as an unexpected change (exit `2`, nothing
@@ -732,7 +838,9 @@ Each git, `gh` or `glab` step, including the commit and pre-push hooks it trigge
 2 minutes. SIGINT or SIGTERM in any phase stops every running process tree (SIGTERM, 2 seconds,
 SIGKILL) and exits `2` naming the phase. After a failed or interrupted step the repository is left
 as it was: a run interrupted while updating leaves the manifest edit (the next run refuses with a
-dirty tree; `git restore <dir>`), and a failure after the branch switch leaves `HEAD` on the update
+dirty tree; `git restore <dir>`, plus the lock file in the workspace root for a member, the sibling
+`package.json` files of a Yarn workspace, and `git clean -fd -- <vendor>` for new untracked files in a
+Go `vendor` tree), and a failure after the branch switch leaves `HEAD` on the update
 branch (`git switch <base>`, `git branch -D <branch>`). If the push may have happened, also delete
 the remote branch with `git push origin --delete <branch>` (or, after a failed or interrupted
 `gh pr create`, open the request by hand); otherwise the next run reports the branch as already
@@ -744,7 +852,7 @@ with the URL already printed.
 | Pull request opened, nothing to commit, no update proposed | as `update` (`0`, or `1` for a mixed run) |
 | Already proposed | as `update` for the dry-run report |
 | No update settled | as `update` for the dry-run report (`1` in practice) |
-| Flag violation, preflight failure, deferred ecosystem, stale local branch, lock file not regenerated, unexpected changed file, git/`gh`/`glab` failure or timeout, interrupt | `2` |
+| Flag violation, preflight failure, untracked vendor tree, stale local branch, lock file not regenerated, unexpected changed file, publish set too large for one command line (`PublishSetTooLarge`, nothing staged), git/`gh`/`glab` failure or timeout, interrupt | `2` |
 
 ### Closing superseded requests (`--close-superseded`)
 
@@ -765,10 +873,14 @@ a later run can match it. An earlier request is closed only when all six checks 
 - the new request covers every dependency of the old one at the same or a newer version.
 
 A request that fails any check stays open, and its branch is never deleted. Closing never changes the
-exit code: failures are printed as warnings. Only Cargo, npm, PyPI, Bundler, Dart, Composer and Deno
-requests are closed; Go, Maven, Gradle, Swift, NuGet, GitHub Actions, GitLab CI and pre-commit never
-are, because their versions cannot be ordered safely (this is decided before any `gh` or `glab` call
-and reported as a warning). Requests opened without the marker are not closed. The checks catch extra
+exit code: failures are printed as warnings. Cargo, npm, PyPI, Bundler, Dart, Composer and Deno
+requests are compared by their requirement floors, and Go, Maven, Gradle, NuGet and Swift requests by
+their ecosystem's own version ordering (a version pair the ordering cannot compare keeps the old
+request open); GitHub Actions, GitLab CI and pre-commit are never closed, because their versions
+cannot be ordered safely (this is decided before any `gh` or `glab` call and reported as a warning).
+For GitHub each candidate is read with one `gh pr view` call; candidates are sorted oldest first and
+at most 50 are read per run, and the report says whether the listing was complete, full or cut by
+that cap. Requests opened without the marker are not closed. The checks catch extra
 commits only: an edit of the request's title or body text is not detected. The `glab` calls of
 this step have not been run against a real host.
 

@@ -139,6 +139,7 @@ fn write_lockfile_lines(out: &mut String, outcome: &LockfileOutcome) {
             lockfile,
             tool,
             pins,
+            ..
         } => {
             let _ = writeln!(
                 out,

@@ -3,10 +3,11 @@
 //!
 //! Every request carries a hidden [`RequestMarker`] naming the update set it proposes. A request
 //! is closed only when all six gates hold: same author, same repository, a `deps-cli/<eco>/`
-//! branch, exactly one commit, a marker of the same scope, and every target at or below the new
-//! one. A request that gained commits is kept, but an edit to the title or body text is not
-//! detected, and a request of another author, a newer proposal or a request without a marker is
-//! never touched. Any failed step is a warning and closes nothing.
+//! branch (narrowed to the manifest's directory part), exactly one commit, a marker of the same
+//! scope, and every target at or below the new one. At most [`MAX_CANDIDATES_READ`] candidates
+//! are read per run, oldest first. A request that gained commits is kept, but an edit to the
+//! title or body text is not detected, and a request of another author, a newer proposal or a
+//! request without a marker is never touched. Any failed step is a warning and closes nothing.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementGate};
 use deps_core::{ConcreteVersion, EcosystemId, VersionReq};
@@ -21,6 +22,8 @@ const MARKER_CLOSE: &str = " -->";
 const MARKER_VERSION: u8 = 1;
 /// Larger markers are left out of the body, so such a request is never closed later.
 const MARKER_MAX_BYTES: usize = 16 * 1024;
+/// Candidates read per run; each costs one `gh` call or two `glab` calls.
+const MAX_CANDIDATES_READ: usize = 50;
 const GITHUB_LIST_LIMIT: usize = 200;
 const GITLAB_LIST_LIMIT: usize = 100;
 
@@ -166,27 +169,30 @@ impl RequestMarker {
     /// Whether `newer` proposes, for every dependency of `self`, a target at or above
     /// `self`'s. A comparison the formatter cannot make counts as not covered.
     fn is_covered_by(&self, newer: &Self, formatter: &dyn EcosystemFormatter) -> bool {
+        let ordering = version_ordering(self.ecosystem);
         !self.updates.is_empty()
             && self.updates.iter().all(|old| {
-                let Some(at_least_old) =
-                    formatter.compile_requirement(&VersionReq::new(format!(">={}", old.target)))
-                else {
-                    return false;
-                };
                 newer.updates.iter().any(|new| {
                     new.name == old.name
-                        && at_least_old.matches(&ConcreteVersion::new(new.target.as_str()))
-                            == Some(true)
+                        && target_at_least(ordering, formatter, &new.target, &old.target)
                 })
             })
     }
 }
 
-/// Whether `ecosystem`'s version matcher orders versions soundly, so `>=<old>` can decide that a
-/// newer request covers an older one. Go, Maven, Gradle, NuGet, Swift and the three ref-based
-/// ecosystems compare literally or not at all, so their requests are never closed.
-#[must_use]
-const fn orders_versions_soundly(ecosystem: EcosystemId) -> bool {
+/// How a request's targets are ordered to decide that a newer request covers an older one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionOrdering {
+    /// A `>=<old target>` requirement compiled by the formatter; verified sound for the seven
+    /// ecosystems whose matcher follows their resolver.
+    RequirementFloor,
+    /// The formatter's own `compare_versions`, `None` for a pair it cannot order.
+    Native,
+    /// No version ordering exists (refs and hashes), so a request is never closed.
+    Unordered,
+}
+
+const fn version_ordering(ecosystem: EcosystemId) -> VersionOrdering {
     match ecosystem {
         EcosystemId::Cargo
         | EcosystemId::Npm
@@ -194,15 +200,33 @@ const fn orders_versions_soundly(ecosystem: EcosystemId) -> bool {
         | EcosystemId::Bundler
         | EcosystemId::Composer
         | EcosystemId::Dart
-        | EcosystemId::Deno => true,
+        | EcosystemId::Deno => VersionOrdering::RequirementFloor,
         EcosystemId::Go
         | EcosystemId::Maven
         | EcosystemId::Gradle
         | EcosystemId::Swift
-        | EcosystemId::NuGet
-        | EcosystemId::GithubActions
-        | EcosystemId::GitlabCi
-        | EcosystemId::PreCommit => false,
+        | EcosystemId::NuGet => VersionOrdering::Native,
+        EcosystemId::GithubActions | EcosystemId::GitlabCi | EcosystemId::PreCommit => {
+            VersionOrdering::Unordered
+        }
+    }
+}
+
+/// Whether `new` is at or above `old`; a pair the ordering cannot decide is not.
+fn target_at_least(
+    ordering: VersionOrdering,
+    formatter: &dyn EcosystemFormatter,
+    new: &str,
+    old: &str,
+) -> bool {
+    match ordering {
+        VersionOrdering::RequirementFloor => formatter
+            .compile_requirement(&VersionReq::new(format!(">={old}")))
+            .is_some_and(|floor| floor.matches(&ConcreteVersion::new(new)) == Some(true)),
+        VersionOrdering::Native => formatter
+            .compare_versions(&ConcreteVersion::new(new), &ConcreteVersion::new(old))
+            .is_some_and(std::cmp::Ordering::is_ge),
+        VersionOrdering::Unordered => false,
     }
 }
 
@@ -250,8 +274,20 @@ pub struct SupersedeReport {
     pub closed: Vec<RequestNumber>,
     /// Steps that failed; each one left its request open.
     pub failures: Vec<SupersedeError>,
-    /// Whether the listing was full, so more open requests may exist than were checked.
-    pub listing_full: bool,
+    /// How much of the open requests the run looked at.
+    pub coverage: SweepCoverage,
+}
+
+/// How much of the author's open requests a sweep looked at.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SweepCoverage {
+    /// Every listed candidate was read.
+    #[default]
+    Complete,
+    /// The listing was full, so more open requests may exist than were listed.
+    ListingFull,
+    /// More candidates matched than `MAX_CANDIDATES_READ`; the newest were not read.
+    CandidateCapReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +321,7 @@ struct GhMeta {
     head_ref_name: String,
     is_cross_repository: bool,
     commits: usize,
+    body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -369,19 +406,13 @@ impl Host<'_> {
                             "view",
                             reference,
                             "--json",
-                            "number,author,headRefName,isCrossRepository,commits",
+                            "number,author,headRefName,isCrossRepository,commits,body",
                             "--jq",
-                            "{number,author,headRefName,isCrossRepository,commits:(.commits|length)}",
+                            "{number,author,headRefName,isCrossRepository,commits:(.commits|length),body}",
                         ]),
                     )
                     .await?;
                 let meta: GhMeta = self.parse(step, &meta)?;
-                let body = self
-                    .read(
-                        step,
-                        strings(&["pr", "view", reference, "--json", "body", "--jq", ".body"]),
-                    )
-                    .await?;
                 Ok(Request {
                     number: RequestNumber(meta.number),
                     author: Author {
@@ -391,14 +422,14 @@ impl Host<'_> {
                     same_repository: !meta.is_cross_repository,
                     head: meta.head_ref_name,
                     commits: meta.commits,
-                    body,
+                    body: meta.body.unwrap_or_default(),
                 })
             }
             PrHost::Gitlab => {
                 let view = self
                     .read(
                         step,
-                        strings(&["mr", "view", reference, "--output", "json"]),
+                        strings(&["mr", "view", glab_reference(reference), "--output", "json"]),
                     )
                     .await?;
                 let mr: GlabMr = self.parse(step, &view)?;
@@ -525,6 +556,21 @@ impl Host<'_> {
     }
 }
 
+/// The argument `glab mr view` documents (an id or a branch).
+///
+/// The iid of a `.../merge_requests/<iid>` URL, any other reference unchanged.
+fn glab_reference(reference: &str) -> &str {
+    let path = reference.split(['?', '#']).next().unwrap_or(reference);
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some((head, iid))
+            if head.ends_with("/merge_requests") && iid.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            iid
+        }
+        _ => reference,
+    }
+}
+
 fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_owned()).collect()
 }
@@ -561,7 +607,7 @@ pub async fn close_superseded(
     formatter: &dyn EcosystemFormatter,
 ) -> SupersedeReport {
     let mut report = SupersedeReport::default();
-    if !orders_versions_soundly(marker.ecosystem) {
+    if version_ordering(marker.ecosystem) == VersionOrdering::Unordered {
         report
             .failures
             .push(SupersedeError::UnsupportedEcosystem(marker.ecosystem));
@@ -586,16 +632,34 @@ async fn sweep(
     report: &mut SupersedeReport,
 ) -> Result<(), SupersedeError> {
     let new = host.fetch(opened.url()).await?;
-    let prefix = format!("{}{}/", super::BRANCH_PREFIX, marker.ecosystem.id());
+    let prefix = format!(
+        "{}{}/{}",
+        super::BRANCH_PREFIX,
+        marker.ecosystem.id(),
+        super::branch_dir_segment(host.ctx)
+    );
     let listing = host.list(&new.author, &prefix).await?;
-    report.listing_full = listing.full;
+    let mut candidates: Vec<RequestNumber> = listing
+        .numbers
+        .into_iter()
+        .filter(|n| *n != new.number)
+        .collect();
+    candidates.sort_by_key(|number| number.0);
+    report.coverage = if candidates.len() > MAX_CANDIDATES_READ {
+        SweepCoverage::CandidateCapReached
+    } else if listing.full {
+        SweepCoverage::ListingFull
+    } else {
+        SweepCoverage::Complete
+    };
+    candidates.truncate(MAX_CANDIDATES_READ);
     let gates = Gates {
         author: &new.author,
         prefix,
         marker,
         formatter,
     };
-    for number in listing.numbers.into_iter().filter(|n| *n != new.number) {
+    for number in candidates {
         let outcome = match host.fetch(&number.0.to_string()).await {
             Ok(request) if gates.admits(&request) => host.close(number, opened.url()).await,
             Ok(_) => continue,
@@ -651,18 +715,72 @@ mod tests {
     }
 
     #[test]
-    fn test_only_the_verified_orderings_may_close() {
-        let allowed: Vec<&str> = EcosystemId::ALL
-            .iter()
-            .filter(|id| orders_versions_soundly(**id))
-            .map(|id| id.id())
-            .collect();
+    fn test_the_ordering_of_each_ecosystem_is_pinned() {
+        let of = |kind: VersionOrdering| -> Vec<&str> {
+            EcosystemId::ALL
+                .iter()
+                .filter(|id| version_ordering(**id) == kind)
+                .map(|id| id.id())
+                .collect()
+        };
 
         assert_eq!(
-            allowed,
+            of(VersionOrdering::RequirementFloor),
             [
                 "cargo", "npm", "pypi", "bundler", "dart", "composer", "deno"
             ]
+        );
+        assert_eq!(
+            of(VersionOrdering::Native),
+            ["go", "maven", "gradle", "swift", "nuget"]
+        );
+        assert_eq!(
+            of(VersionOrdering::Unordered),
+            ["github-actions", "gitlab-ci", "pre-commit"]
+        );
+    }
+
+    #[cfg(all(feature = "nuget", feature = "gradle"))]
+    #[test]
+    fn test_native_ordering_closes_through_the_formatter_and_fails_closed() {
+        let native = |ecosystem, updates: &[(&str, &str)]| {
+            let mut marker = marker(updates);
+            marker.ecosystem = ecosystem;
+            marker
+        };
+        let nuget = deps_engine::setup::NuGetFormatter;
+        let old = native(EcosystemId::NuGet, &[("a", "1.1.0")]);
+
+        assert!(old.is_covered_by(&native(EcosystemId::NuGet, &[("a", "1.1.0")]), &nuget));
+        assert!(old.is_covered_by(&native(EcosystemId::NuGet, &[("a", "1.10.0")]), &nuget));
+        assert!(
+            !old.is_covered_by(&native(EcosystemId::NuGet, &[("a", "1.0.9")]), &nuget),
+            "the >= requirement string wrongly matched 1.0.9"
+        );
+        assert!(!old.is_covered_by(&native(EcosystemId::NuGet, &[("a", "1.x")]), &nuget));
+        let gradle = deps_engine::setup::GradleFormatter;
+        let gradle_old = native(EcosystemId::Gradle, &[("g:a", "1.0")]);
+        assert!(
+            !gradle_old.is_covered_by(&native(EcosystemId::Gradle, &[("g:a", "1.0.0")]), &gradle),
+            "equal prefix, different length: Gradle and Maven disagree"
+        );
+        assert!(gradle_old.is_covered_by(&native(EcosystemId::Gradle, &[("g:a", "1.1")]), &gradle));
+    }
+
+    #[test]
+    fn test_glab_reference_takes_the_iid_of_a_merge_request_url() {
+        assert_eq!(
+            glab_reference("https://gitlab.example/g/p/-/merge_requests/12"),
+            "12"
+        );
+        assert_eq!(
+            glab_reference("https://gitlab.example/g/p/-/merge_requests/12/?x=1"),
+            "12"
+        );
+        assert_eq!(glab_reference("7"), "7");
+        assert_eq!(
+            glab_reference("https://example.test/pr/9"),
+            "https://example.test/pr/9"
         );
     }
 

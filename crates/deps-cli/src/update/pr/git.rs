@@ -23,8 +23,14 @@ use crate::update::regen::{ChildGuard, ProcessGroup};
 /// Time limit of one step, including the hooks it triggers.
 pub(super) const STEP_TIMEOUT: Duration = Duration::from_mins(2);
 
-/// Largest stdout kept per step; the host CLIs print one URL, git answers are one line.
+/// Largest stdout kept by a step that prints a URL or one git answer.
 const STDOUT_CAP: u64 = 64 * 1024;
+
+/// Largest stdout kept when reading one request: its body can be long.
+const READ_REQUEST_CAP: u64 = 1024 * 1024;
+
+/// Largest stdout kept when listing requests: full objects of up to a few hundred requests.
+const LIST_REQUESTS_CAP: u64 = 8 * 1024 * 1024;
 
 /// The external program a step runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +80,8 @@ pub enum Step {
     Restore,
     /// `git diff --name-only -z HEAD`.
     Diff,
+    /// `git ls-files` or `git ls-tree` over the published paths.
+    ListFiles,
     /// `git switch --create`.
     Switch,
     /// `git add -- <paths>`.
@@ -94,6 +102,33 @@ pub enum Step {
     CloseRequest,
 }
 
+impl Step {
+    /// The most stdout the step keeps; longer output is reported as truncated.
+    const fn stdout_cap(self) -> u64 {
+        match self {
+            Self::ReadRequest => READ_REQUEST_CAP,
+            Self::ListRequests => LIST_REQUESTS_CAP,
+            Self::Locate
+            | Self::Prefix
+            | Self::Head
+            | Self::Identity
+            | Self::Status
+            | Self::RemoteBranch
+            | Self::LocalBranch
+            | Self::Restore
+            | Self::Diff
+            | Self::ListFiles
+            | Self::Switch
+            | Self::Stage
+            | Self::Commit
+            | Self::Push
+            | Self::CreateRequest
+            | Self::SwitchBack
+            | Self::CloseRequest => STDOUT_CAP,
+        }
+    }
+}
+
 impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -106,6 +141,7 @@ impl fmt::Display for Step {
             Self::LocalBranch => "looking up the local branch",
             Self::Restore => "restoring the manifest directory",
             Self::Diff => "listing changed files",
+            Self::ListFiles => "listing tracked files",
             Self::Switch => "creating the update branch",
             Self::Stage => "staging the changes",
             Self::Commit => "committing",
@@ -187,12 +223,10 @@ impl Runner {
             .take()
             .ok_or(PrError::UnexpectedOutput { tool, step })?;
 
+        let cap = step.stdout_cap();
         let finished = timeout(STEP_TIMEOUT, async {
             let mut kept = Vec::new();
-            (&mut stdout)
-                .take(STDOUT_CAP)
-                .read_to_end(&mut kept)
-                .await?;
+            (&mut stdout).take(cap).read_to_end(&mut kept).await?;
             // Keep draining so a chatty child never blocks on a full pipe.
             tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await?;
             let status = child.wait().await?;
@@ -204,7 +238,7 @@ impl Runner {
         Ok(StepOutput {
             code: status.code(),
             stdout: String::from_utf8_lossy(&kept).trim().to_owned(),
-            truncated: kept.len() as u64 >= STDOUT_CAP,
+            truncated: kept.len() as u64 >= cap,
             raw: kept,
         })
     }
@@ -230,5 +264,17 @@ impl Runner {
             Some(0) => Ok(output.stdout),
             code => Err(PrError::ToolFailed { tool, step, code }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_steps_keep_more_output_than_the_default() {
+        assert_eq!(Step::Status.stdout_cap(), 64 * 1024);
+        assert_eq!(Step::ReadRequest.stdout_cap(), 1024 * 1024);
+        assert_eq!(Step::ListRequests.stdout_cap(), 8 * 1024 * 1024);
     }
 }

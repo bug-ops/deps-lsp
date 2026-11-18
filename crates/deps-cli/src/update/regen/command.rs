@@ -10,7 +10,14 @@ use std::path::{Path, PathBuf};
 
 use deps_core::ConcreteVersion;
 
+pub(super) mod composer;
+pub(super) mod dart;
+pub(super) mod dotnet;
+pub(super) mod gradle;
+mod js;
 pub(super) mod lockers;
+pub(super) mod python;
+pub(super) mod swift;
 
 /// An external tool `deps-cli` may spawn to regenerate a lockfile.
 ///
@@ -33,6 +40,24 @@ pub enum Program {
     Bundle,
     /// `deno`.
     Deno,
+    /// `bun`.
+    Bun,
+    /// `poetry`.
+    Poetry,
+    /// `pdm`.
+    Pdm,
+    /// `composer` (`composer.bat` on Windows).
+    Composer,
+    /// `dart`.
+    Dart,
+    /// `flutter` (`flutter.bat` on Windows).
+    Flutter,
+    /// `dotnet`.
+    Dotnet,
+    /// `gradle` (`gradle.bat` on Windows).
+    Gradle,
+    /// `swift`.
+    Swift,
 }
 
 impl Program {
@@ -48,13 +73,31 @@ impl Program {
             Self::Uv => "uv",
             Self::Bundle => "bundle",
             Self::Deno => "deno",
+            Self::Bun => "bun",
+            Self::Poetry => "poetry",
+            Self::Pdm => "pdm",
+            Self::Composer => "composer",
+            Self::Dart => "dart",
+            Self::Flutter => "flutter",
+            Self::Dotnet => "dotnet",
+            Self::Gradle => "gradle",
+            Self::Swift => "swift",
         }
     }
 
     /// The executable file name looked up on `PATH`.
     pub(super) const fn executable(self) -> &'static str {
         match self {
-            Self::Cargo | Self::Go | Self::Uv | Self::Deno => self.as_str(),
+            Self::Cargo
+            | Self::Go
+            | Self::Uv
+            | Self::Deno
+            | Self::Bun
+            | Self::Poetry
+            | Self::Pdm
+            | Self::Dart
+            | Self::Dotnet
+            | Self::Swift => self.as_str(),
             #[cfg(windows)]
             Self::Npm => "npm.cmd",
             #[cfg(windows)]
@@ -63,8 +106,20 @@ impl Program {
             Self::Yarn => "yarn.cmd",
             #[cfg(windows)]
             Self::Bundle => "bundle.bat",
+            #[cfg(windows)]
+            Self::Composer => "composer.bat",
+            #[cfg(windows)]
+            Self::Gradle => "gradle.bat",
+            #[cfg(windows)]
+            Self::Flutter => "flutter.bat",
             #[cfg(not(windows))]
-            Self::Npm | Self::Pnpm | Self::Yarn | Self::Bundle => self.as_str(),
+            Self::Npm
+            | Self::Pnpm
+            | Self::Yarn
+            | Self::Bundle
+            | Self::Composer
+            | Self::Gradle
+            | Self::Flutter => self.as_str(),
         }
     }
 }
@@ -75,6 +130,22 @@ impl fmt::Display for Program {
     }
 }
 
+/// A list proven to hold at least one element, so a command that must name its targets can never
+/// be built with none (`bundle lock --update` with no names would update every gem).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::update::regen) struct NonEmpty<T>(Vec<T>);
+
+impl<T> NonEmpty<T> {
+    /// `None` for an empty list.
+    pub(in crate::update::regen) fn new(items: Vec<T>) -> Option<Self> {
+        (!items.is_empty()).then_some(Self(items))
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+}
+
 /// The package manager that owns a JavaScript lockfile, identified by its exact file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpmClient {
@@ -82,9 +153,9 @@ pub enum NpmClient {
     Npm,
     /// pnpm (`pnpm-lock.yaml`).
     Pnpm,
-    /// Yarn (`yarn.lock`); regeneration is deferred.
+    /// Yarn (`yarn.lock`).
     Yarn,
-    /// Bun (`bun.lock`); regeneration is deferred.
+    /// Bun (`bun.lock`).
     Bun,
 }
 
@@ -118,9 +189,9 @@ impl NpmClient {
 pub enum PythonLocker {
     /// uv (`uv.lock`).
     Uv,
-    /// Poetry (`poetry.lock`); regeneration is deferred.
+    /// Poetry (`poetry.lock`).
     Poetry,
-    /// PDM (`pdm.lock`); regeneration is deferred.
+    /// PDM (`pdm.lock`).
     Pdm,
     /// Pipenv (`Pipfile.lock`); regeneration is deferred.
     Pipenv,
@@ -158,6 +229,16 @@ pub(super) enum GoWork {
     Inherit,
     /// `GOWORK=off`: the module resolves on its own `go.mod`/`go.sum`.
     Off,
+}
+
+/// How a `go` invocation resolves modules relative to a `vendor/` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoModuleMode {
+    /// The inherited `GOFLAGS` decide.
+    Inherit,
+    /// `GOFLAGS=-mod=mod`, replacing any inherited value: an inherited `-mod=vendor` would make
+    /// `go get` refuse to change `go.mod`.
+    ModuleCache,
 }
 
 /// A rejected [`ArgComponent`] candidate.
@@ -311,13 +392,14 @@ pub(super) struct Invocation {
     env: &'static [(&'static str, &'static str)],
 }
 
-const COREPACK_ENV: &[(&str, &str)] = &[("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")];
-const YARN_ENV: &[(&str, &str)] = &[
-    ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
-    ("YARN_ENABLE_IMMUTABLE_INSTALLS", "false"),
-    ("YARN_ENABLE_SCRIPTS", "false"),
-];
-const GOWORK_OFF_ENV: &[(&str, &str)] = &[("GOWORK", "off")];
+const fn go_env(work: GoWork, mode: GoModuleMode) -> &'static [(&'static str, &'static str)] {
+    match (work, mode) {
+        (GoWork::Inherit, GoModuleMode::Inherit) => &[],
+        (GoWork::Off, GoModuleMode::Inherit) => &[("GOWORK", "off")],
+        (GoWork::Inherit, GoModuleMode::ModuleCache) => &[("GOFLAGS", "-mod=mod")],
+        (GoWork::Off, GoModuleMode::ModuleCache) => &[("GOWORK", "off"), ("GOFLAGS", "-mod=mod")],
+    }
+}
 
 impl Invocation {
     fn new(program: Program, cwd: &Path, args: Vec<OsString>) -> Self {
@@ -394,6 +476,7 @@ impl Invocation {
         cwd: &Path,
         modules: &[(ArgComponent, ArgComponent)],
         work: GoWork,
+        mode: GoModuleMode,
     ) -> Self {
         let mut args = Self::strs(&["get", "--"]);
         args.extend(
@@ -402,137 +485,27 @@ impl Invocation {
             }),
         );
         let mut invocation = Self::new(Program::Go, cwd, args);
-        if work == GoWork::Off {
-            invocation.env = GOWORK_OFF_ENV;
-        }
+        invocation.env = go_env(work, mode);
         invocation
     }
 
-    /// `npm install --package-lock-only --ignore-scripts --no-audit --no-fund`.
-    pub(super) fn npm_lock(cwd: &Path) -> Self {
-        let mut invocation = Self::new(
-            Program::Npm,
-            cwd,
-            Self::strs(&[
-                "install",
-                "--package-lock-only",
-                "--ignore-scripts",
-                "--no-audit",
-                "--no-fund",
-            ]),
-        );
-        invocation.env = COREPACK_ENV;
+    /// `go mod vendor -o <out>`: writes the vendor tree to `out` instead of `vendor/`.
+    pub(super) fn go_mod_vendor(cwd: &Path, out: &Path, work: GoWork, mode: GoModuleMode) -> Self {
+        let mut args = Self::strs(&["mod", "vendor", "-o"]);
+        args.push(out.into());
+        let mut invocation = Self::new(Program::Go, cwd, args);
+        invocation.env = go_env(work, mode);
         invocation
     }
+}
 
-    /// `npm update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund
-    /// [--workspace=<member>] <names>`: moves the named packages inside their declared ranges
-    /// without editing `package.json`, for one workspace member when `member` is given.
-    pub(super) fn npm_update(
-        cwd: &Path,
-        names: &[NpmPackageArg],
-        member: Option<&WorkspaceMember>,
-    ) -> Self {
-        let mut args = Self::strs(&[
-            "update",
-            "--no-save",
-            "--package-lock-only",
-            "--ignore-scripts",
-            "--no-audit",
-            "--no-fund",
-        ]);
-        args.extend(member.map(|member| format!("--workspace=./{}", member.as_str()).into()));
-        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
-        let mut invocation = Self::new(Program::Npm, cwd, args);
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// `pnpm update --lockfile-only --no-save --ignore-scripts [--filter=./<member>] <names>`.
-    pub(super) fn pnpm_update(
-        cwd: &Path,
-        names: &[NpmPackageArg],
-        member: Option<&WorkspaceMember>,
-    ) -> Self {
-        let mut args = Self::strs(&["update", "--lockfile-only", "--no-save", "--ignore-scripts"]);
-        args.extend(member.map(|member| format!("--filter=./{}", member.as_str()).into()));
-        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
-        let mut invocation = Self::new(Program::Pnpm, cwd, args);
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
-    /// `pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile`.
-    pub(super) fn pnpm_lock(cwd: &Path) -> Self {
-        let mut invocation = Self::new(
-            Program::Pnpm,
-            cwd,
-            Self::strs(&[
-                "install",
-                "--lockfile-only",
-                "--ignore-scripts",
-                "--no-frozen-lockfile",
-            ]),
-        );
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
-    /// `npm prefix`: the directory npm treats as the workspace root of `cwd`.
-    pub(super) fn npm_prefix(cwd: &Path) -> Self {
-        let mut invocation = Self::new(Program::Npm, cwd, Self::strs(&["prefix"]));
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
-    /// `pnpm root -w`: the `node_modules` directory of the workspace root.
-    pub(super) fn pnpm_workspace_root(cwd: &Path) -> Self {
-        let mut invocation = Self::new(Program::Pnpm, cwd, Self::strs(&["root", "-w"]));
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
-    /// `pnpm list --filter=./<member> --depth=-1 --json`, run at the workspace root: a read-only
-    /// probe that lists the workspace projects matching the member path.
-    pub(super) fn pnpm_list_member(root: &Path, member: &WorkspaceMember) -> Self {
-        let mut invocation = Self::new(
-            Program::Pnpm,
-            root,
-            vec![
-                "list".into(),
-                format!("--filter=./{}", member.as_str()).into(),
-                "--depth=-1".into(),
-                "--json".into(),
-            ],
-        );
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
-    /// `yarn --version`.
-    pub(super) fn yarn_version(cwd: &Path) -> Self {
-        let mut invocation = Self::new(Program::Yarn, cwd, Self::strs(&["--version"]));
-        invocation.env = COREPACK_ENV;
-        invocation
-    }
-
-    /// `yarn install --mode=update-lockfile` (Yarn 2+): resolves without linking or scripts.
-    pub(super) fn yarn_lock(cwd: &Path) -> Self {
-        let mut invocation = Self::new(
-            Program::Yarn,
-            cwd,
-            Self::strs(&["install", "--mode=update-lockfile"]),
-        );
-        invocation.env = YARN_ENV;
-        invocation
-    }
-
-    /// `yarn up --recursive --mode=update-lockfile <names>` (Yarn 2+).
-    pub(super) fn yarn_update(cwd: &Path, names: &[NpmPackageArg]) -> Self {
-        let mut args = Self::strs(&["up", "--recursive", "--mode=update-lockfile"]);
-        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
-        let mut invocation = Self::new(Program::Yarn, cwd, args);
-        invocation.env = YARN_ENV;
-        invocation
+    #[test]
+    fn non_empty_rejects_an_empty_list() {
+        assert!(NonEmpty::<u8>::new(Vec::new()).is_none());
+        assert!(NonEmpty::new(vec![1_u8]).is_some());
     }
 }

@@ -9,8 +9,8 @@
 use super::DryRun;
 use crate::report::{Category, CheckReport};
 use crate::update::regen::{
-    LockfileOutcome, NotApplicableReason, NpmClient, PinResolution, Program, PythonLocker,
-    RegenerationError, SkipCause, UnsupportedReason,
+    LockfileOutcome, NotApplicableReason, PinResolution, Program, PythonLocker, RegenerationError,
+    SkipCause, UnsupportedReason,
 };
 use deps_core::EcosystemId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -350,6 +350,24 @@ pub enum ToolToken {
     Bundle,
     /// `deno`.
     Deno,
+    /// `bun`.
+    Bun,
+    /// `poetry`.
+    Poetry,
+    /// `pdm`.
+    Pdm,
+    /// `composer`.
+    Composer,
+    /// `dart`.
+    Dart,
+    /// `flutter`.
+    Flutter,
+    /// `dotnet`.
+    Dotnet,
+    /// `gradle`.
+    Gradle,
+    /// `swift`.
+    Swift,
 }
 
 impl From<Program> for ToolToken {
@@ -363,6 +381,15 @@ impl From<Program> for ToolToken {
             Program::Uv => Self::Uv,
             Program::Bundle => Self::Bundle,
             Program::Deno => Self::Deno,
+            Program::Bun => Self::Bun,
+            Program::Poetry => Self::Poetry,
+            Program::Pdm => Self::Pdm,
+            Program::Composer => Self::Composer,
+            Program::Dart => Self::Dart,
+            Program::Flutter => Self::Flutter,
+            Program::Dotnet => Self::Dotnet,
+            Program::Gradle => Self::Gradle,
+            Program::Swift => Self::Swift,
         }
     }
 }
@@ -419,17 +446,11 @@ pub enum NotApplicableToken {
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnsupportedToken {
-    /// The ecosystem's regeneration is not implemented yet.
-    EcosystemDeferred,
-    /// The JavaScript client is not supported yet.
-    NpmClientDeferred,
     /// The manifest may be a workspace member (ancestor lockfile or workspace, or the workspace
     /// directory set via the environment).
     WorkspaceMemberLockfile,
     /// The located lockfile is not the one the tool would update.
     LockfileOwnershipMismatch,
-    /// The Go module vendors its dependencies.
-    GoVendored,
     /// A cooldown-fallback target cannot be pinned by range resolution.
     CooldownFallbackTarget,
     /// The lockfile is a symlink or not a regular file.
@@ -438,6 +459,20 @@ pub enum UnsupportedToken {
     YarnClassic,
     /// The Python locker is not supported yet.
     PythonLockerDeferred,
+    /// The lock file resolves outside the repository.
+    LockfileOutsideRepository,
+    /// The project uses a legacy lock layout the tool cannot update safely.
+    LegacyLockLayout,
+    /// The project centralizes package versions outside the edited manifest.
+    CentralPackageVersions,
+    /// The project has more lock files than one run handles.
+    LockfileSetTooLarge,
+    /// The tool has no lock-only update mode that leaves unrelated pins alone.
+    LockfileOnlyUpdateUnsupported,
+    /// The installed tool is older than the first version the run supports.
+    ToolTooOld,
+    /// Other dependencies have floating or range requirements the run would re-resolve.
+    OtherFloatingRequirements,
 }
 
 /// The kind of a failed regeneration, as a JSON token.
@@ -470,6 +505,10 @@ pub enum FailureKind {
     SnapshotFailed,
     /// The lock file could not be restored after a failure.
     RestoreFailed,
+    /// The tool could not pin a cooldown-fallback target.
+    FallbackPinRejected,
+    /// The manifest changed during the run in a way the run did not make.
+    ManifestChanged,
 }
 
 impl From<&RegenerationError> for FailureKind {
@@ -488,31 +527,8 @@ impl From<&RegenerationError> for FailureKind {
             RegenerationError::VersionMismatch { .. } => Self::VersionMismatch,
             RegenerationError::SnapshotFailed { .. } => Self::SnapshotFailed,
             RegenerationError::RestoreFailed { .. } => Self::RestoreFailed,
-        }
-    }
-}
-
-/// The JavaScript client an `unsupported` report refers to, as a JSON token.
-#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ClientToken {
-    /// npm.
-    Npm,
-    /// pnpm.
-    Pnpm,
-    /// Yarn.
-    Yarn,
-    /// Bun.
-    Bun,
-}
-
-impl From<NpmClient> for ClientToken {
-    fn from(client: NpmClient) -> Self {
-        match client {
-            NpmClient::Npm => Self::Npm,
-            NpmClient::Pnpm => Self::Pnpm,
-            NpmClient::Yarn => Self::Yarn,
-            NpmClient::Bun => Self::Bun,
+            RegenerationError::FallbackPinRejected { .. } => Self::FallbackPinRejected,
+            RegenerationError::ManifestChanged { .. } => Self::ManifestChanged,
         }
     }
 }
@@ -544,18 +560,18 @@ impl From<PythonLocker> for LockerToken {
 
 /// What an `unsupported` reason refers to; every shape is a bare string on the wire.
 ///
-/// The token sets overlap on `"npm"`, so an untagged `"npm"` deserializes as
-/// [`Self::Ecosystem`] first. This is harmless: only `yarn` and `bun`
-/// ([`Self::Client`]) are ever emitted, and neither is an ecosystem id.
+/// The token sets overlap (`"poetry"`, `"uv"`, ...), so an untagged string deserializes as the
+/// earlier variant. This is harmless: the `reason` token beside `detail` says which one it is.
 #[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum UnsupportedDetail {
-    /// The ecosystem whose regeneration is deferred.
-    Ecosystem(EcosystemToken),
-    /// The client whose regeneration is deferred.
-    Client(ClientToken),
     /// The Python locker whose regeneration is deferred.
     Locker(LockerToken),
+    /// The tool a lock-only or version refusal names.
+    ///
+    /// The `reason` token beside `detail` says which namespace it belongs to, so the overlapping
+    /// strings (`"npm"`, `"uv"`, ...) are never ambiguous for a reader of the full document.
+    Tool(ToolToken),
 }
 
 /// The lockfile step of an `update` run, tagged by `status`.
@@ -587,7 +603,7 @@ pub enum LockfileDocument {
         reason: UnsupportedToken,
         /// The lockfile found, if any.
         path: Option<String>,
-        /// The ecosystem or client the reason refers to, when it names one.
+        /// The locker or tool the reason refers to, when it names one.
         detail: Option<UnsupportedDetail>,
     },
     /// Regeneration started and failed.
@@ -613,6 +629,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                 lockfile,
                 tool,
                 pins,
+                ..
             } => Self::Regenerated {
                 path: clean(&lockfile.to_string()),
                 tool: (*tool).into(),
@@ -648,30 +665,44 @@ impl From<&LockfileOutcome> for LockfileDocument {
             },
             LockfileOutcome::Unsupported { lockfile, reason } => {
                 let (token, detail) = match reason {
-                    UnsupportedReason::EcosystemDeferred(id) => (
-                        UnsupportedToken::EcosystemDeferred,
-                        Some(UnsupportedDetail::Ecosystem(EcosystemToken(*id))),
-                    ),
-                    UnsupportedReason::NpmClientDeferred(client) => (
-                        UnsupportedToken::NpmClientDeferred,
-                        Some(UnsupportedDetail::Client(ClientToken::from(*client))),
-                    ),
                     UnsupportedReason::WorkspaceMemberLockfile => {
                         (UnsupportedToken::WorkspaceMemberLockfile, None)
                     }
                     UnsupportedReason::LockfileOwnershipMismatch => {
                         (UnsupportedToken::LockfileOwnershipMismatch, None)
                     }
-                    UnsupportedReason::GoVendored => (UnsupportedToken::GoVendored, None),
                     UnsupportedReason::CooldownFallbackTarget => {
                         (UnsupportedToken::CooldownFallbackTarget, None)
                     }
                     UnsupportedReason::LockfileSymlink => (UnsupportedToken::LockfileSymlink, None),
                     UnsupportedReason::YarnClassic => (UnsupportedToken::YarnClassic, None),
-                    UnsupportedReason::PythonLockerDeferred(locker) => (
+                    UnsupportedReason::PythonLockerDeferred => (
                         UnsupportedToken::PythonLockerDeferred,
-                        Some(UnsupportedDetail::Locker(LockerToken::from(*locker))),
+                        Some(UnsupportedDetail::Locker(LockerToken::Pipenv)),
                     ),
+                    UnsupportedReason::LockfileOutsideRepository => {
+                        (UnsupportedToken::LockfileOutsideRepository, None)
+                    }
+                    UnsupportedReason::LegacyLockLayout => {
+                        (UnsupportedToken::LegacyLockLayout, None)
+                    }
+                    UnsupportedReason::CentralPackageVersions => {
+                        (UnsupportedToken::CentralPackageVersions, None)
+                    }
+                    UnsupportedReason::LockfileSetTooLarge => {
+                        (UnsupportedToken::LockfileSetTooLarge, None)
+                    }
+                    UnsupportedReason::LockfileOnlyUpdateUnsupported(program) => (
+                        UnsupportedToken::LockfileOnlyUpdateUnsupported,
+                        Some(UnsupportedDetail::Tool(ToolToken::from(*program))),
+                    ),
+                    UnsupportedReason::ToolTooOld(program) => (
+                        UnsupportedToken::ToolTooOld,
+                        Some(UnsupportedDetail::Tool(ToolToken::from(*program))),
+                    ),
+                    UnsupportedReason::OtherFloatingRequirements => {
+                        (UnsupportedToken::OtherFloatingRequirements, None)
+                    }
                 };
                 Self::Unsupported {
                     reason: token,
@@ -701,7 +732,9 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::ManifestReparseFailed { .. }
                     | RegenerationError::LockfileUnreadable { .. }
                     | RegenerationError::SnapshotFailed { .. }
-                    | RegenerationError::RestoreFailed { .. } => (None, None, None),
+                    | RegenerationError::RestoreFailed { .. }
+                    | RegenerationError::FallbackPinRejected { .. }
+                    | RegenerationError::ManifestChanged { .. } => (None, None, None),
                 };
                 Self::Failed {
                     kind: error.into(),

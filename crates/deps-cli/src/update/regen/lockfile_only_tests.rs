@@ -37,7 +37,7 @@ use url::Url;
 
 #[cfg(unix)]
 use super::PinResolution;
-use super::command::NpmPackageArg;
+use super::command::{NpmPackageArg, Program};
 use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, RegenerationGate,
@@ -345,7 +345,7 @@ async fn test_regenerate_lockfile_bun_lock_stays_requires_lockfile_update() {
     assert_matches!(
         run.lockfile,
         LockfileOutcome::Unsupported {
-            reason: UnsupportedReason::NpmClientDeferred(_),
+            reason: UnsupportedReason::LockfileOnlyUpdateUnsupported(Program::Bun),
             ..
         }
     );
@@ -358,7 +358,7 @@ async fn test_regenerate_lockfile_bun_lock_stays_requires_lockfile_update() {
 
 #[cfg(feature = "pypi")]
 #[tokio::test]
-async fn test_regenerate_lockfile_deferred_ecosystem_keeps_requires_lockfile_update() {
+async fn test_regenerate_lockfile_without_a_lock_file_keeps_requires_lockfile_update() {
     let project = Project::new();
     let manifest = project.write("pyproject.toml", "[project]\nname = \"x\"\n");
     let ecosystem = ecosystem(EcosystemId::Pypi);
@@ -1315,9 +1315,13 @@ mod newer_in_range {
             resolution: PinResolution::Newer(ConcreteVersion::from(version)),
         };
         let outcome = LockfileOutcome::Regenerated {
-            lockfile: super::super::DisplayLockPath(PathBuf::from("package-lock.json")),
+            lockfile: super::super::DisplayLockPath {
+                shown: PathBuf::from("package-lock.json"),
+                real: PathBuf::from("package-lock.json"),
+            },
             tool: super::super::Program::Npm,
             pins: vec![newer("4.18.1")],
+            companions: Vec::new(),
         };
 
         super::super::settle_lockfile_only(
