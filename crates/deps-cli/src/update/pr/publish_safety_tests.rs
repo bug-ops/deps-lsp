@@ -153,7 +153,7 @@ fn test_readiness_only_requires_lockfile_update_after_a_regeneration_is_nothing_
         regenerated("Cargo.lock"),
     );
 
-    assert!(matches!(readiness(&run), Readiness::NothingSettled));
+    assert_matches!(readiness(&run), Readiness::NothingSettled);
     assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
 }
 
@@ -164,7 +164,7 @@ fn test_readiness_nothing_applied_is_nothing_settled_even_with_a_clean_lockfile(
         LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied),
     );
 
-    assert!(matches!(readiness(&run), Readiness::NothingSettled));
+    assert_matches!(readiness(&run), Readiness::NothingSettled);
 }
 
 #[test]
@@ -183,8 +183,8 @@ fn test_readiness_applied_or_applied_via_lockfile_is_ready() {
         regenerated("Cargo.lock"),
     );
 
-    assert!(matches!(readiness(&applied_run), Readiness::Ready(_)));
-    assert!(matches!(readiness(&mixed), Readiness::Ready(_)));
+    assert_matches!(readiness(&applied_run), Readiness::Ready(_));
+    assert_matches!(readiness(&mixed), Readiness::Ready(_));
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn test_readiness_lockfile_not_regenerated_wins_over_settled_items() {
     for lockfile in outcomes {
         let run = settled_run(lockfile);
 
-        assert!(matches!(readiness(&run), Readiness::LockfileNotRegenerated));
+        assert_matches!(readiness(&run), Readiness::LockfileNotRegenerated);
     }
 }
 

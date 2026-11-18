@@ -7,6 +7,7 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -193,14 +194,14 @@ fn test_group_names_are_normalized_with_the_ecosystem_formatter_on_both_sides() 
 
     let key = PypiFormatter.normalize_package_name(&PackageName::new("flask-login"));
     assert!(group.contains(&key, UpdateKind::Patch));
-    assert!(matches!(items[0].outcome, Outcome::Applied { .. }));
-    assert!(matches!(
+    assert_matches!(items[0].outcome, Outcome::Applied { .. });
+    assert_matches!(
         items[1].outcome,
         Outcome::Skipped {
             reason: SkipReason::NotInGroup,
             ..
         }
-    ));
+    );
 }
 
 // --- FR-017: demotion ---
@@ -233,7 +234,7 @@ fn test_demote_outside_group_demotes_only_applied_items_outside_the_group() {
 
     demote_outside_group(&mut items, &group, &STUB_FORMATTER);
 
-    assert!(matches!(items[0].outcome, Outcome::Applied { .. }));
+    assert_matches!(items[0].outcome, Outcome::Applied { .. });
     assert_eq!(
         items[1].outcome,
         Outcome::Skipped {
@@ -242,14 +243,8 @@ fn test_demote_outside_group_demotes_only_applied_items_outside_the_group() {
         }
     );
     assert_eq!(items[2].outcome, skipped(SkipReason::IgnoreRule));
-    assert!(matches!(
-        items[3].outcome,
-        Outcome::RequiresLockfileUpdate { .. }
-    ));
-    assert!(matches!(
-        items[4].outcome,
-        Outcome::AppliedViaLockfile { .. }
-    ));
+    assert_matches!(items[3].outcome, Outcome::RequiresLockfileUpdate { .. });
+    assert_matches!(items[4].outcome, Outcome::AppliedViaLockfile { .. });
 }
 
 #[test]
@@ -267,14 +262,14 @@ fn test_demote_outside_group_unclassifiable_kind_is_inside_only_a_group_without_
     let mut for_untyped = unknown_current();
     demote_outside_group(&mut for_untyped, &untyped, &STUB_FORMATTER);
 
-    assert!(matches!(
+    assert_matches!(
         for_typed[0].outcome,
         Outcome::Skipped {
             reason: SkipReason::NotInGroup,
             ..
         }
-    ));
-    assert!(matches!(for_untyped[0].outcome, Outcome::Applied { .. }));
+    );
+    assert_matches!(for_untyped[0].outcome, Outcome::Applied { .. });
 }
 
 #[test]

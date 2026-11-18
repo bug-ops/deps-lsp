@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: new `Outcome::AppliedViaLockfile` and `RegenerationError::Interrupted` variants, `regenerate_lockfile` takes an `UpdatePlan`, and `PlannedUpdateItem` gains `lockfile_fix` (#2049, #2048, #2068)
 - **behavior**: `update --security-only` without `--lockfile` reports the lockfile as `skipped`/`not-enabled` (#2049, #2068)
 - **deps-core**: new `NativeCooldownSource` variants for Yarn and uv index windows, `GateOrigin`, and defaulted `LockFileProvider::{parse_lock_set, companion_listing_dir}` (#2051, #2052, #2054, #2068)
+- **deps-cli**: `UpdateArgs` gains public `open_pr` and `group` fields, and the exhaustive `SkipReason` gains `NotInGroup` (#1117, #1118, #2075)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)

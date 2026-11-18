@@ -144,6 +144,7 @@ fn test_update_open_pr_outside_a_git_repository_exits_2() {
     assert_refused(&output, "refusal");
 }
 
+#[cfg(feature = "pypi")]
 #[test]
 fn test_update_open_pr_for_a_deferred_ecosystem_exits_2_naming_the_supported_ones() {
     let repo = repository("requirements.txt", "requests==2.0.0\n");
