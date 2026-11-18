@@ -23,9 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo**: `.cargo/config.toml` is now a watched config, so editing it re-parses and re-fetches open Cargo manifests (#2043)
 - **deps-npm**: `NpmParseContext::new` is no longer `const` (#2041, #2055)
 - **deps-engine**: `fetch_latest_versions_parallel` takes a `PublishTimeDemand` argument (#2041, #2055)
-- **deps-cli**: new `Outcome::AppliedViaLockfile` and `RegenerationError::Interrupted` variants, `regenerate_lockfile` takes an `UpdatePlan`, and `PlannedUpdateItem` gains `lockfile_fix` (#2049, #2048)
-- **behavior**: `update --security-only` without `--lockfile` reports the lockfile as `skipped`/`not-enabled` (#2049)
-- **deps-core**: new `NativeCooldownSource` variants for Yarn and uv index windows, `GateOrigin`, and defaulted `LockFileProvider::{parse_lock_set, companion_listing_dir}` (#2051, #2052, #2054)
+- **deps-cli**: new `Outcome::AppliedViaLockfile` and `RegenerationError::Interrupted` variants, `regenerate_lockfile` takes an `UpdatePlan`, and `PlannedUpdateItem` gains `lockfile_fix` (#2049, #2048, #2068)
+- **behavior**: `update --security-only` without `--lockfile` reports the lockfile as `skipped`/`not-enabled` (#2049, #2068)
+- **deps-core**: new `NativeCooldownSource` variants for Yarn and uv index windows, `GateOrigin`, and defaulted `LockFileProvider::{parse_lock_set, companion_listing_dir}` (#2051, #2052, #2054, #2068)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
@@ -45,10 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm, deps-core, deps-engine, deps-lsp, deps-cli**: native release-age windows of npm (`min-release-age`, `before`, `.npmrc`), pnpm (`minimumReleaseAge*`, `pnpm-workspace.yaml`) and Bun (`bunfig.toml`) are honored explain-only, with per-package exemptions and publish times fetched when a window applies (#2041, #2055)
 - **deps-pypi, deps-core, deps-lsp, deps-cli**: uv `exclude-newer` and `exclude-newer-package` from `uv.toml` and `[tool.uv]` are honored explain-only (#2042, #2055)
 - **deps-gradle, deps-core, deps-lsp**: in-use versions from the legacy `gradle/dependency-locks/<configuration>.lockfile` layout, and `LockFileProvider::lock_set_root` refreshes documents when a lock file disappears (#2039, #2055)
-- **deps-cli**: `update --security-only --lockfile regenerate` fixes lockfile-only vulnerabilities for Cargo, npm, pnpm and Go (#2049)
-- **deps-core**: `osv::AffectedRanges`, `osv::AffectsVersion` and `Advisory::affected_ranges_for` check a version against an advisory's affected ranges (#2049)
-- **deps-npm**: Yarn `npmMinimalAgeGate` (with `npmScopes` overrides) is honoured as a native release-age gate (#2051)
-- **deps-pypi**: uv per-index `exclude-newer` under `[[tool.uv.index]]` is honoured with package, index, global precedence (#2052)
+- **deps-cli**: `update --security-only --lockfile regenerate` fixes lockfile-only vulnerabilities for Cargo, npm, pnpm and Go (#2049, #2068)
+- **deps-core**: `osv::AffectedRanges`, `osv::AffectsVersion` and `Advisory::affected_ranges_for` check a version against an advisory's affected ranges (#2049, #2068)
+- **deps-npm**: Yarn `npmMinimalAgeGate` (with `npmScopes` overrides) is honoured as a native release-age gate (#2051, #2068)
+- **deps-pypi**: uv per-index `exclude-newer` under `[[tool.uv.index]]` is honoured with package, index, global precedence (#2052, #2068)
 
 ### Changed
 - **workspace**: 3-day dependency release cooldown by default via Cargo `global-min-publish-age` and Dependabot `cooldown` (#2044)
@@ -70,9 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves the GHCR `latest`/major/minor tags or the `action.yml` digest pin, and SARIF is attributed to the tag (#2067)
-- **deps-cli**: SIGTERM, SIGINT and timeout now kill the whole process group of a lockfile regeneration tool instead of leaving it running (#2048)
-- **deps-core, deps-gradle**: the legacy lock-set directory is listed once while parsing and stat-ed only for symlinks, with the directory stamped before the listing (#2054)
-- **deps-engine, deps-cli**: hermetic tests cover the native release-age gate with an advisory for npm and uv (#2053)
+- **deps-cli**: SIGTERM, SIGINT and timeout now kill the whole process group of a lockfile regeneration tool instead of leaving it running (#2048, #2068)
+- **deps-core, deps-gradle**: the legacy lock-set directory is listed once while parsing and stat-ed only for symlinks, with the directory stamped before the listing (#2054, #2068)
+- **deps-engine, deps-cli**: hermetic tests cover the native release-age gate with an advisory for npm and uv (#2053, #2068)
 - **deps-lsp**: a `didClose` during the first parse of a `didOpen` no longer brings the closed document back, and a cold-start load no longer replaces an open still parsing (#2036, #2040)
 - **deps-core, deps-lsp**: inlay hints, the vulnerability quick fix and hover honour operator advisory exemptions (#2030, #2040)
 - **deps-lsp**: initialize wiring of the advisory exemption file is covered by tests through an injected config dir (#2031, #2040)
