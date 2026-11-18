@@ -37,11 +37,11 @@ use url::Url;
 
 #[cfg(unix)]
 use super::PinResolution;
-use super::command::{NpmPackageArg, Program};
+use super::command::NpmPackageArg;
 use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, RegenerationGate,
-    SkipCause, UnsupportedReason, regenerate_lockfile, regenerate_lockfile_with,
+    SkipCause, regenerate_lockfile, regenerate_lockfile_with,
 };
 use crate::exit::{EXIT_CLEAN, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
@@ -319,41 +319,6 @@ async fn test_regenerate_lockfile_with_skip_gate_reports_skipped_for_lockfile_on
         .await;
         assert_matches!(outcome, LockfileOutcome::Skipped(c) if c == cause);
     }
-}
-
-#[cfg(feature = "npm")]
-#[tokio::test]
-async fn test_regenerate_lockfile_bun_lock_stays_requires_lockfile_update() {
-    let project = Project::new();
-    let manifest = project.write("package.json", "{\"dependencies\":{\"lodash\":\"^4\"}}");
-    project.write("bun.lock", "{}\n");
-    let ecosystem = ecosystem(EcosystemId::Npm);
-    let uri = Url::from_file_path(&manifest).expect("file url");
-    let display = PathBuf::from("package.json");
-    let target = ManifestTarget {
-        ecosystem: &ecosystem,
-        manifest_path: &manifest,
-        display_path: &display,
-        uri: &uri,
-    };
-    let plan = UpdatePlan {
-        items: vec![lockfile_only("lodash", "4.17.20", "4.17.21")],
-    };
-
-    let run = regenerate_lockfile(plan, &target, run_gate()).await;
-
-    assert_matches!(
-        run.lockfile,
-        LockfileOutcome::Unsupported {
-            reason: UnsupportedReason::LockfileOnlyUpdateUnsupported(Program::Bun),
-            ..
-        }
-    );
-    assert_matches!(
-        run.plan.items[0].outcome,
-        Outcome::RequiresLockfileUpdate { .. }
-    );
-    assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
 }
 
 #[cfg(feature = "pypi")]

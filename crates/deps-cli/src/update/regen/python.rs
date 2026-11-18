@@ -1,4 +1,4 @@
-//! Regeneration for the Python lockers: uv, Poetry and PDM. Pipenv stays deferred.
+//! Regeneration for the Python lockers: uv, Poetry, PDM and Pipenv.
 
 use std::path::Path;
 
@@ -9,7 +9,8 @@ use super::command::python::PoetryLockStyle;
 use super::lockers::{Located, file_declares};
 use super::{
     ArgComponent, Invocation, LockfileOutcome, NotApplicableReason, PinCheck, Program,
-    PythonLocker, RegenerationError, Session, UnsupportedReason, arg_pair, unsupported,
+    PythonLocker, RegenerationError, Session, UnsupportedReason, arg_pair, unsafe_argument,
+    unsupported,
 };
 
 impl Session<'_> {
@@ -26,25 +27,26 @@ impl Session<'_> {
             Some(PythonLocker::Uv) => self.uv(&located).await,
             Some(PythonLocker::Poetry) => self.poetry(&located).await,
             Some(PythonLocker::Pdm) => self.pdm(&located).await,
-            Some(PythonLocker::Pipenv) => Ok(unsupported(
-                Some(self.display_lock_path(&located)),
-                UnsupportedReason::PythonLockerDeferred,
-            )),
+            Some(PythonLocker::Pipenv) => self.pipenv(&located).await,
             None => Err(RegenerationError::UnrecognizedLockfile {
                 path: self.display_lock_path(&located).shown,
             }),
         }
     }
 
-    /// `Some(Unsupported)` unless the manifest is the `pyproject.toml` the locker reads.
+    /// `Some(Unsupported)` unless the manifest is the file named `expected`, the one the locker
+    /// reads.
+    fn manifest_name_refusal(&self, located: &Path, expected: &str) -> Option<LockfileOutcome> {
+        (self.target.manifest_path.file_name() != Some(std::ffi::OsStr::new(expected))).then(|| {
+            unsupported(
+                Some(self.display_lock_path(located)),
+                UnsupportedReason::LockfileOwnershipMismatch,
+            )
+        })
+    }
+
     fn pyproject_refusal(&self, located: &Path) -> Option<LockfileOutcome> {
-        (self.target.manifest_path.file_name() != Some(std::ffi::OsStr::new("pyproject.toml")))
-            .then(|| {
-                unsupported(
-                    Some(self.display_lock_path(located)),
-                    UnsupportedReason::LockfileOwnershipMismatch,
-                )
-            })
+        self.manifest_name_refusal(located, "pyproject.toml")
     }
 
     /// The refusals Poetry and PDM share; each runs before any spawn.
@@ -171,6 +173,59 @@ impl Session<'_> {
             update,
         )
         .await
+    }
+
+    /// `Some(Unsupported)` when `<manifest dir>/.venv` is a file or symlink: Pipenv reads it
+    /// as the path of a virtualenv whose `python` it then runs, and `PIPENV_VENV_IN_PROJECT=0`
+    /// does not stop that. A `.venv` directory is ignored under that variable.
+    fn saved_virtualenv_refusal(&self, located: &Path) -> Option<LockfileOutcome> {
+        let selects_interpreter = std::fs::symlink_metadata(self.manifest_dir.join(".venv"))
+            .is_ok_and(|metadata| !metadata.file_type().is_dir());
+        selects_interpreter.then(|| {
+            unsupported(
+                Some(self.display_lock_path(located)),
+                UnsupportedReason::SavedVirtualenv,
+            )
+        })
+    }
+
+    /// Pipenv has no manifest-preserving lock command, so one `pipenv upgrade --lock-only` over
+    /// every pinned package moves just those packages against the (possibly edited) `Pipfile`;
+    /// the exact target is not requestable, so [`PinCheck::SatisfiesInLock`] proves each pin.
+    async fn pipenv(&self, located: &Path) -> Result<LockfileOutcome, RegenerationError> {
+        if let Some(outcome) = self
+            .manifest_name_refusal(located, "Pipfile")
+            .or_else(|| self.cooldown_refusal(located))
+            .or_else(|| self.placement_refusal(located))
+            .or_else(|| self.saved_virtualenv_refusal(located))
+        {
+            return Ok(outcome);
+        }
+        let names = self
+            .pins
+            .iter()
+            .map(|pin| ArgComponent::parse(pin.package.as_str()).map_err(|_| unsafe_argument(pin)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(names) = NonEmpty::new(names) else {
+            return Ok(LockfileOutcome::NotApplicable(
+                NotApplicableReason::NothingApplied,
+            ));
+        };
+
+        let manifest = self.target.manifest_path;
+        self.capture(&[located, manifest])?;
+        let original = self.read_manifest(manifest)?;
+        self.runner
+            .run(
+                &Invocation::pipenv_upgrade_lock_only(self.manifest_dir, &names),
+                self.deadline,
+            )
+            .await?;
+        // A Pipfile the tool rewrote (older releases turn ranges into "*") fails the run as
+        // `ManifestChanged`; the snapshot restore then puts the original bytes back.
+        self.restore_formatting([&original])?;
+        self.verified(Program::Pipenv, located, PinCheck::SatisfiesInLock)
+            .await
     }
 
     /// Captures the lock file, runs `lock` when the manifest was edited and `update` when some

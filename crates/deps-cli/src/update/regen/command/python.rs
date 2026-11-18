@@ -1,4 +1,4 @@
-//! Invocation shapes of the Python lockers: uv, Poetry and PDM.
+//! Invocation shapes of the Python lockers: uv, Poetry, PDM and Pipenv.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -11,6 +11,17 @@ const PDM_SKIP_HOOKS: &str = "--skip=:all";
 /// Ignores a committed `.pdm-python`, which would otherwise select a repository-chosen
 /// interpreter to run.
 const PDM_ENV: &[(&str, &str)] = &[("PDM_IGNORE_SAVED_PYTHON", "1")];
+
+/// Hardens Pipenv against repository-controlled code and state: no `.env` (arbitrary
+/// environment variables, such as a package index), no in-project `.venv` interpreter, no
+/// interpreter installation through pyenv or asdf, and no spinner in captured output.
+const PIPENV_ENV: &[(&str, &str)] = &[
+    ("PIPENV_DONT_LOAD_ENV", "1"),
+    ("PIPENV_VENV_IN_PROJECT", "0"),
+    ("PIPENV_DONT_USE_PYENV", "1"),
+    ("PIPENV_DONT_USE_ASDF", "1"),
+    ("PIPENV_NOSPIN", "1"),
+];
 
 /// How Poetry keeps unrelated pins while `poetry lock` re-resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +87,21 @@ impl Invocation {
         args.extend(names.iter().map(|name| OsString::from(name.as_str())));
         let mut invocation = Self::new(Program::Pdm, cwd, args);
         invocation.env = PDM_ENV;
+        invocation
+    }
+
+    /// `pipenv upgrade --lock-only <names>`: re-resolves only the named packages against the
+    /// current `Pipfile` and rewrites `Pipfile.lock`, leaving the `Pipfile` untouched. No version
+    /// is passed because `pipenv upgrade` ignores a `==` specifier and takes the newest release
+    /// the `Pipfile` admits; the verification step checks the outcome.
+    pub(in crate::update::regen) fn pipenv_upgrade_lock_only(
+        cwd: &Path,
+        names: &NonEmpty<ArgComponent>,
+    ) -> Self {
+        let mut args = Self::strs(&["upgrade", "--lock-only"]);
+        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
+        let mut invocation = Self::new(Program::Pipenv, cwd, args);
+        invocation.env = PIPENV_ENV;
         invocation
     }
 
@@ -190,5 +216,22 @@ mod tests {
             assert_eq!(invocation.env(), [("PDM_IGNORE_SAVED_PYTHON", "1")]);
         }
         assert_eq!(update.program(), Program::Pdm);
+    }
+
+    #[test]
+    fn pipenv_upgrade_is_lock_only_scoped_to_the_names_and_ignores_the_repository_env() {
+        let invocation = Invocation::pipenv_upgrade_lock_only(Path::new("."), &names(&["a", "b"]));
+        assert_eq!(lossy(&invocation), ["upgrade", "--lock-only", "a", "b"]);
+        assert_eq!(invocation.program(), Program::Pipenv);
+        assert_eq!(
+            invocation.env(),
+            [
+                ("PIPENV_DONT_LOAD_ENV", "1"),
+                ("PIPENV_VENV_IN_PROJECT", "0"),
+                ("PIPENV_DONT_USE_PYENV", "1"),
+                ("PIPENV_DONT_USE_ASDF", "1"),
+                ("PIPENV_NOSPIN", "1")
+            ]
+        );
     }
 }

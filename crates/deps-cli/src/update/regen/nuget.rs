@@ -1,12 +1,14 @@
 //! Regeneration for NuGet `packages.lock.json` (#2084).
 
+use std::path::Path;
+
 use deps_core::NormalizeName;
 
 use super::command::dotnet::ProjectFileArg;
 use super::lockers::Located;
 use super::{
-    Invocation, LockfileOutcome, NotApplicableReason, PinCheck, Program, RegenerationError,
-    Session, UnsupportedReason, unsupported,
+    Invocation, LockPin, LockfileOutcome, NotApplicableReason, PinCheck, Program,
+    RegenerationError, Session, UnsupportedReason, unsupported,
 };
 
 /// What the manifest file is, decided from its name the way the NuGet ecosystem parser does.
@@ -44,28 +46,15 @@ fn requirement_floats(requirement: &str) -> bool {
 }
 
 impl Session<'_> {
-    /// Whether a dependency other than the pins carries a requirement restore would re-resolve.
+    /// Whether a dependency other than the edited pins carries a requirement restore would
+    /// re-resolve.
     ///
     /// Restore re-resolves every floating dependency of a project once any package changed
     /// (verified: `Serilog 2.*` locked at 2.10.0 moved to 2.12.0 in an unrelated edit), which
-    /// bypasses the cooldown for that package.
+    /// bypasses the cooldown for that package. A lock-only pin is not edited, so its own
+    /// requirement counts here too.
     fn other_requirements_float(&self) -> Result<bool, RegenerationError> {
-        let reparse_failed = || RegenerationError::ManifestReparseFailed {
-            path: self.target.display_path.to_path_buf(),
-        };
-        let content = deps_core::fs_probe::read_to_string_capped_no_follow(
-            self.target.manifest_path,
-            crate::MAX_MANIFEST_FILE_SIZE,
-        )
-        .ok()
-        .flatten()
-        .ok_or_else(reparse_failed)?;
-        let parsed = deps_core::ecosystem::parse_manifest_now(
-            self.target.ecosystem,
-            &content,
-            self.target.uri,
-        )
-        .ok_or_else(reparse_failed)?;
+        let parsed = self.reparse_manifest()?;
         let formatter = self.target.ecosystem.formatter();
         Ok(parsed.dependencies().into_iter().any(|dep| {
             let edited = self
@@ -81,9 +70,11 @@ impl Session<'_> {
 
     /// `dotnet restore <project> --use-lock-file --no-dependencies` after a manifest edit.
     ///
-    /// Lock-only pins are refused as a whole: NuGet resolves the lowest applicable version, so
-    /// no restore form moves a locked package forward except `--force-evaluate`, which
-    /// re-resolves every floating dependency (cooldown bypass, unrelated churn).
+    /// Lock-only pins are never restored: NuGet resolves the lowest applicable version, so no
+    /// restore form moves a locked package forward except `--force-evaluate`, which re-resolves
+    /// every floating dependency (cooldown bypass, unrelated churn). A plan of lock-only pins
+    /// alone is refused; in a mixed plan only the edit pins are restored and verified, and a
+    /// floating requirement of a lock-only package refuses the run like any other floating one.
     pub(super) async fn nuget(&self) -> Result<LockfileOutcome, RegenerationError> {
         let file_name = self
             .target
@@ -112,33 +103,51 @@ impl Session<'_> {
                 UnsupportedReason::LockfileOwnershipMismatch,
             ));
         };
-        if self.pins.iter().any(super::LockPin::is_lockfile_only) {
+        let edit_pins: Vec<LockPin> = self
+            .pins
+            .iter()
+            .filter(|pin| !pin.is_lockfile_only())
+            .cloned()
+            .collect();
+        if edit_pins.is_empty() && self.pins.iter().any(LockPin::is_lockfile_only) {
             return Ok(unsupported(
                 Some(self.display_lock_path(&located)),
                 UnsupportedReason::LockfileOnlyUpdateUnsupported(Program::Dotnet),
             ));
         }
-        if let Some(outcome) = self.cooldown_refusal(&located) {
+        let session = Session {
+            pins: &edit_pins,
+            ..*self
+        };
+        session.restore_edit_pins(&located, &project).await
+    }
+
+    async fn restore_edit_pins(
+        &self,
+        located: &Path,
+        project: &ProjectFileArg,
+    ) -> Result<LockfileOutcome, RegenerationError> {
+        if let Some(outcome) = self.cooldown_refusal(located) {
             return Ok(outcome);
         }
         if self.other_requirements_float()? {
             return Ok(unsupported(
-                Some(self.display_lock_path(&located)),
+                Some(self.display_lock_path(located)),
                 UnsupportedReason::OtherFloatingRequirements,
             ));
         }
-        if let Some(outcome) = self.placement_refusal(&located) {
+        if let Some(outcome) = self.placement_refusal(located) {
             return Ok(outcome);
         }
 
-        self.capture(&[&located])?;
+        self.capture(&[located])?;
         self.runner
             .run(
-                &Invocation::dotnet_restore(self.manifest_dir, &project),
+                &Invocation::dotnet_restore(self.manifest_dir, project),
                 self.deadline,
             )
             .await?;
-        self.verified(Program::Dotnet, &located, PinCheck::SatisfiesInLock)
+        self.verified(Program::Dotnet, located, PinCheck::SatisfiesInLock)
             .await
     }
 }

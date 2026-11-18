@@ -660,7 +660,6 @@ fn test_reason_display_texts_are_distinct_and_non_empty() {
         UnsupportedReason::LockfileOwnershipMismatch,
         UnsupportedReason::CooldownFallbackTarget,
         UnsupportedReason::LockfileSymlink,
-        UnsupportedReason::PythonLockerDeferred,
     ]
     .map(|reason| reason.to_string());
     for group in [&skips[..], &not_applicable[..], &unsupported[..]] {
@@ -2340,15 +2339,15 @@ mod fake_tools {
             );
             let unsupported = lockfile_json(LockfileOutcome::Unsupported {
                 lockfile: None,
-                reason: UnsupportedReason::PythonLockerDeferred,
+                reason: UnsupportedReason::ToolTooOld(Program::Poetry),
             });
             assert_eq!(
                 unsupported,
                 serde_json::json!({
                     "status": "unsupported",
-                    "reason": "python-locker-deferred",
+                    "reason": "tool-too-old",
                     "path": null,
-                    "detail": "pipenv",
+                    "detail": "poetry",
                 })
             );
             let failed = lockfile_json(LockfileOutcome::Failed(RegenerationError::ToolFailed {

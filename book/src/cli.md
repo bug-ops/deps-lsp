@@ -448,13 +448,13 @@ explicit choice.
   is not rewritten to the deprecated version. Every vulnerable dependency is classified into
   exactly one of three outcomes:
   - `applied` — the fix was written to the manifest, or (with `--lockfile regenerate` for
-    Cargo, npm, pnpm, Yarn Berry, Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle and SwiftPM) the lock file was moved to the fix target because the declared
+    Cargo, npm, pnpm, Yarn Berry, Bun, Go, PyPI (including Pipenv), Bundler, Deno, Composer, Dart, Gradle and SwiftPM, and NuGet for edited pins only) the lock file was moved to the fix target because the declared
     requirement already admits it; the report's reason tells the two apart.
   - `requires-lockfile-update` — the declared requirement already admits the fix, so there
     is nothing to rewrite at the manifest level, and the lock file still resolves a vulnerable
     version. Pass `--lockfile regenerate` to let `update` move the lock file (Cargo, npm, pnpm,
-    Yarn Berry, Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle and SwiftPM); for Maven,
-    Pipenv, Yarn Classic and a lock-file-only pin in Bun or NuGet,
+    Yarn Berry, Bun, Go, PyPI (including Pipenv), Bundler, Deno, Composer, Dart, Gradle and SwiftPM); for Maven,
+    Yarn Classic and a lock-file-only pin in NuGet,
     update the lock file yourself.
   - `unfixable` — no independently-verified fix target exists, the registry fetch for that
     dependency failed, the fix target is itself yanked, the declared requirement's syntax has
@@ -523,8 +523,9 @@ the fresh lockfile against every applied version:
 | PyPI (`uv.lock`) | `uv lock --no-build --no-python-downloads --upgrade-package <name>==<version>` per update | the lockfile holds exactly the target |
 | Bundler (`Gemfile.lock`) | `bundle lock` (manifest edits), then `bundle lock --conservative --update <names>` (lock-file-only fixes) | a locked version satisfies the declared requirement and is at least the target |
 | Deno (`deno.lock`) | `deno install --lockfile-only --lock=./deno.lock` (manifest edits), then `deno update --compatible --lockfile-only --lock=./deno.lock <names>` (lock-file-only fixes) | same as Bundler |
-| Bun (`bun.lock`) | `bun install --lockfile-only --ignore-scripts` (manifest edits only) | same as npm |
+| Bun (`bun.lock`) | `bun install --lockfile-only --ignore-scripts` (manifest edits), then `bun update --lockfile-only --ignore-scripts <names>` (lock-file-only fixes), `package.json` restored and `bun install --lockfile-only --ignore-scripts` again | same as npm |
 | PyPI (`poetry.lock`) | `poetry lock` (`poetry lock --no-update` on Poetry 1.x), then `poetry update --lock <names>` (lock-file-only fixes), with `--no-interaction --no-plugins` | a locked version satisfies the declared requirement and is at least the target |
+| PyPI (`Pipfile.lock`) | `pipenv upgrade --lock-only <names>` once for every pin (the `Pipfile` is not edited) | a locked version satisfies the `Pipfile` requirement and is at least the target |
 | PyPI (`pdm.lock`) | `pdm lock --update-reuse` (manifest edits), then `pdm update --no-sync <names>` (lock-file-only fixes) | same as Poetry |
 | Composer (`composer.lock`) | `composer update <vendor/name...> --no-install --no-scripts --no-plugins --no-interaction` with `COMPOSER=composer.json` | same as Poetry |
 | Dart / Flutter (`pubspec.lock`) | `dart pub get --no-example` (manifest edits), then `dart pub upgrade --no-example <names>` (lock-file-only fixes); `flutter pub` instead when a dependency comes from the Flutter SDK | same as Poetry |
@@ -533,8 +534,17 @@ the fresh lockfile against every applied version:
 | SwiftPM (`Package.resolved`) | `swift package resolve` (manifest edits), then `swift package update <identity>` (lock-file-only fixes) | same as Poetry |
 
 For PyPI, Bundler, Deno, Composer, Dart and Swift the lock file must sit beside the manifest, and for
-PyPI the lock file (`uv.lock`, `poetry.lock` or `pdm.lock`) must sit beside a `pyproject.toml`;
-`Pipfile.lock` reports `unsupported` (`python-locker-deferred`). `--no-build` means a dependency that
+PyPI the lock file (`uv.lock`, `poetry.lock` or `pdm.lock`) must sit beside a `pyproject.toml`, and
+`Pipfile.lock` beside a `Pipfile`. Pipenv re-resolves only the named packages and never modifies the
+`Pipfile` (a `Pipfile` the tool does rewrite ends the run as `manifest-changed` and is restored). It
+cannot be asked for an exact version, so it locks the newest release the `Pipfile` admits, and the
+pin is checked as "at least the target and satisfying the `Pipfile` requirement"; a cooldown-fallback
+target is refused (`cooldown-fallback-target`). deps-cli sets `PIPENV_VENV_IN_PROJECT=0`, `PIPENV_DONT_USE_PYENV=1` and
+`PIPENV_DONT_USE_ASDF=1`, and refuses a `.venv` file or symlink beside the `Pipfile`
+(`unsupported` with the reason `saved-virtualenv`); the repository's `.env` is not loaded
+(`PIPENV_DONT_LOAD_ENV=1`). Pipenv still runs repository-controlled interpreters, which the trust
+model below covers. An old Pipenv that rejects
+`--lock-only` ends as `tool-failed` with the lock file restored. `--no-build` means a dependency that
 exists only as a source distribution fails a uv run (the lock file is restored, see below). Poetry and
 PDM may build source distributions to read their metadata, and Poetry can prompt for a keyring in a
 headless session. Poetry 1.x runs `lock --no-update`. The version is probed with
@@ -558,17 +568,26 @@ they are tracked. Dart and Flutter are chosen by the dependencies' SDK source, n
 A cooldown-fallback version is pinned exactly in the manifest for the run: uv, npm, pnpm, Bun and
 Bundler accept it (npm, pnpm, Bun and Bundler write the exact pin, run the tool, restore the
 declaration and re-run it so the lock file keeps the pinned resolution, then check the result).
-Yarn Berry and Deno report `unsupported` with the reason `cooldown-fallback-target` because relaxing
-the pin makes them re-resolve to the newest release; Poetry, PDM, Composer, Dart, Swift, NuGet and
-Gradle refuse it too.
+Yarn Berry and Deno accept it too, but restoring the declaration would make them re-resolve to the
+newest release, so after the first install they rename the lock key back to the declared range
+(Yarn: only the column-0 header descriptor; Deno: the `npm:` or `jsr:` key and the `workspace.dependencies` value) and install again, so
+the lock keeps the pinned version. This needs a plain version range as the declaration: a protocol,
+alias or comparator set still reports `unsupported` with `cooldown-fallback-target`, a lock that
+cannot be re-keyed fails as `fallback-pin-not-kept`, and the lock file is restored. Poetry, PDM,
+Composer, Dart, Swift, NuGet, Gradle and Pipenv refuse a fallback target.
 
 **Refusals by ecosystem.**
-- **Bun:** only manifest edits run, and only for a standalone project; a lock-file-only pin reports
-  `unsupported` with the reason `lockfile-only-update-unsupported`, since `bun update --lockfile-only`
-  rewrites `package.json`. A Bun workspace member reports `workspace-member-lockfile`.
-- **NuGet:** a lock-file-only pin reports `lockfile-only-update-unsupported` before any tool runs
-  (NuGet resolves the lowest applicable version, and only `--force-evaluate` would move it, which
-  bypasses the cooldown); a project using `Directory.Packages.props` reports
+- **Bun:** only a standalone project runs. A lock-file-only pin runs `bun update --lockfile-only`,
+  which rewrites the declared range in `package.json`, so `package.json` is written back and
+  `bun install --lockfile-only` runs again, leaving the declaration untouched and the lock moved. A
+  Bun older than the one that accepts `--lockfile-only` for `update` ends as `tool-failed`, restored.
+  A Bun workspace member reports `workspace-member-lockfile`.
+- **NuGet:** a plan with manifest edits regenerates for the edit pins only; its lock-file-only pins
+  are left untouched and stay `requires-lockfile-update`. A plan of lock-file-only pins alone reports
+  `lockfile-only-update-unsupported` before any tool runs (NuGet resolves the lowest applicable
+  version, and only `--force-evaluate` would move it, which bypasses the cooldown); a floating
+  requirement of a package that is not edited, a lock-file-only one included, refuses the run as
+  `other-floating-requirements`. A project using `Directory.Packages.props` reports
   `central-package-versions`; `packages.config` has no regeneration (`no-lockfile-present`). A
   manifest edit makes `dotnet restore` re-resolve every floating dependency of the project. That
   bypasses the release-age window, so a project with any other `*` requirement or bounded range is
@@ -595,7 +614,6 @@ Gradle refuse it too.
   `gradle.lockfile` for a locked project that had none. Such files are outside the snapshot and are
   not removed on failure.
 - **Yarn Classic:** always `unsupported` (`yarn-classic`).
-- **Pipenv:** `unsupported` (`python-locker-deferred`).
 - **Any ecosystem:** a lock file that is a symlink reports `lockfile-symlink`, and one whose real path
   is outside the repository root reports `lockfile-outside-repository`.
 
@@ -651,8 +669,8 @@ killed with SIGKILL between the two renames can leave a `.deps-cli-vendor-*` dir
 The JSON report always has a `lockfile` object tagged by `status` (`regenerated`, `skipped`,
 `not-applicable`, `unsupported`, `failed`). A failed regeneration prints the full report and
 exits `2`; the manifest edit stays on disk, and the lock files the run touched are restored (see
-below). Nothing runs under `--dry-run` or `--offline`. Maven (which has no lock file format), Yarn Classic
-and Pipenv report `unsupported`, as do a symlinked lockfile, a lockfile outside the repository, a
+below). Nothing runs under `--dry-run` or `--offline`. Maven (which has no lock file format) and Yarn Classic
+report `unsupported`, as do a symlinked lockfile, a lockfile outside the repository, a
 lockfile in an ancestor directory for PyPI, Bundler and Deno (workspace members; for Deno also any
 ancestor `deno.jsonc`, a `deno.json` with `workspace`, or a `package.json` with `workspaces`), and the
 refusals listed above. A binary `bun.lockb` is not recognized as a lockfile, so a Bun project
@@ -674,7 +692,14 @@ The newer tools run repository code too: Gradle executes the build's settings an
 `Package.swift` of the project and its dependencies (not sandboxed on Linux), PDM may load plugins
 (its hooks and a saved interpreter are disabled, see above), and Composer can fetch from the `vcs`
 repositories the manifest declares (its scripts and plugins are disabled). Poetry runs with plugins
-disabled.
+disabled. Pipenv resolution may build source distributions (running the `setup.py` or build backend of
+dependencies) and has no option to disable that.
+
+**Failure kinds.** A failed regeneration carries a typed kind. File operations of the run (rewriting a lock
+file, moving a vendor directory, creating a scratch directory) fail as `io` with the
+operation and path instead of `manifest-changed` or `spawn`; an unreadable lock file still reports `lockfile-unreadable`. A failed manifest write-back restores
+the lock snapshot as well. `fallback-pin-not-kept` means a cooldown-fallback pin could not be kept in
+the lock (Yarn Berry or Deno re-key refused or failed), and the lock file is restored.
 
 **Known limits.** `go get` may raise indirect requirements and the `go` directive in `go.mod`, and
 download a newer toolchain to satisfy it. Deno always reads and writes `./deno.lock` beside the
@@ -763,8 +788,8 @@ deps-cli update --lockfile regenerate --open-pr gitlab --config deps.toml --grou
 pushes it to `origin` and opens a pull request with `gh` (GitHub) or a merge request with `glab`
 (GitLab). It requires `--lockfile regenerate`, conflicts with `--dry-run` and `--offline`, and
 supports the ecosystems whose lock file regeneration is implemented (Cargo, npm, pnpm, Yarn Berry,
-Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle, SwiftPM) plus those without a lock file
-format (GitHub Actions, GitLab CI/CD, pre-commit, Maven). For Pipenv and Yarn Classic the analysis and
+Bun, Go, PyPI, Pipenv, Bundler, Deno, Composer, Dart, NuGet, Gradle, SwiftPM) plus those without a lock file
+format (GitHub Actions, GitLab CI/CD, pre-commit, Maven). For Yarn Classic the analysis and
 the manifest edit run first; the lock file regeneration is then refused (`unsupported`), the manifest
 edit is restored from `HEAD`, the report is printed as a dry run and the run exits `2`. A workspace member whose lock file lies in the workspace root is allowed; a lock file outside
 the repository root is refused (`lockfile-outside-repository`). A Go module with a `vendor` directory

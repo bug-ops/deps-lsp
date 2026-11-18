@@ -384,13 +384,14 @@ pub enum UnfixableReason {
     },
     /// The declared requirement has a shape the formatter has no single unambiguous rewrite
     /// for (e.g. a compound comma-separated Cargo requirement, #1566) *and* a requirement
-    /// matcher exists that has already confirmed the declared requirement does not admit the
-    /// fix target — distinct from [`Outcome::RequiresLockfileUpdate`], which means the
-    /// requirement already admits the fix and nothing needs rewriting at all. Conflating the
-    /// two would tell the operator to regenerate the lock file for a dependency that is still
-    /// vulnerable (#1566 S1).
+    /// matcher gave a decisive verdict while the ecosystem does not resolve to the fix: the
+    /// requirement excludes the fix target, or admits it but restore resolves below it (a
+    /// NuGet bounded range resolves to its lower bound, #2101). Distinct from
+    /// [`Outcome::RequiresLockfileUpdate`], which means the requirement already resolves to
+    /// the fix and nothing needs rewriting at all. Conflating the two would tell the operator
+    /// to regenerate the lock file for a dependency that is still vulnerable (#1566 S1).
     UnsupportedRequirementShape {
-        /// The confirmed-excluded fix target.
+        /// The fix target the declared requirement does not resolve to.
         target: ConcreteVersion,
     },
     /// The declared requirement's raw text exceeds `deps_core::lsp_helpers::MAX_REQUIREMENT_LEN`
@@ -648,7 +649,7 @@ impl PlannedUpdateItem {
             }
             Outcome::Unfixable(UnfixableReason::Yanked { .. }) => "the fix target is yanked",
             Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. }) => {
-                "the declared requirement's syntax has no safe single-value rewrite and does not already admit the fix target — manual edit required"
+                "the declared requirement's syntax has no safe single-value rewrite and does not already resolve to the fix target — manual edit required"
             }
             Outcome::Unfixable(UnfixableReason::OversizedRequirement { .. }) => {
                 "the declared requirement is too large to safely evaluate; treating as unfixable — manual edit required"

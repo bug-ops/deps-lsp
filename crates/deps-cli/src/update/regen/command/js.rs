@@ -139,6 +139,17 @@ impl Invocation {
         )
     }
 
+    /// `bun update --lockfile-only --ignore-scripts <names>`: moves the named packages in
+    /// `bun.lock`, and rewrites their declared range in `package.json` as a side effect.
+    pub(in crate::update::regen) fn bun_update_lockfile_only(
+        cwd: &Path,
+        names: &[NpmPackageArg],
+    ) -> Self {
+        let mut args = Self::strs(&["update", "--lockfile-only", "--ignore-scripts"]);
+        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
+        Self::new(Program::Bun, cwd, args)
+    }
+
     /// `yarn install --mode=update-lockfile` (Yarn 2+): resolves without linking or scripts.
     pub(in crate::update::regen) fn yarn_lock(cwd: &Path) -> Self {
         let mut invocation = Self::new(

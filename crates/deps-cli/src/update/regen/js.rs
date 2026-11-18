@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeOwned, Deserializer, IgnoredAny, MapAccess, Visitor};
 
 use super::command::WorkspaceMember;
-use super::fallback::ExactPinRun;
+use super::fallback::{DescriptorLock, ExactPinRun, Relax};
 use super::run::Probed;
 use super::{
     Invocation, LockfileOutcome, NotApplicableReason, NpmClient, NpmPackageArg, PinCheck, Program,
@@ -195,6 +195,8 @@ impl Session<'_> {
                     manifest: self.target.manifest_path,
                     install: &install,
                     update: update.as_ref(),
+                    relax: Relax::Reinstall,
+                    siblings: &[],
                 })
                 .await;
         }
@@ -338,11 +340,6 @@ impl Session<'_> {
             }
             Layout::Refused(reason) => return Ok(unsupported(Some(display), reason)),
         };
-        // Yarn keys the lock file by descriptor, so relaxing an exact fallback pin back to the
-        // declared range would re-resolve to the withheld release.
-        if let Some(outcome) = self.cooldown_refusal(located) {
-            return Ok(outcome);
-        }
         if let Some(outcome) = self.placement_refusal(located) {
             return Ok(outcome);
         }
@@ -378,6 +375,21 @@ impl Session<'_> {
             .iter()
             .map(|path| self.read_manifest(path))
             .collect::<Result<Vec<_>, _>>()?;
+        if self.has_fallback_pins() {
+            let names = self.update_only_args(NpmPackageArg::parse)?;
+            let update = (!names.is_empty()).then(|| Invocation::yarn_update(&root, &names));
+            return self
+                .run_with_exact_pins(ExactPinRun {
+                    tool: Program::Yarn,
+                    lockfile: located,
+                    manifest: self.target.manifest_path,
+                    install: &install,
+                    update: update.as_ref(),
+                    relax: Relax::Rekey(DescriptorLock::YarnBerry),
+                    siblings: captured.get(1..).unwrap_or_default(),
+                })
+                .await;
+        }
         if self.pins.iter().any(|pin| !pin.is_lockfile_only()) {
             self.runner.run(&install, self.deadline).await?;
         }
@@ -475,8 +487,9 @@ impl Session<'_> {
         Ok(Siblings::Found(manifests))
     }
 
-    /// Bun beside its manifest. Bun has no lockfile-only update that leaves `package.json`
-    /// alone (`bun update` rewrites the declared range), so a lockfile-only pin is refused.
+    /// Bun beside its manifest. `bun update --lockfile-only` rewrites the declared range in
+    /// `package.json`, so a run with lockfile-only or fallback pins writes the captured manifest
+    /// back and installs again, which keeps the locked version under the original range.
     async fn bun(&self, located: &Path) -> Result<LockfileOutcome, RegenerationError> {
         let display = self.display_lock_path(located);
         match self.placement(located, NpmClient::Bun) {
@@ -492,21 +505,20 @@ impl Session<'_> {
         if let Some(outcome) = self.placement_refusal(located) {
             return Ok(outcome);
         }
-        if self.pins.iter().any(|pin| pin.is_lockfile_only()) {
-            return Ok(unsupported(
-                Some(display),
-                UnsupportedReason::LockfileOnlyUpdateUnsupported(Program::Bun),
-            ));
-        }
         let install = Invocation::bun_lock(self.manifest_dir);
-        if self.has_fallback_pins() {
+        if self.has_fallback_pins() || self.pins.iter().any(|pin| pin.is_lockfile_only()) {
+            let names = self.update_only_args(NpmPackageArg::parse)?;
+            let update = (!names.is_empty())
+                .then(|| Invocation::bun_update_lockfile_only(self.manifest_dir, &names));
             return self
                 .run_with_exact_pins(ExactPinRun {
                     tool: Program::Bun,
                     lockfile: located,
                     manifest: self.target.manifest_path,
                     install: &install,
-                    update: None,
+                    update: update.as_ref(),
+                    relax: Relax::Reinstall,
+                    siblings: &[],
                 })
                 .await;
         }

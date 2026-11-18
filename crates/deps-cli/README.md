@@ -256,17 +256,17 @@ github|gitlab`, `--close-superseded` (needs `--open-pr`) and `--group <NAME>`.
   against OSV, and classifies every vulnerable dependency as `applied`,
   `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule. When the
   declared requirement already admits the fix, `--lockfile regenerate` moves only the lock file
-  (Cargo, npm, pnpm, Yarn Berry, Bun, Go, PyPI, Bundler, Deno, Composer, Dart, NuGet, Gradle, SwiftPM): the item becomes `applied` (exit `0`) once the lock file holds the fix
+  (Cargo, npm, pnpm, Yarn Berry, Bun, Go, PyPI, Pipenv, Bundler, Deno, Composer, Dart, Gradle, SwiftPM; NuGet only for pins whose manifest is edited): the item becomes `applied` (exit `0`) once the lock file holds the fix
   or, for npm and pnpm, a newer in-range version that every advisory affecting the locked
   version places outside its affected ranges; otherwise it stays `requires-lockfile-update`.
 - **`[update].ignore`** (`{ name = "tokio", update_types = ["major"] }`) is honored only from
   an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
 - **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm`, `yarn` (Berry), `bun`, `go`, `uv`,
-  `poetry`, `pdm`, `bundle`, `deno`, `composer`, `dart`/`flutter`, `dotnet`, `gradle` or `swift`
+  `poetry`, `pdm`, `pipenv`, `bundle`, `deno`, `composer`, `dart`/`flutter`, `dotnet`, `gradle` or `swift`
   in the manifest's directory after the write and verifies that the lockfile holds every
   applied version; the JSON report always carries a `lockfile` object. It does nothing under
   `--dry-run` or `--offline`, never creates a lockfile, and reports `unsupported` for Yarn Classic,
-  Pipenv, Maven, lock-file-only pins for Bun and NuGet, and the other refusals listed in the mdBook.
+  Maven, NuGet plans of lock-file-only pins, and the other refusals listed in the mdBook.
   npm, pnpm and Yarn Berry workspace members are regenerated. Run it only on repositories you trust: the tool executes repository files such as
   `.pnpmfile.cjs`, a `Gemfile` or `.cargo/config.toml`, with your full environment. On unix a
   timeout, SIGINT or SIGTERM sends SIGTERM to the tool's process group, waits 2 seconds, then

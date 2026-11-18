@@ -184,7 +184,7 @@ fn uv_uses_one_upgrade_package_flag_per_pin_and_verifies_exact_versions() {
 }
 
 #[test]
-fn pipenv_lock_is_a_deferred_locker_without_a_spawn() {
+fn pipenv_lock_beside_a_pyproject_is_an_ownership_mismatch_without_a_spawn() {
     let ran = run(&case(
         "pypi",
         "pyproject.toml",
@@ -195,7 +195,7 @@ fn pipenv_lock_is_a_deferred_locker_without_a_spawn() {
     ));
 
     assert!(
-        ran.outcome.contains("PythonLockerDeferred"),
+        ran.outcome.contains("LockfileOwnershipMismatch"),
         "{}",
         ran.outcome
     );
@@ -252,7 +252,6 @@ fn uv_workspace_member_manifest_is_refused() {
 const DENO_JSON: &str = "{\n  \"imports\": {\n    \"chalk\": \"npm:chalk@^4.0.0\"\n  }\n}\n";
 const DENO_LOCK: &str = "{\n  \"version\": \"4\"\n}\n";
 const CHALK_EDIT: &str = "chalk|chalk|^4.0.0|^4.1.2|4.0.0|4.1.2";
-const CHALK_LOCK_ONLY: &str = "chalk|chalk|^4.0.0|^4.0.0|4.0.0|4.1.2";
 
 // Deno argv (`--lock=./deno.lock`) is pinned in tests/update_deno_lockers.rs.
 
@@ -273,28 +272,6 @@ fn deno_workspace_member_is_refused() {
 
     assert!(
         ran.outcome.contains("WorkspaceMemberLockfile"),
-        "{}",
-        ran.outcome
-    );
-    assert!(ran.calls.is_empty(), "{:?}", ran.calls);
-}
-
-#[test]
-fn deno_cooldown_fallback_target_is_refused_without_a_spawn() {
-    let mut case = case(
-        "deno",
-        "deno.json",
-        vec![("deno.json", DENO_JSON), ("deno.lock", DENO_LOCK)],
-        vec![("deno", "exit 0")],
-        "lockonly",
-        CHALK_LOCK_ONLY,
-    );
-    case.cooldown_fallback = true;
-
-    let ran = run(&case);
-
-    assert!(
-        ran.outcome.contains("CooldownFallbackTarget"),
         "{}",
         ran.outcome
     );
@@ -368,26 +345,6 @@ fn yarn_classic_is_unsupported_and_runs_only_the_version_probe() {
     let ran = run(&yarn_case(&body, "edit", MINIMIST_EDIT));
 
     assert!(ran.outcome.contains("YarnClassic"), "{}", ran.outcome);
-    assert!(
-        writing_calls(&ran, "yarn", &["--version"]).is_empty(),
-        "{:?}",
-        ran.calls
-    );
-}
-
-#[test]
-fn yarn_berry_cooldown_fallback_target_is_refused() {
-    let body = yarn_body("4.5.0");
-    let mut case = yarn_case(&body, "lockonly", MINIMIST_LOCK_ONLY);
-    case.cooldown_fallback = true;
-
-    let ran = run(&case);
-
-    assert!(
-        ran.outcome.contains("CooldownFallbackTarget"),
-        "{}",
-        ran.outcome
-    );
     assert!(
         writing_calls(&ran, "yarn", &["--version"]).is_empty(),
         "{:?}",

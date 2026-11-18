@@ -27,6 +27,7 @@ When several lock files sit in one directory the first of `poetry.lock`, `uv.loc
 - `pdm.lock` needs `[metadata] lock_version` 4.x; all groups are read.
 - `Pipfile.lock` needs `_meta.pipfile-spec` 6; `default` and `develop` are read, and only exact `==` pins count (git, path, editable and range entries show no in-use version).
 - A `Pipfile` manifest is paired only with `Pipfile.lock` in its own directory or an ancestor; a `poetry.lock`, `uv.lock` or `pdm.lock` next to it is never consulted.
+- `deps-cli update --lockfile regenerate` re-locks `Pipfile.lock` with `pipenv upgrade --lock-only <names>`; the `Pipfile` is never edited (see the CLI chapter).
 
 ### Pipfile
 

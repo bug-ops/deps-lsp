@@ -436,7 +436,6 @@ async fn test_gitlab_closes_a_covered_merge_request_with_a_note() {
         )
         .reply("mr view 7 ", gitlab_mr(7, "octo", 1, 1, &old_body))
         .reply("api ", json!([{"id": "a"}]))
-        .reply("mr note 7 ", "")
         .reply("mr close 7", "")
         .install();
 
@@ -445,7 +444,10 @@ async fn test_gitlab_closes_a_covered_merge_request_with_a_note() {
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(report.closed.len(), 1);
     let log = calls(&fx, "glab");
-    assert!(log.contains(&format!("mr note 7 --message=Superseded by {NEW_URL}.")));
+    let note = format!(
+        "api --method POST projects/:id/merge_requests/7/notes -f body=Superseded by {NEW_URL}."
+    );
+    assert!(log.contains(&note), "{log:?}");
     assert!(log.contains(&"mr close 7".to_owned()));
     let position = |prefix: &str| {
         log.iter()
@@ -453,7 +455,7 @@ async fn test_gitlab_closes_a_covered_merge_request_with_a_note() {
             .expect(prefix)
     };
     assert!(
-        position("mr close 7") < position("mr note 7"),
+        position("mr close 7") < position("api --method POST"),
         "close before the note"
     );
     assert!(
