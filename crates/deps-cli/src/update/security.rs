@@ -208,7 +208,7 @@ pub async fn plan_security_updates(
                 )
             });
 
-            items.push(classify_vulnerable_dependency(
+            let mut item = classify_vulnerable_dependency(
                 bound,
                 dv,
                 latest,
@@ -216,10 +216,38 @@ pub async fn plan_security_updates(
                 analysis,
                 current,
                 ignore_rules,
-            ));
+            );
+            if matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. }) {
+                item.lockfile_fix.affected = targets
+                    .iter()
+                    .find(|target| target.key.is_for_name(key.normalized()))
+                    .and_then(|target| {
+                        affected_ranges(dv, target.osv_name.name(), ecosystem_id.osv_ecosystem()?)
+                    })
+                    .unwrap_or_default();
+            }
+            items.push(item);
         });
 
     UpdatePlan { items }
+}
+
+/// The affected ranges of every advisory in `dv`, for settling a lock-file-only fix.
+///
+/// `None` when the advisory list is truncated: a version cleared against part of the list proves
+/// nothing, so the caller then captures no ranges and the fix is never cleared.
+fn affected_ranges(
+    dv: &deps_core::osv::DependencyVulnerabilities,
+    package: &deps_core::osv::OsvPackageName,
+    eco: deps_core::osv::OsvEcosystem,
+) -> Option<Vec<deps_core::osv::AffectedRanges>> {
+    dv.advisories.is_complete().then(|| {
+        dv.advisories
+            .items()
+            .iter()
+            .map(|advisory| advisory.affected_ranges_for(package, eco))
+            .collect()
+    })
 }
 
 /// Classifies one already-confirmed-`Vulnerable`, already-requested dependency into its
@@ -2322,5 +2350,31 @@ mod tests {
             "expected the matcher to run at the exact cap and confirm exclusion, got {:?}",
             item.outcome
         );
+    }
+
+    #[test]
+    fn test_affected_ranges_captures_every_advisory_only_for_a_complete_list() {
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid id"),
+        );
+        let package = deps_core::osv::OsvPackageName::new("lodash").expect("name");
+        let eco = deps_core::osv::OsvEcosystem::Npm;
+        let dv_of = |total| {
+            deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+                vec![std::sync::Arc::clone(&advisory)],
+                total,
+            ))
+        };
+
+        assert_eq!(
+            affected_ranges(&dv_of(1), &package, eco).map(|r| r.len()),
+            Some(1)
+        );
+        assert_eq!(affected_ranges(&dv_of(2), &package, eco), None);
     }
 }

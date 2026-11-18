@@ -790,8 +790,7 @@ async fn run_update(
         display_path: &manifest.display_path,
         uri: &analysis.uri,
     };
-    let lockfile = deps_cli::update::regen::regenerate_lockfile(&plan, &target, gate).await;
-    Ok(deps_cli::update::UpdateRun { plan, lockfile })
+    Ok(deps_cli::update::regen::regenerate_lockfile(plan, &target, gate).await)
 }
 
 #[cfg(test)]

@@ -15,46 +15,21 @@ use deps_cli::analyze::{AnalysisScope, analyze_manifest};
 use deps_cli::exit::update_exit_code;
 use deps_cli::report::{CheckContext, check_manifest};
 use deps_cli::update::ignore::IgnoreRules;
+use deps_cli::update::security::plan_security_updates;
 use deps_cli::update::{Outcome, SkipReason, UpdatePlan, plan_updates};
 use deps_core::lsp_helpers::exemption::OperatorExemptions;
 use deps_core::net_policy::{MapEnv, PRIVATE_REGISTRY_HOSTS_ENV, RegistryEnvironment};
 use deps_core::osv::OsvClient;
-use deps_core::policy_config::{PolicyConfig, RegistriesConfig, WorkspaceRegistriesSetting};
+use deps_core::policy_config::{
+    FetchTimeout, PolicyConfig, RegistriesConfig, WorkspaceRegistriesSetting,
+};
 use deps_core::{Ecosystem, EcosystemId, EcosystemRegistry, HttpCache};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
+use native_advisory::{ADVISORY, AdvisoryFixture, DAY, now_secs, osv_with_advisory, rfc3339};
 
-const DAY: i64 = 86_400;
+mod native_advisory;
+
 const NOTE: &str = "excluded by uv exclude-newer = 7 days";
-
-fn now_secs() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_secs(),
-    )
-    .expect("fits")
-}
-
-fn rfc3339(epoch: i64) -> String {
-    let days = epoch.div_euclid(DAY);
-    let rem = epoch.rem_euclid(DAY);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
-}
 
 struct Fixture {
     _index: mockito::ServerGuard,
@@ -250,4 +225,137 @@ async fn without_uv_config_the_latest_is_applied_and_check_has_no_note() {
             .iter()
             .all(|m| !m.contains("excluded by"))
     );
+}
+
+// ---- advisories: the index is the public tier, so OSV is asked ------------------------------
+
+async fn public_fixture(tool_uv: &str) -> Fixture {
+    let mut index = mockito::Server::new_async().await;
+    let body = format!(
+        r#"{{"meta":{{"api-version":"1.4"}},"name":"requests","versions":["2.31.0","2.32.0"],"files":[
+        {{"filename":"requests-2.31.0.tar.gz","yanked":false,"upload-time":"{}"}},
+        {{"filename":"requests-2.32.0.tar.gz","yanked":false,"upload-time":"{}"}}]}}"#,
+        rfc3339(now_secs() - 100 * DAY),
+        rfc3339(now_secs() - 3 * DAY),
+    );
+    let index_mock = index
+        .mock("GET", "/simple/requests/")
+        .with_status(200)
+        .with_header("content-type", "application/vnd.pypi.simple.v1+json")
+        .with_body(body)
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    let (osv, mut mocks) = osv_with_advisory(&AdvisoryFixture {
+        ecosystem: "PyPI",
+        package: "requests",
+        range_type: "ECOSYSTEM",
+        vulnerable: "2.31.0",
+        fixed: "2.32.0",
+    })
+    .await;
+    mocks.push(index_mock);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical");
+    let content = format!(
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"requests==2.31.0\"]\n\n[tool.uv]\n{tool_uv}\n"
+    );
+    let manifest = root.join("pyproject.toml");
+    std::fs::write(&manifest, &content).expect("manifest");
+    std::fs::write(
+        root.join("uv.lock"),
+        "version = 1\n\n[[package]]\nname = \"requests\"\nversion = \"2.31.0\"\nsource = { registry = \"https://pypi.org/simple\" }\n",
+    )
+    .expect("lock");
+
+    let policy = PolicyConfig::default();
+    let base = url::Url::parse(&format!("{}/simple", index.url())).expect("mock url");
+    let runtime =
+        EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&MapEnv::new()))
+            .with_pypi_public_base_for_test(base);
+    let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+    let registry = EcosystemRegistry::new();
+    let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+    let ecosystem = registry.get(EcosystemId::Pypi).expect("pypi registered");
+    let ctx = CheckContext {
+        cache: Arc::clone(&cache),
+        osv: Arc::new(OsvClient::for_test(Arc::clone(&cache), osv.url())),
+        deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+        lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        advisory_exemptions: Arc::new(OperatorExemptions::none()),
+        policy,
+    };
+    Fixture {
+        _index: index,
+        _osv: osv,
+        _mocks: mocks,
+        _dir: dir,
+        manifest,
+        content,
+        ctx,
+        ecosystem,
+    }
+}
+
+impl Fixture {
+    async fn security_plan(&self) -> UpdatePlan {
+        let analysis = analyze_manifest(
+            &self.ecosystem,
+            &self.manifest,
+            &self.content,
+            &self.ctx,
+            AnalysisScope::vulnerabilities_only(),
+        )
+        .await
+        .expect("analyze_manifest");
+        plan_security_updates(
+            &analysis,
+            self.ecosystem.as_ref(),
+            &self.ctx.osv,
+            &[],
+            &IgnoreRules::empty(),
+            FetchTimeout::try_from_secs(30).expect("timeout"),
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn security_fix_inside_the_window_is_applied_and_annotated() {
+    let held = public_fixture("exclude-newer = \"7 days\"").await;
+    let plain = public_fixture("# nothing configured").await;
+    let (h, p) = (held.security_plan().await, plain.security_plan().await);
+    assert_eq!(applied(&p), ["2.32.0"], "control: {:#?}", p.items);
+    assert_eq!(applied(&h), ["2.32.0"], "{:#?}", h.items);
+    assert!(
+        h.items[0]
+            .reason()
+            .contains("inside uv exclude-newer = 7 days"),
+        "{}",
+        h.items[0].reason()
+    );
+    assert!(
+        !p.items[0].reason().contains("inside"),
+        "{}",
+        p.items[0].reason()
+    );
+}
+
+#[tokio::test]
+async fn check_reports_the_advisory_identically_with_and_without_a_window() {
+    let held = public_fixture("exclude-newer = \"7 days\"").await;
+    let none = public_fixture("# nothing configured").await;
+    let pick = |messages: Vec<String>| {
+        messages
+            .into_iter()
+            .filter(|message| message.contains(ADVISORY))
+            .collect::<Vec<_>>()
+    };
+    let (h, n) = (
+        pick(held.check_messages().await),
+        pick(none.check_messages().await),
+    );
+    assert!(!n.is_empty(), "control: the advisory is reported");
+    assert_eq!(h, n);
 }

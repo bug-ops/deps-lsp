@@ -197,6 +197,11 @@ exclude-newer-package = { requests = "2026-01-01T00:00:00Z", urllib3 = false }
   wins and `[tool.uv]` is ignored. Nothing is merged with a farther directory. Inside the file a
   package entry in `exclude-newer-package` (names compared PEP 503-normalized) beats the global
   `exclude-newer`. An invalid value counts as absent.
+- **Index-level windows:** `exclude-newer` under `[[tool.uv.index]]` (or `[[index]]` in
+  `uv.toml`) applies to dependencies pinned to that index through `[tool.uv.sources]`, and to
+  unpinned ones when the file's only non-explicit index is `default = true`; `false` turns it off.
+  Precedence: package entry, then index, then global. An index-level `exclude-newer-package` is not
+  read.
 - **Workspaces:** a project that is a member of a workspace declared by a parent
   `pyproject.toml` (`[tool.uv.workspace]` `members` globs matched, `exclude` globs not) reads that
   root's file, and its own `[tool.uv]` is ignored, as in uv. A project outside the members keeps
@@ -204,8 +209,7 @@ exclude-newer-package = { requests = "2026-01-01T00:00:00Z", urllib3 = false }
 - **Scope and limits:** the search walks up from the manifest directory (depth-capped) and stops
   at your home directory, so your home directory's config and anything above it, and `UV_*`
   environment variables, are **ignored**. Only `pyproject.toml` documents get a window; `requirements.txt`, `Pipfile` and
-  direct-URL, git or path dependencies do not. Index-level `exclude-newer` under
-  `[[tool.uv.index]]` is not read. The hold is judged per version against its latest file upload
+  direct-URL, git or path dependencies do not. The hold is judged per version against its latest file upload
   time, so deps-lsp may report a hold that uv does not apply to a given file.
 - Set `freshness.honor_native_cooldown` to `false` to ignore the window entirely.
 

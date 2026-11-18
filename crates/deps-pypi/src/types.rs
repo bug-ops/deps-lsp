@@ -65,6 +65,9 @@ pub struct PypiDependency {
     /// `exclude-newer`/`exclude-newer-package`; `None` when no window applies or reading it is
     /// turned off.
     pub(crate) native_cooldown: Option<deps_core::native_cooldown::NativeCooldown>,
+    /// The uv index this dependency is pinned to by `[tool.uv.sources]`, by PEP 503-normalized
+    /// name; selects an index-level `exclude-newer`. `None` when it is not pinned.
+    pub(crate) uv_index: Option<deps_core::native_cooldown::UvIndexLabel>,
 }
 
 /// How a PyPI index declaration routes a dependency away from the public index.
@@ -476,6 +479,7 @@ impl deps_core::lsp_helpers::ProbeDependency for PypiDependency {
             source,
             index_route: None,
             native_cooldown: None,
+            uv_index: None,
         }
     }
 
@@ -485,6 +489,7 @@ impl deps_core::lsp_helpers::ProbeDependency for PypiDependency {
             .map(|route| Self {
                 index_route: Some(route),
                 native_cooldown: None,
+                uv_index: None,
                 ..Self::probe(name.clone(), deps_core::parser::DependencySource::Registry)
             })
             .collect()
@@ -514,6 +519,7 @@ mod tests {
             source: PypiDependencySource::Registry,
             index_route: None,
             native_cooldown: None,
+            uv_index: None,
         };
 
         assert_eq!(

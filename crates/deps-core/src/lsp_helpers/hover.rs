@@ -1055,7 +1055,7 @@ fn push_native_hold_hover_section(
     hold: Option<HeldLatest<'_>>,
     latest_verdict: &LatestVerdict,
 ) {
-    use crate::native_cooldown::NativeCooldownSource;
+    use crate::native_cooldown::{GateOrigin, NativeCooldownSource};
     let Some(hold) = hold else {
         return;
     };
@@ -1096,8 +1096,28 @@ fn push_native_hold_hover_section(
             markdown.push_text(package.as_str(), FieldKind::Name);
             markdown.push_static(" = ");
         }
+        NativeCooldownSource::YarnNpmMinimalAgeGate => {
+            markdown.push_static("yarn npmMinimalAgeGate = ");
+        }
+        NativeCooldownSource::YarnScopeNpmMinimalAgeGate { scope, .. } => {
+            markdown.push_static("yarn npmScopes.");
+            markdown.push_text(scope.as_str(), FieldKind::Name);
+            markdown.push_static(".npmMinimalAgeGate = ");
+        }
+        NativeCooldownSource::UvIndexExcludeNewer { index } => {
+            markdown.push_static("uv index.");
+            markdown.push_text(index.as_str(), FieldKind::Name);
+            markdown.push_static(".exclude-newer = ");
+        }
     }
     markdown.push_text(&hold.cooldown.limit().to_string(), FieldKind::Prose);
+    if let NativeCooldownSource::YarnScopeNpmMinimalAgeGate {
+        origin: GateOrigin::ManagerDefault,
+        ..
+    } = hold.cooldown.source()
+    {
+        markdown.push_static(" (Yarn default)");
+    }
     markdown.push_static("; ");
     markdown.push_text(&hold.hold.eligibility_clause(), FieldKind::Prose);
     markdown.push_static(".\n\n");

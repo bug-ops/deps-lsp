@@ -284,7 +284,7 @@ Resolved open questions and the shape that shipped:
 - **Open pnpm workspace file:** its catalog entries are gated from the buffer, never from disk; `catalog:` dependencies are gated by real name; `overrides` entries are not gated.
 - **Cutoff semantics:** a `before` cutoff holds every release published after it, indefinitely (`NativeHold::Indefinite`).
 - **Refetch:** publish times are fetched on native demand (`PublishTimeDemand::NativeWindow`); a document whose demand rises (window added through a watched file, an edited buffer, or the opt-out turned off) is refetched in full.
-- **Not implemented (F-Y1):** Yarn `npmMinimalAgeGate` (`.yarnrc.yml`) is not honored.
+- **Yarn:** implemented in Phase 4 (#2051); see below.
 
 ### Phase 3 resolution (uv, #2042)
 
@@ -292,9 +292,19 @@ Resolved open questions and the shape that shipped:
 - **Item 6 (absolute timestamp):** a cutoff holds every release uploaded after it indefinitely (`NativeHold::Indefinite`), unlike a rolling span.
 - **Precedence:** only the nearest directory holding `uv.toml` or a `pyproject.toml` with `[tool.uv]` is read; `uv.toml` wins over `[tool.uv]` there; nothing is merged with a farther directory; within that file `exclude-newer-package` beats `exclude-newer`; an invalid value counts as absent.
 - **Workspaces:** the nearest ancestor with `[tool.uv.workspace]` whose `members` globs match the project and whose `exclude` globs do not is the root, and a member reads only the root (its own `[tool.uv]` is ignored); otherwise the project's own nearest file applies. Home and `UV_*` variables are never read.
-- **Scope:** `pyproject.toml` documents only; `requirements.txt`, Pipfile, direct URL, git and path dependencies get no window. Index-level `exclude-newer` is not read (F2).
+- **Scope:** `pyproject.toml` documents only; `requirements.txt`, Pipfile, direct URL, git and path dependencies get no window. Index-level `exclude-newer` is read in Phase 4 (#2052).
 - **Accuracy:** a hold is judged per version by its newest upload time, so deps-lsp may report a hold uv would not apply to an individual file (M3).
 - **Wording:** `uv exclude-newer = <span|cutoff>` and `uv exclude-newer-package.<name> = <span|cutoff>`.
+
+### Phase 4 resolution (Yarn #2051, uv index #2052, advisory tests #2053)
+
+- **Yarn file and units:** `<root>/.yarnrc.yml`, chosen by `yarn.lock`. `npmMinimalAgeGate` is `ms`-package duration text: a bare number is minutes; an integer with `s|m|h|d|w` keeps its unit; a fraction or `ms` is converted to seconds (rounded up) and shown in the largest unit dividing it evenly; zero is off; signs, `${...}`, other units and non-scalars are malformed and ignored with a warning. Wording: `yarn npmMinimalAgeGate = <span>`, `yarn npmScopes.<scope>.npmMinimalAgeGate = <span>`, with `(Yarn default)` for the implicit scope window.
+- **Version bands:** the gate needs Yarn >= 4.10; per-scope keys exist only in Yarn >= 4.17 (older Yarn rejects the key). The key name under any mapping `npmScopes.<s>` entry, whatever its value, proves >= 4.17 (`ScopedGates::Declared`). Then a scope entry without the key gets Yarn's 1 day default (`GateOrigin::ManagerDefault`), never the global value; an entry with a malformed value drops that value with a warning and falls through to the global window. Without the proof a scope entry carries no window and falls through to the global value; Yarn's global default is never assumed (NFR-008: a file with no gate key anywhere behaves as no `.yarnrc.yml`).
+- **Lookup:** unscoped names read the global key only; `@s/x` reads `npmScopes.s`. A non-mapping scope entry is ignored with a warning.
+- **Exemptions:** `npmPreapprovedPackages` through the npm exemption syntax; an entry with a version range rejects the whole list with a warning.
+- **uv index:** `exclude-newer` (string or `false`) of `[[tool.uv.index]]` / `[[index]]`; precedence package > index > global. A dependency's index is the one `[tool.uv.sources]` pins it to, else the file's only non-explicit index when it is `default = true`; otherwise the global window. Only malformed values of `name`, `default`, `explicit` and `exclude-newer` are reported; other index keys are ignored silently. At most 256 index entries per file are read.
+- **F-I1 limitation:** index-level `exclude-newer-package` is not read.
+- **Test seam (#2053):** `EcosystemRuntime::with_{npm,pypi}_public_base_for_test` (feature `test-util`) registers the npm/PyPI registry with a mock public base, so CLI tests reach OSV; the base is passed without a trailing slash.
 
 **F1 (Phase 2 follow-up):** steering a recommended fix past a held version (`steer_past_deprecated`) is not implemented, because Cargo never reports `AdvisoryDeprecated`. When another ecosystem needs it, the native steer filter must be applied identically in deps-engine `resolve_fix_target` and every `FixTargetContext` site, or the fix-target verifier and the action desync and a hostile window could hide a fix.
 

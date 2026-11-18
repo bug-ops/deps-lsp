@@ -160,6 +160,9 @@ fn native_cooldown_source_is_matched_exhaustively_without_wildcard() {
             NativeCooldownSource::BunMinimumReleaseAge => "bun",
             NativeCooldownSource::UvExcludeNewer => "uv",
             NativeCooldownSource::UvExcludeNewerPackage { .. } => "uv-package",
+            NativeCooldownSource::YarnNpmMinimalAgeGate => "yarn",
+            NativeCooldownSource::YarnScopeNpmMinimalAgeGate { .. } => "yarn-scope",
+            NativeCooldownSource::UvIndexExcludeNewer { .. } => "uv-index",
         }
     }
     assert_eq!(label(&NativeCooldownSource::CargoGlobal), "global");

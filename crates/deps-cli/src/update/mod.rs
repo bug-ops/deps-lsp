@@ -195,6 +195,35 @@ pub struct PlannedUpdateItem {
     /// The package manager's own publish-age hold that kept `latest` out of this item
     /// (spec 099), set on [`SkipReason::WithinNativeCooldown`] items only.
     pub native_hold: Option<NativeHoldNote>,
+    /// Evidence for settling a [`Outcome::RequiresLockfileUpdate`] item after a lock-file
+    /// regeneration; written only by the security planner (`affected`) and the regeneration
+    /// settlement (`lockfile`), and meaningful only for that outcome.
+    pub(crate) lockfile_fix: LockfileFix,
+}
+
+/// What a regeneration may do to a [`Outcome::RequiresLockfileUpdate`] item.
+///
+/// Meaningful only while the item's outcome is [`Outcome::RequiresLockfileUpdate`]; every other
+/// outcome keeps the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockfileFix {
+    /// The affected ranges of every advisory that applies to the dependency, bound to its OSV
+    /// package. Empty when they were not captured or are incomplete, which means no version
+    /// other than the fix target itself can ever be cleared.
+    pub affected: Vec<deps_core::osv::AffectedRanges>,
+    /// Where the regenerated lock file left the dependency.
+    pub lockfile: LockfileState,
+}
+
+/// Where a regeneration left a [`Outcome::RequiresLockfileUpdate`] item's lock-file entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LockfileState {
+    /// No regeneration touched it.
+    #[default]
+    Untouched,
+    /// The tool moved it to this newer in-range version, which could not be confirmed to lie
+    /// outside the advisories' affected ranges.
+    MovedTo(deps_core::ConcreteVersion),
 }
 
 /// The native publish-age window that holds a package's `latest`, and how long until it clears.
@@ -259,6 +288,13 @@ pub enum Outcome {
         /// The version this edit moves the dependency to.
         target: ConcreteVersion,
     },
+    /// (`--security-only` with `--lockfile regenerate`) The ecosystem's tool moved the lock file
+    /// to the fix target; no edit was planned for the manifest (Go's `go get` may still raise
+    /// go.mod's `require`). Contributes to exit 0.
+    AppliedViaLockfile {
+        /// The version the lock file now holds.
+        target: ConcreteVersion,
+    },
     /// Excluded from this run, for [`SkipReason`].
     Skipped {
         /// Why this candidate was skipped.
@@ -269,8 +305,8 @@ pub enum Outcome {
         target: Option<ConcreteVersion>,
     },
     /// (`--security-only` only) The dependency is `Vulnerable`, but its declared requirement
-    /// already admits the fix target, so no requirement-level edit exists — needs #1116.
-    /// Contributes to exit 1.
+    /// already admits the fix target, so no requirement-level edit exists; the lock file must
+    /// move (`--lockfile regenerate`). Contributes to exit 1.
     RequiresLockfileUpdate {
         /// The already-admitted fix target.
         target: ConcreteVersion,
@@ -380,7 +416,7 @@ impl Outcome {
     #[must_use]
     pub const fn wire_token(&self) -> &'static str {
         match self {
-            Self::Applied { .. } => "applied",
+            Self::Applied { .. } | Self::AppliedViaLockfile { .. } => "applied",
             Self::Skipped { .. } => "skipped",
             Self::RequiresLockfileUpdate { .. } => "requires-lockfile-update",
             Self::Unfixable(_) => "unfixable",
@@ -393,7 +429,9 @@ impl Outcome {
     #[must_use]
     pub const fn target(&self) -> Option<&ConcreteVersion> {
         match self {
-            Self::Applied { target, .. } | Self::RequiresLockfileUpdate { target } => Some(target),
+            Self::Applied { target, .. }
+            | Self::AppliedViaLockfile { target }
+            | Self::RequiresLockfileUpdate { target } => Some(target),
             Self::Skipped { target, .. } => target.as_ref(),
             Self::Unfixable(
                 UnfixableReason::Yanked { target }
@@ -438,6 +476,7 @@ impl PlannedUpdateItem {
             cooldown_fallback,
             osv_sibling_match: None,
             native_hold: None,
+            lockfile_fix: LockfileFix::default(),
         }
     }
 
@@ -471,6 +510,9 @@ impl PlannedUpdateItem {
     pub fn reason(&self) -> String {
         let base = match &self.outcome {
             Outcome::Applied { .. } => "update applied",
+            Outcome::AppliedViaLockfile { .. } => {
+                "fix applied through the lock file; the declared requirement already admits it"
+            }
             Outcome::Skipped {
                 reason: SkipReason::IgnoreRule,
                 ..
@@ -551,7 +593,7 @@ impl PlannedUpdateItem {
                 ..
             } => "the latest version is held back by the package manager's own publish-age window",
             Outcome::RequiresLockfileUpdate { .. } => {
-                "declared requirement already admits the fix target; regenerate the lock file (see #1116)"
+                "declared requirement already admits the fix target, but the lock file still resolves a vulnerable version; update the lock file (deps-cli can do it with --lockfile regenerate for Cargo, npm, pnpm and Go)"
             }
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix) => {
                 "no independently-verified fix target is available"
@@ -570,7 +612,13 @@ impl PlannedUpdateItem {
                 "the fix version has no matching release in the repository's complete tag/release list, so the commit pin cannot be rewritten — wait for a release or edit manually"
             }
         };
-        let mut reason = base.to_string();
+        let mut reason = match (&self.outcome, &self.lockfile_fix.lockfile) {
+            (Outcome::RequiresLockfileUpdate { .. }, LockfileState::MovedTo(version)) => format!(
+                "the lock file now resolves {version}, a newer in-range version that could not be \
+                 confirmed outside the advisory's affected ranges; review it manually"
+            ),
+            _ => base.to_string(),
+        };
         if self.ignore_rule_overridden {
             reason.push_str(" (a matching [update].ignore rule was overridden by --security-only)");
         }
@@ -602,7 +650,7 @@ impl PlannedUpdateItem {
         }
         if let Some(hold) = &self.native_hold {
             match &self.outcome {
-                Outcome::Applied { .. } => {
+                Outcome::Applied { .. } | Outcome::AppliedViaLockfile { .. } => {
                     reason.push_str(&format!(" (inside {})", hold.cooldown));
                 }
                 _ => reason.push_str(&format!(
@@ -2775,6 +2823,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                lockfile_fix: LockfileFix::default(),
             }],
         };
 
@@ -2814,6 +2863,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                lockfile_fix: LockfileFix::default(),
             }],
         };
 
@@ -2853,6 +2903,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                lockfile_fix: LockfileFix::default(),
             }],
         };
 
@@ -2889,6 +2940,7 @@ mod tests {
                 cooldown_fallback: None,
                 osv_sibling_match: None,
                 native_hold: None,
+                lockfile_fix: LockfileFix::default(),
             }],
         };
 
@@ -2925,6 +2977,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            lockfile_fix: LockfileFix::default(),
         }
     }
 

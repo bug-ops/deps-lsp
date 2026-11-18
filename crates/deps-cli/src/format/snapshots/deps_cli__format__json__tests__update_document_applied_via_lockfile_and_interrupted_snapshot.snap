@@ -1,0 +1,28 @@
+---
+source: crates/deps-cli/src/format/json.rs
+expression: "update_to_document(&run, DryRun::No)"
+---
+{
+  "schema_version": 2,
+  "dry_run": false,
+  "items": [
+    {
+      "name": "serde",
+      "current": "1.0.0",
+      "target": "1.2.0",
+      "outcome": "applied",
+      "reason": "fix applied through the lock file; the declared requirement already admits it",
+      "advisory_ids": [
+        "RUSTSEC-2024-0001"
+      ]
+    }
+  ],
+  "lockfile": {
+    "status": "failed",
+    "kind": "interrupted",
+    "message": "regeneration was interrupted",
+    "package": null,
+    "expected": null,
+    "found": null
+  }
+}

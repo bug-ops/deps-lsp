@@ -260,7 +260,7 @@ impl From<&crate::update::Outcome> for OutcomeToken {
     fn from(outcome: &crate::update::Outcome) -> Self {
         use crate::update::Outcome;
         match outcome {
-            Outcome::Applied { .. } => Self::Applied,
+            Outcome::Applied { .. } | Outcome::AppliedViaLockfile { .. } => Self::Applied,
             Outcome::Skipped { .. } => Self::Skipped,
             Outcome::RequiresLockfileUpdate { .. } => Self::RequiresLockfileUpdate,
             Outcome::Unfixable(_) => Self::Unfixable,
@@ -434,6 +434,8 @@ pub enum FailureKind {
     ToolchainMissing,
     /// The tool could not be started.
     Spawn,
+    /// SIGINT or SIGTERM arrived while the tool was running.
+    Interrupted,
     /// The shared time budget ran out.
     TimedOut,
     /// The tool exited unsuccessfully.
@@ -457,6 +459,7 @@ impl From<&RegenerationError> for FailureKind {
         match error {
             RegenerationError::ToolchainMissing { .. } => Self::ToolchainMissing,
             RegenerationError::Spawn { .. } => Self::Spawn,
+            RegenerationError::Interrupted => Self::Interrupted,
             RegenerationError::TimedOut { .. } => Self::TimedOut,
             RegenerationError::ToolFailed { .. } => Self::ToolFailed,
             RegenerationError::UnexpectedProbeOutput { .. } => Self::UnexpectedProbeOutput,
@@ -638,6 +641,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     ),
                     RegenerationError::ToolchainMissing { .. }
                     | RegenerationError::Spawn { .. }
+                    | RegenerationError::Interrupted
                     | RegenerationError::TimedOut { .. }
                     | RegenerationError::ToolFailed { .. }
                     | RegenerationError::UnexpectedProbeOutput { .. }
@@ -943,6 +947,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            lockfile_fix: crate::update::LockfileFix::default(),
         }
     }
 
@@ -1190,6 +1195,24 @@ mod tests {
             let parsed: EcosystemToken = serde_json::from_str(&json).expect("must round-trip");
             assert_eq!(parsed, token);
         }
+    }
+
+    /// #2049/#2048: a lock-file-only fix is reported as `applied`, and an interrupted
+    /// regeneration carries its own failure kind.
+    #[test]
+    fn test_update_document_applied_via_lockfile_and_interrupted_snapshot() {
+        let plan = crate::update::UpdatePlan {
+            items: vec![update_item(crate::update::Outcome::AppliedViaLockfile {
+                target: deps_core::ConcreteVersion::from("1.2.0"),
+            })],
+        };
+        let run = crate::update::UpdateRun {
+            plan,
+            lockfile: crate::update::regen::LockfileOutcome::Failed(
+                crate::update::regen::RegenerationError::Interrupted,
+            ),
+        };
+        insta::assert_json_snapshot!(update_to_document(&run, DryRun::No));
     }
 
     /// #1626 tester gap 1: an unrecognized `ecosystem` token must be a hard deserialize error.

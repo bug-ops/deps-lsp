@@ -253,14 +253,20 @@ table|json`, `--config <PATH>`, `--offline`, `--lockfile skip|regenerate` (defau
   candidate is refused and the run exits non-zero.
 - **`--security-only`** rewrites to each advisory's recommended fix, independently re-verified
   against OSV, and classifies every vulnerable dependency as `applied`,
-  `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule.
+  `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule. When the
+  declared requirement already admits the fix, `--lockfile regenerate` moves only the lock file
+  (Cargo, npm, pnpm, Go): the item becomes `applied` (exit `0`) once the lock file holds the fix
+  or, for npm and pnpm, a newer in-range version that every advisory affecting the locked
+  version places outside its affected ranges; otherwise it stays `requires-lockfile-update`.
 - **`[update].ignore`** (`{ name = "tokio", update_types = ["major"] }`) is honored only from
   an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
 - **`--lockfile regenerate`** runs `cargo`, `npm`, `pnpm` or `go` in the manifest's directory after
   the write and verifies that the lockfile holds every applied version; the JSON report always
   carries a `lockfile` object. It does nothing under `--dry-run` or `--offline`, never creates a
   lockfile, and reports `unsupported` for Yarn, Bun, workspace members and the other ecosystems.
-  The tool runs with the repository's own configuration and your full environment.
+  The tool runs with the repository's own configuration and your full environment. On unix a
+  timeout, SIGINT or SIGTERM kills the tool's whole process group (exit `2`, see the mdBook for
+  the limits).
 - **Exit codes**: `0` all selected updates applied or deliberately skipped, `1` at least one
   wanted fix could not be applied, `2` execution error (including a failed lockfile
   regeneration). A non-zero exit does not imply the

@@ -107,7 +107,8 @@ it lives.
   scanning and loses its npmjs.com hover link (an advisory or link keyed to the
   public package name does not apply to a same-named private package) and its
   relative-age ("published N days ago") hover suffix.
-- `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) are not read; a
+- `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) are not read for registry routing,
+  only for Yarn's release-age gate (see below); a
   standard `.npmrc` present in the workspace is still honored either way.
   pnpm's own `pnpm-workspace.yaml` catalog extension *is* read — see below.
 
@@ -181,8 +182,15 @@ manifest's directory) is read; your home directory and environment variables nev
 | npm | `.npmrc` | `min-release-age`, or `before` (an absolute cutoff that wins when both are set) | days; RFC 3339 or `YYYY-MM-DD` |
 | pnpm | `pnpm-workspace.yaml` | `minimumReleaseAge` (off when `minimumReleaseAgeStrict: false`) | minutes |
 | Bun | `bunfig.toml` | `[install] minimumReleaseAge` | seconds |
+| Yarn | `.yarnrc.yml` | `npmMinimalAgeGate`, and `npmScopes.<scope>.npmMinimalAgeGate` | minutes when bare, else `<n>ms`/`s`/`m`/`h`/`d`/`w` (fractions allowed) |
 
-Yarn is not supported. pnpm's built-in default is never assumed: only a declared value applies.
+pnpm's and Yarn's built-in global defaults are never assumed: only a declared value applies.
+Yarn's gate needs Yarn 4.10 or newer, and its per-scope keys Yarn 4.17 or newer. A per-scope key
+under any `npmScopes.<scope>` entry proves 4.17 or newer (older Yarn rejects the key name,
+whatever its value); only then does a scoped package whose scope entry lacks the key get Yarn's
+own 1 day default (shown as `(Yarn default)`) instead of the global value. Scopes without an entry
+use the global `npmMinimalAgeGate`; `0` turns a window off. `npmPreapprovedPackages` exempts by
+name or `*` glob; an entry with a version range discards the whole list.
 Exemptions (`min-release-age-exclude`, `minimumReleaseAgeExclude`, `minimumReleaseAgeExcludes`)
 accept names, `name@version` and `*` wildcards (segment-scoped for npm); an entry the server cannot
 interpret exactly discards the whole list, so the window holds more rather than less. A malformed

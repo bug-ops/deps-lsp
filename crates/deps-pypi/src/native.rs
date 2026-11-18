@@ -4,11 +4,14 @@
 //! Resolution follows uv's nearest-file rule: only the closest directory (the manifest's, then
 //! its parents) that holds a `uv.toml` or a `pyproject.toml` with a `[tool.uv]` table is read,
 //! `uv.toml` wins over `[tool.uv]` in that directory, and nothing is merged with a farther
-//! directory. Inside the chosen file a package-specific `exclude-newer-package` entry beats the
-//! global `exclude-newer`. A workspace member reads its workspace root's file instead of its own
-//! (uv ignores a member's `[tool.uv]`). The user's home directory is never read, so a
-//! developer's personal config cannot change what an opened repository holds back. An invalid
-//! value counts as absent and is reported in one warning per file.
+//! directory. Inside the chosen file a package-specific `exclude-newer-package` entry beats an
+//! index-level `exclude-newer` (`[[tool.uv.index]]` / `[[index]]`), which beats the global
+//! `exclude-newer`. A dependency's index is the one `[tool.uv.sources]` pins it to, else the
+//! file's only non-explicit index when that index is `default = true`. Index-level
+//! `exclude-newer-package` is not read. A workspace member reads its workspace root's file
+//! instead of its own (uv ignores a member's `[tool.uv]`). The user's home directory is never
+//! read, so a developer's personal config cannot change what an opened repository holds back.
+//! An invalid value counts as absent and is reported in one warning per file.
 //!
 //! The open document's text is used for its own `pyproject.toml` (an unsaved edit takes effect
 //! immediately); every other file is read from disk through an mtime-gated cache.
@@ -23,7 +26,7 @@ use deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH;
 use deps_core::mtime_cache::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 use deps_core::native_cooldown::{
     NativeCooldown, NativeCooldownSource, NativeCutoff, NativeLimit, PypiPackageLabel,
-    TimeSpanValue, parse_uv_span,
+    TimeSpanValue, UvIndexLabel, parse_uv_span,
 };
 use toml_span::value::Table;
 
@@ -31,6 +34,9 @@ const UV_TOML: &str = "uv.toml";
 const PYPROJECT_TOML: &str = "pyproject.toml";
 const GLOBAL_KEY: &str = "exclude-newer";
 const PACKAGE_KEY: &str = "exclude-newer-package";
+const INDEX_KEY: &str = "index";
+/// Index entries read per file; a hostile file cannot make a lookup expensive.
+const MAX_INDEXES: usize = 256;
 
 /// A valid value of one release-age key.
 #[derive(Debug, Clone, Copy)]
@@ -50,12 +56,24 @@ impl Setting {
     }
 }
 
+/// One `[[index]]` / `[[tool.uv.index]]` entry that can carry a window.
+#[derive(Debug)]
+struct UvIndex {
+    /// PEP 503-normalized name, the form `[tool.uv.sources]` bindings are keyed by.
+    key: String,
+    label: UvIndexLabel,
+    is_default: bool,
+    is_explicit: bool,
+    setting: Option<Setting>,
+}
+
 /// The release-age keys of one `uv.toml` or `pyproject.toml`.
 #[derive(Debug, Default)]
 pub(crate) struct UvLayer {
     global: Option<Setting>,
     /// `exclude-newer-package` entries by PEP 503-normalized name.
     packages: HashMap<String, Setting>,
+    indexes: Vec<UvIndex>,
     /// Whether the file configures uv at all: any `uv.toml`, or a pyproject with `[tool.uv]`.
     configures_uv: bool,
     /// Whether `[tool.uv.workspace]` is declared, which makes this directory a workspace root.
@@ -109,6 +127,7 @@ impl UvLayer {
                 None => self.invalid_keys.push(GLOBAL_KEY),
             }
         }
+        self.read_indexes(uv);
         if let Some(packages) = uv.get(PACKAGE_KEY) {
             let Some(packages) = packages.as_table() else {
                 self.invalid_keys.push(PACKAGE_KEY);
@@ -129,6 +148,75 @@ impl UvLayer {
                 }
             }
         }
+    }
+
+    /// Reads the `name`, `default`, `explicit` and `exclude-newer` keys of every index entry;
+    /// every other index key is irrelevant here and ignored without a warning.
+    fn read_indexes(&mut self, uv: &Table<'_>) {
+        let Some(entries) = uv.get(INDEX_KEY).and_then(|value| value.as_array()) else {
+            return;
+        };
+        for table in entries
+            .iter()
+            .take(MAX_INDEXES)
+            .filter_map(|entry| entry.as_table())
+        {
+            let Some(name) = table.get("name") else {
+                continue;
+            };
+            let Some(name) = name.as_str() else {
+                self.invalid_keys.push("index.name");
+                continue;
+            };
+            let is_default = self.flag(table, "default", "index.default");
+            let is_explicit = self.flag(table, "explicit", "index.explicit");
+            let setting = table.get(GLOBAL_KEY).and_then(|value| {
+                let setting = match (value.as_bool(), value.as_str()) {
+                    (Some(false), _) => Some(Setting::Off),
+                    (_, Some(raw)) => parse_limit(raw),
+                    _ => None,
+                };
+                if setting.is_none() {
+                    self.invalid_keys.push("index.exclude-newer");
+                }
+                setting
+            });
+            if let Some(label) = UvIndexLabel::new(name) {
+                self.indexes.push(UvIndex {
+                    key: crate::name::normalize(name),
+                    label,
+                    is_default,
+                    is_explicit,
+                    setting,
+                });
+            }
+        }
+    }
+
+    /// A boolean index key; a non-boolean value is recorded as invalid and reads as `false`.
+    fn flag(&mut self, table: &Table<'_>, key: &str, invalid: &'static str) -> bool {
+        match table.get(key).map(|value| value.as_bool()) {
+            None => false,
+            Some(Some(flag)) => flag,
+            Some(None) => {
+                self.invalid_keys.push(invalid);
+                false
+            }
+        }
+    }
+
+    /// The index whose window applies to a dependency: the pinned one, else the file's only
+    /// non-explicit index when it is the default.
+    fn index_for(&self, pinned: Option<&UvIndexLabel>) -> Option<&UvIndex> {
+        if let Some(pinned) = pinned {
+            return self
+                .indexes
+                .iter()
+                .find(|index| index.key == pinned.as_str());
+        }
+        let mut open = self.indexes.iter().filter(|index| !index.is_explicit);
+        let only = open.next().filter(|_| open.next().is_none())?;
+        only.is_default.then_some(only)
     }
 
     /// Whether the project at `relative` (from this workspace root) is a member: matched by a
@@ -344,9 +432,13 @@ pub(crate) struct UvNativeConfig {
 }
 
 impl UvNativeConfig {
-    /// The window for the package with PEP 503-normalized `name`, or `None` when no window
-    /// applies.
-    pub(crate) fn cooldown_for(&self, name: &str) -> Option<NativeCooldown> {
+    /// The window for the package with PEP 503-normalized `name` pinned to `uv_index`, or `None`
+    /// when no window applies. Precedence: package, then index, then global.
+    pub(crate) fn cooldown_for(
+        &self,
+        name: &str,
+        uv_index: Option<&UvIndexLabel>,
+    ) -> Option<NativeCooldown> {
         let layer = self.layer.as_ref()?;
         if let Some(setting) = layer.packages.get(name).copied() {
             let package = PypiPackageLabel::new(name)?;
@@ -354,6 +446,18 @@ impl UvNativeConfig {
                 NativeCooldown::new(
                     limit,
                     NativeCooldownSource::UvExcludeNewerPackage { package },
+                )
+            });
+        }
+        if let Some(index) = layer.index_for(uv_index)
+            && let Some(setting) = index.setting
+        {
+            return setting.limit().map(|limit| {
+                NativeCooldown::new(
+                    limit,
+                    NativeCooldownSource::UvIndexExcludeNewer {
+                        index: index.label.clone(),
+                    },
                 )
             });
         }

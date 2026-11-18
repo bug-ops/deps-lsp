@@ -295,6 +295,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            lockfile_fix: crate::update::LockfileFix::default(),
         }
     }
 
@@ -325,6 +326,24 @@ mod tests {
         assert!(table.contains("1.2.0"));
         assert!(table.contains("applied"));
         assert!(!table.contains("dry run"));
+    }
+
+    /// #2049/#2048: a lock-file-only fix renders as `applied`; an interrupted regeneration is
+    /// reported after the plan.
+    #[test]
+    fn test_render_update_applied_via_lockfile_and_interrupted_snapshot() {
+        let plan = crate::update::UpdatePlan {
+            items: vec![update_item(crate::update::Outcome::AppliedViaLockfile {
+                target: deps_core::ConcreteVersion::from("1.2.0"),
+            })],
+        };
+        let run = crate::update::UpdateRun {
+            plan,
+            lockfile: crate::update::regen::LockfileOutcome::Failed(
+                crate::update::regen::RegenerationError::Interrupted,
+            ),
+        };
+        insta::assert_snapshot!(render_update(&run, DryRun::No));
     }
 
     #[test]

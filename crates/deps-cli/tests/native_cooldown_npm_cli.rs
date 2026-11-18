@@ -6,10 +6,9 @@
 //! Explain-only: a held `latest` is never written, the skip carries the same note `check`
 //! prints (FR-016), and a project without a window is unaffected.
 //!
-//! Advisories are not covered here: OSV is never asked about a package fetched through a
-//! `.npmrc`-overridden registry, and this harness can only reach a mock registry that way. The
-//! advisory and security-fix paths read the window through the same `NativeGate` sinks the Cargo
-//! suite (`native_cooldown_cli.rs`) already exercises.
+//! The advisory and security-fix scenarios reach the mock registry through
+//! `EcosystemRuntime::with_npm_public_base_for_test` instead, so the package counts as public
+//! and OSV is asked about it.
 
 #![cfg(feature = "npm")]
 #![allow(clippy::expect_used, clippy::panic)]
@@ -21,47 +20,23 @@ use deps_cli::analyze::{AnalysisScope, analyze_manifest};
 use deps_cli::exit::update_exit_code;
 use deps_cli::report::{CheckContext, check_manifest};
 use deps_cli::update::ignore::IgnoreRules;
+use deps_cli::update::security::plan_security_updates;
 use deps_cli::update::{Outcome, SkipReason, UpdatePlan, plan_updates};
 use deps_core::lsp_helpers::exemption::OperatorExemptions;
 use deps_core::net_policy::{MapEnv, PRIVATE_REGISTRY_HOSTS_ENV, RegistryEnvironment};
 use deps_core::osv::OsvClient;
-use deps_core::policy_config::{PolicyConfig, RegistriesConfig, WorkspaceRegistriesSetting};
+use deps_core::policy_config::{
+    FetchTimeout, PolicyConfig, RegistriesConfig, WorkspaceRegistriesSetting,
+};
 use deps_core::{Ecosystem, EcosystemId, EcosystemRegistry, HttpCache};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
+use native_advisory::{ADVISORY, AdvisoryFixture, DAY, now_secs, osv_with_advisory, rfc3339};
 
-const DAY: i64 = 86_400;
+mod native_advisory;
+
 const MANIFEST: &str = r#"{"dependencies": {"widget": "1.0.0"}}"#;
 const WINDOW_7D: &str = "min-release-age=7\n";
 const NOTE: &str = "excluded by npm min-release-age = 7 days";
-
-fn now_secs() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_secs(),
-    )
-    .expect("fits")
-}
-
-fn rfc3339(epoch: i64) -> String {
-    let (days, rem) = (epoch.div_euclid(DAY), epoch.rem_euclid(DAY));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
-}
 
 struct Fixture {
     _registry: mockito::ServerGuard,
@@ -262,4 +237,179 @@ async fn without_a_window_nothing_is_held() {
             .all(|message| !message.contains("excluded by"))
     );
     assert_eq!(applied(&fx.update_plan().await), ["1.1.0"]);
+}
+
+// ---- advisories: the registry is the public tier, so OSV is asked -------------------------
+
+/// `(version, age in seconds, deprecated)`, oldest first; the newest entry is `latest`.
+type PublicVersions<'a> = &'a [(&'a str, i64, bool)];
+
+async fn public_fixture(npmrc: &str, versions: PublicVersions<'_>, fixed: &str) -> Fixture {
+    let mut registry = mockito::Server::new_async().await;
+    let latest = versions.last().expect("a version").0;
+    let entries: Vec<String> = versions
+        .iter()
+        .map(|(version, _, deprecated)| {
+            let body = if *deprecated {
+                r#"{"deprecated":"use a newer release"}"#
+            } else {
+                "{}"
+            };
+            format!(r#""{version}":{body}"#)
+        })
+        .collect();
+    let abbreviated = registry
+        .mock("GET", "/widget")
+        .match_header("accept", "application/vnd.npm.install-v1+json")
+        .with_status(200)
+        .with_body(format!(
+            r#"{{"dist-tags":{{"latest":"{latest}"}},"versions":{{{}}}}}"#,
+            entries.join(",")
+        ))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    let times: Vec<String> = versions
+        .iter()
+        .map(|(version, age, _)| format!(r#""{version}":"{}""#, rfc3339(now_secs() - age)))
+        .collect();
+    let full = registry
+        .mock("GET", "/widget")
+        .match_header("accept", "application/json")
+        .with_status(200)
+        .with_body(format!(r#"{{"time":{{{}}}}}"#, times.join(",")))
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    let (osv, mut mocks) = osv_with_advisory(&AdvisoryFixture {
+        ecosystem: "npm",
+        package: "widget",
+        range_type: "SEMVER",
+        vulnerable: "1.0.0",
+        fixed,
+    })
+    .await;
+    mocks.extend([abbreviated, full]);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical");
+    std::fs::write(root.join(".npmrc"), npmrc).expect("npmrc");
+    std::fs::write(root.join("package-lock.json"), "{}").expect("lock");
+    let manifest = root.join("package.json");
+    std::fs::write(&manifest, MANIFEST).expect("manifest");
+
+    let mut policy = PolicyConfig::default();
+    policy.freshness.enabled = false;
+    let env = MapEnv::new();
+    let base = url::Url::parse(&registry.url()).expect("mock url");
+    let runtime = EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&env))
+        .with_npm_public_base_for_test(base);
+    let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+    let ecosystems = EcosystemRegistry::new();
+    let _ = register_ecosystems(&ecosystems, Arc::clone(&cache), &runtime);
+    let ecosystem = ecosystems.get(EcosystemId::Npm).expect("npm registered");
+    let ctx = CheckContext {
+        cache: Arc::clone(&cache),
+        osv: Arc::new(OsvClient::for_test(Arc::clone(&cache), osv.url())),
+        deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+        lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+        advisory_exemptions: Arc::new(OperatorExemptions::none()),
+        policy,
+    };
+    Fixture {
+        _registry: registry,
+        _osv: osv,
+        _mocks: mocks,
+        _dir: dir,
+        manifest,
+        ctx,
+        ecosystem,
+    }
+}
+
+impl Fixture {
+    async fn security_plan(&self) -> UpdatePlan {
+        let analysis = analyze_manifest(
+            &self.ecosystem,
+            &self.manifest,
+            MANIFEST,
+            &self.ctx,
+            AnalysisScope::vulnerabilities_only(),
+        )
+        .await
+        .expect("analyze_manifest");
+        plan_security_updates(
+            &analysis,
+            self.ecosystem.as_ref(),
+            &self.ctx.osv,
+            &[],
+            &IgnoreRules::empty(),
+            FetchTimeout::try_from_secs(30).expect("timeout"),
+        )
+        .await
+    }
+}
+
+const FIXABLE: PublicVersions<'static> = &[("1.0.0", 100 * DAY, false), ("1.0.1", 3 * DAY, false)];
+
+#[tokio::test]
+async fn security_fix_inside_the_window_is_applied_and_annotated() {
+    let held = public_fixture(WINDOW_7D, FIXABLE, "1.0.1").await;
+    let plain = public_fixture("", FIXABLE, "1.0.1").await;
+    let (h, p) = (held.security_plan().await, plain.security_plan().await);
+    assert_eq!(applied(&p), ["1.0.1"], "control: {:#?}", p.items);
+    assert_eq!(applied(&h), ["1.0.1"], "{:#?}", h.items);
+    assert!(
+        h.items[0]
+            .reason()
+            .contains("inside npm min-release-age = 7 days"),
+        "{}",
+        h.items[0].reason()
+    );
+    assert!(
+        !p.items[0].reason().contains("inside"),
+        "{}",
+        p.items[0].reason()
+    );
+}
+
+#[tokio::test]
+async fn check_reports_the_advisory_identically_with_and_without_a_window() {
+    let held = public_fixture(WINDOW_7D, FIXABLE, "1.0.1").await;
+    let none = public_fixture("", FIXABLE, "1.0.1").await;
+    let pick = |messages: Vec<String>| {
+        messages
+            .into_iter()
+            .filter(|message| message.contains(ADVISORY))
+            .collect::<Vec<_>>()
+    };
+    let (h, n) = (
+        pick(held.check_messages().await),
+        pick(none.check_messages().await),
+    );
+    assert!(!n.is_empty(), "control: the advisory is reported");
+    assert_eq!(h, n);
+}
+
+/// `1.0.1` fixes the advisory but is deprecated; `1.0.2` is `latest`, one day old.
+const DEPRECATED_FIX: PublicVersions<'static> = &[
+    ("1.0.0", 100 * DAY, false),
+    ("1.0.1", 50 * DAY, true),
+    ("1.0.2", DAY, false),
+];
+
+#[tokio::test]
+async fn deprecated_fix_steers_past_a_fresh_latest_only_when_publish_times_are_known() {
+    let unknown = public_fixture("", DEPRECATED_FIX, "1.0.1").await;
+    let known = public_fixture(WINDOW_7D, DEPRECATED_FIX, "1.0.1").await;
+    assert_eq!(
+        applied(&unknown.security_plan().await),
+        ["1.0.2"],
+        "control: without publish times the fresh latest is an acceptable steer target"
+    );
+    assert_eq!(
+        applied(&known.security_plan().await),
+        ["1.0.1"],
+        "the window asks for publish times, so the one-day-old latest is not used"
+    );
 }

@@ -1361,6 +1361,39 @@ pub trait LockFileProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Directory whose listing produces [`Self::companion_lockfiles`] for `located`.
+    ///
+    /// The cache stamps it before listing, so a file created while the listing runs bumps
+    /// the directory's mtime past the stamp and invalidates the entry on the next lookup.
+    /// It must also be present in `companion_lockfiles(located)`.
+    ///
+    /// Default: none.
+    fn companion_listing_dir(&self, located: &Path) -> Option<PathBuf> {
+        let _ = located;
+        None
+    }
+
+    /// Parses `located` together with the `companions` the cache listed for this load.
+    ///
+    /// `companions` is this load's [`Self::companion_lockfiles`] result (it may hold
+    /// directories and paths that vanished since); implementations must not list the
+    /// directory again.
+    ///
+    /// Default: [`Self::parse_lockfile`] on `located`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::parse_lockfile`].
+    fn parse_lock_set<'a>(
+        &'a self,
+        located: &'a Path,
+        companions: &'a [PathBuf],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        let _ = companions;
+        self.parse_lockfile(located)
+    }
+
     /// The directory that identifies the lock set `lockfile` belongs to, used to find the set
     /// again when `lockfile` itself is created, edited or deleted.
     ///
@@ -1592,11 +1625,21 @@ impl LockFileCache {
             path: lockfile_path.to_path_buf(),
             modified_at: Some(metadata.modified()?),
         }];
-        for companion in provider.companion_lockfiles(lockfile_path) {
-            stamps.push(FileStamp::of_companion(companion).await);
+        // The listing directory is stamped before it is listed: a file created during the
+        // listing bumps the directory's mtime past this stamp and invalidates the entry on the
+        // next lookup, instead of being absorbed into a stamp taken after the fact.
+        let listing_dir = provider.companion_listing_dir(lockfile_path);
+        if let Some(dir) = &listing_dir {
+            stamps.push(FileStamp::of_companion(dir.clone()).await);
+        }
+        let companions = provider.companion_lockfiles(lockfile_path);
+        for companion in &companions {
+            if listing_dir.as_ref() != Some(companion) {
+                stamps.push(FileStamp::of_companion(companion.clone()).await);
+            }
         }
 
-        let packages = Arc::new(provider.parse_lockfile(lockfile_path).await?);
+        let packages = Arc::new(provider.parse_lock_set(lockfile_path, &companions).await?);
 
         if !self.entries.contains_key(lockfile_path) && self.entries.len() >= self.capacity {
             self.evict_oldest();

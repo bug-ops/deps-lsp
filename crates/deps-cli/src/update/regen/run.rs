@@ -1,7 +1,8 @@
 //! Bounded, argv-only process runner for lockfile regeneration.
 //!
 //! Every spawned process shares one deadline, never sees stdin, and is killed when its future
-//! is dropped. Run calls forward the tool's stdout to this process's stderr so the report on
+//! is dropped; on unix a tool that leads its own process group is killed together with its
+//! descendants. Run calls forward the tool's stdout to this process's stderr so the report on
 //! stdout stays machine-readable; probes capture a small, capped stdout instead.
 
 use std::io::ErrorKind;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use std::ffi::OsString;
 
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::{Instant, timeout_at};
 
 use super::RegenerationError;
@@ -36,6 +37,99 @@ pub(super) enum SearchPath {
     Override(OsString),
 }
 
+/// Whether a spawned tool leads its own process group or stays in deps-cli's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessGroup {
+    /// The tool leads a new group, so a timeout or interrupt kills its whole process tree.
+    Own,
+    /// The tool stays in deps-cli's group. Chosen only for a foreground terminal run, where a
+    /// new group would be background to the terminal (`/dev/tty` prompts would stop it).
+    /// Process groups are a unix concept, so the variant exists only there (and in tests).
+    #[cfg(any(unix, test))]
+    Inherit,
+}
+
+impl ProcessGroup {
+    /// Picks the policy for one regeneration: [`Self::Inherit`] only when deps-cli is in its
+    /// controlling terminal's foreground group.
+    #[cfg(unix)]
+    pub(super) fn detect() -> Self {
+        let foreground = std::fs::File::open("/dev/tty")
+            .ok()
+            .and_then(|tty| rustix::termios::tcgetpgrp(&tty).ok())
+            .map(|pgid| pgid.as_raw_nonzero().get());
+        Self::choose(
+            foreground,
+            rustix::process::getpgrp().as_raw_nonzero().get(),
+        )
+    }
+
+    /// Without process groups the tool is a plain child.
+    #[cfg(not(unix))]
+    pub(super) const fn detect() -> Self {
+        Self::Own
+    }
+
+    /// The pure decision: `foreground` is the terminal's foreground group when `/dev/tty` opened
+    /// and answered, `own` is deps-cli's group.
+    #[cfg(any(unix, test))]
+    pub(super) const fn choose(foreground: Option<i32>, own: i32) -> Self {
+        match foreground {
+            Some(pgid) if pgid == own => Self::Inherit,
+            Some(_) | None => Self::Own,
+        }
+    }
+}
+
+/// A spawned tool that is killed, with its process group when it leads one, on drop.
+///
+/// Gating on [`Child::id`] is the "not yet reaped" proof: tokio returns `None` once the child
+/// was waited for, and until then the leader still holds the group id, so the group cannot have
+/// been recycled for an unrelated process.
+struct ChildGuard {
+    child: Child,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    group: ProcessGroup,
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        use rustix::io::Errno;
+        use rustix::process::{Pid, Signal, kill_process_group};
+
+        if self.group != ProcessGroup::Own {
+            return;
+        }
+        let Some(leader) = self
+            .child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw)
+        else {
+            return;
+        };
+        match kill_process_group(leader, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH) => {}
+            Err(error) => tracing::debug!(%error, "could not kill the tool's process group"),
+        }
+    }
+}
+
 /// Spawns the regeneration tools under one shared time budget.
 #[derive(Debug, Clone)]
 pub(super) struct ToolRunner {
@@ -43,6 +137,8 @@ pub(super) struct ToolRunner {
     pub(super) deadline: Duration,
     /// Where the tools are looked up.
     pub(super) search_path: SearchPath,
+    /// Process-group policy for every spawned tool.
+    pub(super) group: ProcessGroup,
 }
 
 impl ToolRunner {
@@ -63,6 +159,10 @@ impl ToolRunner {
                 command
             }
         };
+        #[cfg(unix)]
+        if self.group == ProcessGroup::Own {
+            command.process_group(0);
+        }
         command
             .args(invocation.args())
             .current_dir(invocation.cwd())
@@ -86,11 +186,11 @@ impl ToolRunner {
         deadline: Instant,
     ) -> Result<(), RegenerationError> {
         let program = invocation.program();
-        let mut child = self
-            .command(invocation)
-            .stdout(Stdio::from(std::io::stderr()))
-            .spawn()
-            .map_err(|source| spawn_error(program, source))?;
+        let mut child = self.spawn(
+            self.command(invocation)
+                .stdout(Stdio::from(std::io::stderr())),
+            program,
+        )?;
         let status = timeout_at(deadline, child.wait())
             .await
             .map_err(|_| self.timed_out())?
@@ -110,11 +210,7 @@ impl ToolRunner {
         deadline: Instant,
     ) -> Result<String, RegenerationError> {
         let program = invocation.program();
-        let mut child = self
-            .command(invocation)
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|source| spawn_error(program, source))?;
+        let mut child = self.spawn(self.command(invocation).stdout(Stdio::piped()), program)?;
         let mut stdout = child
             .stdout
             .take()
@@ -143,6 +239,20 @@ impl ToolRunner {
         String::from_utf8(buffer)
             .map(|text| text.trim().to_owned())
             .map_err(|_| RegenerationError::UnexpectedProbeOutput { program })
+    }
+
+    fn spawn(
+        &self,
+        command: &mut Command,
+        program: Program,
+    ) -> Result<ChildGuard, RegenerationError> {
+        let child = command
+            .spawn()
+            .map_err(|source| spawn_error(program, source))?;
+        Ok(ChildGuard {
+            child,
+            group: self.group,
+        })
     }
 
     const fn timed_out(&self) -> RegenerationError {

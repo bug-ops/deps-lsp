@@ -53,7 +53,7 @@ deno = ["dep:deps-deno"]
 # CI leak guard (`.github/workflows/ci.yml`'s "Guard against test-util leaking into the
 # release dependency tree"). Forwards to `deps-core/test-util` since `test_util.rs` reuses
 # `deps_core::test_util::stub_parse_result_with_dependencies`.
-test-util = ["deps-core/test-util"]
+test-util = ["deps-core/test-util", "deps-npm?/test-util", "deps-pypi?/test-util"]
 
 # Forwards `deps-core`'s and every currently-enabled ecosystem crate's `lsp-responses`
 # feature (issue #1083, spec 064) — `deps-lsp` enables this explicitly, `deps-cli` does

@@ -658,6 +658,7 @@ dependencies = [
  "insta",
  "jsonschema",
  "mockito",
+ "rustix",
  "serde",
  "serde-sarif",
  "serde_json",
