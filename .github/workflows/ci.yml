@@ -1052,7 +1052,9 @@ jobs:
         run: cargo nextest run --workspace --all-features -E 'test(probe_dependency_compile_fail)' --run-ignored ignored-only --profile ci --retries 0
 
       - name: Run doctests
-        if: matrix.shard == matrix.shards
+        # Shard 1 carries the trybuild steps outside PRs, so doctests go to the last shard there;
+        # in PRs shard 1 has no trybuild and takes the doctests to even out the Windows legs (#2059).
+        if: matrix.shard == (github.event_name == 'pull_request' && 1 || matrix.shards)
         run: cargo test --workspace --doc --all-features
 
   test-aarch64-linux:
