@@ -33,7 +33,7 @@ fn kind_of(result: &impl ParseResult, name: &str) -> Option<DependencyKind> {
 
 #[test]
 fn kind_maps_cargo_sections() {
-    let uri = url::Url::parse("file:///project/Cargo.toml").expect("uri");
+    let uri = url::Url::parse("file:///C:/project/Cargo.toml").expect("uri");
     let result = deps_cargo::parse_cargo_toml(MANIFEST, &uri).expect("parse");
 
     assert_eq!(kind_of(&result, "normal-dep"), Some(DependencyKind::Normal));
