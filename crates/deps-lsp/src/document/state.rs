@@ -2743,46 +2743,12 @@ mod tests {
         }
 
         #[test]
-        fn test_loading_state_clone() {
-            let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
-
-            doc.set_loading();
-            let cloned = doc.clone();
-
-            assert_eq!(cloned.loading_state(), LoadingState::Loading);
-            assert!(cloned.loading_started_at().is_some());
-        }
-
-        #[test]
-        fn test_loading_state_debug() {
-            let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
-            doc.set_loading();
-
-            let debug_str = format!("{:?}", doc);
-            assert!(debug_str.contains("loading_state"));
-            assert!(debug_str.contains("Loading"));
-        }
-
-        #[test]
         fn test_loading_duration_none_when_idle() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
             let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             assert_eq!(doc.loading_state(), LoadingState::Idle);
             assert!(doc.loading_duration().is_none());
-        }
-
-        #[test]
-        fn test_loading_state_equality() {
-            assert_eq!(LoadingState::Idle, LoadingState::Idle);
-            assert_eq!(LoadingState::Loading, LoadingState::Loading);
-            assert_eq!(LoadingState::Loaded, LoadingState::Loaded);
-            assert_eq!(LoadingState::Failed, LoadingState::Failed);
-
-            assert_ne!(LoadingState::Idle, LoadingState::Loading);
-            assert_ne!(LoadingState::Loading, LoadingState::Loaded);
         }
 
         #[test]
@@ -3921,17 +3887,6 @@ mod tests {
         fn test_document_state_parse_result_accessor() {
             let state = DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
             assert!(state.parse_result().is_none());
-        }
-
-        #[test]
-        fn test_document_state_clone() {
-            let state =
-                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test content".into());
-            let cloned = state.clone();
-
-            assert_eq!(cloned.ecosystem, state.ecosystem);
-            assert_eq!(cloned.content, state.content);
-            assert!(cloned.parse_result().is_none());
         }
 
         /// `parse_result` is stored as `Arc<dyn ParseResult>` (#319), so — unlike the

@@ -428,25 +428,8 @@ impl deps_core::lsp_helpers::ProbeDependency for ComposerDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::position::Position;
     use deps_core::{Metadata, Version};
     use std::assert_matches;
-
-    #[test]
-    fn test_composer_dependency_creation() {
-        let dep = ComposerDependency {
-            name: "symfony/console".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 15)),
-            version_req: Some("^6.0".into()),
-            version_range: Some(Range::new(Position::new(0, 18), Position::new(0, 22))),
-            section: ComposerSection::Require,
-            source: deps_core::parser::DependencySource::Registry,
-        };
-
-        assert_eq!(dep.name, "symfony/console");
-        assert_eq!(dep.version_req, Some("^6.0".into()));
-        assert_matches!(dep.section, ComposerSection::Require);
-    }
 
     #[test]
     fn test_composer_section_variants() {

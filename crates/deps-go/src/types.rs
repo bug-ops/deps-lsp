@@ -289,10 +289,4 @@ mod tests {
             Some("https://pkg.go.dev/github.com/gin-gonic/gin")
         );
     }
-
-    #[test]
-    fn test_go_directive_equality() {
-        assert_eq!(GoDirective::Require, GoDirective::Require);
-        assert_ne!(GoDirective::Require, GoDirective::Replace);
-    }
 }

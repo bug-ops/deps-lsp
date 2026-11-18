@@ -1362,12 +1362,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_registry_creation() {
-        let cache = Arc::new(HttpCache::new());
-        let _registry = GoRegistry::new(cache);
-    }
-
     /// #365 end-to-end coverage (critic S2): exercises the real production
     /// `get_versions` — not a reimplemented gate+sink pair — proving the gate is actually
     /// wired into the call path a real completion/hover/diagnostic request would take. No
@@ -1383,13 +1377,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_matches!(err, DepsError::InvalidPackageName(_));
-    }
-
-    #[tokio::test]
-    async fn test_registry_clone() {
-        let cache = Arc::new(HttpCache::new());
-        let registry = GoRegistry::new(cache);
-        let _cloned = registry;
     }
 
     #[tokio::test]

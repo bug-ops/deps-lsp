@@ -642,12 +642,6 @@ mod tests {
         assert_eq!(response.packages[0].package, "provider");
     }
 
-    #[test]
-    fn test_registry_creation() {
-        let cache = Arc::new(HttpCache::new());
-        let _registry = PubDevRegistry::new(cache);
-    }
-
     /// #349: `../../search` must not escape the `/api/packages/` prefix via dot-segment
     /// normalization — the raw `.`/`/` characters have to be percent-encoded. Asserted on
     /// the *parsed* URL's path (`url::Url::parse`), not the raw format-string output: a

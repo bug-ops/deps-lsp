@@ -1990,25 +1990,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_source_equality() {
-        let source1 = ResolvedSource::Registry {
-            url: "https://test.com".into(),
-            checksum: "abc".into(),
-        };
-        let source2 = ResolvedSource::Registry {
-            url: "https://test.com".into(),
-            checksum: "abc".into(),
-        };
-        let source3 = ResolvedSource::Git {
-            url: "https://github.com/test".into(),
-            rev: "abc123".into(),
-        };
-
-        assert_eq!(source1, source2);
-        assert_ne!(source1, source3);
-    }
-
-    #[test]
     fn test_resolved_packages_iter() {
         let mut packages = ResolvedPackages::new();
 

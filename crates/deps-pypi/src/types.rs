@@ -494,31 +494,8 @@ impl deps_core::lsp_helpers::ProbeDependency for PypiDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::position::Position;
     use deps_core::{Metadata, Version};
     use std::assert_matches;
-
-    #[test]
-    fn test_pypi_dependency_creation() {
-        let dep = PypiDependency {
-            name: "flask".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            version_req: Some(">=3.0.0".into()),
-            version_range: Some(Range::new(Position::new(0, 6), Position::new(0, 14))),
-            extras: vec!["async".into()],
-            extras_range: None,
-            markers: Some("python_version>='3.9'".into()),
-            markers_range: None,
-            section: PypiDependencySection::Dependencies,
-            source: PypiDependencySource::Registry,
-            index_route: None,
-            native_cooldown: None,
-        };
-
-        assert_eq!(dep.name, "flask");
-        assert_eq!(dep.version_req, Some(">=3.0.0".into()));
-        assert_eq!(dep.extras, vec!["async"]);
-    }
 
     #[test]
     fn test_pypi_dependency_features_maps_to_extras() {
@@ -587,19 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pypi_version_creation() {
-        let version = PypiVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            published_at: None,
-        };
-
-        assert_eq!(version.version, "1.0.0");
-        assert!(!version.yanked);
-        assert!(!version.is_prerelease());
-    }
-
-    #[test]
     fn test_pypi_version_prerelease_detection() {
         let stable = PypiVersion {
             version: "1.0.0".into(),
@@ -660,25 +624,6 @@ mod tests {
 
         assert_eq!(version.version_string(), "2.28.2");
         assert!(version.removal_status().blocks_resolution());
-    }
-
-    #[test]
-    fn test_pypi_package_creation() {
-        let pkg = PypiPackage {
-            name: "requests".into(),
-            summary: Some("Python HTTP for Humans.".into()),
-            project_urls: vec![
-                ("Homepage".into(), "https://requests.readthedocs.io".into()),
-                (
-                    "Repository".into(),
-                    "https://github.com/psf/requests".into(),
-                ),
-            ],
-            latest_version: "2.28.2".into(),
-        };
-
-        assert_eq!(pkg.name, "requests");
-        assert_eq!(pkg.latest_version, "2.28.2");
     }
 
     #[test]

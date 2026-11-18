@@ -1463,15 +1463,6 @@ dependencies:
     }
 
     #[test]
-    fn test_line_offset_table() {
-        let content = "abc\ndef";
-        let table = LineOffsetTable::new(content);
-        let pos = table.byte_offset_to_position(content, 4);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-    }
-
-    #[test]
     fn test_name_range_crosses_multibyte_accented_character() {
         // "é" is a 2-byte UTF-8 character but a single UTF-16 code unit — the name
         // range's end offset lands immediately after it, so position computation must

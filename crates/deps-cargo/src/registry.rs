@@ -792,19 +792,6 @@ mod tests {
         assert!(!url.contains(']'));
     }
 
-    #[tokio::test]
-    async fn test_registry_creation() {
-        let cache = Arc::new(HttpCache::new());
-        let _registry = CratesIoRegistry::new(cache);
-    }
-
-    #[tokio::test]
-    async fn test_registry_clone() {
-        let cache = Arc::new(HttpCache::new());
-        let registry = CratesIoRegistry::new(cache);
-        let _cloned = registry;
-    }
-
     // #794 impl-critic S1: `build_arc:` against the real `Ecosystem::registry()` wiring
     // (`Arc<CargoRegistry>`), not `build:` against `CratesIoRegistry` directly — a
     // `CratesIoRegistry`-only fixture would stay green even if `CargoRegistry`'s own
@@ -890,12 +877,6 @@ mod tests {
             registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
             Some(0)
         );
-    }
-
-    #[tokio::test]
-    async fn test_cargo_registry_creation() {
-        let cache = Arc::new(HttpCache::new());
-        let _registry = CargoRegistry::new(cache);
     }
 
     #[tokio::test]

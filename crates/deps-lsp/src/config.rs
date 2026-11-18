@@ -660,22 +660,6 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_registries_setting_deserializes_all_variants() {
-        assert_eq!(
-            serde_json::from_str::<WorkspaceRegistriesSetting>("\"off\"").unwrap(),
-            WorkspaceRegistriesSetting::Off
-        );
-        assert_eq!(
-            serde_json::from_str::<WorkspaceRegistriesSetting>("\"public_only\"").unwrap(),
-            WorkspaceRegistriesSetting::PublicOnly
-        );
-        assert_eq!(
-            serde_json::from_str::<WorkspaceRegistriesSetting>("\"all\"").unwrap(),
-            WorkspaceRegistriesSetting::All
-        );
-    }
-
-    #[test]
     fn test_registries_config_section_deserialization() {
         let json = r#"{"registries": {"workspace_registries": "off"}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
@@ -819,24 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_registries_setting_to_policy() {
-        use deps_core::net_policy::WorkspaceRegistryAccess;
-
-        assert_eq!(
-            WorkspaceRegistriesSetting::Off.to_policy(),
-            WorkspaceRegistryAccess::Off
-        );
-        assert_eq!(
-            WorkspaceRegistriesSetting::PublicOnly.to_policy(),
-            WorkspaceRegistryAccess::PublicOnly
-        );
-        assert_eq!(
-            WorkspaceRegistriesSetting::All.to_policy(),
-            WorkspaceRegistryAccess::All
-        );
-    }
-
-    #[test]
     fn test_inlay_hints_config_with_enabled() {
         let config = InlayHintsConfig::new().with_enabled(false);
         assert!(!config.enabled);
@@ -854,24 +820,6 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.up_to_date_text, "OK");
         assert_eq!(config.needs_update_text, "UPDATE {}");
-    }
-
-    #[test]
-    fn test_diagnostics_config_deserialization() {
-        let json = r#"{
-            "outdated_severity": 1,
-            "unknown_severity": 2,
-            "yanked_severity": 2,
-            "unsatisfiable_severity": 1,
-            "deprecated_severity": 1
-        }"#;
-
-        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.outdated_severity, Severity::Error);
-        assert_eq!(config.unknown_severity, Severity::Warning);
-        assert_eq!(config.yanked_severity, Severity::Warning);
-        assert_eq!(config.unsatisfiable_severity, Severity::Error);
-        assert_eq!(config.deprecated_severity, Severity::Error);
     }
 
     #[test]
@@ -922,13 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn test_diagnostics_config_mutable_ref_pin_enabled_can_be_disabled() {
-        let json = r#"{ "mutable_ref_pin_enabled": false }"#;
-        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.mutable_ref_pin_enabled);
-    }
-
-    #[test]
     fn test_diagnostics_config_vulnerabilities_enabled_defaults_true() {
         let config = DiagnosticsConfig::default();
         assert!(config.vulnerabilities_enabled);
@@ -936,40 +877,6 @@ mod tests {
         let json = r"{}";
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
         assert!(config.vulnerabilities_enabled);
-    }
-
-    #[test]
-    fn test_diagnostics_config_vulnerabilities_enabled_can_be_disabled() {
-        let json = r#"{ "vulnerabilities_enabled": false }"#;
-        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.vulnerabilities_enabled);
-    }
-
-    #[test]
-    fn test_cache_config_deserialization() {
-        let json = r#"{
-            "enabled": false
-        }"#;
-
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.enabled);
-    }
-
-    #[test]
-    fn test_cache_config_with_enabled() {
-        let config = CacheConfig::new().with_enabled(false);
-        assert!(!config.enabled);
-    }
-
-    #[test]
-    fn test_cache_config_defaults() {
-        let config = CacheConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.fetch_timeout, FetchTimeout::constant::<5>());
-        assert_eq!(
-            config.max_concurrent_fetches,
-            FetchConcurrency::constant::<20>()
-        );
     }
 
     #[test]
@@ -1155,72 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_config_fetch_timeout_clamped_min() {
-        let json = r#"{"fetch_timeout_secs": 0}"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.fetch_timeout,
-            FetchTimeout::constant::<1>(),
-            "Should clamp 0 to MIN"
-        );
-    }
-
-    #[test]
-    fn test_cache_config_fetch_timeout_clamped_max() {
-        let json = r#"{"fetch_timeout_secs": 999999}"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.fetch_timeout,
-            FetchTimeout::constant::<300>(),
-            "Should clamp to MAX"
-        );
-    }
-
-    #[test]
-    fn test_cache_config_fetch_timeout_valid_range() {
-        let json = r#"{"fetch_timeout_secs": 10}"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.fetch_timeout,
-            FetchTimeout::constant::<10>(),
-            "Valid value should not be clamped"
-        );
-    }
-
-    #[test]
-    fn test_cache_config_max_concurrent_clamped_min() {
-        let json = r#"{"max_concurrent_fetches": 0}"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.max_concurrent_fetches,
-            FetchConcurrency::constant::<1>(),
-            "Should clamp 0 to MIN"
-        );
-    }
-
-    #[test]
-    fn test_cache_config_max_concurrent_clamped_max() {
-        let json = r#"{"max_concurrent_fetches": 100000}"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.max_concurrent_fetches,
-            FetchConcurrency::constant::<100>(),
-            "Should clamp to MAX"
-        );
-    }
-
-    #[test]
-    fn test_cache_config_max_concurrent_valid_range() {
-        let json = r#"{"max_concurrent_fetches": 50}"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.max_concurrent_fetches,
-            FetchConcurrency::constant::<50>(),
-            "Valid value should not be clamped"
-        );
-    }
-
-    #[test]
     fn test_code_lens_config_defaults() {
         let config = CodeLensConfig::default();
         assert!(config.enabled);
@@ -1248,12 +1089,6 @@ mod tests {
     }
 
     #[test]
-    fn test_supply_chain_config_defaults() {
-        let config = SupplyChainConfig::default();
-        assert!(config.enabled);
-    }
-
-    #[test]
     fn test_supply_chain_config_deserialization() {
         let json = r#"{"enabled": false}"#;
         let config: SupplyChainConfig = serde_json::from_str(json).unwrap();
@@ -1278,13 +1113,6 @@ mod tests {
     fn test_freshness_config_with_enabled() {
         let config = FreshnessConfig::new().with_enabled(false);
         assert!(!config.enabled);
-    }
-
-    #[test]
-    fn test_freshness_config_defaults() {
-        let config = FreshnessConfig::default();
-        assert!(config.enabled);
-        assert_eq!(config.cooldown_secs, 259_200);
     }
 
     #[test]

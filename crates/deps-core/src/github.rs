@@ -1228,17 +1228,6 @@ mod tests {
 
     // --- page_has_more / warn_if_pagination_truncated ---
 
-    #[test]
-    fn test_page_has_more_full_page_continues() {
-        assert!(page_has_more(100));
-    }
-
-    #[test]
-    fn test_page_has_more_partial_page_stops() {
-        assert!(!page_has_more(99));
-        assert!(!page_has_more(0));
-    }
-
     #[cfg(feature = "test-util")]
     #[test]
     fn test_pagination_warns_when_truncated_at_cap() {

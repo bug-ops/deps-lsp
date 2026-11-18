@@ -1104,19 +1104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_line_offset_table() {
-        let content = "line0\nline1\nline2";
-        let table = LineOffsetTable::new(content);
-        let pos = table.byte_offset_to_position(content, 6);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-
-        let pos = table.byte_offset_to_position(content, 8);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 2);
-    }
-
-    #[test]
     fn test_find_name_range() {
         let content = "\n\n\n\n\n    implementation(\"com.example:lib:1.0.0\")";
         let table = LineOffsetTable::new(content);

@@ -278,21 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bundler_version_creation() {
-        let version = BundlerVersion {
-            number: "7.0.8".into(),
-            prerelease: false,
-            yanked: false,
-            published_at: Some(deps_core::PublishTime::from_unix_secs(1_694_208_000)),
-            platform: "ruby".into(),
-        };
-
-        assert_eq!(version.number, "7.0.8");
-        assert!(!version.yanked);
-        assert!(version.is_stable());
-    }
-
-    #[test]
     fn test_bundler_version_prerelease() {
         let version = BundlerVersion {
             number: "7.1.0.beta1".into(),
@@ -547,19 +532,5 @@ mod tests {
         assert_eq!(gem.licenses.len(), 2);
         assert_eq!(gem.authors, Some("Test Author".into()));
         assert_eq!(gem.downloads, 1000);
-    }
-
-    #[test]
-    fn test_bundler_dependency_clone() {
-        let dep = create_test_dependency(DependencySource::Registry);
-        let cloned = dep.clone();
-        assert_eq!(dep, cloned);
-    }
-
-    #[test]
-    fn test_bundler_dependency_debug() {
-        let dep = create_test_dependency(DependencySource::Registry);
-        let debug_str = format!("{:?}", dep);
-        assert!(debug_str.contains("test_gem"));
     }
 }

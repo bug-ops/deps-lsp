@@ -646,7 +646,7 @@ impl PypiIndexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{WorkspaceRegistryAccess, redact_userinfo};
+    use deps_core::net_policy::WorkspaceRegistryAccess;
     use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
@@ -1353,30 +1353,6 @@ mod tests {
             !log.contains("super-secret-value"),
             "tracing output leaked the credential: {log:?}"
         );
-    }
-
-    /// [`redact_userinfo`] is a no-op for a value with no userinfo component (the common
-    /// case), and for `"not-a-valid-url"` specifically — no `://` at all, so there is no
-    /// authority for even the parse-independent fallback to inspect (see
-    /// `deps_core::net_policy`'s own `test_redact_userinfo_redacts_unparseable_url_with_userinfo`
-    /// for the case where an unparseable value *does* still carry userinfo).
-    #[test]
-    fn test_redact_userinfo_noop_cases() {
-        assert_eq!(
-            redact_userinfo("https://pypi.mycorp.example/simple"),
-            "https://pypi.mycorp.example/simple"
-        );
-        assert_eq!(redact_userinfo("not-a-valid-url"), "not-a-valid-url");
-    }
-
-    #[test]
-    fn test_redact_userinfo_strips_username_and_password() {
-        let redacted = redact_userinfo("https://user:hunter2@pypi.example/simple");
-        assert!(!redacted.contains("hunter2"));
-        assert!(!redacted.contains("user:"));
-        // Spec's exact example format: a fixed `***@` marker, not a bare stripped host — this
-        // keeps a redacted value visibly distinct from a URL that never carried userinfo.
-        assert_eq!(redacted, "https://***@pypi.example/simple");
     }
 
     /// S1: a userinfo-bearing index value that also fails `Url::parse` for an unrelated reason

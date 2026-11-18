@@ -2925,14 +2925,6 @@ mod tests {
         assert_eq!(redact_userinfo("c:///@scope/pkg"), "c:///@scope/pkg");
     }
 
-    #[test]
-    fn test_redact_userinfo_opaque_path_token_prefix_no_op_unprefixed_username() {
-        assert_eq!(
-            redact_userinfo("file:///home/user@example/file"),
-            "file:///home/user@example/file"
-        );
-    }
-
     /// impl-critic F4.1: pins [`find_token_prefix_at`]'s `starts_with` (not `contains`) rule —
     /// the one property that keeps its false-positive population bounded. A leading `x` right
     /// before the token prefix, with no `/`/`?`/`#`/`\` boundary between them, must not match.
