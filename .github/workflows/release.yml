@@ -18,33 +18,55 @@ permissions:
   contents: read
 
 jobs:
+  resolve-tag:
+    name: Resolve Tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      # Single source of the release tag for every job: the dispatched `tag` input, or the
+      # pushed tag. Passed via env (never interpolated into the script) and format-validated.
+      - name: Resolve and validate tag
+        id: resolve
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag '${TAG}' (expected vX.Y.Z or vX.Y.Z-prerelease)"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
   create-release:
     name: Create Release
+    needs: resolve-tag
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
       upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
+      version: ${{ needs.resolve-tag.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Get version from tag
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           draft: false
           prerelease: false
           generate_release_notes: true
-          name: Release v${{ steps.get_version.outputs.version }}
+          name: Release v${{ needs.resolve-tag.outputs.version }}
 
   build-binaries:
     name: Build (${{ matrix.target }})
-    needs: create-release
+    needs: [resolve-tag, create-release]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -96,6 +118,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -187,19 +211,22 @@ jobs:
       - name: Upload release archive
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           files: |
             deps-lsp-${{ matrix.target }}.*
             deps-cli-${{ matrix.target }}.*
 
   generate-sbom:
     name: Generate SBOM
-    needs: create-release
+    needs: [resolve-tag, create-release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
@@ -226,13 +253,14 @@ jobs:
       - name: Upload SBOM to release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           files: |
             deps-lsp.cdx.json*
             deps-cli.cdx.json*
 
   scan-github-action-image:
     name: Scan GitHub Action Image
-    needs: [create-release, build-binaries]
+    needs: [resolve-tag, create-release, build-binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -240,6 +268,8 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -294,7 +324,7 @@ jobs:
 
   build-github-action-image:
     name: Build and Publish GitHub Action Image
-    needs: [create-release, build-binaries, scan-github-action-image]
+    needs: [resolve-tag, create-release, build-binaries, scan-github-action-image]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -304,6 +334,8 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - name: Compute image tags
         id: tags
@@ -428,7 +460,7 @@ jobs:
 
   build-wasm:
     name: Build WASM (Zed Extension)
-    needs: create-release
+    needs: [resolve-tag, create-release]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -436,6 +468,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
           submodules: true
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
@@ -463,12 +496,13 @@ jobs:
       - name: Upload WASM archive
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           files: |
             deps-zed.wasm.*
 
   publish-crates:
     name: Publish to crates.io
-    needs: [create-release, build-binaries]
+    needs: [resolve-tag, create-release, build-binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -476,14 +510,17 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
 
       - name: Verify version matches tag
+        env:
+          TAG_VERSION: ${{ needs.resolve-tag.outputs.version }}
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
@@ -501,20 +538,19 @@ jobs:
 
   update-release-notes:
     name: Update Release Notes
-    needs: [create-release, build-binaries, build-wasm, publish-crates]
+    needs: [resolve-tag, create-release, build-binaries, build-wasm, publish-crates]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
 
       - name: Update release with installation instructions
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           append_body: true
           body: |
 
