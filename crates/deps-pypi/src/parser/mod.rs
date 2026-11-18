@@ -752,6 +752,7 @@ impl PypiParser {
             source,
             index_route: None,
             native_cooldown: None,
+            uv_index: None,
         })
     }
 }

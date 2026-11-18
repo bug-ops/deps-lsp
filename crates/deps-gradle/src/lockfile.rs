@@ -75,24 +75,33 @@ fn is_legacy_lock_name(name: &str) -> bool {
     name.ends_with(LEGACY_LOCKFILE_SUFFIX) && !name.starts_with(SETTINGS_PREFIX)
 }
 
-/// The first [`MAX_LEGACY_DIR_ENTRIES`] eligible lock files of a legacy lock directory by name,
-/// chosen from at most [`MAX_LEGACY_SCAN_ENTRIES`] directory entries.
+/// Eligible legacy lock files among the first [`MAX_LEGACY_SCAN_ENTRIES`] entries of `dir`.
+///
+/// Classified by [`std::fs::DirEntry::file_type`] without a `stat`; only a symlink is resolved
+/// (via `fs_probe::is_file`), so a link to a directory or FIFO is never eligible.
+fn eligible_legacy_files(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .take(MAX_LEGACY_SCAN_ENTRIES)
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_legacy_lock_name))
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| {
+                kind.is_file() || (kind.is_symlink() && deps_core::fs_probe::is_file(&entry.path()))
+            })
+        })
+        .map(|entry| entry.path())
+}
+
+/// The first [`MAX_LEGACY_DIR_ENTRIES`] eligible lock files of a legacy lock directory by name.
 ///
 /// Eligibility is decided before the cap, so unrelated entries never crowd out lock files and
 /// the located file is the name-first one whenever the directory is within the scan bound.
 fn legacy_lock_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<PathBuf> = entries
-        .take(MAX_LEGACY_SCAN_ENTRIES)
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_str().is_some_and(is_legacy_lock_name))
-        .map(|entry| entry.path())
-        .collect();
+    let mut files: Vec<PathBuf> = eligible_legacy_files(dir).collect();
     files.sort();
     files.truncate(MAX_LEGACY_DIR_ENTRIES);
-    files.retain(|path| deps_core::fs_probe::is_file(path));
     files
 }
 
@@ -141,13 +150,12 @@ impl LockFileProvider for GradleLockParser {
             } else {
                 manifest_dir
             };
-            legacy_lock_files(
+            eligible_legacy_files(
                 &project_dir
                     .join(CATALOG_DIR_NAME)
                     .join(LEGACY_LOCKS_DIR_NAME),
             )
-            .into_iter()
-            .next()
+            .min()
         })
     }
 
@@ -186,23 +194,41 @@ impl LockFileProvider for GradleLockParser {
             .collect()
     }
 
+    fn companion_listing_dir(&self, located: &Path) -> Option<PathBuf> {
+        match GradleLockLayout::of(located) {
+            GradleLockLayout::Legacy => located.parent().map(Path::to_path_buf),
+            GradleLockLayout::Unified => None,
+        }
+    }
+
     fn parse_lockfile<'a>(
         &'a self,
         lockfile_path: &'a Path,
     ) -> Pin<Box<dyn std::future::Future<Output = deps_core::Result<ResolvedPackages>> + Send + 'a>>
     {
         Box::pin(async move {
-            if GradleLockLayout::of(lockfile_path) == GradleLockLayout::Legacy {
-                return parse_legacy_set(lockfile_path, self.companion_lockfiles(lockfile_path))
-                    .await;
+            let companions = self.companion_lockfiles(lockfile_path);
+            self.parse_lock_set(lockfile_path, &companions).await
+        })
+    }
+
+    fn parse_lock_set<'a>(
+        &'a self,
+        located: &'a Path,
+        companions: &'a [PathBuf],
+    ) -> Pin<Box<dyn std::future::Future<Output = deps_core::Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if GradleLockLayout::of(located) == GradleLockLayout::Legacy {
+                return parse_legacy_set(located, companions).await;
             }
-            let mut packages = parse_scoped_file(lockfile_path).await?;
-            for companion in self.companion_lockfiles(lockfile_path) {
+            let mut packages = parse_scoped_file(located).await?;
+            for companion in companions {
                 // Absence is normal (most projects have no buildscript locking). An unreadable
                 // companion (symlink, oversized) degrades to the located file's data alone
                 // rather than dropping the whole lock set.
-                if deps_core::fs_probe::is_file(&companion) {
-                    let scoped = match parse_scoped_file(&companion).await {
+                if deps_core::fs_probe::is_file(companion) {
+                    let scoped = match parse_scoped_file(companion).await {
                         Ok(scoped) => scoped,
                         Err(e) => {
                             tracing::warn!(
@@ -231,13 +257,20 @@ impl LockFileProvider for GradleLockParser {
 /// budget is dropped with a warning and what was read so far is kept.
 async fn parse_legacy_set(
     located: &Path,
-    companions: Vec<PathBuf>,
+    companions: &[PathBuf],
 ) -> deps_core::Result<ResolvedPackages> {
     let mut seen: HashSet<(LockScope, String, String)> = HashSet::new();
     let mut packages = ResolvedPackages::new();
     let mut budget = MAX_LOCKFILE_BYTES;
-    let files = std::iter::once(located.to_path_buf())
-        .chain(companions.into_iter().filter(|path| path.is_file()));
+    // The listing directory is a companion for its mtime stamp, not a file to read; a vanished
+    // companion fails its read below and is skipped.
+    let listing_dir = located.parent();
+    let files = std::iter::once(located.to_path_buf()).chain(
+        companions
+            .iter()
+            .filter(|path| Some(path.as_path()) != listing_dir)
+            .cloned(),
+    );
     for path in files {
         let content = match read_lockfile_content(&path, LOCKFILE_NAME).await {
             Ok(content) => content,

@@ -34,11 +34,11 @@ use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use url::Url;
 
 use super::command::{ArgComponent, NpmClient, Program, compat_class};
-use super::run::{SearchPath, ToolRunner};
+use super::run::{ProcessGroup, SearchPath, ToolRunner};
 use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, PinResolution,
     RegenerationError, RegenerationGate, SkipCause, Strategy, UnsupportedReason,
-    regenerate_lockfile_with, strategy,
+    regenerate_lockfile_with, regenerate_until, strategy,
 };
 use crate::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
@@ -171,6 +171,7 @@ fn inherit_runner() -> ToolRunner {
     ToolRunner {
         deadline: Duration::from_mins(5),
         search_path: SearchPath::Inherit,
+        group: ProcessGroup::Own,
     }
 }
 
@@ -960,6 +961,7 @@ mod fake_tools {
             ToolRunner {
                 deadline,
                 search_path: SearchPath::Override(self.dir.path().as_os_str().to_owned()),
+                group: ProcessGroup::Own,
             }
         }
 
@@ -2338,6 +2340,116 @@ mod fake_tools {
                 }
             );
             assert!(run.calls.is_empty(), "{:?}", run.calls);
+        }
+    }
+}
+
+#[test]
+fn test_process_group_choose_inherits_only_for_the_terminals_foreground_group() {
+    assert_eq!(ProcessGroup::choose(Some(100), 100), ProcessGroup::Inherit);
+    assert_eq!(ProcessGroup::choose(Some(200), 100), ProcessGroup::Own);
+    assert_eq!(ProcessGroup::choose(None, 100), ProcessGroup::Own);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_interrupts_recv_resolves_on_sigterm_instead_of_killing_the_process() {
+    let mut interrupts = super::interrupt::Interrupts::install().expect("install handlers");
+
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+        .expect("signal self");
+
+    tokio::time::timeout(Duration::from_secs(5), interrupts.recv())
+        .await
+        .expect("SIGTERM was delivered to the handler");
+}
+
+#[cfg(all(unix, feature = "npm"))]
+mod interrupted {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn read_pid(path: &Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{} was never written", path.display());
+    }
+
+    #[tokio::test]
+    async fn test_regenerate_until_interrupt_kills_the_tool_tree_and_reports_interrupted() {
+        let project = Project::new();
+        let content =
+            "{\"name\":\"a\",\"version\":\"1.0.0\",\"dependencies\":{\"lodash\":\"^4.17.0\"}}";
+        let manifest = project.write("package.json", content);
+        project.write("package-lock.json", "{}");
+        let bin = tempfile::tempdir().expect("bin dir");
+        let leader = bin.path().join("leader.pid");
+        let grandchild = bin.path().join("grandchild.pid");
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nsleep 30 &\necho $! > '{}'\nsleep 30\n",
+            leader.display(),
+            grandchild.display()
+        );
+        let npm = bin.path().join("npm");
+        std::fs::write(&npm, script).expect("write shim");
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let runner = ToolRunner {
+            deadline: Duration::from_mins(1),
+            search_path: SearchPath::Override(bin.path().as_os_str().to_owned()),
+            group: ProcessGroup::Own,
+        };
+        let plan = plan_of(
+            content,
+            &[Bump::new(
+                "lodash", "lodash", "^4.17.0", "^4.17.21", "4.17.20", "4.17.21",
+            )],
+        );
+        let ecosystem = ecosystem(EcosystemId::Npm);
+        let uri = Url::from_file_path(&manifest).expect("file url");
+        let display = PathBuf::from("package.json");
+        let target = ManifestTarget {
+            ecosystem: &ecosystem,
+            manifest_path: &manifest,
+            display_path: &display,
+            uri: &uri,
+        };
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        let interrupt = async move {
+            fired.await.expect("sender alive");
+        };
+        let signaller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            fire.send(()).expect("receiver alive");
+        });
+
+        let outcome = regenerate_until(&plan, &target, run_gate(), &runner, interrupt).await;
+        signaller.await.expect("signaller");
+
+        assert_matches!(
+            outcome,
+            LockfileOutcome::Failed(RegenerationError::Interrupted)
+        );
+        for pid in [read_pid(&leader), read_pid(&grandchild)] {
+            let start = std::time::Instant::now();
+            // Async sleep: a blocked runtime thread would never reap the killed leader.
+            while alive(pid) && start.elapsed() < Duration::from_secs(2) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(!alive(pid), "pid {pid} survived the interrupt");
         }
     }
 }

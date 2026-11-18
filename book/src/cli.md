@@ -447,12 +447,13 @@ explicit choice.
   default three-day cooldown), which is verified the same way; if that fails the dependency
   is not rewritten to the deprecated version. Every vulnerable dependency is classified into
   exactly one of three outcomes:
-  - `applied` — the fix was written.
+  - `applied` — the fix was written to the manifest, or (with `--lockfile regenerate` for
+    Cargo, npm, pnpm and Go) the lock file was moved to the fix target because the declared
+    requirement already admits it; the report's reason tells the two apart.
   - `requires-lockfile-update` — the declared requirement already admits the fix, so there
-    is nothing to rewrite at the manifest level; a lock-file regeneration step (tracked by
-    [#1116](https://github.com/bug-ops/deps-lsp/issues/1116), not yet implemented) is
-    needed to actually pull the fixed version in. `update` does not regenerate lock files
-    itself.
+    is nothing to rewrite at the manifest level, and the lock file still resolves a vulnerable
+    version. Pass `--lockfile regenerate` to let `update` move the lock file (Cargo, npm, pnpm
+    and Go); for other ecosystems and for Yarn and Bun, update the lock file yourself.
   - `unfixable` — no independently-verified fix target exists, the registry fetch for that
     dependency failed, the fix target is itself yanked, the declared requirement's syntax has
     no safe single-value rewrite and is confirmed not to already admit the fix target, or the
@@ -512,10 +513,23 @@ the fresh lockfile against every applied version:
 
 | Ecosystem | Tool run | Checked against the lockfile |
 |---|---|---|
-| Cargo | `cargo update --workspace`, then `cargo update --package=<name>@<class> --precise=<version>` per update | the lockfile holds exactly the target |
-| npm (`package-lock.json`) | `npm install --package-lock-only --ignore-scripts --no-audit --no-fund` | a locked version satisfies the edited requirement and is at least the target |
-| pnpm (`pnpm-lock.yaml`) | `pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile` | same as npm |
+| Cargo | `cargo update --workspace` (only when a manifest was edited), then `cargo update --package=<name>@<class> --precise=<version>` per update | the lockfile holds exactly the target |
+| npm (`package-lock.json`) | `npm install --package-lock-only --ignore-scripts --no-audit --no-fund` (manifest edits), then `npm update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund <names>` (lock-file-only fixes) | a locked version satisfies the declared requirement and is at least the target |
+| pnpm (`pnpm-lock.yaml`) | `pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile`, then `pnpm update --lockfile-only --no-save --ignore-scripts <names>` | same as npm |
 | Go | `go get -- <module>@<version>` | `go.sum` holds the module's content checksum for the target |
+
+A `--security-only` fix whose declared requirement already admits the target (a caret range,
+say) needs no manifest edit: with `--lockfile regenerate` only the lock file moves, and the item
+becomes `applied` once the regenerated lock file holds the target. `npm update` and `pnpm update`
+always pick the newest in-range release, so a newer version also counts, but only when every
+advisory affecting the locked version (captured from OSV with the plan, no extra query) places that
+version outside its affected ranges (an advisory introduced by a release between the fix and the newer version is not checked, and the next run reports it); the item then reports the version the lock file now holds. When a
+newer version cannot be cleared (it lies in a later affected range, the ranges are not SemVer or
+could not be evaluated, or the advisory list was truncated), the item stays
+`requires-lockfile-update` (exit `1`) and its reason says the lock file now resolves that version
+and it needs a manual review; the report's `lockfile` object shows it as `newer`. Names handed to `npm update`
+and `pnpm update` are validated (pnpm treats them as patterns, so `*` and a leading `!` are
+refused with exit `2`). `go get` may also raise the module's `require` line in `go.mod`.
 
 The JSON report always has a `lockfile` object tagged by `status` (`regenerated`, `skipped`,
 `not-applicable`, `unsupported`, `failed`). A failed regeneration prints the full report and
@@ -535,9 +549,22 @@ network traffic is not subject to deps-cli's registry policy. Child processes in
 environment, so tokens in it are readable by `.pnpmfile.cjs` and the like, and corepack may
 download a package manager silently. Known limits: a Cargo cooldown
 fallback below a sibling's new minimum fails the `--precise` step and leaves the lockfile at the
-newest compatible version; a grandchild process may outlive a timeout (5 minutes in total); `go
-get` may raise indirect requirements and the `go` directive in `go.mod`, and download a newer
+newest compatible version; `go get` may raise indirect requirements and the `go` directive in `go.mod`, and download a newer
 toolchain to satisfy it.
+
+**Timeouts and signals (unix).** The whole regeneration shares a 5-minute budget. Each tool runs
+in its own process group, and on a timeout, on SIGINT or on SIGTERM the whole group is killed
+(SIGKILL), so no grandchild outlives the run; an interrupted run prints the report with
+`lockfile: failed` (`kind: interrupted`) and exits `2`. When deps-cli is in the foreground group of
+its controlling terminal (an interactive run) the tool stays in that group instead, so `/dev/tty`
+prompts keep working and Ctrl-C reaches it. Limits: in that foreground mode a timeout, or a SIGTERM
+sent to deps-cli alone, kills only the direct child and grandchildren may survive; a SIGKILL of
+deps-cli's own process group (`timeout -k`, `kill -9 -- -PGID`) does not reach a tool in its own
+group; a `deps-cli ... &` job brought back with `fg` while `stty tostop` is set leaves the tool in
+its own, background group, so its first terminal write stops it and the run waits for the 5-minute
+timeout (exit `2`); the signal handlers are installed whenever a regeneration has pins to verify,
+even for ecosystems where nothing is spawned, stay installed until exit, and override an inherited
+`SIG_IGN` for SIGINT or SIGTERM; on Windows only the direct child is killed.
 
 ### Write safety and exit codes
 

@@ -6,17 +6,24 @@
 //! a [`LockfileOutcome`] value so the plan report is always printed.
 
 mod command;
+mod interrupt;
+#[cfg(test)]
+mod lockfile_only_tests;
+#[cfg(all(test, unix))]
+mod process_group_tests;
 mod run;
 #[cfg(test)]
 mod tests;
 
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use deps_core::lockfile::LockFileCache;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementGate};
+use deps_core::osv::AffectsVersion;
 use deps_core::{
     ConcreteVersion, Ecosystem, EcosystemId, NetworkMode, NormalizeName, NormalizedName,
     PackageName, VersionReq,
@@ -25,11 +32,12 @@ use deps_engine::classify::resolved::{LockfileLoad, load_resolved_versions};
 use tokio::time::Instant;
 use url::Url;
 
-use command::{ArgComponent, Invocation, compat_class};
+use command::{ArgComponent, Invocation, NpmPackageArg, compat_class};
 pub use command::{NpmClient, Program};
-use run::{SearchPath, ToolRunner};
+use interrupt::Interrupts;
+use run::{ProcessGroup, SearchPath, ToolRunner};
 
-use super::{CooldownFallbackNote, Outcome, UpdatePlan};
+use super::{CooldownFallbackNote, CurrentVersion, LockfileState, Outcome, UpdatePlan, UpdateRun};
 use crate::format::DryRun;
 
 /// Shared time budget for every probe and tool call of one regeneration.
@@ -175,6 +183,9 @@ pub enum RegenerationError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// SIGINT or SIGTERM arrived while the tool was running.
+    #[error("regeneration was interrupted")]
+    Interrupted,
     /// The shared time budget ran out.
     #[error("regeneration timed out after {:.1}s", after.as_secs_f64())]
     TimedOut {
@@ -361,26 +372,68 @@ enum PinCheck {
     SatisfiesInLock,
 }
 
-/// One applied update to verify, deduplicated by `(normalized, target)`.
+/// Where a pin's fix comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinOrigin {
+    /// The plan edited the manifest.
+    ManifestEdit,
+    /// The declared requirement already admits the target; only the lock file moves.
+    LockfileOnly {
+        /// The version the lock file held before, when the plan resolved it.
+        locked: Option<ConcreteVersion>,
+    },
+}
+
+/// One update to verify, deduplicated by `(normalized, target)`.
 struct LockPin {
     package: PackageName,
     normalized: NormalizedName,
     target: ConcreteVersion,
     cooldown_fallback: bool,
+    origin: PinOrigin,
+}
+
+impl LockPin {
+    /// The version whose caret class `cargo update --package` addresses.
+    fn compat_basis(&self) -> &ConcreteVersion {
+        match &self.origin {
+            PinOrigin::LockfileOnly {
+                locked: Some(locked),
+            } => locked,
+            PinOrigin::ManifestEdit | PinOrigin::LockfileOnly { locked: None } => &self.target,
+        }
+    }
+
+    const fn is_lockfile_only(&self) -> bool {
+        matches!(self.origin, PinOrigin::LockfileOnly { .. })
+    }
 }
 
 fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<LockPin> {
     let mut pins: Vec<LockPin> = Vec::new();
     for item in &plan.items {
-        let Outcome::Applied { target, .. } = &item.outcome else {
-            continue;
+        let (target, origin) = match &item.outcome {
+            Outcome::Applied { target, .. } => (target, PinOrigin::ManifestEdit),
+            Outcome::RequiresLockfileUpdate { target } => (
+                target,
+                PinOrigin::LockfileOnly {
+                    locked: match &item.current {
+                        CurrentVersion::Resolved(version) => Some(version.clone()),
+                        CurrentVersion::Declared(_) | CurrentVersion::Unknown => None,
+                    },
+                },
+            ),
+            _ => continue,
         };
         let package = PackageName::new(item.name.as_str());
         let normalized = formatter.normalize_package_name(&package);
-        if pins
-            .iter()
-            .any(|pin| pin.normalized == normalized && pin.target == *target)
+        if let Some(existing) = pins
+            .iter_mut()
+            .find(|pin| pin.normalized == normalized && pin.target == *target)
         {
+            if origin == PinOrigin::ManifestEdit {
+                existing.origin = origin;
+            }
             continue;
         }
         pins.push(LockPin {
@@ -391,31 +444,145 @@ fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<Lo
                 item.cooldown_fallback,
                 Some(CooldownFallbackNote::AppliedInsteadOf(_))
             ),
+            origin,
         });
     }
     pins
 }
 
-/// Regenerates the lockfile for the manifest `plan` was applied to, using the inherited `PATH`.
+/// Regenerates the lockfile for the manifest `plan` was applied to, using the inherited `PATH`,
+/// and settles every `RequiresLockfileUpdate` item the regenerated lockfile now satisfies into
+/// `AppliedViaLockfile`.
 ///
 /// Never panics and never writes a file itself; a failure is a [`LockfileOutcome`] variant.
 pub async fn regenerate_lockfile(
-    plan: &UpdatePlan,
+    plan: UpdatePlan,
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
-) -> LockfileOutcome {
+) -> UpdateRun {
     let runner = ToolRunner {
         deadline: TOOL_BUDGET,
         search_path: SearchPath::Inherit,
+        group: ProcessGroup::detect(),
     };
-    regenerate_lockfile_with(plan, target, gate, &runner).await
+    let interrupt = interrupt_listener(&plan, target, gate);
+    let lockfile = regenerate_until(&plan, target, gate, &runner, interrupt).await;
+    let mut plan = plan;
+    settle_lockfile_only(&mut plan, &lockfile, target.ecosystem.formatter());
+    UpdateRun { plan, lockfile }
 }
 
+/// Installs the signal handlers right before the first spawn, when the gate is `Run` and there
+/// is at least one pin.
+///
+/// This is decided before the strategy is known, so handlers are also installed for runs that
+/// end up spawning nothing (deferred ecosystems, a missing lock file); the signals are then
+/// swallowed for the rest of the short-lived process.
+///
+/// The returned future resolves on the first SIGINT/SIGTERM and never when no handler could be
+/// installed (the previous behaviour: the signal kills deps-cli itself).
+fn interrupt_listener(
+    plan: &UpdatePlan,
+    target: &ManifestTarget<'_>,
+    gate: RegenerationGate,
+) -> impl Future<Output = ()> {
+    let will_spawn = gate == RegenerationGate::Run
+        && !collect_pins(plan, target.ecosystem.formatter()).is_empty();
+    let interrupts = will_spawn
+        .then(Interrupts::install)
+        .and_then(|installed| match installed {
+            Ok(interrupts) => Some(interrupts),
+            Err(error) => {
+                tracing::warn!(%error, "could not install signal handlers for the lockfile tool");
+                None
+            }
+        });
+    async move {
+        match interrupts {
+            Some(mut interrupts) => interrupts.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Turns each `RequiresLockfileUpdate` item whose regenerated lockfile holds the fix target, or
+/// a newer version provably outside every advisory's affected ranges, into `AppliedViaLockfile`.
+///
+/// A newer in-range version (npm and pnpm always pick the newest) is settled only when every
+/// captured advisory range says it is unaffected; anything else, including missing or
+/// undecidable ranges, keeps the item `RequiresLockfileUpdate` (exit 1) and records where the
+/// lock file now stands.
+fn settle_lockfile_only(
+    plan: &mut UpdatePlan,
+    lockfile: &LockfileOutcome,
+    formatter: &dyn EcosystemFormatter,
+) {
+    let LockfileOutcome::Regenerated { pins, .. } = lockfile else {
+        return;
+    };
+    for item in &mut plan.items {
+        let Outcome::RequiresLockfileUpdate { target } = &item.outcome else {
+            continue;
+        };
+        let name = formatter.normalize_package_name(&PackageName::new(item.name.as_str()));
+        let Some(resolution) = pins.iter().find_map(|pin| {
+            (pin.target == *target && formatter.normalize_package_name(&pin.package) == name)
+                .then_some(&pin.resolution)
+        }) else {
+            continue;
+        };
+        match resolution {
+            PinResolution::Exact => {
+                item.outcome = Outcome::AppliedViaLockfile {
+                    target: target.clone(),
+                };
+            }
+            PinResolution::Newer(version) if outside_affected_ranges(item, version, formatter) => {
+                item.outcome = Outcome::AppliedViaLockfile {
+                    target: version.clone(),
+                };
+            }
+            PinResolution::Newer(version) => {
+                item.lockfile_fix.lockfile = LockfileState::MovedTo(version.clone());
+            }
+        }
+    }
+}
+
+/// Whether the item captured at least one advisory range set and every one of them places
+/// `version` outside its affected ranges.
+fn outside_affected_ranges(
+    item: &super::PlannedUpdateItem,
+    version: &ConcreteVersion,
+    formatter: &dyn EcosystemFormatter,
+) -> bool {
+    let osv_version = formatter.osv_version(version);
+    !item.lockfile_fix.affected.is_empty()
+        && item
+            .lockfile_fix
+            .affected
+            .iter()
+            .all(|ranges| ranges.affects(&osv_version) == AffectsVersion::No)
+}
+
+#[cfg(test)]
 async fn regenerate_lockfile_with(
     plan: &UpdatePlan,
     target: &ManifestTarget<'_>,
     gate: RegenerationGate,
     runner: &ToolRunner,
+) -> LockfileOutcome {
+    regenerate_until(plan, target, gate, runner, std::future::pending()).await
+}
+
+/// Regenerates like [`regenerate_lockfile`], but abandons the run when `interrupt` resolves: dropping
+/// the session fires every child guard, so the tool's process tree is killed.
+async fn regenerate_until(
+    plan: &UpdatePlan,
+    target: &ManifestTarget<'_>,
+    gate: RegenerationGate,
+    runner: &ToolRunner,
+    interrupt: impl Future<Output = ()>,
 ) -> LockfileOutcome {
     let pins = collect_pins(plan, target.ecosystem.formatter());
     if pins.is_empty() {
@@ -434,10 +601,10 @@ async fn regenerate_lockfile_with(
             .parent()
             .unwrap_or_else(|| Path::new("")),
     };
-    session
-        .execute()
-        .await
-        .unwrap_or_else(LockfileOutcome::Failed)
+    tokio::select! {
+        result = session.execute() => result.unwrap_or_else(LockfileOutcome::Failed),
+        () = interrupt => LockfileOutcome::Failed(RegenerationError::Interrupted),
+    }
 }
 
 /// The state of one regeneration: the target, the shared deadline and the pins to verify.
@@ -485,7 +652,7 @@ impl Session<'_> {
 
         let mut updates = Vec::with_capacity(self.pins.len());
         for pin in self.pins {
-            let class = compat_class(&pin.target).ok_or_else(|| unsafe_argument(pin))?;
+            let class = compat_class(pin.compat_basis()).ok_or_else(|| unsafe_argument(pin))?;
             let (name, version) = arg_pair(pin)?;
             updates.push(Invocation::cargo_update_precise(
                 self.manifest_dir,
@@ -496,12 +663,14 @@ impl Session<'_> {
             ));
         }
 
-        self.runner
-            .run(
-                &Invocation::cargo_update_workspace(self.manifest_dir, manifest),
-                self.deadline,
-            )
-            .await?;
+        if self.pins.iter().any(|pin| !pin.is_lockfile_only()) {
+            self.runner
+                .run(
+                    &Invocation::cargo_update_workspace(self.manifest_dir, manifest),
+                    self.deadline,
+                )
+                .await?;
+        }
         for update in &updates {
             self.runner.run(update, self.deadline).await?;
         }
@@ -562,16 +731,23 @@ impl Session<'_> {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .and_then(NpmClient::from_lockfile_name);
-        let (client, program, invocation) = match client {
+        let (client, program, install, update): (
+            _,
+            _,
+            _,
+            fn(&Path, &[NpmPackageArg]) -> Invocation,
+        ) = match client {
             Some(client @ NpmClient::Npm) => (
                 client,
                 Program::Npm,
                 Invocation::npm_lock(self.manifest_dir),
+                Invocation::npm_update,
             ),
             Some(client @ NpmClient::Pnpm) => (
                 client,
                 Program::Pnpm,
                 Invocation::pnpm_lock(self.manifest_dir),
+                Invocation::pnpm_update,
             ),
             Some(deferred @ (NpmClient::Yarn | NpmClient::Bun)) => {
                 return Ok(unsupported(
@@ -597,7 +773,21 @@ impl Session<'_> {
             return Ok(outcome);
         }
 
-        self.runner.run(&invocation, self.deadline).await?;
+        let lockfile_only = self
+            .pins
+            .iter()
+            .filter(|pin| pin.is_lockfile_only())
+            .map(|pin| NpmPackageArg::parse(pin.package.as_str()).map_err(|_| unsafe_argument(pin)))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if self.pins.iter().any(|pin| !pin.is_lockfile_only()) {
+            self.runner.run(&install, self.deadline).await?;
+        }
+        if !lockfile_only.is_empty() {
+            self.runner
+                .run(&update(self.manifest_dir, &lockfile_only), self.deadline)
+                .await?;
+        }
         self.verified(program, &located, PinCheck::SatisfiesInLock)
             .await
     }

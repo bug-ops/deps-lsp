@@ -125,6 +125,45 @@ impl ArgComponent {
     }
 }
 
+/// An npm package name proven safe for argv: `name` or `@scope/name` over npm's URL-safe
+/// alphabet (letters, digits and `-_.~!'()`), so no `file:`/`npm:`/`git+` spec and no `*`
+/// pattern; never a leading `-`, `.` or `!`; at most 214 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NpmPackageArg(String);
+
+impl NpmPackageArg {
+    /// Longest package name npm accepts.
+    const MAX_LEN: usize = 214;
+
+    /// Validates `value` as an npm package name argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnsafeArgument`] when `value` breaks the rules above.
+    pub(super) fn parse(value: &str) -> Result<Self, UnsafeArgument> {
+        let url_safe = |c: char| {
+            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '!' | '\'' | '(' | ')')
+        };
+        let well_formed_part = |part: &str| {
+            !part.is_empty() && !part.starts_with(['-', '.', '!']) && part.chars().all(url_safe)
+        };
+        let shape_ok = match value.strip_prefix('@') {
+            Some(scoped) => scoped
+                .split_once('/')
+                .is_some_and(|(scope, name)| well_formed_part(scope) && well_formed_part(name)),
+            None => well_formed_part(value),
+        };
+        if value.len() > Self::MAX_LEN || !shape_ok {
+            return Err(UnsafeArgument);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The caret compatibility class of a concrete version, as `cargo update --package name@class`
 /// expects it (`1.2.3` -> `1`, `0.2.3` -> `0.2`, `0.0.3` -> `0.0.3`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +305,32 @@ impl Invocation {
                 "--no-fund",
             ]),
         );
+        invocation.env = Some(COREPACK_NO_PROMPT);
+        invocation
+    }
+
+    /// `npm update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund <names>`:
+    /// moves the named packages inside their declared ranges without editing `package.json`.
+    pub(super) fn npm_update(cwd: &Path, names: &[NpmPackageArg]) -> Self {
+        let mut args = Self::strs(&[
+            "update",
+            "--no-save",
+            "--package-lock-only",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ]);
+        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
+        let mut invocation = Self::new(Program::Npm, cwd, args);
+        invocation.env = Some(COREPACK_NO_PROMPT);
+        invocation
+    }
+
+    /// `pnpm update --lockfile-only --no-save --ignore-scripts <names>`.
+    pub(super) fn pnpm_update(cwd: &Path, names: &[NpmPackageArg]) -> Self {
+        let mut args = Self::strs(&["update", "--lockfile-only", "--no-save", "--ignore-scripts"]);
+        args.extend(names.iter().map(|name| OsString::from(name.as_str())));
+        let mut invocation = Self::new(Program::Pnpm, cwd, args);
         invocation.env = Some(COREPACK_NO_PROMPT);
         invocation
     }

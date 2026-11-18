@@ -206,6 +206,138 @@ pub fn parse_uv_span(raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
     NativeTimeSpan::from_count(count?, unit)
 }
 
+/// Parses Yarn's `npmMinimalAgeGate` duration (`ms` package grammar, unitless = minutes).
+///
+/// The grammar is `<number>[ms|s|m|h|d|w]` with `<number>` an integer or a decimal (`.5`,
+/// `1.5`); no sign, no whitespace, no exponent. A bare number is minutes. An integer with a
+/// unit keeps that unit; a fraction or `ms` is converted to seconds (rounded up) and shown in
+/// the largest unit that divides it evenly. Zero in any spelling is
+/// [`TimeSpanValue::Disabled`].
+///
+/// # Errors
+///
+/// [`TimeSpanError::Malformed`] outside the grammar; [`TimeSpanError::Overflow`] when the span
+/// exceeds `u64` seconds.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::native_cooldown::{TimeSpanError, TimeSpanValue, parse_yarn_duration};
+///
+/// assert!(matches!(parse_yarn_duration("7d"), Ok(TimeSpanValue::Span(_))));
+/// assert!(matches!(parse_yarn_duration("1.5h"), Ok(TimeSpanValue::Span(_))));
+/// assert_eq!(parse_yarn_duration("0"), Ok(TimeSpanValue::Disabled));
+/// assert_eq!(parse_yarn_duration("${AGE}"), Err(TimeSpanError::Malformed));
+/// ```
+pub fn parse_yarn_duration(raw: &str) -> Result<TimeSpanValue, TimeSpanError> {
+    let number = YarnNumber::split(raw).ok_or(TimeSpanError::Malformed)?;
+    if number.mantissa_is_zero() {
+        return Ok(TimeSpanValue::Disabled);
+    }
+    match (number.fraction_len, number.unit) {
+        (0, YarnUnit::Exact(unit)) => {
+            let count = number
+                .mantissa
+                .parse()
+                .map_err(|_| TimeSpanError::Overflow)?;
+            NativeTimeSpan::from_count(count, unit)
+        }
+        (fraction_len, unit) => number.rounded_span(fraction_len, unit),
+    }
+}
+
+/// The unit suffix of a Yarn duration.
+#[derive(Debug, Clone, Copy)]
+enum YarnUnit {
+    /// A whole unit the span can keep verbatim.
+    Exact(TimeUnit),
+    /// `ms`: always normalised through seconds.
+    Millis,
+}
+
+/// A Yarn duration split into digits, the number of fraction digits and the unit.
+struct YarnNumber {
+    /// Integer and fraction digits concatenated, trailing fraction zeros removed.
+    mantissa: String,
+    fraction_len: u32,
+    unit: YarnUnit,
+}
+
+impl YarnNumber {
+    /// Largest fraction (after trailing-zero removal) accepted before reporting overflow.
+    const MAX_FRACTION_DIGITS: u32 = 18;
+
+    fn split(raw: &str) -> Option<Self> {
+        let int_len = raw.bytes().take_while(u8::is_ascii_digit).count();
+        let (int_digits, rest) = raw.split_at(int_len);
+        let (fraction, rest) = match rest.strip_prefix('.') {
+            Some(after) => {
+                let len = after.bytes().take_while(u8::is_ascii_digit).count();
+                if len == 0 {
+                    return None;
+                }
+                after.split_at(len)
+            }
+            None => ("", rest),
+        };
+        if int_digits.is_empty() && fraction.is_empty() {
+            return None;
+        }
+        let unit = match rest {
+            "" | "m" => YarnUnit::Exact(TimeUnit::Minute),
+            "s" => YarnUnit::Exact(TimeUnit::Second),
+            "h" => YarnUnit::Exact(TimeUnit::Hour),
+            "d" => YarnUnit::Exact(TimeUnit::Day),
+            "w" => YarnUnit::Exact(TimeUnit::Week),
+            "ms" => YarnUnit::Millis,
+            _ => return None,
+        };
+        let fraction = fraction.trim_end_matches('0');
+        Some(Self {
+            mantissa: format!("{int_digits}{fraction}"),
+            fraction_len: u32::try_from(fraction.len()).unwrap_or(u32::MAX),
+            unit,
+        })
+    }
+
+    fn mantissa_is_zero(&self) -> bool {
+        self.mantissa.bytes().all(|b| b == b'0')
+    }
+
+    /// Converts to whole seconds (rounded up) and picks the largest unit dividing them evenly.
+    fn rounded_span(
+        &self,
+        fraction_len: u32,
+        unit: YarnUnit,
+    ) -> Result<TimeSpanValue, TimeSpanError> {
+        if fraction_len > Self::MAX_FRACTION_DIGITS {
+            return Err(TimeSpanError::Overflow);
+        }
+        let unit_millis: u128 = match unit {
+            YarnUnit::Exact(unit) => u128::from(unit.secs()) * 1000,
+            YarnUnit::Millis => 1,
+        };
+        let mantissa: u128 = self.mantissa.parse().map_err(|_| TimeSpanError::Overflow)?;
+        let scaled_millis = mantissa
+            .checked_mul(unit_millis)
+            .ok_or(TimeSpanError::Overflow)?;
+        let denominator = 10_u128.pow(fraction_len) * 1000;
+        let secs = u64::try_from(scaled_millis.div_ceil(denominator))
+            .map_err(|_| TimeSpanError::Overflow)?;
+        let unit = [
+            TimeUnit::Week,
+            TimeUnit::Day,
+            TimeUnit::Hour,
+            TimeUnit::Minute,
+            TimeUnit::Second,
+        ]
+        .into_iter()
+        .find(|unit| secs % unit.secs() == 0)
+        .unwrap_or(TimeUnit::Second);
+        NativeTimeSpan::from_count(secs / unit.secs(), unit)
+    }
+}
+
 type CountAndUnit = (Result<u64, TimeSpanError>, TimeUnit);
 
 /// Splits a leading digit run off `text`; the count is `Err(Overflow)` when it exceeds `u64`.
@@ -365,6 +497,16 @@ impl NativeHold {
     }
 }
 
+/// Whether `name` is non-empty, at most `max_len` bytes, and ASCII alphanumerics plus `-_.`:
+/// safe to quote in a diagnostic without sanitising.
+fn is_safe_label(name: &str, max_len: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= max_len
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// A PyPI package name restricted to characters safe to quote in a diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PypiPackageLabel(String);
@@ -376,12 +518,7 @@ impl PypiPackageLabel {
     /// Wraps `name`, or `None` when it is empty or has a character outside PEP 508 names.
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
-        let valid = !name.is_empty()
-            && name.len() <= Self::MAX_LEN
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
-        valid.then(|| Self(name.to_owned()))
+        is_safe_label(name, Self::MAX_LEN).then(|| Self(name.to_owned()))
     }
 
     /// The label text.
@@ -389,6 +526,56 @@ impl PypiPackageLabel {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// An npm scope key as written under `npmScopes` (no leading `@`), restricted to a charset safe
+/// to quote in a diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmScopeLabel(String);
+
+impl NpmScopeLabel {
+    /// Longest scope accepted (npm's own package-name limit).
+    const MAX_LEN: usize = 214;
+
+    /// Wraps `scope`, or `None` when it is empty, oversized or outside the safe charset.
+    #[must_use]
+    pub fn new(scope: &str) -> Option<Self> {
+        is_safe_label(scope, Self::MAX_LEN).then(|| Self(scope.to_owned()))
+    }
+
+    /// The label text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A uv index name as written in `[[tool.uv.index]] name = ...`, restricted like a
+/// [`PypiPackageLabel`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UvIndexLabel(String);
+
+impl UvIndexLabel {
+    /// Wraps `name`, or `None` when it is empty, oversized or outside the safe charset.
+    #[must_use]
+    pub fn new(name: &str) -> Option<Self> {
+        is_safe_label(name, PypiPackageLabel::MAX_LEN).then(|| Self(name.to_owned()))
+    }
+
+    /// The label text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Whether a per-scope Yarn window was written in the file or is Yarn's own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOrigin {
+    /// The key is present in the configuration file.
+    Configured,
+    /// Yarn applies its built-in default; the file does not state the value.
+    ManagerDefault,
 }
 
 /// A non-zero publish-age window, clamped to ten years.
@@ -494,6 +681,20 @@ pub enum NativeCooldownSource {
     UvExcludeNewerPackage {
         /// The package the override belongs to.
         package: PypiPackageLabel,
+    },
+    /// Yarn `npmMinimalAgeGate` in `.yarnrc.yml`.
+    YarnNpmMinimalAgeGate,
+    /// Yarn `npmScopes.<scope>.npmMinimalAgeGate` in `.yarnrc.yml`.
+    YarnScopeNpmMinimalAgeGate {
+        /// The scope the key belongs to.
+        scope: NpmScopeLabel,
+        /// Whether the window was written or is Yarn's default.
+        origin: GateOrigin,
+    },
+    /// uv `index.<name>.exclude-newer`.
+    UvIndexExcludeNewer {
+        /// The index the key belongs to.
+        index: UvIndexLabel,
     },
 }
 
@@ -612,6 +813,23 @@ impl fmt::Display for NativeCooldown {
             NativeCooldownSource::UvExcludeNewer => write!(f, "uv exclude-newer = {limit}"),
             NativeCooldownSource::UvExcludeNewerPackage { package } => {
                 write!(f, "uv exclude-newer-package.{} = {limit}", package.as_str())
+            }
+            NativeCooldownSource::YarnNpmMinimalAgeGate => {
+                write!(f, "yarn npmMinimalAgeGate = {limit}")
+            }
+            NativeCooldownSource::YarnScopeNpmMinimalAgeGate { scope, origin } => {
+                write!(
+                    f,
+                    "yarn npmScopes.{}.npmMinimalAgeGate = {limit}",
+                    scope.as_str()
+                )?;
+                match origin {
+                    GateOrigin::Configured => Ok(()),
+                    GateOrigin::ManagerDefault => f.write_str(" (Yarn default)"),
+                }
+            }
+            NativeCooldownSource::UvIndexExcludeNewer { index } => {
+                write!(f, "uv index.{}.exclude-newer = {limit}", index.as_str())
             }
         }
     }

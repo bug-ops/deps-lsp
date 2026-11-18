@@ -29,13 +29,13 @@ use local_match::{LocalVersion, Verdict, match_affected};
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
-    Advisory, AdvisoryCount, AlternativeCoverage, CandidateStatusMap, CandidateStatuses, Capped,
-    CoverageGap, DependencyVulnerabilities, EmptyOsvPackageName, FixRecommendation, InvalidOsvId,
-    LatestStatusMap, LockPresence, LockResolution, MatchOrigin, MatchedTags, NonPublicRoute,
-    OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, PrimaryRole, ScanOutcome,
-    ScanTarget, ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason,
-    UpgradeStatus, VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
-    vuln_key_for, vulnerability_keys,
+    Advisory, AdvisoryCount, AffectedRanges, AffectsVersion, AlternativeCoverage,
+    CandidateStatusMap, CandidateStatuses, Capped, CoverageGap, DependencyVulnerabilities,
+    EmptyOsvPackageName, FixRecommendation, InvalidOsvId, LatestStatusMap, LockPresence,
+    LockResolution, MatchOrigin, MatchedTags, NonPublicRoute, OsvEcosystem, OsvId, OsvPackageName,
+    OsvQueryName, OsvVersion, PrimaryRole, ScanOutcome, ScanTarget, ScanVersion, SiblingCoverage,
+    SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus, VersionMatching, VulnKey,
+    VulnKeys, VulnSeverity, VulnerabilityMap, vuln_key_for, vulnerability_keys,
 };
 use types::{
     BatchStubs, OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,

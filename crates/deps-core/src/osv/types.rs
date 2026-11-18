@@ -938,9 +938,124 @@ pub struct Advisory {
     /// recorded no fix. The highest entry is the one to surface as "the fix" — see
     /// `architecture.md` §6 for why the *first* one is not.
     pub fixed_versions: Vec<OsvVersion>,
+    /// The record's `affected[]` entries for the package it was parsed for, kept so a caller can
+    /// ask whether a version lies outside them; read via [`Self::affected_ranges_for`]. `None`
+    /// for an advisory not built from a record, or whose entries were a fallback for a
+    /// different package.
+    affected: Option<AffectedRanges>,
+}
+
+/// Whether a version lies inside an advisory's affected ranges, as answered by
+/// [`AffectedRanges::affects`].
+///
+/// `Unknown` is the fail-closed answer: callers must treat it like `Yes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AffectsVersion {
+    /// The version lies inside an affected range.
+    Yes,
+    /// The version lies outside every affected range.
+    No,
+    /// The ranges cannot decide (no ranges kept, a non-SemVer version, a `GIT`-only or
+    /// unevaluable range, or the ranges were kept for a different package).
+    Unknown,
+}
+
+/// The affected ranges one advisory declares for one package, bound to that package's identity.
+///
+/// The OSV record cache is keyed by advisory id alone, so one cached record can be handed to
+/// several packages. Binding the ranges to the `(package, ecosystem)` they were filtered for
+/// keeps [`Self::affects`] from answering from another package's ranges; obtain one through
+/// [`Advisory::affected_ranges_for`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::{Advisory, AffectsVersion, OsvEcosystem, OsvPackageName, OsvVersion, VulnSeverity};
+///
+/// let advisory = Advisory::new("GHSA-xxxx".into(), "2023-01-01T00:00:00Z".into(), VulnSeverity::High)
+///     .expect("valid id");
+/// let name = OsvPackageName::new("lodash").expect("non-empty");
+/// // An advisory built without a record keeps no ranges, so nothing can be proven.
+/// let ranges = advisory.affected_ranges_for(&name, OsvEcosystem::Npm);
+/// assert_eq!(ranges.affects(&OsvVersion::new("4.17.21")), AffectsVersion::Unknown);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffectedRanges {
+    package: OsvPackageName,
+    eco: OsvEcosystem,
+    entries: Arc<[OsvAffected]>,
+}
+
+impl AffectedRanges {
+    fn empty(package: OsvPackageName, eco: OsvEcosystem) -> Self {
+        Self {
+            package,
+            eco,
+            entries: Arc::from([]),
+        }
+    }
+
+    /// Whether `version` lies inside the declared ranges.
+    ///
+    /// [`AffectsVersion::No`] only when every entry evaluates `version` as outside its ranges;
+    /// an empty set, a version that is not full SemVer, and any range that cannot be evaluated
+    /// give [`AffectsVersion::Unknown`].
+    #[must_use]
+    pub fn affects(&self, version: &OsvVersion) -> AffectsVersion {
+        use super::local_match::{LocalVersion, Verdict, match_affected};
+
+        if self.entries.is_empty() {
+            return AffectsVersion::Unknown;
+        }
+        let Some(local) = LocalVersion::parse(version) else {
+            return AffectsVersion::Unknown;
+        };
+        let entries: Vec<&OsvAffected> = self.entries.iter().collect();
+        match match_affected(&entries, &local) {
+            Verdict::Affected => AffectsVersion::Yes,
+            Verdict::NotAffected => AffectsVersion::No,
+            Verdict::Undeterminable => AffectsVersion::Unknown,
+        }
+    }
+
+    /// Builds the ranges from the JSON of a record's `affected[]` array.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error when `affected_json` is not a valid `affected[]` array.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn from_affected_json_for_test(
+        package: OsvPackageName,
+        eco: OsvEcosystem,
+        affected_json: &str,
+    ) -> Result<Self, serde_json::Error> {
+        let entries: Vec<OsvAffected> = serde_json::from_str(affected_json)?;
+        Ok(Self {
+            package,
+            eco,
+            entries: entries.into(),
+        })
+    }
 }
 
 impl Advisory {
+    /// The affected ranges this advisory declares for `package` in `eco`.
+    ///
+    /// Empty (every [`AffectedRanges::affects`] answer is [`AffectsVersion::Unknown`]) when the
+    /// advisory keeps no ranges or keeps them for a different package or ecosystem, so a record
+    /// shared through the OSV cache can never vouch for the wrong package.
+    #[must_use]
+    pub fn affected_ranges_for(
+        &self,
+        package: &OsvPackageName,
+        eco: OsvEcosystem,
+    ) -> AffectedRanges {
+        match &self.affected {
+            Some(kept) if kept.package == *package && kept.eco == eco => kept.clone(),
+            Some(_) | None => AffectedRanges::empty(package.clone(), eco),
+        }
+    }
+
     /// Constructs an `Advisory` from its required fields, deriving [`Self::url()`] from `id`,
     /// with [`Self::summary`], [`Self::aliases`], [`Self::cvss_vector`], and
     /// [`Self::fixed_versions`] left empty/`None` — chain the corresponding `with_*` setters
@@ -994,6 +1109,7 @@ impl Advisory {
             severity,
             cvss_vector: None,
             fixed_versions: Vec::new(),
+            affected: None,
         })
     }
 
@@ -3012,7 +3128,7 @@ impl OsvQuery {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct OsvPackage {
     pub(super) name: String,
     pub(super) ecosystem: String,
@@ -3152,7 +3268,7 @@ pub(super) struct OsvSeverityEntry {
     pub(super) score: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub(super) struct OsvAffected {
     /// Which package this entry describes. A single OSV record can cover
     /// several packages sharing one advisory id (e.g. a GHSA affecting both
@@ -3205,7 +3321,7 @@ pub(super) enum OsvRangeType {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub(super) struct OsvRange {
     #[serde(rename = "type", default)]
     pub(super) range_type: OsvRangeType,
@@ -3213,7 +3329,7 @@ pub(super) struct OsvRange {
     pub(super) events: Vec<OsvEvent>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 pub(super) struct OsvEvent {
     #[serde(default)]
     pub(super) introduced: Option<String>,
@@ -3440,6 +3556,13 @@ impl OsvVulnRecord {
         fixed_versions.sort_by(|a, b| super::compare_version_strings(a, b));
         fixed_versions.dedup();
 
+        // A fallback entry describes some other package, so its ranges must never vouch.
+        let affected = (!used_fallback_all).then(|| AffectedRanges {
+            package: osv_name.clone(),
+            eco: osv_eco,
+            entries: relevant.iter().map(|entry| (*entry).clone()).collect(),
+        });
+
         // Exhaustive literal (not `Advisory::new`) so a future new field fails to compile here.
         Some(Advisory {
             id,
@@ -3449,6 +3572,7 @@ impl OsvVulnRecord {
             severity,
             cvss_vector,
             fixed_versions: fixed_versions.into_iter().map(OsvVersion::new).collect(),
+            affected,
         })
     }
 }
@@ -3470,6 +3594,7 @@ mod recommended_fix_tests {
                 .copied()
                 .map(OsvVersion::new)
                 .collect(),
+            affected: None,
         })
     }
 
@@ -3691,6 +3816,7 @@ mod advisories_for_display_tests {
             severity,
             cvss_vector: None,
             fixed_versions: vec![],
+            affected: None,
         })
     }
 
@@ -4982,5 +5108,107 @@ mod vulnerability_keys_candidates_tests {
         let cold = keys.get(&deps[1].name_range()).unwrap();
         assert_ne!(keys.get(&deps[0].name_range()).unwrap(), cold);
         assert!(cold.as_str().ends_with("not-yet-indexed"));
+    }
+}
+
+#[cfg(test)]
+mod affected_ranges_tests {
+    use super::*;
+
+    fn name(raw: &str) -> OsvPackageName {
+        OsvPackageName::new(raw).expect("non-empty name")
+    }
+
+    fn record_for(package: &str, ranges: &str) -> OsvVulnRecord {
+        serde_json::from_str(&format!(
+            r#"{{"id":"GHSA-test","modified":"2023-01-01T00:00:00Z","affected":[{{"package":{{"name":"{package}","ecosystem":"npm"}},"ranges":[{ranges}]}}]}}"#
+        ))
+        .expect("record JSON")
+    }
+
+    fn advisory_of(package: &str, ranges: &str) -> Advisory {
+        record_for(package, ranges)
+            .into_advisory(&name(package), OsvEcosystem::Npm)
+            .expect("advisory")
+    }
+
+    const FIXED_THEN_REINTRODUCED: &str = r#"{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.2.6"},{"introduced":"1.3.0"},{"fixed":"1.3.4"}]}"#;
+
+    fn verdict(ranges: &AffectedRanges, version: &str) -> AffectsVersion {
+        ranges.affects(&OsvVersion::new(version))
+    }
+
+    #[test]
+    fn version_above_every_fixed_event_is_not_affected() {
+        let advisory = advisory_of("minimist", FIXED_THEN_REINTRODUCED);
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "1.3.4"), AffectsVersion::No);
+        assert_eq!(verdict(&ranges, "2.0.0"), AffectsVersion::No);
+    }
+
+    #[test]
+    fn version_inside_a_later_introduced_range_is_affected() {
+        let advisory = advisory_of("minimist", FIXED_THEN_REINTRODUCED);
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "1.3.1"), AffectsVersion::Yes);
+        assert_eq!(verdict(&ranges, "1.2.5"), AffectsVersion::Yes);
+    }
+
+    #[test]
+    fn version_between_fixed_and_the_next_introduced_is_not_affected() {
+        let advisory = advisory_of("minimist", FIXED_THEN_REINTRODUCED);
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "1.2.8"), AffectsVersion::No);
+    }
+
+    #[test]
+    fn git_only_ranges_cannot_decide() {
+        let advisory = advisory_of(
+            "minimist",
+            r#"{"type":"GIT","events":[{"introduced":"0"},{"fixed":"abcdef0123456789abcdef0123456789abcdef01"}]}"#,
+        );
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "1.2.8"), AffectsVersion::Unknown);
+    }
+
+    #[test]
+    fn ranges_asked_for_another_package_or_ecosystem_cannot_decide() {
+        let advisory = advisory_of("minimist", FIXED_THEN_REINTRODUCED);
+        let other_package = advisory.affected_ranges_for(&name("lodash"), OsvEcosystem::Npm);
+        let other_eco = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::PyPI);
+        assert_eq!(verdict(&other_package, "1.3.4"), AffectsVersion::Unknown);
+        assert_eq!(verdict(&other_eco, "1.3.4"), AffectsVersion::Unknown);
+    }
+
+    #[test]
+    fn advisory_without_a_record_keeps_no_ranges() {
+        let advisory = Advisory::new(
+            "GHSA-test".into(),
+            "2023-01-01T00:00:00Z".into(),
+            VulnSeverity::High,
+        )
+        .expect("valid id");
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "1.3.4"), AffectsVersion::Unknown);
+    }
+
+    #[test]
+    fn non_semver_version_cannot_decide() {
+        let advisory = advisory_of("minimist", FIXED_THEN_REINTRODUCED);
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "4"), AffectsVersion::Unknown);
+    }
+
+    #[test]
+    fn fallback_entries_for_another_package_are_not_kept() {
+        let record: OsvVulnRecord = serde_json::from_str(&format!(
+            r#"{{"id":"GHSA-test","modified":"2023-01-01T00:00:00Z","affected":[{{"package":{{"name":"stranger","ecosystem":"npm"}},"ranges":[{FIXED_THEN_REINTRODUCED}]}}]}}"#
+        ))
+        .expect("record JSON");
+        let advisory = record
+            .into_advisory(&name("minimist"), OsvEcosystem::Npm)
+            .expect("advisory");
+        let ranges = advisory.affected_ranges_for(&name("minimist"), OsvEcosystem::Npm);
+        assert_eq!(verdict(&ranges, "1.3.4"), AffectsVersion::Unknown);
     }
 }

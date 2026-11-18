@@ -92,14 +92,21 @@ impl IndexContext<'_> {
             .get(dep.name.as_str())
             .map(String::as_str);
         (dep.source, dep.index_route) = self.config.resolve_for(named);
+        dep.uv_index = named.and_then(deps_core::native_cooldown::UvIndexLabel::new);
+        self.record_unusable_route(named, dep.name_range);
+    }
+
+    /// Records the dependency at `name_range` as blocked or rejected when the index it routes
+    /// to (`named`, or the primary/extras chain for `None`) is unusable.
+    fn record_unusable_route(&self, named: Option<&str>, name_range: deps_core::position::Range) {
         if let Some(classification) = self.config.blocked_class_for(named) {
             self.blocked_registries
                 .borrow_mut()
-                .push(classification.into_occurrence(dep.name_range));
+                .push(classification.into_occurrence(name_range));
         } else if let Some(classification) = self.config.rejected_reason_for(named) {
             self.rejected_registries
                 .borrow_mut()
-                .push(classification.into_occurrence(dep.name_range));
+                .push(classification.into_occurrence(name_range));
         }
     }
 }
@@ -662,15 +669,7 @@ impl PypiParser {
             // String-form Poetry dependencies have no `source =` key of their own — resolve
             // through the primary/extras chain only (FR-002/003/005), same as a plain PEP
             // 621/requirements.txt dependency.
-            if let Some(classification) = ctx.config.blocked_class_for(None) {
-                ctx.blocked_registries
-                    .borrow_mut()
-                    .push(classification.into_occurrence(name_range));
-            } else if let Some(classification) = ctx.config.rejected_reason_for(None) {
-                ctx.rejected_registries
-                    .borrow_mut()
-                    .push(classification.into_occurrence(name_range));
-            }
+            ctx.record_unusable_route(None, name_range);
             let (source, index_route) = ctx.config.resolve_for(None);
             return Ok(PypiDependency {
                 name: name.into(),
@@ -685,6 +684,7 @@ impl PypiParser {
                 source,
                 index_route,
                 native_cooldown: None,
+                uv_index: None,
             });
         }
 
@@ -749,15 +749,7 @@ impl PypiParser {
                 let source_name = table
                     .get(ctx.dialect.named_source_key())
                     .and_then(|s| s.as_str());
-                if let Some(classification) = ctx.config.blocked_class_for(source_name) {
-                    ctx.blocked_registries
-                        .borrow_mut()
-                        .push(classification.into_occurrence(name_range));
-                } else if let Some(classification) = ctx.config.rejected_reason_for(source_name) {
-                    ctx.rejected_registries
-                        .borrow_mut()
-                        .push(classification.into_occurrence(name_range));
-                }
+                ctx.record_unusable_route(source_name, name_range);
                 ctx.config.resolve_for(source_name)
             };
 
@@ -774,6 +766,7 @@ impl PypiParser {
                 source,
                 index_route,
                 native_cooldown: None,
+                uv_index: None,
             });
         }
 

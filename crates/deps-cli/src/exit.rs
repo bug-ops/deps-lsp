@@ -105,8 +105,8 @@ pub fn exit_code(
 /// Computes the process exit code for a completed `update` run (spec §5's exit-code table,
 /// as amended by S3 — see below).
 ///
-/// `0` if every item is [`Outcome::Applied`], the plan was empty (nothing eligible), or every
-/// non-`Applied` item is a deliberate exclusion
+/// `0` if every item is [`Outcome::Applied`] or [`Outcome::AppliedViaLockfile`], the plan was
+/// empty (nothing eligible), or every other item is a deliberate exclusion
 /// ([`Outcome::Skipped`] with reason [`SkipReason::NotRequested`] — a `--package` narrowing —
 /// [`Outcome::Skipped`] with reason [`SkipReason::IgnoreRule`] — a `[update].ignore` match —
 /// [`Outcome::Skipped`] with reason [`SkipReason::WithinFreshnessCooldown`], issue #1525's
@@ -159,6 +159,7 @@ pub fn update_exit_code(run: &UpdateRun) -> i32 {
         !matches!(
             item.outcome,
             Outcome::Applied { .. }
+                | Outcome::AppliedViaLockfile { .. }
                 | Outcome::Skipped {
                     reason: SkipReason::NotRequested
                         | SkipReason::IgnoreRule
@@ -576,6 +577,7 @@ mod tests {
             cooldown_fallback: None,
             osv_sibling_match: None,
             native_hold: None,
+            lockfile_fix: crate::update::LockfileFix::default(),
         }
     }
 

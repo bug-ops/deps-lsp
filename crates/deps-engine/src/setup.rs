@@ -61,6 +61,14 @@ pub struct EcosystemRuntime {
     /// set it with [`Self::with_scm_to_registry`] or derive it with [`Self::from_policy`].
     #[cfg(feature = "swift")]
     pub scm_to_registry: Arc<deps_swift::ScmToRegistryHandle>,
+    /// Test-only: the base URL [`register_ecosystems`] gives the npm registry as its public tier
+    /// instead of `registry.npmjs.org`; set with [`Self::with_npm_public_base_for_test`].
+    #[cfg(all(feature = "test-util", feature = "npm"))]
+    npm_public_base: Option<url::Url>,
+    /// Test-only: the base URL [`register_ecosystems`] gives the PyPI registry as its public
+    /// tier instead of `pypi.org`; set with [`Self::with_pypi_public_base_for_test`].
+    #[cfg(all(feature = "test-util", feature = "pypi"))]
+    pypi_public_base: Option<url::Url>,
 }
 
 impl EcosystemRuntime {
@@ -104,7 +112,57 @@ impl EcosystemRuntime {
             keychain_credentials: Arc::default(),
             #[cfg(feature = "swift")]
             scm_to_registry: Arc::default(),
+            #[cfg(all(feature = "test-util", feature = "npm"))]
+            npm_public_base: None,
+            #[cfg(all(feature = "test-util", feature = "pypi"))]
+            pypi_public_base: None,
         }
+    }
+
+    /// Points the registered npm registry at `base` as its public tier, so a test can serve
+    /// packuments (publish times, deprecations) from a local mock instead of `registry.npmjs.org`.
+    ///
+    /// Test-only (feature `test-util`); without this call [`register_ecosystems`] is unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
+    /// use deps_core::policy_config::PolicyConfig;
+    /// use deps_engine::setup::EcosystemRuntime;
+    ///
+    /// let base = url::Url::parse("http://127.0.0.1:9").unwrap();
+    /// let _runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv))
+    ///     .with_npm_public_base_for_test(base);
+    /// ```
+    #[cfg(all(feature = "test-util", feature = "npm"))]
+    #[must_use]
+    pub fn with_npm_public_base_for_test(mut self, base: url::Url) -> Self {
+        self.npm_public_base = Some(base);
+        self
+    }
+
+    /// Points the registered PyPI registry at `base` as its public tier, so a test can serve the
+    /// simple index from a local mock instead of `pypi.org`.
+    ///
+    /// Test-only (feature `test-util`); without this call [`register_ecosystems`] is unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
+    /// use deps_core::policy_config::PolicyConfig;
+    /// use deps_engine::setup::EcosystemRuntime;
+    ///
+    /// let base = url::Url::parse("http://127.0.0.1:9").unwrap();
+    /// let _runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv))
+    ///     .with_pypi_public_base_for_test(base);
+    /// ```
+    #[cfg(all(feature = "test-util", feature = "pypi"))]
+    #[must_use]
+    pub fn with_pypi_public_base_for_test(mut self, base: url::Url) -> Self {
+        self.pypi_public_base = Some(base);
+        self
     }
 
     /// Overrides [`Self::native_cooldown`]'s default (a toggle at `Honor`).
@@ -561,6 +619,37 @@ ecosystem!(
     ]
 );
 
+/// The npm registry client: `runtime`'s test base as its public tier when set, else production's.
+#[cfg(feature = "npm")]
+fn npm_registry(runtime: &EcosystemRuntime, cache: &Arc<HttpCache>) -> NpmRegistry {
+    #[cfg(feature = "test-util")]
+    if let Some(base) = &runtime.npm_public_base {
+        // `Url` serializes a bare origin with a trailing `/`, which `versions_url` would double.
+        return NpmRegistry::with_public_base_for_test(
+            Arc::clone(cache),
+            base.as_str().trim_end_matches('/').to_owned(),
+        );
+    }
+    #[cfg(not(feature = "test-util"))]
+    let _ = runtime;
+    NpmRegistry::new(Arc::clone(cache))
+}
+
+/// The PyPI registry client: `runtime`'s test base as its public tier when set, else production's.
+#[cfg(feature = "pypi")]
+fn pypi_registry(runtime: &EcosystemRuntime, cache: &Arc<HttpCache>) -> PypiRegistry {
+    #[cfg(feature = "test-util")]
+    if let Some(base) = &runtime.pypi_public_base {
+        return PypiRegistry::with_public_base_for_test(
+            Arc::clone(cache),
+            base.as_str().trim_end_matches('/').to_owned(),
+        );
+    }
+    #[cfg(not(feature = "test-util"))]
+    let _ = runtime;
+    PypiRegistry::new(Arc::clone(cache))
+}
+
 /// Registers all enabled ecosystems.
 ///
 /// `cargo` is special-cased (spec #443/#441, plan-1b §1.6): unlike `register!`'s generic
@@ -650,7 +739,7 @@ pub fn register_ecosystems(
         .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown));
         let deno_context =
             deps_deno::parser::DenoParseContext::new(Arc::clone(&policy), npm_config_cache);
-        let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
+        let npm_registry = Arc::new(npm_registry(runtime, &cache));
         registry.register(Arc::new(NpmEcosystem::with_context(
             Arc::clone(&npm_registry),
             npm_context,
@@ -681,7 +770,7 @@ pub fn register_ecosystems(
         )
         .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown));
         registry.register(Arc::new(NpmEcosystem::with_context(
-            Arc::new(NpmRegistry::new(Arc::clone(&cache))),
+            Arc::new(npm_registry(runtime, &cache)),
             npm_context,
         )));
         workspace_registry_ecosystems.push(deps_core::EcosystemId::Npm);
@@ -712,7 +801,7 @@ pub fn register_ecosystems(
     {
         registry.register(Arc::new(
             PypiEcosystem::with_policy(
-                Arc::new(PypiRegistry::new(Arc::clone(&cache))),
+                Arc::new(pypi_registry(runtime, &cache)),
                 Arc::clone(&policy),
             )
             .with_native_cooldown_toggle(Arc::clone(&runtime.native_cooldown)),

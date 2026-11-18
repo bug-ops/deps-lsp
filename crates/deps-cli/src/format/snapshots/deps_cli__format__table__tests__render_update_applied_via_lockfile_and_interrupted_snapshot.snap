@@ -1,0 +1,6 @@
+---
+source: crates/deps-cli/src/format/table.rs
+expression: "render_update(&run, DryRun::No)"
+---
+[applied] serde 1.0.0 -> 1.2.0 — fix applied through the lock file; the declared requirement already admits it
+lockfile: failed — regeneration was interrupted

@@ -160,8 +160,10 @@ impl PypiEcosystem {
                     | DependencySource::CustomRegistry { .. }
                     | DependencySource::AlternateRegistry { .. }
             ) {
-                dependency.native_cooldown =
-                    config.cooldown_for(&crate::name::normalize(dependency.name.as_str()));
+                dependency.native_cooldown = config.cooldown_for(
+                    &crate::name::normalize(dependency.name.as_str()),
+                    dependency.uv_index.as_ref(),
+                );
             }
         }
     }
@@ -2183,6 +2185,7 @@ dependencies = []
                     source,
                     index_route: None,
                     native_cooldown: None,
+                    uv_index: None,
                 }],
                 workspace_root: None,
                 uri: deps_core::test_util::test_uri("/test/requirements.txt"),
