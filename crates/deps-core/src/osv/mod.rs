@@ -243,6 +243,27 @@ struct QueryCacheEntry {
     fetched_at: Instant,
 }
 
+/// Identity of a cached [`Advisory`]: the advisory plus the package it was derived for.
+///
+/// One OSV record can describe several packages, and [`OsvVulnRecord::into_advisory`] keeps only
+/// the queried package's severity and fix target, so the advisory id alone cannot key the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct RecordCacheKey {
+    id: OsvId,
+    osv_eco: OsvEcosystem,
+    osv_name: OsvPackageName,
+}
+
+impl RecordCacheKey {
+    fn new(id: &OsvId, osv_eco: OsvEcosystem, osv_name: &OsvPackageName) -> Self {
+        Self {
+            id: id.clone(),
+            osv_eco,
+            osv_name: osv_name.clone(),
+        }
+    }
+}
+
 struct RecordCacheEntry {
     advisory: Arc<Advisory>,
     modified: String,
@@ -294,10 +315,12 @@ impl InFlightRecord {
 pub struct OsvClient {
     cache: Arc<HttpCache>,
     query_cache: DashMap<QueryCacheKey, QueryCacheEntry>,
-    record_cache: DashMap<OsvId, RecordCacheEntry>,
-    /// Raw records keyed by advisory id, validated by `modified` — lets a
+    /// Per-package advisories keyed by [`RecordCacheKey`], validated by `modified`.
+    record_cache: DashMap<RecordCacheKey, RecordCacheEntry>,
+    /// Raw records keyed by advisory id, validated by `modified`, bounded by
+    /// [`MAX_CACHE_ENTRIES`]. Filled by every record fetch: it lets a
     /// [`VersionMatching::LocalUnversioned`] scan of another version of the same package match
-    /// locally without refetching.
+    /// locally, and lets another package covered by the same advisory skip a second GET.
     raw_record_cache: DashMap<OsvId, RawRecordCacheEntry>,
     /// Client-wide bound (permits = [`RECORD_FETCH_CONCURRENCY`]) on concurrent
     /// `/v1/vulns/{id}`/`/v1/query` requests — see [`RECORD_FETCH_CONCURRENCY`]'s doc for why
@@ -998,7 +1021,7 @@ impl OsvClient {
                 id: advisory.id().clone(),
                 modified: advisory.modified.clone(),
             });
-            self.store_record_cache(&advisory);
+            self.store_record_cache(osv_eco, target.osv_name.name(), &advisory);
             if advisories.len() < MAX_ADVISORY_RECORDS {
                 advisories.push(advisory);
             }
@@ -1068,16 +1091,17 @@ impl OsvClient {
 
         stream::iter(stubs.iter().cloned())
             .map(|VulnStub { id, modified }| async move {
-                let cached = self.record_cache.get(&id).and_then(|entry| {
+                let key = RecordCacheKey::new(&id, osv_eco, osv_name);
+                let cached = self.record_cache.get(&key).and_then(|entry| {
                     (entry.modified == modified).then(|| Arc::clone(&entry.advisory))
                 });
                 if let Some(advisory) = cached {
                     return Some(advisory);
                 }
 
-                let record = self.fetch_record_single_flight(&id, deadline).await?;
+                let record = self.fetch_raw_record(&id, &modified, deadline).await?;
                 let advisory = Arc::new((*record).clone().into_advisory(osv_name, osv_eco)?);
-                self.store_record_cache(&advisory);
+                self.store_record_cache(osv_eco, osv_name, &advisory);
                 Some(advisory)
             })
             .buffer_unordered(RECORD_FETCH_CONCURRENCY)
@@ -1306,14 +1330,19 @@ impl OsvClient {
         );
     }
 
-    fn store_record_cache(&self, advisory: &Arc<Advisory>) {
+    fn store_record_cache(
+        &self,
+        osv_eco: OsvEcosystem,
+        osv_name: &OsvPackageName,
+        advisory: &Arc<Advisory>,
+    ) {
         if self.record_cache.len() >= MAX_CACHE_ENTRIES {
             crate::cache_policy::evict_oldest_batch(&self.record_cache, MAX_CACHE_ENTRIES, |e| {
                 e.fetched_at
             });
         }
         self.record_cache.insert(
-            advisory.id().clone(),
+            RecordCacheKey::new(advisory.id(), osv_eco, osv_name),
             RecordCacheEntry {
                 advisory: Arc::clone(advisory),
                 modified: advisory.modified.clone(),
@@ -3875,7 +3904,11 @@ mod tests {
                 )
                 .expect("valid osv id"),
             );
-            client.store_record_cache(&advisory);
+            client.store_record_cache(
+                OsvEcosystem::Npm,
+                &OsvPackageName::new("pkg").unwrap(),
+                &advisory,
+            );
         }
         assert_eq!(client.record_cache.len(), MAX_CACHE_ENTRIES);
 
@@ -3887,7 +3920,11 @@ mod tests {
             )
             .expect("valid osv id"),
         );
-        client.store_record_cache(&overflow);
+        client.store_record_cache(
+            OsvEcosystem::Npm,
+            &OsvPackageName::new("pkg").unwrap(),
+            &overflow,
+        );
 
         assert!(
             client.record_cache.len() <= MAX_CACHE_ENTRIES,
@@ -3929,7 +3966,11 @@ mod tests {
         let (mut server, client) = mock_client().await;
 
         client.record_cache.insert(
-            crate::test_util::osv_id("ADV-1"),
+            RecordCacheKey::new(
+                &crate::test_util::osv_id("ADV-1"),
+                OsvEcosystem::Npm,
+                &OsvPackageName::new("pkg").unwrap(),
+            ),
             RecordCacheEntry {
                 advisory: Arc::new(
                     Advisory::new(

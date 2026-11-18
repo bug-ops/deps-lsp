@@ -962,10 +962,10 @@ pub enum AffectsVersion {
 
 /// The affected ranges one advisory declares for one package, bound to that package's identity.
 ///
-/// The OSV record cache is keyed by advisory id alone, so one cached record can be handed to
-/// several packages. Binding the ranges to the `(package, ecosystem)` they were filtered for
-/// keeps [`Self::affects`] from answering from another package's ranges; obtain one through
-/// [`Advisory::affected_ranges_for`].
+/// One OSV record can describe several packages, and a record shared between them (the raw
+/// record cache, the single-flight fetch) carries every package's ranges. Binding the ranges to
+/// the `(package, ecosystem)` they were filtered for keeps [`Self::affects`] from answering
+/// from another package's ranges; obtain one through [`Advisory::affected_ranges_for`].
 ///
 /// # Examples
 ///
@@ -1043,7 +1043,7 @@ impl Advisory {
     ///
     /// Empty (every [`AffectedRanges::affects`] answer is [`AffectsVersion::Unknown`]) when the
     /// advisory keeps no ranges or keeps them for a different package or ecosystem, so a record
-    /// shared through the OSV cache can never vouch for the wrong package.
+    /// handed out per package by the OSV cache can never vouch for the wrong package.
     #[must_use]
     pub fn affected_ranges_for(
         &self,
