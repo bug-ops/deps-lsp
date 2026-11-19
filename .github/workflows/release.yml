@@ -573,6 +573,8 @@ jobs:
       - name: Publish crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          # Workspace crates published moments earlier are inside the 3-day cooldown window
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
         run: scripts/publish-crates.sh
 
   update-release-notes:
