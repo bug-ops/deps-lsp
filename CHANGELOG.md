@@ -58,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-lsp**: inlay hints, the vulnerability quick fix and hover honour operator advisory exemptions (#2030, #2040)
 - **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves GHCR `latest`/major/minor tags or the `action.yml` digest pin (#2067)
 - **workspace**: pass clippy 1.100 (#2027)
-- **deps-core-macros**: add the `README.md` its manifest declares, so `cargo publish` no longer fails
+- **deps-core-macros**: add the `README.md` its manifest declares, so `cargo publish` no longer fails (#2122)
 - **deps-cli**: fuzz seed `Pipfile.lock` bumped to patched `requests` and `pytest` (#2107)
 
 ## [5.0.0] - 2026-11-10
