@@ -462,10 +462,11 @@ explicit choice.
     declared requirement is too large to safely evaluate, or a commit (SHA) pin's fix version
     has no matching release in the repository's complete tag list (GitHub Actions, GitLab CI;
     for a GitLab `component:` include, its release list), so the pin cannot be rewritten and
-    still points at the vulnerable commit. A missing, cold or
-    truncated tag list cannot prove that, and is reported as no verified fix instead. For the
-    last four causes (a yanked, confirmed-unsupported-requirement-shape, oversized-requirement
-    or no-release-tag fix target), the table's target column and JSON `target` field report
+    still points at the vulnerable commit, or (`--lockfile regenerate`) the package manager would
+    resolve a version inside the freshness cooldown window once the edit is written, so the edit
+    is withheld. A missing, cold or truncated tag list cannot prove that, and is reported as no verified fix instead. For the
+    last five causes (a yanked, confirmed-unsupported-requirement-shape, oversized-requirement,
+    no-release-tag or withheld-by-cooldown fix target), the table's target column and JSON `target` field report
     that rejected version instead of staying empty, so the operator can see what was ruled out
     even though nothing was written.
 
@@ -473,9 +474,10 @@ explicit choice.
   ecosystem (a documented limitation, not a bug) — such a dependency can still be classified
   `applied` even though its yanked status was never actually checked.
 
-  `--cooldown` (and a `[freshness]` cooldown sourced from `--config`) has no effect under
-  `--security-only`: the fix target comes from the advisory, never the freshness-filtered
-  registry pick. It is also a no-op in default mode when an explicit `--config` also sets
+  `--cooldown` (and a `[freshness]` cooldown sourced from `--config`) does not change the fix
+  target under `--security-only`: it comes from the advisory, never the freshness-filtered
+  registry pick (with `--lockfile regenerate` the window still rejects a lock-file-only move onto
+  a version inside it). It is also a no-op in default mode when an explicit `--config` also sets
   `[freshness] enabled = false` — `deps-cli` warns in both cases rather than silently ignoring
   the flag.
 
@@ -630,6 +632,30 @@ and it needs a manual review; the report's `lockfile` object shows it as `newer`
 and `pnpm update` are validated (pnpm treats them as patterns, so `*` and a leading `!` are
 refused with exit `2`). `go get` may also raise the module's `require` line in `go.mod`.
 
+A tool that cannot pin an exact version (`npm update`, `pnpm update`, `pipenv upgrade --lock-only`
+and the like) may lock a newer in-range release that is still inside the freshness cooldown
+window, and `update` accepts such a pin only when that version is outside the window. When the tool
+lands inside it, `update` restores the lock files from the snapshot and withholds the held fixes:
+
+- A held lock-file-only pin stays `requires-lockfile-update` (exit `1`), with a reason that names
+  the resolved version and the window.
+- A held pin that edits the manifest is not written: the item is `unfixable` (exit `1`), with a
+  reason naming the resolved version and the window, and its target shows in the `target` column.
+- The tool runs once more for the remaining pins, and their fixes apply.
+- When every pin is held, nothing is rerun: the manifest and the lock files stay unchanged and the
+  table's lockfile line reads `not applicable — every fix resolved to a version inside the
+  freshness cooldown window and was withheld`, and the JSON `lockfile.reason` is
+  `all-withheld-by-cooldown`.
+
+With `--open-pr`, a withheld fix and its version never reach the proposal; a run that settles
+nothing opens none.
+
+The run fails with `cooldown-held-version` (exit `2`, lock files restored) only when the manifest
+changed during the run (or cannot be rewritten), or when the single retry lands inside the window again. A version without
+a known publish time, or any version with freshness disabled, is not held back, and a
+cooldown-fallback target is unaffected because it is pinned exactly. `update` checks the window
+itself; the package manager's own cooldown setting is not consulted.
+
 **npm and pnpm workspace members.** When the manifest is a member of an npm or pnpm workspace and the
 lock file sits in the workspace root, a plain run regenerates that root lock file with the member
 selected (`--workspace=./<member>` for npm, `--filter=./<member>` for pnpm). For pnpm the member must
@@ -700,6 +726,11 @@ file, moving a vendor directory, creating a scratch directory) fail as `io` with
 operation and path instead of `manifest-changed` or `spawn`; an unreadable lock file still reports `lockfile-unreadable`. A failed manifest write-back restores
 the lock snapshot as well. `fallback-pin-not-kept` means a cooldown-fallback pin could not be kept in
 the lock (Yarn Berry or Deno re-key refused or failed), and the lock file is restored.
+`cooldown-held-version` means the tool locked a version inside the freshness cooldown window and
+the single retry without the held pins held again, or the manifest changed during the run or could not be rewritten; the
+lock files are restored.
+The report carries the first held package as `package` and its version as `found`; the message
+lists any further held pins.
 
 **Known limits.** `go get` may raise indirect requirements and the `go` directive in `go.mod`, and
 download a newer toolchain to satisfy it. Deno always reads and writes `./deno.lock` beside the

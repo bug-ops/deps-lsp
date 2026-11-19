@@ -35,6 +35,10 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 /// never to suppress a candidate; pass [`IgnoreRules::empty`] when no `--config` was given,
 /// same as the default planner.
 ///
+/// `freshness` never changes a fix target (it comes from the advisory); it only records, on each
+/// `RequiresLockfileUpdate` item, which versions are inside the cooldown window, so a lock file
+/// regeneration does not settle on one of them.
+///
 /// # Examples
 ///
 /// With no OSV scan having run (`analysis.vulnerabilities` is `None` — `--security-only` was
@@ -88,6 +92,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 ///     &osv,
 ///     &[],
 ///     &IgnoreRules::empty(),
+///     deps_core::FreshnessSettings::default(),
 ///     FetchTimeout::try_from_secs(30).unwrap(),
 /// )
 /// .await;
@@ -101,6 +106,7 @@ pub async fn plan_security_updates(
     osv: &OsvClient,
     package_filter: &[String],
     ignore_rules: &IgnoreRules,
+    freshness: deps_core::FreshnessSettings,
     fetch_timeout: FetchTimeout,
 ) -> UpdatePlan {
     let formatter = ecosystem.formatter();
@@ -226,10 +232,63 @@ pub async fn plan_security_updates(
                     })
                     .unwrap_or_default();
             }
+            if matches!(
+                item.outcome,
+                Outcome::RequiresLockfileUpdate { .. } | Outcome::Applied { .. }
+            ) {
+                item.lockfile_fix.cooldown_held = cooldown_held_versions(analysis, &key, freshness);
+                item.lockfile_fix.cooldown_window = freshness.cooldown();
+                item.lockfile_fix.ecosystem = Some(ecosystem_id);
+            }
             items.push(item);
         });
 
     UpdatePlan { items }
+}
+
+/// The published versions of `key` that are inside the cooldown window at `analysis.now`, by the
+/// shared precedence rule (an active GOSSIP finding when the analysis has any, else the local
+/// window).
+///
+/// A version without a known publish time is never held, matching the freshness signal elsewhere.
+/// Without per-version publish times only `latest` can be judged.
+fn cooldown_held_versions(
+    analysis: &ManifestAnalysis,
+    key: &PackageKey,
+    freshness: deps_core::FreshnessSettings,
+) -> Vec<deps_core::ConcreteVersion> {
+    let Some(cooldown) = freshness.cooldown() else {
+        return Vec::new();
+    };
+    let Some(versions) = analysis.cached_versions.get(key.normalized()) else {
+        return Vec::new();
+    };
+    let published: Vec<_> = if versions.publish_times.len() == versions.available.len() {
+        versions
+            .available
+            .iter()
+            .zip(versions.publish_times.iter().copied())
+            .collect()
+    } else {
+        vec![(&versions.latest, versions.published_at)]
+    };
+    published
+        .into_iter()
+        .filter(|(version, published_at)| {
+            matches!(
+                deps_core::lsp_helpers::cooldown_precedence(
+                    Some(&analysis.gossip_findings),
+                    key.normalized(),
+                    version.as_str(),
+                    *published_at,
+                    cooldown,
+                    analysis.now,
+                ),
+                deps_core::lsp_helpers::CooldownPrecedence::Blocked(_)
+            )
+        })
+        .map(|(version, _)| version.clone())
+        .collect()
 }
 
 /// The affected ranges of every advisory in `dv`, for settling a lock-file-only fix.
@@ -2364,5 +2423,129 @@ mod tests {
             Some(1)
         );
         assert_eq!(affected_ranges(&dv_of(2), &package, eco), None);
+    }
+
+    fn analysis_with_publish_times() -> (ManifestAnalysis, PackageKey) {
+        let name = PackageName::new("lodash");
+        let key = PackageKey::new(&name, &NO_COMPILE_REQUIREMENT_FORMATTER);
+        let mut analysis = test_analysis(HashMap::new(), HashSet::new());
+        let secs = |age: i64| {
+            Some(deps_core::PublishTime::from_unix_secs(
+                analysis.now.as_unix_secs() - age,
+            ))
+        };
+        let versions = PackageVersions::new(
+            ConcreteVersion::new("1.0.2"),
+            std::sync::Arc::from(vec![
+                ConcreteVersion::new("1.0.2"),
+                ConcreteVersion::new("1.0.1"),
+                ConcreteVersion::new("1.0.0"),
+            ]),
+        )
+        .with_publish_times(std::sync::Arc::from(vec![
+            secs(100),
+            secs(10 * 86_400),
+            None,
+        ]));
+        analysis
+            .cached_versions
+            .insert(key.normalized().clone(), versions);
+        (analysis, key)
+    }
+
+    #[test]
+    fn test_cooldown_held_versions_lists_only_versions_published_inside_the_window() {
+        let (analysis, key) = analysis_with_publish_times();
+
+        assert_eq!(
+            cooldown_held_versions(&analysis, &key, deps_core::FreshnessSettings::default()),
+            vec![ConcreteVersion::new("1.0.2")]
+        );
+    }
+
+    #[test]
+    fn test_cooldown_held_versions_is_empty_when_freshness_is_disabled() {
+        let (analysis, key) = analysis_with_publish_times();
+
+        assert!(
+            cooldown_held_versions(&analysis, &key, deps_core::FreshnessSettings::Disabled)
+                .is_empty()
+        );
+    }
+
+    fn held_with_one_version_aged(
+        age_secs: i64,
+        freshness: deps_core::FreshnessSettings,
+    ) -> Vec<ConcreteVersion> {
+        let key = PackageKey::new(
+            &PackageName::new("lodash"),
+            &NO_COMPILE_REQUIREMENT_FORMATTER,
+        );
+        let mut analysis = test_analysis(HashMap::new(), HashSet::new());
+        let published =
+            deps_core::PublishTime::from_unix_secs(analysis.now.as_unix_secs() - age_secs);
+        let version = ConcreteVersion::new("1.0.0");
+        analysis.cached_versions.insert(
+            key.normalized().clone(),
+            PackageVersions::new(version.clone(), std::sync::Arc::from(vec![version]))
+                .with_publish_times(std::sync::Arc::from(vec![Some(published)])),
+        );
+        cooldown_held_versions(&analysis, &key, freshness)
+    }
+
+    #[test]
+    fn test_cooldown_held_versions_window_edge_is_exclusive() {
+        let window = deps_core::freshness::DEFAULT_COOLDOWN_SECS.cast_signed();
+        let default = deps_core::FreshnessSettings::default();
+
+        assert_eq!(held_with_one_version_aged(window - 1, default).len(), 1);
+        assert!(held_with_one_version_aged(window, default).is_empty());
+    }
+
+    #[test]
+    fn test_cooldown_held_versions_honours_a_custom_window() {
+        let custom = deps_core::FreshnessSettings::Enabled {
+            cooldown: deps_core::CooldownWindow::from_secs(60),
+        };
+
+        assert_eq!(held_with_one_version_aged(59, custom).len(), 1);
+        assert!(held_with_one_version_aged(100, custom).is_empty());
+    }
+
+    #[test]
+    fn test_cooldown_held_versions_without_per_version_times_judges_only_latest() {
+        let key = PackageKey::new(
+            &PackageName::new("lodash"),
+            &NO_COMPILE_REQUIREMENT_FORMATTER,
+        );
+        let mut analysis = test_analysis(HashMap::new(), HashSet::new());
+        let recent = deps_core::PublishTime::from_unix_secs(analysis.now.as_unix_secs() - 10);
+        analysis.cached_versions.insert(
+            key.normalized().clone(),
+            PackageVersions::new(
+                ConcreteVersion::new("1.0.1"),
+                std::sync::Arc::from(vec![
+                    ConcreteVersion::new("1.0.1"),
+                    ConcreteVersion::new("1.0.0"),
+                ]),
+            )
+            .with_published_at(recent),
+        );
+
+        assert_eq!(
+            cooldown_held_versions(&analysis, &key, deps_core::FreshnessSettings::default()),
+            vec![ConcreteVersion::new("1.0.1")]
+        );
+    }
+
+    #[test]
+    fn test_cooldown_held_versions_is_empty_without_registry_data() {
+        let (mut analysis, key) = analysis_with_publish_times();
+        analysis.cached_versions.clear();
+
+        assert!(
+            cooldown_held_versions(&analysis, &key, deps_core::FreshnessSettings::default())
+                .is_empty()
+        );
     }
 }

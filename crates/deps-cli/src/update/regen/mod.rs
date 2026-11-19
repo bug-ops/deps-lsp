@@ -46,14 +46,17 @@ use deps_engine::classify::resolved::{LockfileLoad, load_resolved_versions};
 use tokio::time::Instant;
 use url::Url;
 
-use command::{ArgComponent, Invocation, NpmPackageArg};
+use command::{ArgComponent, Invocation, LockfileOnlyMove, NpmPackageArg};
 pub use command::{NpmClient, Program, PythonLocker};
 pub(in crate::update) use interrupt::Interrupts;
 pub use rekey::RekeyRefusal;
 pub(in crate::update) use run::{ChildGuard, ProcessGroup};
 use run::{SearchPath, ToolRunner};
 
-use super::{CooldownFallbackNote, CurrentVersion, LockfileState, Outcome, UpdatePlan, UpdateRun};
+use super::{
+    CooldownFallbackNote, CurrentVersion, LockfileState, Outcome, UnfixableReason, UpdatePlan,
+    UpdateRun,
+};
 use crate::format::DryRun;
 
 /// Shared time budget for every probe and tool call of one regeneration.
@@ -116,6 +119,21 @@ pub struct ManifestTarget<'a> {
     pub display_path: &'a Path,
     /// `file://` URI of [`Self::manifest_path`].
     pub uri: &'a Url,
+    /// The manifest as it was before the plan's edits were written, so a run that finds an edit
+    /// resolving to a version inside the cooldown window can write the manifest back without it.
+    pub original: OriginalManifest<'a>,
+}
+
+/// The text of a manifest before any edit of an `update` run was written to it.
+#[derive(Debug, Clone, Copy)]
+pub struct OriginalManifest<'a>(&'a str);
+
+impl<'a> OriginalManifest<'a> {
+    /// Wraps the manifest text the plan's edit ranges were computed against.
+    #[must_use]
+    pub const fn new(content: &'a str) -> Self {
+        Self(content)
+    }
 }
 
 /// The lockfile path as shown to the user, relative to the manifest's display directory
@@ -177,6 +195,25 @@ pub enum PinResolution {
     Newer(ConcreteVersion),
 }
 
+/// A pin whose regenerated lock entry sits on a version inside the freshness cooldown window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldVersion {
+    /// The package whose pin landed on the version.
+    pub package: PackageName,
+    /// The version the lock file held.
+    pub version: ConcreteVersion,
+    /// The fix target of the pin.
+    pub target: ConcreteVersion,
+}
+
+fn more_held(rest: &[HeldVersion]) -> String {
+    if rest.is_empty() {
+        String::new()
+    } else {
+        format!(" (and {} more)", rest.len())
+    }
+}
+
 /// One applied update and the verified lockfile result for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinReport {
@@ -197,6 +234,9 @@ pub enum NotApplicableReason {
     NoLockfileFormat,
     /// No lockfile exists for this manifest, and none is ever created.
     NoLockfilePresent,
+    /// The tool ran, but every fix resolved to a version inside the freshness cooldown window and
+    /// was withheld, so the lock files are as they were.
+    AllWithheldByCooldown,
 }
 
 /// Why regeneration is not supported for this manifest.
@@ -341,6 +381,20 @@ pub enum RegenerationError {
         /// The lockfile's version for the package, if any.
         found: Option<ConcreteVersion>,
     },
+    /// The tool locked a newer in-range version inside the freshness cooldown window; the lock
+    /// files are restored.
+    #[error(
+        "lockfile resolves {} to {}, which is inside the freshness cooldown window{}",
+        first.package.as_str(),
+        first.version,
+        more_held(rest)
+    )]
+    CooldownHeldVersion {
+        /// The first pin that landed on a version inside the window.
+        first: HeldVersion,
+        /// Every other pin that did.
+        rest: Vec<HeldVersion>,
+    },
     /// A lock file could not be read before the tool ran, so nothing was spawned.
     #[error("could not snapshot {} before regeneration", path.display())]
     SnapshotFailed {
@@ -474,6 +528,9 @@ impl fmt::Display for NotApplicableReason {
             Self::NothingApplied => "no update was applied",
             Self::NoLockfileFormat => "this ecosystem has no lockfile format",
             Self::NoLockfilePresent => "no lockfile present",
+            Self::AllWithheldByCooldown => {
+                "every fix resolved to a version inside the freshness cooldown window and was withheld"
+            }
         })
     }
 }
@@ -602,32 +659,49 @@ pub const fn lockfile_support(id: EcosystemId) -> LockfileSupport {
     }
 }
 
-/// The tools `--lockfile regenerate` drives, as prose (`Cargo, npm, pnpm, Yarn 2+, Bun, Go, ...`),
-/// derived from [`strategy`] so it cannot drift from the support set.
-pub(super) fn supported_tools_text() -> String {
-    let mut tools: Vec<&str> = EcosystemId::ALL
-        .iter()
-        .flat_map(|id| match strategy(*id) {
-            Strategy::Cargo => ["Cargo"].as_slice(),
-            Strategy::NpmFamily => ["npm", "pnpm", "Yarn 2+", "Bun"].as_slice(),
-            Strategy::Go => ["Go"].as_slice(),
-            Strategy::Pypi => ["uv", "Poetry", "PDM", "Pipenv"].as_slice(),
-            Strategy::Bundler => ["Bundler"].as_slice(),
-            Strategy::Deno => ["Deno"].as_slice(),
-            Strategy::Composer => ["Composer"].as_slice(),
-            Strategy::Dart => ["Dart", "Flutter"].as_slice(),
-            Strategy::NuGet => ["NuGet"].as_slice(),
-            Strategy::Gradle => ["Gradle"].as_slice(),
-            Strategy::Swift => ["SwiftPM"].as_slice(),
-            Strategy::NoLockfileFormat => [].as_slice(),
-        })
-        .copied()
-        .collect();
-    match tools.pop() {
-        Some(last) if tools.is_empty() => last.to_owned(),
-        Some(last) => format!("{} and {last}", tools.join(", ")),
-        None => String::new(),
+/// The regeneration tools of a strategy as `(name shown to the user, program)`.
+const fn strategy_tools(strategy: Strategy) -> &'static [(&'static str, Program)] {
+    match strategy {
+        Strategy::Cargo => &[("Cargo", Program::Cargo)],
+        Strategy::NpmFamily => &[
+            ("npm", Program::Npm),
+            ("pnpm", Program::Pnpm),
+            ("Yarn 2+", Program::Yarn),
+            ("Bun", Program::Bun),
+        ],
+        Strategy::Go => &[("Go", Program::Go)],
+        Strategy::Pypi => &[
+            ("uv", Program::Uv),
+            ("Poetry", Program::Poetry),
+            ("PDM", Program::Pdm),
+            ("Pipenv", Program::Pipenv),
+        ],
+        Strategy::Bundler => &[("Bundler", Program::Bundle)],
+        Strategy::Deno => &[("Deno", Program::Deno)],
+        Strategy::Composer => &[("Composer", Program::Composer)],
+        Strategy::Dart => &[("Dart", Program::Dart), ("Flutter", Program::Flutter)],
+        Strategy::NuGet => &[("NuGet", Program::Dotnet)],
+        Strategy::Gradle => &[("Gradle", Program::Gradle)],
+        Strategy::Swift => &[("SwiftPM", Program::Swift)],
+        Strategy::NoLockfileFormat => &[],
     }
+}
+
+/// The tools of `id`'s ecosystem that can move a lock file without a planned manifest edit, as prose
+/// (`npm, pnpm, Yarn 2+ and Bun`), derived from [`strategy`] and [`Program::lockfile_only_move`]
+/// so it cannot drift from what the tools accept; `None` when no tool can.
+pub(super) fn lockfile_only_tools_text(id: EcosystemId) -> Option<String> {
+    let mut tools: Vec<&str> = strategy_tools(strategy(id))
+        .iter()
+        .filter(|(_, program)| program.lockfile_only_move() == LockfileOnlyMove::Supported)
+        .map(|(label, _)| *label)
+        .collect();
+    let last = tools.pop()?;
+    Some(if tools.is_empty() {
+        last.to_owned()
+    } else {
+        format!("{} and {last}", tools.join(", "))
+    })
 }
 
 /// How a pin is proven against the regenerated lockfile.
@@ -659,6 +733,8 @@ struct LockPin {
     normalized: NormalizedName,
     target: ConcreteVersion,
     cooldown_fallback: bool,
+    /// Versions inside the freshness cooldown window that the lock file must not end up on.
+    cooldown_held: Vec<ConcreteVersion>,
     origin: PinOrigin,
 }
 
@@ -675,6 +751,12 @@ impl LockPin {
 
     const fn is_lockfile_only(&self) -> bool {
         matches!(self.origin, PinOrigin::LockfileOnly { .. })
+    }
+
+    fn is_held_at(&self, formatter: &dyn EcosystemFormatter, version: &ConcreteVersion) -> bool {
+        self.cooldown_held
+            .iter()
+            .any(|held| same_release(formatter, held, version))
     }
 }
 
@@ -703,6 +785,9 @@ fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<Lo
             if origin == PinOrigin::ManifestEdit {
                 existing.origin = origin;
             }
+            existing
+                .cooldown_held
+                .extend_from_slice(&item.lockfile_fix.cooldown_held);
             continue;
         }
         pins.push(LockPin {
@@ -713,6 +798,7 @@ fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<Lo
                 item.cooldown_fallback,
                 Some(CooldownFallbackNote::AppliedInsteadOf(_))
             ),
+            cooldown_held: item.lockfile_fix.cooldown_held.clone(),
             origin,
         });
     }
@@ -772,10 +858,76 @@ async fn regenerate_with_interrupt(
         search_path: SearchPath::Inherit,
         group: ProcessGroup::detect(),
     };
-    let lockfile = regenerate_until(&plan, target, gate, &runner, scope, interrupt).await;
+    regenerate_planned(plan, target, gate, &runner, scope, interrupt).await
+}
+
+/// Regenerates, settles and marks the cooldown-held items of `plan` with `runner`.
+async fn regenerate_planned(
+    plan: UpdatePlan,
+    target: &ManifestTarget<'_>,
+    gate: RegenerationGate,
+    runner: &ToolRunner,
+    scope: LockfileScope<'_>,
+    interrupt: impl Future<Output = ()>,
+) -> UpdateRun {
+    let RegenerationRun { lockfile, retried } =
+        regenerate_until(&plan, target, gate, runner, scope, interrupt).await;
+    let formatter = target.ecosystem.formatter();
     let mut plan = plan;
-    settle_lockfile_only(&mut plan, &lockfile, target.ecosystem.formatter());
+    settle_lockfile_only(&mut plan, &lockfile, formatter);
+    withhold(&mut plan, &retried, formatter);
+    if let LockfileOutcome::Failed(RegenerationError::CooldownHeldVersion { first, rest }) =
+        &lockfile
+    {
+        let refused: Vec<HeldVersion> = std::iter::once(first).chain(rest).cloned().collect();
+        mark_held(&mut plan, &refused, formatter);
+    }
     UpdateRun { plan, lockfile }
+}
+
+/// Withholds every fix `held` names: an `Applied` item becomes `Unfixable(ResolvesWithinCooldown)`
+/// (its edit is written back out of the manifest), a lock-file-only item stays as it is; both
+/// record the version the tool resolved.
+fn withhold(plan: &mut UpdatePlan, held: &[HeldVersion], formatter: &dyn EcosystemFormatter) {
+    for item in &mut plan.items {
+        let Outcome::Applied { target, .. } = &item.outcome else {
+            continue;
+        };
+        if let Some(entry) = held_entry(held, formatter, item.name.as_str(), target) {
+            item.lockfile_fix.lockfile = LockfileState::HeldByCooldown(entry.version.clone());
+            item.outcome = Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown {
+                target: target.clone(),
+                resolved: entry.version.clone(),
+            });
+        }
+    }
+    mark_held(plan, held, formatter);
+}
+
+/// Records on each still-unsettled `RequiresLockfileUpdate` item named in `held` that the tool
+/// resolved it to a version inside the cooldown window.
+fn mark_held(plan: &mut UpdatePlan, held: &[HeldVersion], formatter: &dyn EcosystemFormatter) {
+    for item in &mut plan.items {
+        let Outcome::RequiresLockfileUpdate { target } = &item.outcome else {
+            continue;
+        };
+        if let Some(entry) = held_entry(held, formatter, item.name.as_str(), target) {
+            item.lockfile_fix.lockfile = LockfileState::HeldByCooldown(entry.version.clone());
+        }
+    }
+}
+
+/// The entry of `held` for the pin of package `name` with fix target `target`.
+fn held_entry<'a>(
+    held: &'a [HeldVersion],
+    formatter: &dyn EcosystemFormatter,
+    name: &str,
+    target: &ConcreteVersion,
+) -> Option<&'a HeldVersion> {
+    let name = formatter.normalize_package_name(&PackageName::new(name));
+    held.iter().find(|entry| {
+        entry.target == *target && formatter.normalize_package_name(&entry.package) == name
+    })
 }
 
 /// Installs the signal handlers right before the first spawn, when the gate is `Run` and there
@@ -819,7 +971,9 @@ fn interrupt_listener(
 /// A newer in-range version (npm and pnpm always pick the newest) is settled only when every
 /// captured advisory range says it is unaffected; anything else, including missing or
 /// undecidable ranges, keeps the item `RequiresLockfileUpdate` (exit 1) and records where the
-/// lock file now stands.
+/// lock file now stands. A newer version inside the cooldown window never reaches this point:
+/// verification fails the run with [`RegenerationError::CooldownHeldVersion`] and restores the
+/// lock files.
 fn settle_lockfile_only(
     plan: &mut UpdatePlan,
     lockfile: &LockfileOutcome,
@@ -889,6 +1043,42 @@ async fn regenerate_lockfile_with(
         std::future::pending(),
     )
     .await
+    .lockfile
+}
+
+#[cfg(all(test, unix))]
+async fn regenerate_run_with(
+    plan: UpdatePlan,
+    target: &ManifestTarget<'_>,
+    gate: RegenerationGate,
+    runner: &ToolRunner,
+) -> UpdateRun {
+    regenerate_planned(
+        plan,
+        target,
+        gate,
+        runner,
+        LockfileScope::Unrestricted,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// The outcome of [`regenerate_until`], with the pins it left out of a retry.
+struct RegenerationRun {
+    lockfile: LockfileOutcome,
+    /// Lock-file-only pins the first attempt resolved inside the cooldown window; the retry
+    /// regenerated without them.
+    retried: Vec<HeldVersion>,
+}
+
+impl RegenerationRun {
+    const fn plain(lockfile: LockfileOutcome) -> Self {
+        Self {
+            lockfile,
+            retried: Vec::new(),
+        }
+    }
 }
 
 /// Regenerates like [`regenerate_lockfile`], but abandons the run when `interrupt` resolves:
@@ -900,20 +1090,105 @@ async fn regenerate_until(
     runner: &ToolRunner,
     scope: LockfileScope<'_>,
     interrupt: impl Future<Output = ()>,
-) -> LockfileOutcome {
-    let pins = collect_pins(plan, target.ecosystem.formatter());
+) -> RegenerationRun {
+    let formatter = target.ecosystem.formatter();
+    let pins = collect_pins(plan, formatter);
     if pins.is_empty() {
-        return LockfileOutcome::NotApplicable(NotApplicableReason::NothingApplied);
+        return RegenerationRun::plain(LockfileOutcome::NotApplicable(
+            NotApplicableReason::NothingApplied,
+        ));
     }
     if let RegenerationGate::Skip(cause) = gate {
-        return LockfileOutcome::Skipped(cause);
+        return RegenerationRun::plain(LockfileOutcome::Skipped(cause));
     }
+    let deadline = Instant::now() + runner.deadline;
+    tokio::pin!(interrupt);
+    let first = run_attempt(target, runner, deadline, scope, &pins, interrupt.as_mut()).await;
+    let LockfileOutcome::Failed(RegenerationError::CooldownHeldVersion { first: held, rest }) =
+        &first
+    else {
+        return RegenerationRun::plain(first);
+    };
+    let held: Vec<HeldVersion> = std::iter::once(held).chain(rest).cloned().collect();
+    let is_held = |pin: &LockPin| {
+        held.iter().any(|entry| {
+            entry.target == pin.target
+                && formatter.normalize_package_name(&entry.package) == pin.normalized
+        })
+    };
+    let mut retry_plan = plan.clone();
+    withhold(&mut retry_plan, &held, formatter);
+    if pins
+        .iter()
+        .any(|pin| is_held(pin) && !pin.is_lockfile_only())
+        && !rewrite_without_held_edits(target, plan, &retry_plan)
+    {
+        return RegenerationRun::plain(first);
+    }
+    let remaining: Vec<LockPin> = collect_pins(&retry_plan, formatter)
+        .into_iter()
+        .filter(|pin| !(pin.is_lockfile_only() && is_held(pin)))
+        .collect();
+    if remaining.is_empty() {
+        return RegenerationRun {
+            lockfile: LockfileOutcome::NotApplicable(NotApplicableReason::AllWithheldByCooldown),
+            retried: held,
+        };
+    }
+    let second = run_attempt(
+        target,
+        runner,
+        deadline,
+        scope,
+        &remaining,
+        interrupt.as_mut(),
+    )
+    .await;
+    RegenerationRun {
+        lockfile: second,
+        retried: held,
+    }
+}
+
+/// Writes the manifest back as the original text plus the edits `after` still applies, so a held
+/// edit disappears from it. `false` when the file no longer holds what `before` wrote (it was
+/// changed during the run) or the write fails.
+fn rewrite_without_held_edits(
+    target: &ManifestTarget<'_>,
+    before: &UpdatePlan,
+    after: &UpdatePlan,
+) -> bool {
+    let original = target.original.0;
+    let current = deps_core::fs_probe::read_to_string_capped(
+        target.manifest_path,
+        crate::MAX_MANIFEST_FILE_SIZE,
+    )
+    .ok()
+    .flatten();
+    current.as_deref() == Some(super::planned_manifest(before, original).as_str())
+        && deps_core::fs_probe::write_atomic(
+            target.manifest_path,
+            &super::planned_manifest(after, original),
+        )
+        .is_ok()
+}
+
+/// One regeneration of `pins` under a fresh snapshot, restored when it fails or `interrupt`
+/// resolves.
+async fn run_attempt(
+    target: &ManifestTarget<'_>,
+    runner: &ToolRunner,
+    deadline: Instant,
+    scope: LockfileScope<'_>,
+    pins: &[LockPin],
+    interrupt: std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> LockfileOutcome {
     let snapshot = OnceLock::new();
     let session = Session {
         target,
         runner,
-        deadline: Instant::now() + runner.deadline,
-        pins: &pins,
+        deadline,
+        pins,
         manifest_dir: target
             .manifest_path
             .parent()
@@ -921,11 +1196,9 @@ async fn regenerate_until(
         snapshot: &snapshot,
         scope,
     };
-    let outcome = {
-        tokio::select! {
-            result = session.execute() => result.unwrap_or_else(LockfileOutcome::Failed),
-            () = interrupt => LockfileOutcome::Failed(RegenerationError::Interrupted),
-        }
+    let outcome = tokio::select! {
+        result = session.execute() => result.unwrap_or_else(LockfileOutcome::Failed),
+        () = interrupt => LockfileOutcome::Failed(RegenerationError::Interrupted),
     };
     match outcome {
         LockfileOutcome::Failed(error) => {
@@ -962,6 +1235,7 @@ const fn restore_after(error: &RegenerationError) -> bool {
         | RegenerationError::ManifestReparseFailed { .. }
         | RegenerationError::LockfileUnreadable { .. }
         | RegenerationError::VersionMismatch { .. }
+        | RegenerationError::CooldownHeldVersion { .. }
         | RegenerationError::FallbackPinRejected { .. }
         | RegenerationError::ManifestChanged { .. }
         | RegenerationError::Io { .. }
@@ -1234,62 +1508,83 @@ impl Session<'_> {
         };
 
         let formatter = self.target.ecosystem.formatter();
-        self.pins
-            .iter()
-            .map(|pin| {
-                let evidence: Vec<&ConcreteVersion> = versions
-                    .get(&pin.normalized)
-                    .into_iter()
-                    .chain(
-                        candidates
-                            .get(&pin.normalized)
-                            .into_iter()
-                            .flat_map(|found| found.versions()),
-                    )
-                    .collect();
-                let exact = || {
-                    evidence
-                        .contains(&&pin.target)
-                        .then_some(PinResolution::Exact)
-                };
-                let resolution = match check {
-                    PinCheck::ExactInLock => exact(),
-                    // A cooldown-fallback target is deliberately below the newest release, so a
-                    // newer satisfying version would be the very release the cooldown excludes.
-                    PinCheck::SatisfiesInLock if pin.cooldown_fallback => exact(),
-                    PinCheck::SatisfiesInLock => {
-                        let requirements: Vec<&VersionReq> = parsed
-                            .dependencies()
-                            .into_iter()
-                            .filter(|dep| {
-                                formatter.normalize_package_name(dep.name()) == pin.normalized
-                            })
-                            .filter_map(|dep| dep.version_requirement())
-                            .collect();
-                        satisfying_version(formatter, &requirements, &evidence, &pin.target).map(
-                            |version| {
-                                if version == pin.target {
-                                    PinResolution::Exact
-                                } else {
-                                    PinResolution::Newer(version)
-                                }
-                            },
+        let reports =
+            self.pins
+                .iter()
+                .map(|pin| {
+                    let evidence: Vec<&ConcreteVersion> = versions
+                        .get(&pin.normalized)
+                        .into_iter()
+                        .chain(
+                            candidates
+                                .get(&pin.normalized)
+                                .into_iter()
+                                .flat_map(|found| found.versions()),
                         )
+                        .collect();
+                    let exact = || {
+                        evidence
+                            .contains(&&pin.target)
+                            .then_some(PinResolution::Exact)
+                    };
+                    let resolution = match check {
+                        PinCheck::ExactInLock => exact(),
+                        // A cooldown-fallback target is deliberately below the newest release, so a
+                        // newer satisfying version would be the very release the cooldown excludes.
+                        PinCheck::SatisfiesInLock if pin.cooldown_fallback => exact(),
+                        PinCheck::SatisfiesInLock => {
+                            let requirements: Vec<&VersionReq> = parsed
+                                .dependencies()
+                                .into_iter()
+                                .filter(|dep| {
+                                    formatter.normalize_package_name(dep.name()) == pin.normalized
+                                })
+                                .filter_map(|dep| dep.version_requirement())
+                                .collect();
+                            satisfying_version(formatter, &requirements, &evidence, &pin.target)
+                                .map(|version| {
+                                    if version == pin.target {
+                                        PinResolution::Exact
+                                    } else {
+                                        PinResolution::Newer(version)
+                                    }
+                                })
+                        }
+                    };
+                    resolution
+                        .map(|resolution| PinReport {
+                            package: pin.package.clone(),
+                            target: pin.target.clone(),
+                            resolution,
+                        })
+                        .ok_or_else(|| RegenerationError::VersionMismatch {
+                            package: pin.package.clone(),
+                            expected: pin.target.clone(),
+                            found: versions.get(&pin.normalized).cloned(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        let mut held =
+            self.pins
+                .iter()
+                .zip(&reports)
+                .filter_map(|(pin, report)| match &report.resolution {
+                    PinResolution::Newer(version) if pin.is_held_at(formatter, version) => {
+                        Some(HeldVersion {
+                            package: pin.package.clone(),
+                            version: version.clone(),
+                            target: pin.target.clone(),
+                        })
                     }
-                };
-                resolution
-                    .map(|resolution| PinReport {
-                        package: pin.package.clone(),
-                        target: pin.target.clone(),
-                        resolution,
-                    })
-                    .ok_or_else(|| RegenerationError::VersionMismatch {
-                        package: pin.package.clone(),
-                        expected: pin.target.clone(),
-                        found: versions.get(&pin.normalized).cloned(),
-                    })
-            })
-            .collect()
+                    PinResolution::Newer(_) | PinResolution::Exact => None,
+                });
+        match held.next() {
+            Some(first) => Err(RegenerationError::CooldownHeldVersion {
+                first,
+                rest: held.collect(),
+            }),
+            None => Ok(reports),
+        }
     }
 
     /// The lockfile as shown to the user: the manifest's display directory joined with the
@@ -1308,6 +1603,25 @@ impl Session<'_> {
             real: to,
         }
     }
+}
+
+/// Whether `a` and `b` name the same release under the ecosystem's own version ordering, so
+/// spellings the registry and the lock file normalize differently (PEP 440 `2.31.1` and
+/// `2.31.1.0`) still compare equal. Unparsable versions are equal only when spelled identically.
+fn same_release(
+    formatter: &dyn EcosystemFormatter,
+    a: &ConcreteVersion,
+    b: &ConcreteVersion,
+) -> bool {
+    let at_least = |version: &ConcreteVersion| {
+        formatter.compile_requirement(&VersionReq::new(format!(">={version}")))
+    };
+    a == b
+        || at_least(a)
+            .zip(at_least(b))
+            .is_some_and(|(at_least_a, at_least_b)| {
+                at_least_a.matches(b) == Some(true) && at_least_b.matches(a) == Some(true)
+            })
 }
 
 /// The first of `evidence` that satisfies one of `requirements` and is at least `target`.

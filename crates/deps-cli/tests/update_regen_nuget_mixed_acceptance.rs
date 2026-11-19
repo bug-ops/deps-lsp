@@ -201,11 +201,13 @@ async fn mixed_child_main() {
     let ecosystem = registry.get(id).expect("ecosystem registered");
     let uri = url::Url::from_file_path(&manifest).expect("uri");
     let display = PathBuf::from(harness::env("REGEN_MANIFEST"));
+    let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: &manifest,
         display_path: &display,
         uri: &uri,
+        original: deps_cli::update::regen::OriginalManifest::new(&original_text),
     };
     let gate = RegenerationGate::new(LockfileMode::Regenerate, DryRun::No, NetworkMode::Online);
     let run = regenerate_lockfile(plan, &target, gate).await;

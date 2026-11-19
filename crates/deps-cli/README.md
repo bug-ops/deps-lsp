@@ -244,7 +244,7 @@ deps-cli update --lockfile regenerate Cargo.toml
 
 Flags: `--package <NAME>` (repeatable), `--security-only`, `--dry-run`, `--format
 table|json`, `--config <PATH>`, `--offline`, `--lockfile skip|regenerate` (default `skip`), and
-`--cooldown <DURATION>` (`--cooldown` has no effect under `--security-only`), `--open-pr
+`--cooldown <DURATION>` (under `--security-only` it does not change the fix target, but with `--lockfile regenerate` it rejects a lock-file-only move to a version inside the window), `--open-pr
 github|gitlab`, `--close-superseded` (needs `--open-pr`) and `--group <NAME>`.
 
 - **Default mode** honors the freshness cooldown (default 3 days) even with no flags: a

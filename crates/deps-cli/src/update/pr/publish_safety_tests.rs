@@ -843,11 +843,13 @@ async fn interrupt_the_update_phase_repeatedly(shim_dir: &Path) {
     let ecosystem = cargo_ecosystem();
     let uri = Url::from_file_path(&manifest).expect("file url");
     let display = PathBuf::from("Cargo.toml");
+    let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: &manifest,
         display_path: &display,
         uri: &uri,
+        original: crate::update::regen::OriginalManifest::new(&original_text),
     };
     let gate = RegenerationGate::new(LockfileMode::Regenerate, DryRun::No, NetworkMode::Online);
     let plan = UpdatePlan {

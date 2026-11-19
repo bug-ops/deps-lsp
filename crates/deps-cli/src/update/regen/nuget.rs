@@ -4,6 +4,7 @@ use std::path::Path;
 
 use deps_core::NormalizeName;
 
+use super::command::LockfileOnlyMove;
 use super::command::dotnet::ProjectFileArg;
 use super::lockers::Located;
 use super::{
@@ -109,7 +110,10 @@ impl Session<'_> {
             .filter(|pin| !pin.is_lockfile_only())
             .cloned()
             .collect();
-        if edit_pins.is_empty() && self.pins.iter().any(LockPin::is_lockfile_only) {
+        if edit_pins.is_empty()
+            && Program::Dotnet.lockfile_only_move() == LockfileOnlyMove::Refused
+            && self.pins.iter().any(LockPin::is_lockfile_only)
+        {
             return Ok(unsupported(
                 Some(self.display_lock_path(&located)),
                 UnsupportedReason::LockfileOnlyUpdateUnsupported(Program::Dotnet),

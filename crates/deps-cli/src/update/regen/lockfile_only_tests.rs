@@ -43,6 +43,8 @@ use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, RegenerationGate,
     SkipCause, regenerate_lockfile, regenerate_lockfile_with,
 };
+#[cfg(unix)]
+use crate::exit::EXIT_EXECUTION_ERROR;
 use crate::exit::{EXIT_CLEAN, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
 #[cfg(unix)]
@@ -107,6 +109,33 @@ fn lockfile_only(name: &str, locked: &str, target: &str) -> PlannedUpdateItem {
     )
 }
 
+/// A dependency whose first `from` text in `content` is replaced by `to`, with the real range.
+#[cfg(unix)]
+fn real_edit(
+    content: &str,
+    name: &str,
+    (current, target): (&str, &str),
+    (from, to): (&str, &str),
+) -> PlannedUpdateItem {
+    let offset = content.find(from).expect("text to replace");
+    let before = content.get(..offset).expect("char boundary");
+    let line = u32::try_from(before.matches('\n').count()).expect("line");
+    let column = before.rsplit('\n').next().map_or(0, str::len);
+    let start = Position::new(line, u32::try_from(column).expect("column"));
+    let end = Position::new(line, u32::try_from(column + from.len()).expect("column"));
+    item(
+        name,
+        current,
+        Outcome::Applied {
+            edit: ManifestEdit {
+                range: Range::new(start, end),
+                new_text: to.to_string(),
+            },
+            target: ConcreteVersion::from(target),
+        },
+    )
+}
+
 /// A dependency with a manifest edit at line 0 (never written by these tests).
 fn manifest_edit(name: &str, current: &str, target: &str) -> PlannedUpdateItem {
     item(
@@ -136,13 +165,50 @@ async fn regenerate(
     let ecosystem = ecosystem(id);
     let uri = Url::from_file_path(manifest).expect("file url");
     let display_path = PathBuf::from(manifest.file_name().expect("file name"));
+    let original_text = std::fs::read_to_string(manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: manifest,
         display_path: &display_path,
         uri: &uri,
+        original: super::OriginalManifest::new(&original_text),
     };
     regenerate_lockfile_with(plan, &target, gate, runner).await
+}
+
+/// Like [`regenerate`], but with the retry, settlement and held-item marking of a real run.
+#[cfg(unix)]
+async fn regenerate_run(
+    id: EcosystemId,
+    manifest: &Path,
+    plan: UpdatePlan,
+    runner: &ToolRunner,
+) -> UpdateRun {
+    let original = std::fs::read_to_string(manifest).unwrap_or_default();
+    regenerate_run_from(id, manifest, plan, runner, &original).await
+}
+
+/// [`regenerate_run`] with the manifest text from before the plan's edits (for plans whose edits
+/// are already written to `manifest`).
+#[cfg(unix)]
+async fn regenerate_run_from(
+    id: EcosystemId,
+    manifest: &Path,
+    plan: UpdatePlan,
+    runner: &ToolRunner,
+    original: &str,
+) -> UpdateRun {
+    let ecosystem = ecosystem(id);
+    let uri = Url::from_file_path(manifest).expect("file url");
+    let display_path = PathBuf::from(manifest.file_name().expect("file name"));
+    let target = ManifestTarget {
+        ecosystem: &ecosystem,
+        manifest_path: manifest,
+        display_path: &display_path,
+        uri: &uri,
+        original: super::OriginalManifest::new(original),
+    };
+    super::regenerate_run_with(plan, &target, run_gate(), runner).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -244,13 +310,44 @@ fn item_reason_of_manifest_edit() -> String {
     manifest_edit("stuba", "1.0.0", "1.0.1").reason()
 }
 
+fn lockfile_only_in(id: EcosystemId, name: &str) -> PlannedUpdateItem {
+    let mut item = lockfile_only(name, "1.0.0", "1.0.1");
+    item.lockfile_fix.ecosystem = Some(id);
+    item
+}
+
 #[test]
-fn test_requires_lockfile_update_reason_is_ecosystem_neutral_and_names_the_flag() {
-    let reason = lockfile_only("stuba", "1.0.0", "1.0.1").reason();
+fn test_requires_lockfile_update_reason_names_the_flag_and_only_its_ecosystems_tools() {
+    let reason = lockfile_only_in(EcosystemId::Npm, "stuba").reason();
+
     assert!(!reason.contains("#1116"), "{reason}");
-    assert!(reason.contains("--lockfile regenerate"), "{reason}");
-    for ecosystem in ["Cargo", "npm", "pnpm", "Go"] {
-        assert!(reason.contains(ecosystem), "{ecosystem} missing: {reason}");
+    assert!(
+        reason.ends_with("--lockfile regenerate for npm, pnpm, Yarn 2+ and Bun)"),
+        "{reason}"
+    );
+    for other in ["Cargo", "Go", "Poetry"] {
+        assert!(!reason.contains(other), "{other} listed: {reason}");
+    }
+}
+
+#[test]
+fn test_requires_lockfile_update_reason_for_pypi_lists_pipenv_with_the_other_lockers() {
+    let reason = lockfile_only_in(EcosystemId::Pypi, "stuba").reason();
+
+    assert!(
+        reason.ends_with("for uv, Poetry, PDM and Pipenv)"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn test_requires_lockfile_update_reason_omits_the_sentence_when_no_tool_can_move_the_lock() {
+    for reason in [
+        lockfile_only_in(EcosystemId::NuGet, "stuba").reason(),
+        lockfile_only("stuba", "1.0.0", "1.0.1").reason(),
+    ] {
+        assert!(!reason.contains("--lockfile regenerate"), "{reason}");
+        assert!(reason.ends_with("update the lock file"), "{reason}");
     }
 }
 
@@ -329,14 +426,16 @@ async fn test_regenerate_lockfile_without_a_lock_file_keeps_requires_lockfile_up
     let ecosystem = ecosystem(EcosystemId::Pypi);
     let uri = Url::from_file_path(&manifest).expect("file url");
     let display = PathBuf::from("pyproject.toml");
+    let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: &manifest,
         display_path: &display,
         uri: &uri,
+        original: super::OriginalManifest::new(&original_text),
     };
     let plan = UpdatePlan {
-        items: vec![lockfile_only("requests", "2.0.0", "2.0.1")],
+        items: vec![lockfile_only_in(EcosystemId::Pypi, "requests")],
     };
 
     let run = regenerate_lockfile(plan, &target, run_gate()).await;
@@ -348,8 +447,85 @@ async fn test_regenerate_lockfile_without_a_lock_file_keeps_requires_lockfile_up
     assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
     let reason = run.plan.items[0].reason();
     assert!(
-        reason.contains(&super::supported_tools_text()),
-        "the text names exactly the tools deps-cli can regenerate: {reason}"
+        reason.contains(
+            &super::lockfile_only_tools_text(EcosystemId::Pypi)
+                .expect("some tool moves a lock file")
+        ),
+        "the text names exactly the tools that can move a lock file alone: {reason}"
+    );
+}
+
+#[test]
+fn test_cooldown_held_error_counts_the_other_held_pins_in_its_message() {
+    use super::{HeldVersion, RegenerationError};
+
+    let held = |name: &str| HeldVersion {
+        package: deps_core::PackageName::new(name),
+        version: ConcreteVersion::from("1.0.1"),
+        target: ConcreteVersion::from("1.0.0"),
+    };
+    let alone = RegenerationError::CooldownHeldVersion {
+        first: held("a"),
+        rest: Vec::new(),
+    };
+    let with_two_more = RegenerationError::CooldownHeldVersion {
+        first: held("a"),
+        rest: vec![held("b"), held("c")],
+    };
+
+    assert!(!alone.to_string().contains("more"), "{alone}");
+    assert!(
+        with_two_more.to_string().ends_with(" (and 2 more)"),
+        "{with_two_more}"
+    );
+}
+
+#[test]
+fn test_lockfile_only_move_table_pins_every_program() {
+    use super::Program::{
+        Bun, Bundle, Cargo, Composer, Dart, Deno, Dotnet, Flutter, Go, Gradle, Npm, Pdm, Pipenv,
+        Pnpm, Poetry, Swift, Uv, Yarn,
+    };
+    use super::command::LockfileOnlyMove::{Refused, Supported};
+
+    let expected = [
+        (Cargo, Supported),
+        (Go, Supported),
+        (Npm, Supported),
+        (Pnpm, Supported),
+        (Yarn, Supported),
+        (Uv, Supported),
+        (Bundle, Supported),
+        (Deno, Supported),
+        (Bun, Supported),
+        (Poetry, Supported),
+        (Pdm, Supported),
+        (Pipenv, Supported),
+        (Composer, Supported),
+        (Dart, Supported),
+        (Flutter, Supported),
+        (Dotnet, Refused),
+        (Gradle, Supported),
+        (Swift, Supported),
+    ];
+
+    for (program, move_kind) in expected {
+        assert_eq!(program.lockfile_only_move(), move_kind, "{program}");
+    }
+}
+
+#[test]
+fn test_lockfile_only_tools_text_is_none_for_ecosystems_without_a_capable_tool() {
+    for id in [
+        EcosystemId::NuGet,
+        EcosystemId::Maven,
+        EcosystemId::GithubActions,
+    ] {
+        assert_eq!(super::lockfile_only_tools_text(id), None, "{id:?}");
+    }
+    assert_eq!(
+        super::lockfile_only_tools_text(EcosystemId::Cargo).as_deref(),
+        Some("Cargo")
     );
 }
 
@@ -831,6 +1007,519 @@ mod shim_tools {
         );
     }
 
+    /// An npm shim: `install` writes the lock for the manifest edit (react 16.1.0), `update`
+    /// moves lodash to `lodash_after` on top of it.
+    #[cfg(feature = "npm")]
+    fn two_step_npm(bin: &FakeBin, react_after_install: &str, lodash_after: &str) {
+        bin.install(
+            "npm",
+            &format!(
+                "case \"$1\" in\nupdate) cat > package-lock.json <<'EOF'\n{}\nEOF\n;;\n*) cat > package-lock.json <<'EOF'\n{}\nEOF\n;;\nesac",
+                npm_two_lock(react_after_install, lodash_after),
+                npm_two_lock(react_after_install, "4.17.20"),
+            ),
+        );
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_mixed_plan_retries_without_the_cooldown_held_lock_only_pin() {
+        let project = Project::new();
+        let manifest = project.write("package.json", TWO_PACKAGE_JSON);
+        project.write("package-lock.json", &npm_two_lock("16.0.0", "4.17.20"));
+        let bin = FakeBin::new();
+        two_step_npm(&bin, "16.1.0", "4.17.22");
+        let mut plan = mixed_plan();
+        plan.items[1].lockfile_fix.cooldown_held = vec![ConcreteVersion::from("4.17.22")];
+        plan.items[1].lockfile_fix.cooldown_window =
+            Some(deps_core::CooldownWindow::from_secs(3 * 86_400));
+        plan.items[1].lockfile_fix.ecosystem = Some(EcosystemId::Npm);
+
+        let run = regenerate_run(EcosystemId::Npm, &manifest, plan, &bin.runner()).await;
+
+        let install = "install --package-lock-only --ignore-scripts --no-audit --no-fund";
+        assert_eq!(
+            bin.calls(),
+            vec![
+                install.to_string(),
+                "update --no-save --package-lock-only --ignore-scripts --no-audit --no-fund lodash"
+                    .to_string(),
+                install.to_string(),
+            ],
+            "one retry, without lodash"
+        );
+        assert_eq!(
+            rows(&run.lockfile),
+            vec![("react".into(), "16.1.0".into(), PinResolution::Exact)]
+        );
+        assert_eq!(
+            project.read("package-lock.json").trim_end(),
+            npm_two_lock("16.1.0", "4.17.20"),
+            "react's bump kept, lodash left where it was"
+        );
+        assert_matches!(
+            run.plan.items[1].outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        );
+        assert_eq!(
+            run.plan.items[1].lockfile_fix.lockfile,
+            LockfileState::HeldByCooldown(ConcreteVersion::from("4.17.22"))
+        );
+        let reason = run.plan.items[1].reason();
+        assert!(
+            reason.contains("4.17.22") && reason.contains("3 days"),
+            "{reason}"
+        );
+        assert!(!reason.contains("--lockfile regenerate"), "{reason}");
+        assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_retry_that_holds_again_fails_after_exactly_one_retry() {
+        let before = npm_two_lock("16.0.0", "4.17.20");
+        let project = Project::new();
+        let manifest = project.write("package.json", TWO_PACKAGE_JSON);
+        project.write("package-lock.json", &before);
+        let bin = FakeBin::new();
+        // The first run holds lodash only; the retry, naming react alone, lands react on a
+        // held version.
+        bin.install(
+            "npm",
+            &format!(
+                "if [ -f .seen ]; then cat > package-lock.json <<'EOF'\n{}\nEOF\nelse touch .seen; cat > package-lock.json <<'EOF'\n{}\nEOF\nfi",
+                npm_two_lock("16.2.0", "4.17.20"),
+                npm_two_lock("16.1.0", "4.17.22"),
+            ),
+        );
+        let mut plan = UpdatePlan {
+            items: vec![
+                lockfile_only("react", "16.0.0", "16.1.0"),
+                lockfile_only("lodash", "4.17.20", "4.17.21"),
+            ],
+        };
+        plan.items[0].lockfile_fix.cooldown_held = vec![ConcreteVersion::from("16.2.0")];
+        plan.items[1].lockfile_fix.cooldown_held = vec![ConcreteVersion::from("4.17.22")];
+
+        let run = regenerate_run(EcosystemId::Npm, &manifest, plan, &bin.runner()).await;
+
+        assert_eq!(bin.calls().len(), 2, "exactly one retry: {:?}", bin.calls());
+        assert_matches!(
+            &run.lockfile,
+            LockfileOutcome::Failed(super::super::RegenerationError::CooldownHeldVersion {
+                first,
+                rest,
+            }) if first.package.as_str() == "react" && rest.is_empty()
+        );
+        assert_eq!(project.read("package-lock.json"), before);
+        assert_eq!(update_exit_code(&run), EXIT_EXECUTION_ERROR);
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_held_edit_is_not_withheld_when_the_manifest_changed_during_the_run()
+     {
+        let before = npm_two_lock("16.0.0", "4.17.20");
+        let project = Project::new();
+        let manifest = project.write("package.json", TWO_PACKAGE_JSON);
+        project.write("package-lock.json", &before);
+        let bin = FakeBin::new();
+        two_step_npm(&bin, "16.2.0", "4.17.21");
+        let mut plan = mixed_plan();
+        plan.items[0].lockfile_fix.cooldown_held = vec![ConcreteVersion::from("16.2.0")];
+
+        let run = regenerate_run(EcosystemId::Npm, &manifest, plan, &bin.runner()).await;
+
+        assert_eq!(bin.calls().len(), 2, "no retry: {:?}", bin.calls());
+        assert_matches!(
+            &run.lockfile,
+            LockfileOutcome::Failed(super::super::RegenerationError::CooldownHeldVersion {
+                first,
+                ..
+            }) if first.package.as_str() == "react"
+        );
+        assert_eq!(project.read("package-lock.json"), before);
+        assert_eq!(update_exit_code(&run), EXIT_EXECUTION_ERROR);
+    }
+
+    /// An npm shim for a held manifest-edit pin: `install` locks react 16.2.0 (inside the window),
+    /// the first `update` moves lodash on top of it, and the retry's `update` (the manifest
+    /// without react's edit) leaves react at 16.0.0.
+    #[cfg(feature = "npm")]
+    fn npm_react_held_on_install(bin: &FakeBin) {
+        bin.install(
+            "npm",
+            &format!(
+                "case \"$1\" in\ninstall) cat > package-lock.json <<'EOF'\n{}\nEOF\n;;\nupdate) if [ -f .seen ]; then cat > package-lock.json <<'EOF'\n{}\nEOF\nelse touch .seen; cat > package-lock.json <<'EOF'\n{}\nEOF\nfi;;\nesac",
+                npm_two_lock("16.2.0", "4.17.20"),
+                npm_two_lock("16.0.0", "4.17.21"),
+                npm_two_lock("16.2.0", "4.17.21"),
+            ),
+        );
+    }
+
+    #[cfg(feature = "npm")]
+    fn react_edit_and_lodash_lock_only() -> UpdatePlan {
+        let mut plan = UpdatePlan {
+            items: vec![
+                real_edit(
+                    TWO_PACKAGE_JSON,
+                    "react",
+                    ("16.0.0", "16.1.0"),
+                    ("^16.0.0", "^16.1.0"),
+                ),
+                lockfile_only("lodash", "4.17.20", "4.17.21"),
+            ],
+        };
+        plan.items[0].lockfile_fix.cooldown_held = vec![ConcreteVersion::from("16.2.0")];
+        plan.items[0].lockfile_fix.cooldown_window =
+            Some(deps_core::CooldownWindow::from_secs(3 * 86_400));
+        plan
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_held_manifest_edit_pin_is_withheld_and_the_manifest_written_back()
+    {
+        let project = Project::new();
+        let plan = react_edit_and_lodash_lock_only();
+        let edited = crate::update::planned_manifest(&plan, TWO_PACKAGE_JSON);
+        assert_ne!(edited, TWO_PACKAGE_JSON);
+        let manifest = project.write("package.json", &edited);
+        project.write("package-lock.json", &npm_two_lock("16.0.0", "4.17.20"));
+        let bin = FakeBin::new();
+        npm_react_held_on_install(&bin);
+
+        let run = regenerate_run_from(
+            EcosystemId::Npm,
+            &manifest,
+            plan,
+            &bin.runner(),
+            TWO_PACKAGE_JSON,
+        )
+        .await;
+
+        assert_eq!(
+            project.read("package.json"),
+            TWO_PACKAGE_JSON,
+            "react's edit is gone from the manifest"
+        );
+        assert_eq!(
+            project.read("package-lock.json").trim_end(),
+            npm_two_lock("16.0.0", "4.17.21"),
+            "the lock matches the manifest: lodash moved, react untouched"
+        );
+        assert_eq!(
+            rows(&run.lockfile),
+            vec![("lodash".into(), "4.17.21".into(), PinResolution::Exact)]
+        );
+        assert_matches!(
+            &run.plan.items[0].outcome,
+            Outcome::Unfixable(crate::update::UnfixableReason::ResolvesWithinCooldown { target, .. })
+                if target.as_str() == "16.1.0"
+        );
+        assert_matches!(
+            &run.plan.items[1].outcome,
+            Outcome::AppliedViaLockfile { target } if target.as_str() == "4.17.21"
+        );
+        let reason = run.plan.items[0].reason();
+        assert!(
+            reason.contains("16.2.0") && reason.contains("3 days"),
+            "{reason}"
+        );
+        assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_withholds_only_the_held_target_of_a_package_pinned_twice() {
+        let project = Project::new();
+        let manifest = project.write("package.json", TWO_PACKAGE_JSON);
+        project.write("package-lock.json", &npm_two_lock("16.0.0", "4.17.20"));
+        let bin = FakeBin::new();
+        bin.install(
+            "npm",
+            &format!(
+                "cat > package-lock.json <<'EOF'\n{}\nEOF",
+                npm_two_lock("16.0.0", "4.17.22")
+            ),
+        );
+        let mut held = lockfile_only("lodash", "4.17.20", "4.17.21");
+        held.lockfile_fix.cooldown_held = vec![ConcreteVersion::from("4.17.22")];
+        let plan = UpdatePlan {
+            items: vec![held, lockfile_only("lodash", "4.17.20", "4.17.22")],
+        };
+
+        let run = regenerate_run(EcosystemId::Npm, &manifest, plan, &bin.runner()).await;
+
+        assert_eq!(
+            bin.calls().len(),
+            2,
+            "the other target is retried: {:?}",
+            bin.calls()
+        );
+        assert_eq!(
+            rows(&run.lockfile),
+            vec![("lodash".into(), "4.17.22".into(), PinResolution::Exact)]
+        );
+        assert_eq!(
+            run.plan.items[0].lockfile_fix.lockfile,
+            LockfileState::HeldByCooldown(ConcreteVersion::from("4.17.22"))
+        );
+        assert_matches!(
+            &run.plan.items[1].outcome,
+            Outcome::AppliedViaLockfile { target } if target.as_str() == "4.17.22"
+        );
+    }
+
+    /// `plan` written to a fresh project (manifest edited, lock at the old versions), regenerated
+    /// with the original text known; returns the project, the run and the fake `npm`.
+    #[cfg(feature = "npm")]
+    async fn run_withheld(plan: UpdatePlan, lodash_after: &str) -> (Project, UpdateRun, FakeBin) {
+        let project = Project::new();
+        let edited = crate::update::planned_manifest(&plan, TWO_PACKAGE_JSON);
+        let manifest = project.write("package.json", &edited);
+        project.write("package-lock.json", &npm_two_lock("16.0.0", "4.17.20"));
+        let bin = FakeBin::new();
+        two_step_npm(&bin, "16.2.0", lodash_after);
+        let run = regenerate_run_from(
+            EcosystemId::Npm,
+            &manifest,
+            plan,
+            &bin.runner(),
+            TWO_PACKAGE_JSON,
+        )
+        .await;
+        (project, run, bin)
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_lone_held_manifest_edit_is_withheld_without_rerunning_the_tool() {
+        let mut plan = react_edit_and_lodash_lock_only();
+        plan.items.truncate(1);
+
+        let (project, run, bin) = run_withheld(plan, "4.17.20").await;
+
+        assert_eq!(bin.calls().len(), 1, "no rerun: {:?}", bin.calls());
+        assert_eq!(project.read("package.json"), TWO_PACKAGE_JSON);
+        assert_eq!(
+            project.read("package-lock.json"),
+            npm_two_lock("16.0.0", "4.17.20"),
+            "the lock is restored"
+        );
+        assert_matches!(
+            run.lockfile,
+            LockfileOutcome::NotApplicable(
+                super::super::NotApplicableReason::AllWithheldByCooldown
+            )
+        );
+        assert_matches!(
+            &run.plan.items[0].outcome,
+            Outcome::Unfixable(crate::update::UnfixableReason::ResolvesWithinCooldown {
+                target,
+                resolved,
+            }) if target.as_str() == "16.1.0" && resolved.as_str() == "16.2.0"
+        );
+        assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_regenerate_run_every_pin_held_withholds_all_and_leaves_manifest_and_lock_alone() {
+        let mut plan = react_edit_and_lodash_lock_only();
+        plan.items[1].lockfile_fix.cooldown_held = vec![ConcreteVersion::from("4.17.22")];
+
+        let (project, run, bin) = run_withheld(plan, "4.17.22").await;
+
+        assert_eq!(bin.calls().len(), 2, "no rerun: {:?}", bin.calls());
+
+        assert_eq!(project.read("package.json"), TWO_PACKAGE_JSON);
+        assert_eq!(
+            project.read("package-lock.json"),
+            npm_two_lock("16.0.0", "4.17.20")
+        );
+        assert_matches!(
+            &run.plan.items[0].outcome,
+            Outcome::Unfixable(crate::update::UnfixableReason::ResolvesWithinCooldown { .. })
+        );
+        assert_matches!(
+            &run.plan.items[1].outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        );
+        assert_eq!(
+            run.plan.items[1].lockfile_fix.lockfile,
+            LockfileState::HeldByCooldown(ConcreteVersion::from("4.17.22"))
+        );
+        assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
+    }
+
+    #[cfg(feature = "nuget")]
+    const CSPROJ: &str = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.1\" />\n    <PackageReference Include=\"Serilog\" Version=\"2.10.0\" />\n  </ItemGroup>\n</Project>\n";
+
+    #[cfg(feature = "nuget")]
+    fn nuget_lock(newtonsoft: &str, serilog: &str) -> String {
+        let entry = |name: &str, version: &str| {
+            format!(
+                "      \"{name}\": {{\n        \"type\": \"Direct\",\n        \"requested\": \"[{version}, )\",\n        \"resolved\": \"{version}\",\n        \"contentHash\": \"abc\"\n      }}"
+            )
+        };
+        format!(
+            "{{\n  \"version\": 1,\n  \"dependencies\": {{\n    \"net8.0\": {{\n{},\n{}\n    }}\n  }}\n}}\n",
+            entry("Newtonsoft.Json", newtonsoft),
+            entry("Serilog", serilog)
+        )
+    }
+
+    #[cfg(feature = "nuget")]
+    #[tokio::test]
+    async fn test_regenerate_lockfile_nuget_lock_only_plan_is_refused_before_any_tool_runs() {
+        let project = Project::new();
+        let manifest = project.write("App.csproj", CSPROJ);
+        project.write("packages.lock.json", &nuget_lock("13.0.1", "2.10.0"));
+        let bin = FakeBin::new();
+        bin.install("dotnet", "exit 0");
+        let plan = UpdatePlan {
+            items: vec![lockfile_only("Serilog", "2.10.0", "2.12.0")],
+        };
+
+        let outcome = regenerate(
+            EcosystemId::NuGet,
+            &manifest,
+            &plan,
+            run_gate(),
+            &bin.runner(),
+        )
+        .await;
+
+        assert_matches!(
+            outcome,
+            LockfileOutcome::Unsupported {
+                reason: super::super::UnsupportedReason::LockfileOnlyUpdateUnsupported(
+                    super::super::Program::Dotnet
+                ),
+                ..
+            }
+        );
+        assert!(bin.calls().is_empty(), "{:?}", bin.calls());
+    }
+
+    #[cfg(feature = "nuget")]
+    #[tokio::test]
+    async fn test_regenerate_lockfile_nuget_mixed_plan_restores_for_the_edit_pins_only() {
+        let project = Project::new();
+        let manifest = project.write("App.csproj", CSPROJ);
+        project.write("packages.lock.json", &nuget_lock("13.0.1", "2.10.0"));
+        let bin = FakeBin::new();
+        bin.install(
+            "dotnet",
+            &format!(
+                "cat > packages.lock.json <<'EOF'\n{}EOF",
+                nuget_lock("13.0.3", "2.10.0")
+            ),
+        );
+        let plan = UpdatePlan {
+            items: vec![
+                manifest_edit("Newtonsoft.Json", "13.0.1", "13.0.3"),
+                lockfile_only("Serilog", "2.10.0", "2.12.0"),
+            ],
+        };
+
+        let outcome = regenerate(
+            EcosystemId::NuGet,
+            &manifest,
+            &plan,
+            run_gate(),
+            &bin.runner(),
+        )
+        .await;
+
+        assert_eq!(
+            rows(&outcome),
+            vec![(
+                "Newtonsoft.Json".into(),
+                "13.0.3".into(),
+                PinResolution::Exact
+            )]
+        );
+    }
+
+    #[cfg(feature = "pypi")]
+    fn pipfile_lock(version: &str) -> String {
+        format!(
+            "{{\"_meta\": {{\"pipfile-spec\": 6}}, \"default\": {{\"requests\": {{\"version\": \"=={version}\"}}}}, \"develop\": {{}}}}\n"
+        )
+    }
+
+    /// Runs a lock-only Pipenv pin to 2.31.0 whose tool locks 2.31.1, with `held` inside the
+    /// window; returns the outcome and whether the lock file is back to its original bytes.
+    #[cfg(feature = "pypi")]
+    async fn run_pipenv_lock_only(held: &str) -> (LockfileOutcome, bool) {
+        let before = pipfile_lock("2.0.0");
+        let project = Project::new();
+        let manifest = project.write("Pipfile", "[packages]\nrequests = \">=2.0\"\n");
+        project.write("Pipfile.lock", &before);
+        let bin = FakeBin::new();
+        bin.install(
+            "pipenv",
+            &format!("cat > Pipfile.lock <<'EOF'\n{}EOF", pipfile_lock("2.31.1")),
+        );
+        let mut item = lockfile_only("requests", "2.0.0", "2.31.0");
+        item.lockfile_fix.cooldown_held = vec![ConcreteVersion::from(held)];
+        let plan = UpdatePlan { items: vec![item] };
+
+        let outcome = regenerate(
+            EcosystemId::Pypi,
+            &manifest,
+            &plan,
+            run_gate(),
+            &bin.runner(),
+        )
+        .await;
+        (outcome, project.read("Pipfile.lock") == before)
+    }
+
+    #[cfg(feature = "pypi")]
+    #[tokio::test]
+    async fn test_regenerate_lockfile_pipenv_lock_only_pin_on_a_held_version_restores_the_lock() {
+        let (outcome, restored) = run_pipenv_lock_only("2.31.1").await;
+
+        assert_matches!(
+            outcome,
+            LockfileOutcome::NotApplicable(
+                super::super::NotApplicableReason::AllWithheldByCooldown
+            )
+        );
+        assert!(restored);
+    }
+
+    #[cfg(feature = "pypi")]
+    #[tokio::test]
+    async fn test_regenerate_lockfile_pipenv_held_version_is_matched_under_pep_440_normalization() {
+        let (outcome, restored) = run_pipenv_lock_only("2.31.1.0").await;
+
+        assert_matches!(
+            outcome,
+            LockfileOutcome::NotApplicable(
+                super::super::NotApplicableReason::AllWithheldByCooldown
+            )
+        );
+        assert!(restored);
+    }
+
+    #[cfg(feature = "pypi")]
+    #[tokio::test]
+    async fn test_regenerate_lockfile_pipenv_newer_version_outside_the_held_set_is_kept() {
+        let (outcome, restored) = run_pipenv_lock_only("2.32.0").await;
+
+        assert_matches!(
+            &outcome,
+            LockfileOutcome::Regenerated { pins, .. }
+                if matches!(&pins[0].resolution, PinResolution::Newer(version) if version.as_str() == "2.31.1")
+        );
+        assert!(!restored);
+    }
+
     #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_regenerate_lockfile_npm_mixed_pins_stale_lockfile_only_pin_is_a_mismatch() {
@@ -1044,11 +1733,13 @@ mod cargo_real {
         let ecosystem = ecosystem(EcosystemId::Cargo);
         let uri = Url::from_file_path(&manifest).expect("file url");
         let display = PathBuf::from("Cargo.toml");
+        let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
         let target = ManifestTarget {
             ecosystem: &ecosystem,
             manifest_path: &manifest,
             display_path: &display,
             uri: &uri,
+            original: crate::update::regen::OriginalManifest::new(&original_text),
         };
         let plan = UpdatePlan {
             items: vec![lockfile_only("stuba", "1.0.0", "1.0.1")],
@@ -1083,11 +1774,13 @@ mod cargo_real {
         let ecosystem = ecosystem(EcosystemId::Cargo);
         let uri = Url::from_file_path(&manifest).expect("file url");
         let display = PathBuf::from("Cargo.toml");
+        let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
         let target = ManifestTarget {
             ecosystem: &ecosystem,
             manifest_path: &manifest,
             display_path: &display,
             uri: &uri,
+            original: crate::update::regen::OriginalManifest::new(&original_text),
         };
         let plan = UpdatePlan {
             items: vec![
@@ -1129,7 +1822,15 @@ mod newer_in_range {
     async fn settle_with_lock_after_update(
         after: &str,
         affected: Vec<AffectedRanges>,
-    ) -> (LockfileOutcome, UpdateRun) {
+    ) -> UpdateRun {
+        settle_with_cooldown_held(after, affected, vec![]).await
+    }
+
+    async fn settle_with_cooldown_held(
+        after: &str,
+        affected: Vec<AffectedRanges>,
+        cooldown_held: Vec<ConcreteVersion>,
+    ) -> UpdateRun {
         let project = Project::new();
         let manifest = project.write("package.json", MANIFEST);
         project.write("package-lock.json", &lock("4.17.20"));
@@ -1151,20 +1852,14 @@ mod newer_in_range {
         };
         let mut item = lockfile_only("lodash", "4.17.20", "4.17.21");
         item.lockfile_fix.affected = affected;
-        let mut plan = UpdatePlan { items: vec![item] };
-        let outcome = regenerate(EcosystemId::Npm, &manifest, &plan, run_gate(), &runner).await;
-        super::super::settle_lockfile_only(
-            &mut plan,
-            &outcome,
-            ecosystem(EcosystemId::Npm).formatter(),
-        );
-        (
-            outcome,
-            UpdateRun {
-                plan,
-                lockfile: LockfileOutcome::Skipped(SkipCause::NotEnabled),
-            },
+        item.lockfile_fix.cooldown_held = cooldown_held;
+        regenerate_run(
+            EcosystemId::Npm,
+            &manifest,
+            UpdatePlan { items: vec![item] },
+            &runner,
         )
+        .await
     }
 
     /// Fixed in 4.17.21, re-introduced from 4.18.0 up to a fix in 4.18.5.
@@ -1196,10 +1891,10 @@ mod newer_in_range {
     #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_without_captured_ranges_stays_unsettled() {
-        let (outcome, run) = settle_with_lock_after_update("4.17.22", vec![]).await;
+        let run = settle_with_lock_after_update("4.17.22", vec![]).await;
 
         assert_matches!(
-            &outcome,
+            &run.lockfile,
             LockfileOutcome::Regenerated { pins, .. }
                 if matches!(pins[0].resolution, PinResolution::Newer(_))
         );
@@ -1209,7 +1904,7 @@ mod newer_in_range {
     #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_inside_a_later_affected_range_stays_unsettled() {
-        let (_, run) = settle_with_lock_after_update("4.18.1", vec![ranges()]).await;
+        let run = settle_with_lock_after_update("4.18.1", vec![ranges()]).await;
 
         assert_stays_unsettled_at(&run, "4.18.1");
     }
@@ -1217,10 +1912,10 @@ mod newer_in_range {
     #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_newer_version_outside_every_affected_range_becomes_applied() {
-        let (outcome, run) = settle_with_lock_after_update("4.17.22", vec![ranges()]).await;
+        let run = settle_with_lock_after_update("4.17.22", vec![ranges()]).await;
 
         assert_matches!(
-            &outcome,
+            &run.lockfile,
             LockfileOutcome::Regenerated { pins, .. }
                 if matches!(pins[0].resolution, PinResolution::Newer(_))
         );
@@ -1233,13 +1928,78 @@ mod newer_in_range {
 
     #[cfg(feature = "npm")]
     #[tokio::test]
+    async fn test_regenerate_npm_lone_lock_only_pin_inside_the_cooldown_window_stays_unsettled_with_exit_1()
+     {
+        let run = settle_with_cooldown_held(
+            "4.17.22",
+            vec![ranges()],
+            vec![ConcreteVersion::from("4.17.22")],
+        )
+        .await;
+
+        assert_matches!(
+            &run.lockfile,
+            LockfileOutcome::NotApplicable(
+                super::super::NotApplicableReason::AllWithheldByCooldown
+            )
+        );
+        assert_matches!(
+            run.plan.items[0].outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        );
+        assert_eq!(
+            run.plan.items[0].lockfile_fix.lockfile,
+            LockfileState::HeldByCooldown(ConcreteVersion::from("4.17.22"))
+        );
+        assert!(
+            !run.plan.items[0].reason().contains("--lockfile regenerate"),
+            "{}",
+            run.plan.items[0].reason()
+        );
+        assert_eq!(update_exit_code(&run), EXIT_POLICY_VIOLATION);
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_settle_npm_newer_version_outside_the_cooldown_window_still_becomes_applied() {
+        let run = settle_with_cooldown_held(
+            "4.17.22",
+            vec![ranges()],
+            vec![ConcreteVersion::from("4.17.23")],
+        )
+        .await;
+
+        assert_matches!(
+            &run.plan.items[0].outcome,
+            Outcome::AppliedViaLockfile { target } if target.as_str() == "4.17.22"
+        );
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_settle_npm_exact_target_inside_the_cooldown_window_still_becomes_applied() {
+        let run = settle_with_cooldown_held(
+            "4.17.21",
+            vec![ranges()],
+            vec![ConcreteVersion::from("4.17.21")],
+        )
+        .await;
+
+        assert_matches!(
+            &run.plan.items[0].outcome,
+            Outcome::AppliedViaLockfile { target } if target.as_str() == "4.17.21"
+        );
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
     async fn test_settle_npm_newer_version_with_one_undecidable_range_set_stays_unsettled() {
         let undecidable = AffectedRanges::from_affected_json_for_test(
             OsvPackageName::new("lodash").expect("name"),
             OsvEcosystem::Npm,
             r#"[{"package":{"name":"lodash","ecosystem":"npm"},"ranges":[{"type":"GIT","events":[{"introduced":"0"}]}]}]"#,
         ).expect("valid affected JSON");
-        let (_, run) = settle_with_lock_after_update("4.17.22", vec![ranges(), undecidable]).await;
+        let run = settle_with_lock_after_update("4.17.22", vec![ranges(), undecidable]).await;
 
         assert_stays_unsettled_at(&run, "4.17.22");
     }
@@ -1247,7 +2007,7 @@ mod newer_in_range {
     #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_settle_npm_lock_resolving_exactly_the_target_becomes_applied_via_lockfile() {
-        let (_, run) = settle_with_lock_after_update("4.17.21", vec![]).await;
+        let run = settle_with_lock_after_update("4.17.21", vec![]).await;
 
         assert_matches!(
             run.plan.items[0].outcome,

@@ -190,6 +190,24 @@ mod tests {
             ),
         }
     }
+    #[test]
+    fn test_all_withheld_by_cooldown_is_named_in_the_lockfile_line() {
+        let run = crate::update::UpdateRun {
+            plan: crate::update::UpdatePlan::default(),
+            lockfile: crate::update::regen::LockfileOutcome::NotApplicable(
+                crate::update::regen::NotApplicableReason::AllWithheldByCooldown,
+            ),
+        };
+        let mut out = String::new();
+
+        write_lockfile_lines(&mut out, &run.lockfile);
+
+        assert!(
+            out.contains("lockfile: not applicable — every fix resolved to a version inside the freshness cooldown window"),
+            "{out}"
+        );
+    }
+
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
     use deps_core::diagnostic::Severity;

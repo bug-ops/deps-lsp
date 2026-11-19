@@ -443,6 +443,8 @@ pub enum NotApplicableToken {
     NoLockfileFormat,
     /// No lockfile exists for the manifest.
     NoLockfilePresent,
+    /// Every fix resolved inside the freshness cooldown window and was withheld.
+    AllWithheldByCooldown,
 }
 
 /// Why regeneration is unsupported, as a JSON token.
@@ -504,6 +506,8 @@ pub enum FailureKind {
     LockfileUnreadable,
     /// The regenerated lockfile does not hold the applied target.
     VersionMismatch,
+    /// The tool locked a newer version inside the freshness cooldown window.
+    CooldownHeldVersion,
     /// A lock file could not be snapshotted before the tool ran.
     SnapshotFailed,
     /// The lock file could not be restored after a failure.
@@ -532,6 +536,7 @@ impl From<&RegenerationError> for FailureKind {
             RegenerationError::ManifestReparseFailed { .. } => Self::ManifestReparseFailed,
             RegenerationError::LockfileUnreadable { .. } => Self::LockfileUnreadable,
             RegenerationError::VersionMismatch { .. } => Self::VersionMismatch,
+            RegenerationError::CooldownHeldVersion { .. } => Self::CooldownHeldVersion,
             RegenerationError::SnapshotFailed { .. } => Self::SnapshotFailed,
             RegenerationError::RestoreFailed { .. } => Self::RestoreFailed,
             RegenerationError::FallbackPinRejected { .. } => Self::FallbackPinRejected,
@@ -640,6 +645,9 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     NotApplicableReason::NothingApplied => NotApplicableToken::NothingApplied,
                     NotApplicableReason::NoLockfileFormat => NotApplicableToken::NoLockfileFormat,
                     NotApplicableReason::NoLockfilePresent => NotApplicableToken::NoLockfilePresent,
+                    NotApplicableReason::AllWithheldByCooldown => {
+                        NotApplicableToken::AllWithheldByCooldown
+                    }
                 },
             },
             LockfileOutcome::Unsupported { lockfile, reason } => {
@@ -713,6 +721,11 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::ManifestChanged { .. }
                     | RegenerationError::Io { .. }
                     | RegenerationError::FallbackPinNotKept { .. } => (None, None, None),
+                    RegenerationError::CooldownHeldVersion { first, .. } => (
+                        Some(clean(first.package.as_str())),
+                        None,
+                        Some(clean(first.version.as_str())),
+                    ),
                 };
                 Self::Failed {
                     kind: error.into(),
@@ -819,6 +832,20 @@ mod tests {
             ),
         }
     }
+    #[test]
+    fn test_all_withheld_by_cooldown_lockfile_reason_has_its_own_token() {
+        let run = crate::update::UpdateRun {
+            plan: crate::update::UpdatePlan::default(),
+            lockfile: crate::update::regen::LockfileOutcome::NotApplicable(
+                crate::update::regen::NotApplicableReason::AllWithheldByCooldown,
+            ),
+        };
+
+        let json = render_update(&run, DryRun::No).expect("render");
+
+        assert!(json.contains("all-withheld-by-cooldown"), "{json}");
+    }
+
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
     use deps_core::diagnostic::{DiagnosticKind, Severity};

@@ -383,6 +383,7 @@ async fn security_update_proposes_the_cross_major_fix_target() {
         &f.ctx.osv,
         &[],
         &IgnoreRules::empty(),
+        f.ctx.policy.freshness.to_freshness(),
         f.ctx.policy.cache.fetch_timeout,
     )
     .await;
