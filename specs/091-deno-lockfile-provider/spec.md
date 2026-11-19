@@ -9,7 +9,7 @@ tags:
   - lockfile
   - cross-ecosystem
 created: 2026-11-08
-status: implemented
+status: shipped
 related:
   - "[[constitution]]"
   - "[[052-pnpm-lockfile-provider/spec|pnpm-lock.yaml Lock File Provider]]"

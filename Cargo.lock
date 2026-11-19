@@ -608,7 +608,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "deps-bundler"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "criterion",
  "deps-core",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "deps-cargo"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "deps-cli"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "clap",
  "deps-core",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "deps-composer"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "deps-core",
  "mockito",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core-macros"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "deps-dart"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "criterion",
  "deps-core",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "deps-deno"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "deps-core",
  "deps-npm",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "deps-engine"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "deps-bundler",
  "deps-cargo",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "deps-github-actions"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "dashmap",
  "deps-core",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "deps-gitlab-ci"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "deps-go"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "deps-gradle"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "deps-core",
  "deps-maven",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "deps-lsp"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "deps-maven"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "deps-npm"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "deps-nuget"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "deps-precommit"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "deps-core",
  "deps-github-actions",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "deps-pypi"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "deps-swift"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "bytes",
  "dashmap",

@@ -11,7 +11,7 @@ tags:
   - cross-ecosystem
   - priority/p4
 created: 2026-11-08
-status: implemented
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

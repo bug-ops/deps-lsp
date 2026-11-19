@@ -78,7 +78,7 @@ See `deps_core::Registry`'s own "Registry client API contract" doc section for t
 rationale, and `deps_core::registry_conformance!`'s `ty:` form to add a compile-time check
 that your crate's registry struct exposes the first four names as true inherent methods
 (not merely reachable through a trait — see `deps_core::conformance::NotInherent`'s doc).
-Wired into 9 of the 14 ecosystem crates directly (`deps-maven`'s check transitively covers
+Wired into 9 of the 15 ecosystem crates directly (`deps-maven`'s check transitively covers
 `deps-gradle`, which reuses `deps-maven`'s `MavenCentralRegistry` unchanged); `deps-go`/
 `deps-github-actions` (no search endpoint to call at all — an inherent `search` would be a
 fabricated stub existing only to pass this check) and `deps-deno`/`deps-gitlab-ci` (no

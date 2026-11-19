@@ -11,7 +11,9 @@ GitHub Actions workflow dependency support for deps-lsp.
 This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It
 provides parsing and registry integration for `.github/workflows/*.yml`/`*.yaml` workflow
 files and `action.yml`/`action.yaml` composite/Docker/JS action manifests (a repository root
-or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`.
+or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`. The same parser, registry and diagnostics also serve
+`.pre-commit-config.yaml` through the `PreCommit` flavor, exposed by the
+[`deps-precommit`](../deps-precommit) crate.
 
 ## Features
 
@@ -63,7 +65,7 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
 
 ```toml
 [dependencies]
-deps-github-actions = "5.0"
+deps-github-actions = "6.0"
 ```
 
 > [!IMPORTANT]

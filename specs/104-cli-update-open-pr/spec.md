@@ -52,11 +52,11 @@ related:
 
 ### Out of Scope
 
-- Updating, rebasing or closing earlier deps-cli pull requests (a superseded pull request stays open).
+- Updating or rebasing earlier deps-cli pull requests. Closing superseded ones is opt-in via `--close-superseded` (§10, #2073); without it a superseded pull request stays open.
 - Several pull requests from one run, or runs over several manifests.
 - A direct GitHub/GitLab REST client, configurable remote (`origin` is fixed), branch prefix, commit-message prefix, labels, reviewers, assignees.
-- `--open-pr` for lock file formats whose regeneration is refused (Pipenv, Yarn Classic; lock-file-only pins for Bun and NuGet).
-- Group rules by dependency type (dev-dependencies) or by wildcard pattern; groups under `--security-only`.
+- `--open-pr` for lock file formats whose regeneration is refused (Yarn Classic and the other `unsupported` reasons of the regeneration module). Pipenv and Bun lock-file-only pins and NuGet mixed plans regenerate since #2114; NuGet lock-file-only pins stay refused (§10).
+- Groups under `--security-only`. Group rules by dependency type and by `*` name pattern ship since #2072 (§10).
 - Windows-specific testing (the code path has no shell and is expected to work; acceptance tests are unix-only).
 
 ## 2. User Stories
@@ -90,7 +90,7 @@ related:
 |----|------|-------------|----------|
 | FR-001 | O | WHERE `--open-pr <github\|gitlab>` is given THE SYSTEM SHALL require `--lockfile regenerate` and reject `--dry-run` and `--offline`; a violation exits 2 before any analysis | must |
 | FR-002 | E | WHEN `--open-pr` is given THE SYSTEM SHALL, before walking the manifest, verify: the manifest is inside a git work tree; `HEAD` is a named branch not starting with `deps-cli/` or `-`; a committer identity is configured (`git var GIT_COMMITTER_IDENT`); `git status --porcelain --untracked-files=no` is empty. Any failure exits 2 with a reason naming the check; a `HEAD` branch starting with `-` is its own error (`UnsafeBaseBranch`), distinct from one starting with `deps-cli/` (`OnUpdateBranch`) | must |
-| FR-003 | E | WHEN `--open-pr` is given and the manifest's lock file regeneration is refused (`unsupported`, for example Pipenv or Yarn Classic) THE SYSTEM SHALL restore the manifest edit (FR-007) and exit 2, naming the reason; only a Go module whose `vendor` tree is not tracked in `HEAD` is refused before analysis | must |
+| FR-003 | E | WHEN `--open-pr` is given and the manifest's lock file regeneration is refused (`unsupported`, for example Yarn Classic) THE SYSTEM SHALL restore the manifest edit (FR-007) and exit 2, naming the reason; only a Go module whose `vendor` tree is not tracked in `HEAD` is refused before analysis | must |
 | FR-004 | E | WHEN planning finishes THE SYSTEM SHALL derive the branch name (§5) from the proposed items (outcome `applied` or `requires-lockfile-update` after dedup and group demotion); with no proposed item THE SYSTEM SHALL open nothing and continue as `update` does today | must |
 | FR-005 | E | WHEN the branch exists on `origin` THE SYSTEM SHALL write nothing, skip lock file regeneration, render the report as a dry run, print `already proposed on <branch>` on stderr and exit with the code `update` computes for that report | must |
 | FR-006 | E | WHEN the branch exists locally but not on `origin` THE SYSTEM SHALL exit 2 before any write, naming the branch to delete | must |
@@ -106,7 +106,7 @@ related:
 | FR-015 | E | WHEN `[update.groups.<name>]` tables are present in an explicit `--config` THE SYSTEM SHALL parse them with unknown keys rejected; `<name>` is 1 to 64 characters of `[a-z0-9-]`, not starting or ending with `-` | must |
 | FR-016 | O | WHERE `--group <name>` is given THE SYSTEM SHALL require `--config`, reject `--security-only`, and exit 2 before analysis when `<name>` is not defined | must |
 | FR-017 | E | WHEN `--group` is given THE SYSTEM SHALL demote every `applied` item outside the group to `skipped` with reason `outside the selected --group`, before anything is written; such items do not raise the exit code | must |
-| FR-018 | U | THE SYSTEM SHALL count an item as inside a group only if its normalized name is listed in `dependencies` (or `dependencies` is absent) AND its update kind is listed in `update_types` (or `update_types` is absent); an unclassifiable kind is inside only a group without `update_types` | must |
+| FR-018 | U | THE SYSTEM SHALL count an item as inside a group only if its normalized name is listed in `dependencies` or matches a `patterns` glob (or neither selector is set) AND its update kind is listed in `update_types` (or `update_types` is absent) AND its dependency role is admitted by `dependency_type` (or `dependency_type` is absent); an unclassifiable kind or unknown role is inside only a group without the respective field (amended by #2072) | must |
 | FR-019 | U | THE SYSTEM SHALL leave `update` without `--open-pr` and `--group` byte-for-byte unchanged | must |
 
 ## 4. Non-Functional Requirements
@@ -138,7 +138,7 @@ update_types = ["minor", "patch"]
 dependencies = ["tokio", "tokio-util", "tracing"]
 ```
 
-Both keys are optional; a group without keys matches every update. Groups are honored only from an explicit `--config` (as `[update].ignore`, spec 068 FR-007).
+All keys (`dependencies`, `patterns`, `update_types`, `dependency_type`) are optional; a group without keys matches every update. Groups are honored only from an explicit `--config` (as `[update].ignore`, spec 068 FR-007).
 
 ### Branch name
 
@@ -176,7 +176,7 @@ The pull request body is a Markdown table (package, from, to, kind) plus a line 
 
 | Case | Behavior |
 |---|---|
-| Lock file `unsupported` (symlinked lock file, a lock file outside the repository root, Pipenv, Yarn Classic) | FR-007: restore, exit 2 |
+| Lock file `unsupported` (symlinked lock file, a lock file outside the repository root, Yarn Classic, a saved `.venv` file beside a Pipfile) | FR-007: restore, exit 2 |
 | Workspace member whose lock file is in the workspace root, inside the repository | allowed: the root lock file is published with the manifest |
 | Go module with `vendor/modules.txt` | regenerated; `vendor` must be tracked in `HEAD` and is published and restored as a tree |
 | Pull request creation fails after the push | exit 2; the remote branch exists, so the next run reports "already proposed": the message says to open the pull request manually or delete the remote branch |
@@ -241,14 +241,23 @@ None.
 ### Live-test limits
 
 - `gh pr create` and `glab mr create` were exercised only through fake host CLIs; neither ran against a real GitHub or GitLab host. The docs list the exact flags and say so.
-- FR-020 (no update settled) is covered by tests but not reachable in a live run: the OSV API base URL cannot be overridden, so a hermetic advisory scenario cannot be staged (#2074).
+- FR-020 (no update settled) was not reachable in a live run when the spec shipped; the operator-only `DEPS_OSV_BASE_URL` override (#2074, PR #2096) now lets a hermetic advisory scenario be staged.
 
 ### Follow-ups
 
-- #2071 — plain `update --lockfile regenerate` leaves a truncated lock file after a failed or interrupted run (`--open-pr` runs are covered by FR-007)
-- #2072 — groups lack dependency-name patterns and dependency-type groups (excluded #1118 scope)
-- #2073 — superseded update pull requests are neither closed nor updated
-- #2074 — OSV API base URL override for hermetic live tests
+- #2071 — plain `update --lockfile regenerate` leaves a truncated lock file after a failed or interrupted run. Fixed in PR #2096: the lock file, `go.mod` and `go.sum` are restored after a failed or interrupted run
+- #2072 — groups lacked dependency-name patterns and dependency-type groups. Fixed in PR #2096 (see below)
+- #2073 — superseded update pull requests were neither closed nor updated. Fixed in PR #2096 (see below)
+- #2074 — OSV API base URL override for hermetic live tests. Fixed in PR #2096: `DEPS_OSV_BASE_URL`
+
+### Shipped after the original PR
+
+| PR | Change |
+|---|---|
+| #2096 | `[update.groups.<name>]` accepts `patterns` (`*`-only globs, 1 to 214 bytes, no whitespace; a union with `dependencies`) and `dependency_type` (`production`, `development`, `build`, `peer`, `optional`); a group without a name selector admits every name, and an unknown role matches no `dependency_type`. FR-018 reads: inside only if the name matches `dependencies` or `patterns` (or neither is set), the update kind is in `update_types` (or unset) and the role is admitted by `dependency_type` (or unset) |
+| #2096 | `--close-superseded` (requires `--open-pr`): after opening a request, closes this author's open `deps-cli/<eco>/` requests only when six gates hold: same author, same repository, a `deps-cli/<eco>/` branch (narrowed to the manifest's directory part), exactly one commit, a hidden request marker of the same scope (same manifest, group and mode), and every target at or below the new one. At most 50 candidates are read per run, oldest first; any failed step is a warning and closes nothing |
+| #2096, #2106 | Lock files of workspace members and companion trees are staged and restored under `--open-pr` (member lock files allowed with repo-root containment) |
+| #2114 | GitLab superseded notes use `glab api` instead of the deprecated `mr note` flag |
 
 ## 11. See Also
 

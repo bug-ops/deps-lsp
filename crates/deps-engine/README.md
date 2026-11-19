@@ -32,7 +32,7 @@ workspace's own adapter crates.
 
 ```toml
 [dependencies]
-deps-engine = { version = "5.0", default-features = false, features = ["cargo", "npm"] }
+deps-engine = { version = "6.0", default-features = false, features = ["cargo", "npm"] }
 ```
 
 > [!IMPORTANT]
@@ -44,7 +44,7 @@ deps-engine = { version = "5.0", default-features = false, features = ["cargo", 
 ## Feature flags
 
 One flag per ecosystem — `cargo`, `npm`, `pypi`, `go`, `bundler`, `dart`, `maven`, `gradle`,
-`swift`, `composer`, `nuget`, `deno`, `github-actions`, `gitlab-ci` — each gating that
+`swift`, `composer`, `nuget`, `deno`, `github-actions`, `gitlab-ci`, `pre-commit` — each gating that
 ecosystem crate's optional dependency and its `ecosystem!`-generated re-exports.
 
 ## License
