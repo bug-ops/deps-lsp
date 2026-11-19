@@ -38,8 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `UnsupportedReason::PythonLockerDeferred`, the `python-locker-deferred` token, `UnsupportedDetail::Locker` and `LockerToken` are removed (#2114)
 - **behavior**: NuGet bounded ranges (e.g. `[1.0,2.0)`) under `--security-only` move from `requires-lockfile-update` to `unfixable` unless the fix is the range's inclusive lower bound (#2101, #2114)
 - **behavior**: `update --lockfile regenerate` reports file-operation failures as `io` instead of `manifest-changed` or `spawn`, and a failed manifest write-back restores the lock snapshot (#2104, #2105, #2114)
-- **deps-cli**: `plan_security_updates` takes a `freshness` argument, `ManifestTarget` gains a required `original`, and `LockfileFix`, `UnfixableReason::ResolvesWithinCooldown`, `NotApplicableReason::AllWithheldByCooldown` (token `all-withheld-by-cooldown`), `RegenerationError::CooldownHeldVersion` (token `cooldown-held-version`) and `Program::lockfile_only_move` are new (PR_LINK)
-- **behavior**: `update --security-only --lockfile regenerate` no longer accepts a newer lock-only or manifest-edit pin inside the cooldown window: it restores the lock, withholds the held pins and reruns once (PR_LINK)
+- **deps-cli**: `plan_security_updates` takes a `freshness` argument, `ManifestTarget` gains a required `original`, and `LockfileFix`, `UnfixableReason::ResolvesWithinCooldown`, `NotApplicableReason::AllWithheldByCooldown` (token `all-withheld-by-cooldown`), `RegenerationError::CooldownHeldVersion` (token `cooldown-held-version`) and `Program::lockfile_only_move` are new (#2121)
+- **behavior**: `update --security-only --lockfile regenerate` no longer accepts a newer lock-only or manifest-edit pin inside the cooldown window: it restores the lock, withholds the held pins and reruns once (#2121)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` re-resolves and verifies `Cargo.lock`, `package-lock.json`, `pnpm-lock.yaml` and `go.sum` after the manifest edit (#1116, #2050)
@@ -98,8 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **specs**: spec 099 Phase 1 shipped explain-only; steering past a held version is not needed, the fix target is annotated and never moved (#2043)
 
 ### Fixed
-- **deps-cli**: `update --security-only --lockfile regenerate` keeps a release still inside the cooldown window out of the lock file and the PR, including for Pipenv, npm and pnpm pins (#2110, PR_LINK)
-- **deps-cli**: the `requires-lockfile-update` reason names only the tools of the item's ecosystem that can move a lock file without a manifest edit (#2109, PR_LINK)
+- **deps-cli**: `update --security-only --lockfile regenerate` keeps a release still inside the cooldown window out of the lock file and the PR, including for Pipenv, npm and pnpm pins (#2110, #2121)
+- **deps-cli**: the `requires-lockfile-update` reason names only the tools of the item's ecosystem that can move a lock file without a manifest edit (#2109, #2121)
 - **deps-cli**: npm workspace member ownership no longer depends on `npm prefix`, and a compact Yarn Berry `package.json` is no longer rewritten by a lock-only update (#2089, #2091, #2106)
 - **deps-cli**: `update --close-superseded` orders Go, Maven, Gradle and NuGet versions natively, bounds candidate reads and caps glab output per step (#2090, #2092, #2093, #2106)
 - **deps-lsp**: `native_cooldown_surfaces` waits for the advisory diagnostic instead of racing the OSV fetch (#2094, #2106)
