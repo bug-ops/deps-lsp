@@ -4,7 +4,7 @@
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/bug-ops/deps-lsp/badge)](https://scorecard.dev/viewer/?uri=github.com/bug-ops/deps-lsp)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ)](https://codecov.io/gh/bug-ops/deps-lsp)
-[![Tests](https://img.shields.io/badge/tests-9553%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
+[![Tests](https://img.shields.io/badge/tests-11201%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.98-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
@@ -168,8 +168,13 @@ docker run --rm -v "$PWD:/workspace" -w /workspace \
   `github/codeql-action/upload-sarif`
 - **`deps-cli update <MANIFEST>`**: plans and atomically writes back version-requirement edits
   for outdated (default, honoring the freshness cooldown) or OSV-vulnerable (`--security-only`)
-  dependencies, with `--package`, `--dry-run`, and `--format table|json` — see
+  dependencies, with `--package`, `--dry-run`, and `--format table|json`; opt-in
+  `--lockfile regenerate` re-resolves and verifies lock files with the ecosystem's own tool, and
+  `--open-pr github|gitlab`, `--group` and `--close-superseded` open and tidy one PR per run — see
   [`crates/deps-cli/README.md`](crates/deps-cli/README.md#update-subcommand)
+- **Advisory exemptions and native cooldown gates**: `check --advisory-exemptions <PATH>` downgrades
+  operator-approved advisories to a notice (never confirmed malware), and the release-age windows of
+  Cargo, npm, pnpm, Yarn, Bun and uv are honored by default (`freshness.honor_native_cooldown`)
 - **[Pre-commit hook](.pre-commit-hooks.yaml)**: `deps-lsp-check`, runs `deps-cli check`
   against staged files
 - **[GitHub Action](crates/github-action/README.md)**: a Docker-based action wrapping

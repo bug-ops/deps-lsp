@@ -12,7 +12,7 @@ tags:
   - deps-cli
   - priority/p3
 created: 2026-11-17
-status: implemented
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

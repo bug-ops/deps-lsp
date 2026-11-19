@@ -70,13 +70,13 @@ an aspiration (see FR-001).
 
 Explicitly deferred — do not design or task any of the following here:
 
-- **Lockfile regeneration** (#1116) — `update` rewrites declared version
-  requirements only; a requirement that already admits a vulnerable resolved
-  version is reported as `RequiresLockfileUpdate`, not remediated.
-- **Git branch/commit/PR automation** (#1117) — `update` only writes to the
-  working tree; it never touches git. #1117 consumes this feature's
-  `--format json` output.
-- **Update grouping config** (#1118).
+- **Lockfile regeneration** (#1116) — originally out of scope: `update` rewrote declared version
+  requirements only. Shipped later as the opt-in `--lockfile regenerate`, see
+  "As shipped: lockfile regeneration" below; without it a requirement that already admits a
+  vulnerable resolved version is still reported as `RequiresLockfileUpdate`.
+- **Git branch/commit/PR automation** (#1117) and **update grouping config** (#1118) — deferred
+  here, shipped in [[104-cli-update-open-pr/spec|spec 104]] (`--open-pr`, `[update.groups]`,
+  `--group`); without `--open-pr` `update` never touches git.
 - **Bulk multi-manifest mode and its transactional write semantics** —
   `update` takes exactly one explicit manifest path; a directory, a glob,
   or a path no ecosystem claims is an execution error (exit 2). This
@@ -402,6 +402,18 @@ the authoritative implementation.
 - Let a `--security-only` run exit 0 while any `Vulnerable` dependency remains in `RequiresLockfileUpdate` or `Unfixable` state (FR-010)
 - Rebuild the vulnerability-keys map per dependency inside the security planner (FR-012's O(n²) prohibition)
 - Change `dedup_overlapping_edits`'s LSP-facing behavior while generalizing its signature (FR-001/FR-023 — the generalization must be behavior-preserving for the existing `ls_types::TextEdit` caller)
+
+## As shipped: lockfile regeneration
+
+> [!success] Status
+> `update --lockfile regenerate` (default `skip`) shipped in PR #2050 (Cargo, npm, pnpm, Go) and widened in PRs #2068, #2096, #2106, #2114 and #2121. The requirements below are the current behavior verified against `crates/deps-cli/src/update/regen/`.
+
+- **Coverage:** Cargo, npm, pnpm, Go (including workspaces and vendored modules), uv, Poetry, PDM, Pipenv, Bundler, Composer, Deno, Bun, Yarn Berry (standalone and workspace members), Dart and Flutter, NuGet, Gradle and SwiftPM. Yarn Classic is a documented refusal (no lock-file-only mode); other refusals are typed `UnsupportedReason` values (workspace-member or foreign lock file, symlinked lock file, lock file outside the repository, saved `.venv`, legacy lock layout, central package versions, oversized lock set, tool too old, floating requirements elsewhere, no lock-only update mode).
+- **Outcome contract:** every outcome, failures included, is a typed `LockfileOutcome`, so the report is always printed. A regenerated lock file that moves a `RequiresLockfileUpdate` item to the fix target settles it as `AppliedViaLockfile` (wire `applied`, exit 0).
+- **Lock-file-only security fixes:** `--security-only --lockfile regenerate` settles them for Cargo, npm, pnpm and Go (#2068) and later for every regeneration tool except NuGet (`dotnet` has no lock-file-only mode, so such a plan is reported `unsupported`); an in-range version settles only when the affected ranges of every advisory place it outside them.
+- **Process safety:** the tool runs in its own process group, killed on timeout, SIGINT and SIGTERM (#2048); after a failed or interrupted run the lock file, `go.mod` and `go.sum` are restored (#2071).
+- **Cooldown interplay:** a cooldown-fallback target below the newest release is pinned by an exact-pin run (npm, pnpm, Bun, Bundler; Yarn Berry and Deno rename the lock key afterwards, a failed rename restores and reports `fallback-pin-not-kept`; Cargo reports a typed `fallback-pin-rejected`). A newer in-range version chosen by a tool that cannot pin an exact version is accepted only outside the freshness cooldown window; a held pin restores the lock files, is withheld from the plan and the tool reruns once for the rest (#2121). The `requires-lockfile-update` reason names only the lock-only tools of the item's ecosystem.
+- **Operator override:** `DEPS_OSV_BASE_URL` selects the OSV endpoint (#2074); only an operator-set environment variable can waive plain `http`, and only for a loopback IP literal.
 
 ## 9. Open Questions
 

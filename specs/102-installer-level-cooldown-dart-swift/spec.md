@@ -10,7 +10,7 @@ tags:
   - deps-core
   - priority/p4
 created: 2026-11-17
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -24,7 +24,7 @@ related:
 > [!info] Metadata
 > **Type / priority**: research finding, P4, `deps-core` / `deps-dart` / `deps-swift`
 > **Issue**: #1569 (this spec closes it; surfacing for Cargo, npm and uv is tracked in #1982 and [[099-honor-native-package-manager-cooldown/spec|spec 099]])
-> **Phase**: specify. Open `[NEEDS CLARIFICATION]`: 0.
+> **Phase**: specify, shipped as a findings-only spec (PR #2029, no code change). Open `[NEEDS CLARIFICATION]`: 0.
 
 > [!abstract]
 > #1569 asked whether an installer-level release-age gate exists for ecosystems whose manifest requirement auto-follows new releases, so `deps-cli update` need not write an exact pin ([[076-cli-update-cooldown-fallback-no-lockfile/spec|076]] section 8). Cargo, npm and uv now have one (answered in the issue comment and covered by spec 099). As of 2026-11-17, neither pub (Dart) nor SwiftPM has a shipped gate, so there is nothing to surface for them. Existing fail-closed behavior stays; no code change.

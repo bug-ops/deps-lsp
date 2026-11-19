@@ -12,7 +12,7 @@ tags:
   - deps-core
   - priority/p2
 created: 2026-11-08
-status: implemented
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

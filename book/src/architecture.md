@@ -39,7 +39,7 @@ documented contract enforced by code review, not a compiler-enforced wall.
   instead of re-deriving a partial string match: an unhandled variant here is a compile error,
   while an unhandled string is a silent runtime bug (the class of bug issue #118 fixed, where
   two call sites silently mishandled ecosystems missing from an incomplete string match).
-  Adding a 15th ecosystem therefore forces every exhaustive `match` on `EcosystemId` across the
+  Adding a 16th ecosystem therefore forces every exhaustive `match` on `EcosystemId` across the
   workspace — including `EcosystemId::osv_ecosystem()`'s OSV.dev name mapping and
   `deps-core::deps_dev`'s deps.dev `system` mapping — to be updated at compile time.
 - **`ParseResult` / `Dependency`** — trait-object interfaces a parser returns; ecosystem-specific
@@ -458,6 +458,7 @@ deps-lsp/
 │   ├── deps-deno/      # deno.json parser + JSR registry (npm: delegates to deps-npm)
 │   ├── deps-github-actions/ # workflow YAML parser + GitHub tags API registry
 │   ├── deps-gitlab-ci/ # .gitlab-ci.yml parser + GitLab tags/releases API registry
+│   ├── deps-precommit/ # .pre-commit-config.yaml ecosystem: the GitHub Actions tags registry with the pre-commit flavor
 │   ├── deps-engine/    # Shared classification pipeline (see engine.md) used by deps-lsp/deps-cli
 │   ├── deps-lsp/       # Main LSP server
 │   ├── deps-cli/       # `deps-cli check` — CLI for CI/pre-commit/shell workflows

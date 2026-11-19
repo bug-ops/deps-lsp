@@ -65,6 +65,10 @@ version-requirement edits to one manifest.
   repository's `uv.toml` or `[tool.uv]` is skipped (`within-native-cooldown`, exit 0), never written
 - **Safe rewrites** — an unresolved version placeholder (`${VAR}`, `$(VAR)`, `%VAR%`,
   `self.version`, string interpolation) is never overwritten by a rewrite
+- **Advisory exemptions** — `check --advisory-exemptions <PATH>` loads an operator-owned file of
+  `[[advisory]]` entries (`id`, `reason`, optional `expires`); an exempted advisory becomes an
+  informational `advisory-exempted` notice (`--fail-on other` still fails on it), and confirmed
+  malware is never exemptible. A missing or malformed file exits 2
 - **Offline mode** — `--offline` serves only already-cached registry data, useful for
   air-gapped CI runners or fast local iteration
 
@@ -139,7 +143,7 @@ To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
-deps-cli = "5.0"
+deps-cli = "6.0"
 ```
 
 > [!IMPORTANT]

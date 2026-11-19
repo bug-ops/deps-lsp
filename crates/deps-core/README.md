@@ -22,6 +22,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`config_trust` module** — shared `ConfigTier`/`expand_env_vars` config-trust-tier and `${VAR}`/`%VAR%` interpolation logic
 - **`interval::VersionRange`, `lsp_helpers::BoundedVersionReq` and `MatchedSpans`** — shared bounded-interval requirement matching and oversized-requirement gating, so every ecosystem rejects unsatisfiable or pathological ranges the same way
 - **`policy_config::{GossipConfig, TyposquatConfig}`** — opt-in deps.dev GOSSIP-signal and typosquat-similarity settings (both default off)
+- **Advisory exemptions** — operator-controlled exemption entries replace a matching advisory with an `advisory-exempted` notice (`DiagnosticKind::AdvisoryExempted`); confirmed malware is never exemptible
 - **`LockFileProvider` trait** — Abstract lock file parsing for resolved versions
 - **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics_from_cache`, `generate_code_lenses`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
 - **`collect_update_all_edits`** — batch `TextEdit`s bringing every safely-editable outdated dependency to latest, shared across all ecosystems; guards against rewriting a `version_range` that isn't actually the version literal (property references, DSL variables, catalog aliases, synthesized range bounds)
@@ -44,7 +45,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 
 ```toml
 [dependencies]
-deps-core = "5.0"
+deps-core = "6.0"
 ```
 
 > [!IMPORTANT]
