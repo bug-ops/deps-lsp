@@ -1046,7 +1046,7 @@ async fn regenerate_lockfile_with(
     .lockfile
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn regenerate_run_with(
     plan: UpdatePlan,
     target: &ManifestTarget<'_>,

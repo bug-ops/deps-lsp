@@ -43,7 +43,9 @@ use super::{
     LockfileMode, LockfileOutcome, ManifestTarget, NotApplicableReason, RegenerationGate,
     SkipCause, regenerate_lockfile, regenerate_lockfile_with,
 };
-use crate::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, update_exit_code};
+#[cfg(unix)]
+use crate::exit::EXIT_EXECUTION_ERROR;
+use crate::exit::{EXIT_CLEAN, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
 #[cfg(unix)]
 use crate::update::LockfileState;
@@ -108,6 +110,7 @@ fn lockfile_only(name: &str, locked: &str, target: &str) -> PlannedUpdateItem {
 }
 
 /// A dependency whose first `from` text in `content` is replaced by `to`, with the real range.
+#[cfg(unix)]
 fn real_edit(
     content: &str,
     name: &str,
@@ -174,6 +177,7 @@ async fn regenerate(
 }
 
 /// Like [`regenerate`], but with the retry, settlement and held-item marking of a real run.
+#[cfg(unix)]
 async fn regenerate_run(
     id: EcosystemId,
     manifest: &Path,
@@ -186,6 +190,7 @@ async fn regenerate_run(
 
 /// [`regenerate_run`] with the manifest text from before the plan's edits (for plans whose edits
 /// are already written to `manifest`).
+#[cfg(unix)]
 async fn regenerate_run_from(
     id: EcosystemId,
     manifest: &Path,
