@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: re-dispatching `release.yml` for a non-latest or pre-release tag no longer moves GHCR `latest`/major/minor tags or the `action.yml` digest pin (#2067)
 - **workspace**: pass clippy 1.100 (#2027)
 - **deps-core-macros**: add the `README.md` its manifest declares, so `cargo publish` no longer fails (#2122)
+- **ci**: `release.yml` publish step sets `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow` so freshly published workspace crates pass the 3-day cooldown (#2122)
 - **deps-cli**: fuzz seed `Pipfile.lock` bumped to patched `requests` and `pytest` (#2107)
 
 ## [5.0.0] - 2026-11-10
