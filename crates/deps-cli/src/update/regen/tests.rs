@@ -201,11 +201,13 @@ async fn regenerate(
     let ecosystem = ecosystem(id);
     let uri = Url::from_file_path(manifest).expect("file url");
     let display_path = PathBuf::from(display);
+    let original_text = std::fs::read_to_string(manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: manifest,
         display_path: &display_path,
         uri: &uri,
+        original: super::OriginalManifest::new(&original_text),
     };
     regenerate_lockfile_with(plan, &target, gate, runner).await
 }
@@ -221,11 +223,13 @@ async fn regenerate_within(
     let ecosystem = ecosystem(id);
     let uri = Url::from_file_path(manifest).expect("file url");
     let display_path = PathBuf::from("Cargo.toml");
+    let original_text = std::fs::read_to_string(manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: manifest,
         display_path: &display_path,
         uri: &uri,
+        original: super::OriginalManifest::new(&original_text),
     };
     regenerate_until(
         plan,
@@ -236,6 +240,7 @@ async fn regenerate_within(
         std::future::pending(),
     )
     .await
+    .lockfile
 }
 
 fn pin_rows(outcome: &LockfileOutcome) -> Vec<(String, String, PinResolution)> {
@@ -2733,11 +2738,13 @@ async fn test_regenerate_until_refuses_a_lockfile_outside_the_scope_without_spaw
     let ecosystem = ecosystem(EcosystemId::Npm);
     let uri = Url::from_file_path(&manifest).expect("file url");
     let display = PathBuf::from("package.json");
+    let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
     let target = ManifestTarget {
         ecosystem: &ecosystem,
         manifest_path: &manifest,
         display_path: &display,
         uri: &uri,
+        original: super::OriginalManifest::new(&original_text),
     };
 
     let outcome = regenerate_until(
@@ -2748,7 +2755,8 @@ async fn test_regenerate_until_refuses_a_lockfile_outside_the_scope_without_spaw
         LockfileScope::Within(&elsewhere.root),
         std::future::pending(),
     )
-    .await;
+    .await
+    .lockfile;
 
     assert_matches!(
         outcome,
@@ -2817,11 +2825,13 @@ mod interrupted {
         let ecosystem = ecosystem(EcosystemId::Npm);
         let uri = Url::from_file_path(&manifest).expect("file url");
         let display = PathBuf::from("package.json");
+        let original_text = std::fs::read_to_string(&manifest).unwrap_or_default();
         let target = ManifestTarget {
             ecosystem: &ecosystem,
             manifest_path: &manifest,
             display_path: &display,
             uri: &uri,
+            original: crate::update::regen::OriginalManifest::new(&original_text),
         };
         let (fire, fired) = tokio::sync::oneshot::channel::<()>();
         let interrupt = async move {
@@ -2840,7 +2850,8 @@ mod interrupted {
             LockfileScope::Unrestricted,
             interrupt,
         )
-        .await;
+        .await
+        .lockfile;
         signaller.await.expect("signaller");
 
         assert_matches!(

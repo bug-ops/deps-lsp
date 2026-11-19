@@ -11,6 +11,8 @@ pub mod security;
 
 #[cfg(test)]
 mod group_tests;
+#[cfg(all(test, feature = "npm"))]
+mod security_lockfile_fix_tests;
 
 use deps_core::ConcreteVersion;
 use deps_core::NormalizeName;
@@ -202,15 +204,16 @@ pub struct PlannedUpdateItem {
     pub native_hold: Option<NativeHoldNote>,
     /// The dependency's role in its manifest; `None` when unknown.
     pub dependency_kind: Option<deps_core::DependencyKind>,
-    /// Evidence for settling a [`Outcome::RequiresLockfileUpdate`] item after a lock-file
-    /// regeneration; written only by the security planner (`affected`) and the regeneration
-    /// settlement (`lockfile`), and meaningful only for that outcome.
+    /// Evidence for regenerating and settling a [`Outcome::RequiresLockfileUpdate`] item; written
+    /// only by the security planner (`affected`, `cooldown_held`, `ecosystem`) and the
+    /// regeneration settlement (`lockfile`), and meaningful only for that outcome.
     pub(crate) lockfile_fix: LockfileFix,
 }
 
 /// What a regeneration may do to a [`Outcome::RequiresLockfileUpdate`] item.
 ///
-/// Meaningful only while the item's outcome is [`Outcome::RequiresLockfileUpdate`]; every other
+/// Meaningful only for [`Outcome::RequiresLockfileUpdate`] items and, for `cooldown_held`,
+/// `cooldown_window` and `ecosystem`, `--security-only` [`Outcome::Applied`] items; every other
 /// outcome keeps the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockfileFix {
@@ -218,6 +221,16 @@ pub struct LockfileFix {
     /// package. Empty when they were not captured or are incomplete, which means no version
     /// other than the fix target itself can ever be cleared.
     pub affected: Vec<deps_core::osv::AffectedRanges>,
+    /// The published versions that were inside the cooldown window when the plan was made. A tool
+    /// that cannot pin an exact version may lock one of them; a regeneration that does fails and
+    /// restores the lock files. Empty when freshness is disabled or no publish times are known.
+    pub cooldown_held: Vec<deps_core::ConcreteVersion>,
+    /// The cooldown window [`Self::cooldown_held`] was judged against; `None` when freshness is
+    /// disabled.
+    pub cooldown_window: Option<deps_core::CooldownWindow>,
+    /// The dependency's ecosystem, which decides the tools the reason may name; `None` until the
+    /// planner records it.
+    pub ecosystem: Option<deps_core::EcosystemId>,
     /// Where the regenerated lock file left the dependency.
     pub lockfile: LockfileState,
 }
@@ -231,6 +244,46 @@ pub enum LockfileState {
     /// The tool moved it to this newer in-range version, which could not be confirmed to lie
     /// outside the advisories' affected ranges.
     MovedTo(deps_core::ConcreteVersion),
+    /// The tool resolved it to this newer in-range version, which is inside the cooldown
+    /// window, so the lock file was not moved to it.
+    HeldByCooldown(deps_core::ConcreteVersion),
+}
+
+/// Why a fix was withheld: the tool resolved `version`, which is inside the cooldown window.
+fn held_reason(
+    version: &deps_core::ConcreteVersion,
+    window: Option<deps_core::CooldownWindow>,
+) -> String {
+    let window = window.map_or_else(String::new, |window| {
+        format!(" ({})", deps_core::format_duration_bucket(window.as_secs()))
+    });
+    format!(
+        "the tool resolved this dependency to {version}, which is inside the freshness cooldown \
+         window{window}, so the fix was withheld; rerun once that version has cleared the window"
+    )
+}
+
+impl LockfileFix {
+    /// The reason text of a [`Outcome::RequiresLockfileUpdate`] item, given the generic `base`
+    /// reason. Names only the tools of the item's ecosystem that can move a lock file alone, and
+    /// no tool when there are none.
+    fn reason(&self, base: &str) -> String {
+        match &self.lockfile {
+            LockfileState::MovedTo(version) => format!(
+                "the lock file now resolves {version}, a newer in-range version that could not be \
+                 confirmed outside the advisory's affected ranges; review it manually"
+            ),
+            LockfileState::HeldByCooldown(version) => held_reason(version, self.cooldown_window),
+            LockfileState::Untouched => {
+                match self.ecosystem.and_then(regen::lockfile_only_tools_text) {
+                    Some(tools) => format!(
+                        "{base} (deps-cli can do it with --lockfile regenerate for {tools})"
+                    ),
+                    None => base.to_owned(),
+                }
+            }
+        }
+    }
 }
 
 /// The native publish-age window that holds a package's `latest`, and how long until it clears.
@@ -417,6 +470,15 @@ pub enum UnfixableReason {
         /// The fix target that has no release tag.
         target: ConcreteVersion,
     },
+    /// (`--lockfile regenerate`) Writing the fix edit made the package manager resolve a newer
+    /// version inside the freshness cooldown window, so the edit was withheld and the manifest
+    /// written back without it.
+    ResolvesWithinCooldown {
+        /// The fix target whose edit was withheld.
+        target: ConcreteVersion,
+        /// The version inside the window that the package manager resolved.
+        resolved: ConcreteVersion,
+    },
 }
 
 impl Outcome {
@@ -448,7 +510,8 @@ impl Outcome {
                 UnfixableReason::Yanked { target }
                 | UnfixableReason::UnsupportedRequirementShape { target }
                 | UnfixableReason::OversizedRequirement { target }
-                | UnfixableReason::NoReleaseTagForFix { target },
+                | UnfixableReason::NoReleaseTagForFix { target }
+                | UnfixableReason::ResolvesWithinCooldown { target, .. },
             ) => Some(target),
             Self::Unfixable(
                 UnfixableReason::NoVerifiedFix | UnfixableReason::FetchFailedOrAbsent,
@@ -657,16 +720,15 @@ impl PlannedUpdateItem {
             Outcome::Unfixable(UnfixableReason::NoReleaseTagForFix { .. }) => {
                 "the fix version has no matching release in the repository's complete tag/release list, so the commit pin cannot be rewritten — wait for a release or edit manually"
             }
+            Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown { .. }) => {
+                "the fix edit was withheld: the package manager would resolve a version inside the freshness cooldown window"
+            }
         };
-        let mut reason = match (&self.outcome, &self.lockfile_fix.lockfile) {
-            (Outcome::RequiresLockfileUpdate { .. }, LockfileState::MovedTo(version)) => format!(
-                "the lock file now resolves {version}, a newer in-range version that could not be \
-                 confirmed outside the advisory's affected ranges; review it manually"
-            ),
-            (Outcome::RequiresLockfileUpdate { .. }, _) => format!(
-                "{base} (deps-cli can do it with --lockfile regenerate for {})",
-                regen::supported_tools_text()
-            ),
+        let mut reason = match &self.outcome {
+            Outcome::RequiresLockfileUpdate { .. } => self.lockfile_fix.reason(base),
+            Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown { resolved, .. }) => {
+                held_reason(resolved, self.lockfile_fix.cooldown_window)
+            }
             _ => base.to_string(),
         };
         if self.ignore_rule_overridden {
@@ -1759,6 +1821,15 @@ pub fn dedup_applied_items(items: &mut [PlannedUpdateItem]) {
     }
 }
 
+/// `original_content` with the edits of every `Applied` item of `plan`.
+///
+/// Defensive: `dedup_applied_items` should already have run over `plan`, so the overlap dedup here
+/// is normally a no-op — kept as a safety net, not the primary mechanism.
+pub(crate) fn planned_manifest(plan: &UpdatePlan, original_content: &str) -> String {
+    let edits = dedup_overlapping_edits(plan.applied_edits(), "deps-cli update");
+    apply_edits(original_content, &edits)
+}
+
 /// Applies `plan`'s [`Outcome::Applied`] edits to `path`, whose content the plan's ranges
 /// were computed against was `original_content` (FR-016 through FR-020).
 ///
@@ -1781,10 +1852,7 @@ pub fn apply_plan(
     original_content: &str,
     dry_run: crate::format::DryRun,
 ) -> Result<(), ApplyError> {
-    // Defensive: `dedup_applied_items` should already have run over `plan` before this is
-    // called, so this is normally a no-op — kept as a safety net, not the primary mechanism.
-    let edits = dedup_overlapping_edits(plan.applied_edits(), "deps-cli update");
-    let new_content = apply_edits(original_content, &edits);
+    let new_content = planned_manifest(plan, original_content);
 
     let reread = deps_core::fs_probe::read_to_string_capped(path, crate::MAX_MANIFEST_FILE_SIZE)
         .map_err(|source| ApplyError::Read {

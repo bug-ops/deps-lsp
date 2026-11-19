@@ -510,9 +510,10 @@ fn run_update_command(
 
     // FR-014 (M6: covers both clauses in one check, not just `--cooldown`): a non-default
     // `freshness.cooldown_secs` — whether it came from `--cooldown` or from a `[freshness]`
-    // section in an explicit `--config` file — has no effect under `--security-only`, since
-    // the fix target comes from the advisory's `recommended_fix()`, never the
-    // freshness-filtered registry pick. Warn, don't reject; comparing the final resolved
+    // section in an explicit `--config` file — does not change the fix target under
+    // `--security-only`, since it comes from the advisory's `recommended_fix()`, never the
+    // freshness-filtered registry pick (`--lockfile regenerate` still applies the window to a
+    // lock-file-only move). Warn, don't reject; comparing the final resolved
     // `policy` value (after `apply_overrides`) against the default catches both sources
     // uniformly instead of checking `args.cooldown` alone.
     let freshness_non_default =
@@ -530,8 +531,13 @@ fn run_update_command(
             (false, false) => None,
         };
         if let Some(source) = source {
+            let lockfile_tail = if freshness_non_default {
+                "; with --lockfile regenerate the freshness cooldown still rejects a lock-file-only move onto a version inside the window"
+            } else {
+                ""
+            };
             eprintln!(
-                "deps-cli: warning: {source} has no effect under --security-only (the fix target comes from the advisory, not the freshness/GOSSIP-filtered registry pick)"
+                "deps-cli: warning: {source} does not change the fix target under --security-only (it comes from the advisory, not the freshness/GOSSIP-filtered registry pick){lockfile_tail}"
             );
         }
     } else if freshness_non_default && !policy.freshness.enabled {
@@ -1052,6 +1058,7 @@ async fn run_update<'a>(
             &ctx.osv,
             &args.package,
             &ignore_rules,
+            ctx.policy.freshness.to_freshness(),
             ctx.policy.cache.fetch_timeout,
         )
         .await
@@ -1118,6 +1125,7 @@ async fn run_update<'a>(
         manifest_path: &manifest.path,
         display_path: &manifest.display_path,
         uri: &analysis.uri,
+        original: deps_cli::update::regen::OriginalManifest::new(&content),
     };
     let run = regenerate(plan, &target, gate, repo.map(pr::RepoContext::root)).await;
     Ok(UpdateOutput {

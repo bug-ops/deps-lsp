@@ -294,6 +294,7 @@ impl Fixture {
             &self.ctx.osv,
             &[],
             &IgnoreRules::empty(),
+            self.ctx.policy.freshness.to_freshness(),
             FetchTimeout::try_from_secs(30).expect("timeout"),
         )
         .await

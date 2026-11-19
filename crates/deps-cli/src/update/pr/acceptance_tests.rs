@@ -30,7 +30,7 @@ use crate::cli::Cli;
 use crate::update::group::UpdateGroup;
 use crate::update::group_tests::{applied, group_from, item, skipped};
 use crate::update::regen::{LockfileOutcome, NotApplicableReason, ProcessGroup};
-use crate::update::{CurrentVersion, Outcome, SkipReason, UpdatePlan, UpdateRun};
+use crate::update::{CurrentVersion, Outcome, SkipReason, UnfixableReason, UpdatePlan, UpdateRun};
 
 fn no_run() -> UpdateRun {
     UpdateRun {
@@ -715,6 +715,62 @@ struct Opened {
     title: String,
     body: String,
     commit_body: String,
+}
+
+fn withheld_and_applied() -> UpdatePlan {
+    UpdatePlan {
+        items: vec![
+            item("serde", "1.0.0", applied("1.2.0")),
+            item(
+                "tokio",
+                "1.0.0",
+                Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown {
+                    target: ConcreteVersion::from("1.5.0"),
+                    resolved: ConcreteVersion::from("1.6.0"),
+                }),
+            ),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn test_describe_leaves_a_withheld_fix_out_of_the_request_text() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("Cargo.toml").await;
+
+    let text = text_of(&ctx, &run_of(withheld_and_applied()), None);
+
+    assert!(text.body.contains("serde"), "{}", text.body);
+    for part in [&text.title, &text.body, &text.commit_body] {
+        assert!(
+            !part.contains("tokio") && !part.contains("1.5.0"),
+            "withheld fix leaked into: {part}"
+        );
+    }
+}
+
+#[test]
+fn test_readiness_with_only_a_withheld_fix_is_nothing_settled() {
+    let plan = UpdatePlan {
+        items: vec![withheld_and_applied().items.remove(1)],
+    };
+
+    assert_matches!(readiness(&run_of(plan)), Readiness::NothingSettled);
+}
+
+#[test]
+fn test_readiness_with_only_a_held_lock_only_fix_is_nothing_settled() {
+    let plan = UpdatePlan {
+        items: vec![item(
+            "tokio",
+            "1.0.0",
+            Outcome::RequiresLockfileUpdate {
+                target: ConcreteVersion::from("1.5.0"),
+            },
+        )],
+    };
+
+    assert_matches!(readiness(&run_of(plan)), Readiness::NothingSettled);
 }
 
 async fn open_with(
