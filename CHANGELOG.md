@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workspace**: scheduled `semver` job excludes crates new since the baseline and allows the just-published baseline version (#2126, #2128)
 
 ### Changed
+- **workspace**: bumped `url` to 2.5.9 for RUSTSEC-2026-0592 and let the musl cross-compile legs build under `build.warnings = "deny"` (#2128)
 - **workspace**: `build.warnings = "deny"` for local builds and `#[expect]` with reasons instead of file-level `#[allow]` (#2125, #2128)
 - **deps-cli**: `update --format json` lists every held pin, rekey parses a lock file once, and a `test-util` feature backs new regeneration tests (#2111, #2112, #2116, #2118, #2119, #2128)
 

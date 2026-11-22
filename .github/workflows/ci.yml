@@ -1185,7 +1185,9 @@ jobs:
         if: matrix.use_cross_tool
         env:
           CROSS_CONFIG: .github/Cross.toml
-        run: cross build --workspace --target ${{ matrix.target }}
+        # The cross linker wrapper prints to stderr, which rustc reports as a `linker_messages`
+        # warning; `--config` reaches cargo inside the container, an env var would not.
+        run: cross build --workspace --target ${{ matrix.target }} --config 'build.warnings="warn"'
 
       # Populates the cache path for the `actions/cache` step above to pick up and
       # upload at job end (its automatic post-step). Skipped on a cache hit (no new
