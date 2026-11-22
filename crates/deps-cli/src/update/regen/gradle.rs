@@ -15,7 +15,7 @@ mod lock_state;
 mod legacy_tests;
 
 pub use lock_state::{LockConfiguration, LockStateChange, LockedCoordinate};
-use lock_state::{LockScope, LockState, first_drift, parse_legacy, parse_unified};
+use lock_state::{LockScope, LockState, first_drift, parse_legacy, parse_unified, without_modules};
 
 use super::command::NonEmpty;
 use super::command::gradle::{GradleCoordArg, GradleProjectPath};
@@ -273,6 +273,22 @@ struct LegacyFile {
     held_nothing: bool,
 }
 
+/// The unified lock files a spawn in `dirs` may create: those of each directory not in `existing`.
+fn missing_unified_locks(dirs: &[&Path], existing: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .flat_map(|dir| LockScope::ALL.map(|scope| dir.join(scope.unified_file_name())))
+        .filter(|path| !existing.contains(path))
+        .collect()
+}
+
+/// The parsed state of one unified lock file.
+struct UnifiedLock {
+    path: PathBuf,
+    state: LockState,
+}
+
 /// The legacy lock state of one project, read before the first spawn.
 struct LegacyState {
     state: LockState,
@@ -392,22 +408,51 @@ impl Session<'_> {
         let dirs: Vec<&Path> = unified.iter().filter_map(|lock| lock.parent()).collect();
         let projects = lock_projects(root, &dirs)?;
 
-        let to_capture: Vec<&Path> = unified.iter().map(PathBuf::as_path).collect();
-        self.capture(&to_capture)?;
+        let created = missing_unified_locks(&dirs, unified);
+        let present: Vec<&Path> = unified.iter().map(PathBuf::as_path).collect();
+        let created_refs: Vec<&Path> = created.iter().map(PathBuf::as_path).collect();
+        self.capture_creating(&present, &created_refs)?;
+        let guarded: Vec<PathBuf> = unified.iter().chain(&created).cloned().collect();
+        let before = self.read_unified_states(&guarded)?;
         self.runner
             .run(
                 &Invocation::gradle_update_locks(root, &projects, coordinates),
                 self.deadline,
             )
             .await?;
-        let companions = unified
+        self.ensure_only_pins_moved(&before, &guarded)?;
+        let mut companions: Vec<Companion> = unified
             .iter()
             .filter(|lock| !same_file(Some(lock), Some(located)))
             .map(|lock| self.companion_file(lock))
             .collect();
-        // Exact, not satisfying: the Gradle grammar has no `>=target` matcher for `SatisfiesInLock`.
-        self.verified_with(Program::Gradle, located, companions, PinCheck::ExactInLock)
-            .await
+        companions.extend(self.created_companions(&created)?);
+        self.verified_with(
+            Program::Gradle,
+            located,
+            companions,
+            PinCheck::AtLeastTarget,
+        )
+        .await
+    }
+
+    /// A [`Companion::Created`] for each of `created` that the run wrote as a regular file.
+    fn created_companions(&self, created: &[PathBuf]) -> Result<Vec<Companion>, RegenerationError> {
+        let mut companions = Vec::new();
+        for path in created {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    companions.push(Companion::Created(self.companion_path(path)));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) | Err(_) => {
+                    return Err(RegenerationError::LockfileUnreadable {
+                        path: self.display_lock_path(path).shown,
+                    });
+                }
+            }
+        }
+        Ok(companions)
     }
 
     fn companion_file(&self, lock: &Path) -> Companion {
@@ -448,13 +493,13 @@ impl Session<'_> {
             }
             None => None,
         };
-        let created: Vec<PathBuf> = set
-            .legacy
+        let project_dirs: Vec<&Path> = set
+            .unified
             .iter()
-            .flat_map(|project| {
-                LockScope::ALL.map(|scope| project.dir.join(scope.unified_file_name()))
-            })
+            .filter_map(|lock| lock.parent())
+            .chain(set.legacy.iter().map(|project| project.dir.as_path()))
             .collect();
+        let created = missing_unified_locks(&project_dirs, &set.unified);
         let present: Vec<&Path> = set
             .unified
             .iter()
@@ -470,6 +515,14 @@ impl Session<'_> {
             .iter()
             .map(|project| project.dir.as_path())
             .collect();
+        let locks_to_guard: Vec<PathBuf> = set.unified.iter().chain(&created).cloned().collect();
+        // The migration spawn may rewrite locks of other projects too, so their baseline is read
+        // before it; a legacy project's own locks are proven equal to the legacy state instead.
+        let (in_legacy_dirs, outside_legacy_dirs): (Vec<PathBuf>, Vec<PathBuf>) = locks_to_guard
+            .iter()
+            .cloned()
+            .partition(|lock| lock.parent().is_some_and(|dir| legacy_dirs.contains(&dir)));
+        let mut baseline = self.read_unified_states(&outside_legacy_dirs)?;
         let mut guard = manifest
             .as_ref()
             .filter(|_| neutral.is_some())
@@ -525,12 +578,14 @@ impl Session<'_> {
             .filter_map(|lock| lock.parent())
             .chain(legacy_dirs.iter().copied())
             .collect();
+        baseline.extend(self.read_unified_states(&in_legacy_dirs)?);
         self.runner
             .run(
                 &Invocation::gradle_update_locks(root, &lock_projects(root, &dirs)?, coordinates),
                 self.deadline,
             )
             .await?;
+        self.ensure_only_pins_moved(&baseline, &locks_to_guard)?;
 
         let mut companions: Vec<Companion> = set
             .unified
@@ -538,19 +593,7 @@ impl Session<'_> {
             .filter(|lock| !same_file(Some(lock), Some(&verified)))
             .map(|lock| self.companion_file(lock))
             .collect();
-        for path in &created {
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.file_type().is_file() => {
-                    companions.push(Companion::Created(self.companion_path(path)));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) | Err(_) => {
-                    return Err(RegenerationError::LockfileUnreadable {
-                        path: self.display_lock_path(path).shown,
-                    });
-                }
-            }
-        }
+        companions.extend(self.created_companions(&created)?);
         companions.extend(
             removals
                 .into_iter()
@@ -563,9 +606,69 @@ impl Session<'_> {
             Program::Gradle,
             &verified,
             companions,
-            PinCheck::ExactInLock,
+            PinCheck::AtLeastTarget,
         )
         .await
+    }
+
+    /// The parsed state of every existing unified lock file among `paths`.
+    fn read_unified_states(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<UnifiedLock>, RegenerationError> {
+        let mut locks = Vec::new();
+        for path in paths {
+            let scope = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(LockScope::of_unified_file_name)
+                .ok_or_else(|| self.unrecognized(path))?;
+            let text = match Self::read_lock_text(path) {
+                LockRead::Text(text) => text,
+                LockRead::Missing => continue,
+                LockRead::Unreadable => {
+                    return Err(RegenerationError::LockfileUnreadable {
+                        path: self.display_lock_path(path).shown,
+                    });
+                }
+            };
+            let state = parse_unified(scope, &text).ok_or_else(|| self.unrecognized(path))?;
+            locks.push(UnifiedLock {
+                path: path.clone(),
+                state,
+            });
+        }
+        Ok(locks)
+    }
+
+    /// Refuses a run that moved a coordinate no pin names, in a configuration the lock already
+    /// held or one it was missing (which Gradle resolves fresh, past the cooldown).
+    ///
+    /// The caller's snapshot restores the files on the returned error.
+    fn ensure_only_pins_moved(
+        &self,
+        before: &[UnifiedLock],
+        paths: &[PathBuf],
+    ) -> Result<(), RegenerationError> {
+        let modules: Vec<&str> = self.pins.iter().map(|pin| pin.package.as_str()).collect();
+        let empty = LockState::new();
+        for after in self.read_unified_states(paths)? {
+            let prior = before
+                .iter()
+                .find(|lock| lock.path == after.path)
+                .map_or(&empty, |lock| &lock.state);
+            if let Some((_, configuration, change)) = first_drift(
+                &without_modules(prior, &modules),
+                &without_modules(&after.state, &modules),
+            ) {
+                return Err(RegenerationError::LockStateDrift {
+                    path: self.display_lock_path(&after.path).shown,
+                    configuration,
+                    change,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn write_manifest(

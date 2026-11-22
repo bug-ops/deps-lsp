@@ -163,8 +163,9 @@ impl Session<'_> {
         }
     }
 
-    /// `dotnet restore <project> --use-lock-file --no-dependencies --force` after a manifest
-    /// edit, and for lock-only pins whose declaration lets restore reach the target.
+    /// `dotnet restore <project> --use-lock-file --no-dependencies --disable-build-servers
+    /// --force -p:RestoreLockedMode=false` after a manifest edit, and for lock-only pins whose
+    /// declaration lets restore reach the target.
     ///
     /// A lock-only pin is one of three kinds (see [`LockOnlyClass`]). A floating one is pinned
     /// exactly in the manifest for one restore, then the declared requirement goes back into the

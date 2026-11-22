@@ -50,7 +50,12 @@ pub(in crate::update::regen) enum RestoreMode {
 
 impl Invocation {
     /// `dotnet restore <project> --use-lock-file --no-dependencies --disable-build-servers
-    /// --force`, plus `--locked-mode` for [`RestoreMode::Locked`].
+    /// --force`, plus `-p:RestoreLockedMode=false` for [`RestoreMode::Resolve`] or
+    /// `--locked-mode` for [`RestoreMode::Locked`].
+    ///
+    /// The resolving restore overrides the property because a project's own
+    /// `<RestoreLockedMode>true</RestoreLockedMode>` would otherwise fail it with `NU1004`
+    /// (#2129); `--locked-mode` already wins over the property.
     ///
     /// `--force` makes restore re-resolve although the project looks up to date, which is how a
     /// package already locked moves to a newly pinned version. `--no-dependencies` keeps
@@ -69,9 +74,10 @@ impl Invocation {
             "--disable-build-servers",
             "--force",
         ]));
-        if mode == RestoreMode::Locked {
-            args.extend(Self::strs(&["--locked-mode"]));
-        }
+        args.extend(Self::strs(&[match mode {
+            RestoreMode::Resolve => "-p:RestoreLockedMode=false",
+            RestoreMode::Locked => "--locked-mode",
+        }]));
         let mut invocation = Self::new(Program::Dotnet, cwd, args);
         invocation.env = DOTNET_ENV;
         invocation
@@ -106,7 +112,7 @@ mod tests {
         }
     }
 
-    const RESOLVE_ARGS: [&str; 6] = [
+    const BASE_ARGS: [&str; 6] = [
         "restore",
         "App.csproj",
         "--use-lock-file",
@@ -125,7 +131,9 @@ mod tests {
         let invocation = restore(RestoreMode::Resolve);
 
         assert_eq!(invocation.program(), Program::Dotnet);
-        assert_eq!(invocation.args(), RESOLVE_ARGS);
+        let mut expected = BASE_ARGS.to_vec();
+        expected.push("-p:RestoreLockedMode=false");
+        assert_eq!(invocation.args(), expected);
         assert!(
             invocation
                 .args()
@@ -136,10 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn locked_restore_is_the_resolve_restore_plus_locked_mode() {
+    fn locked_restore_is_the_base_restore_plus_locked_mode_without_the_property_override() {
         let invocation = restore(RestoreMode::Locked);
 
-        let mut expected = RESOLVE_ARGS.to_vec();
+        let mut expected = BASE_ARGS.to_vec();
         expected.push("--locked-mode");
         assert_eq!(invocation.args(), expected);
     }

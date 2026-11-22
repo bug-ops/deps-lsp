@@ -506,6 +506,46 @@ fn test_update_exit_code_only_failed_lockfile_raises_to_execution_error() {
 // Real cargo against the committed offline local registry
 // ---------------------------------------------------------------------------------------------
 
+mod display_path_normalization {
+    use super::super::lexically_normalized;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_project_route_collapses_against_the_display_dir() {
+        use super::super::DisplayLockPath;
+
+        let lock = DisplayLockPath::for_test("app/Cargo.lock", Path::new("/r/app/Cargo.lock"));
+        assert_eq!(
+            lock.display_of(Path::new("/r/lib/gradle.lockfile")),
+            PathBuf::from("lib/gradle.lockfile")
+        );
+    }
+
+    #[test]
+    fn clean_paths_are_unchanged() {
+        for clean in ["app/gradle/dependency-locks/a.lockfile", "Cargo.lock"] {
+            assert_eq!(lexically_normalized(Path::new(clean)), PathBuf::from(clean));
+        }
+    }
+
+    #[test]
+    fn parent_beyond_the_root_is_preserved() {
+        assert_eq!(
+            lexically_normalized(Path::new("../outside.txt")),
+            PathBuf::from("../outside.txt")
+        );
+        assert_eq!(
+            lexically_normalized(Path::new("app/../../outside.txt")),
+            PathBuf::from("../outside.txt")
+        );
+        assert_eq!(
+            lexically_normalized(Path::new("/../x")),
+            PathBuf::from("/../x")
+        );
+    }
+}
+
 mod inside_workspace_seam {
     use super::super::inside_workspace;
     use super::*;

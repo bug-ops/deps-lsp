@@ -167,7 +167,7 @@ impl DisplayLockPath {
     pub fn display_of(&self, path: &Path) -> PathBuf {
         let from = self.real.parent().unwrap_or_else(|| Path::new(""));
         let shown_dir = self.shown.parent().unwrap_or_else(|| Path::new(""));
-        shown_dir.join(relative_route(from, path))
+        lexically_normalized(&shown_dir.join(relative_route(from, path)))
     }
 
     /// Builds a display path for fixtures that stand in for a regeneration result.
@@ -526,7 +526,7 @@ pub enum RegenerationError {
         reason: RekeyRefusal,
     },
     /// The run changed which coordinates a configuration locks beyond the requested update.
-    #[error("the migration changed the lock state of configuration {configuration} in {}: {change}", path.display())]
+    #[error("the run changed the lock state of configuration {configuration} in {}: {change}", path.display())]
     LockStateDrift {
         /// The lock file's display path.
         path: PathBuf,
@@ -538,6 +538,24 @@ pub enum RegenerationError {
 }
 
 impl RegenerationError {
+    /// Builds a [`Self::LockStateDrift`] for tests outside this module, whose lock-state types
+    /// have module-private constructors; `None` for a malformed configuration or coordinate.
+    ///
+    /// `change` is the variant constructor (`LockStateChange::Gained` or `::Lost`).
+    #[cfg(test)]
+    pub(crate) fn lock_state_drift_for_test(
+        path: PathBuf,
+        configuration: &str,
+        coordinate: &str,
+        change: fn(LockedCoordinate) -> LockStateChange,
+    ) -> Option<Self> {
+        Some(Self::LockStateDrift {
+            path,
+            configuration: LockConfiguration::new(configuration)?,
+            change: change(LockedCoordinate::new(coordinate)?),
+        })
+    }
+
     /// The failure behind any restore wrapper: `self` unless this is a
     /// [`Self::RestoreFailed`], then the failure that triggered the restore.
     #[must_use]
@@ -796,6 +814,10 @@ enum PinCheck {
     /// The lockfile holds a version that satisfies the edited requirement and is at least the
     /// target (npm, pnpm).
     SatisfiesInLock,
+    /// The lockfile holds the target or a newer version by the ecosystem's own ordering, for
+    /// ecosystems whose matcher grammar has no `>=target` (Gradle). Only a lock-file-only pin may
+    /// land on a newer version; an edited or cooldown-fallback pin must hold the exact target.
+    AtLeastTarget,
 }
 
 /// Where a pin's fix comes from.
@@ -1715,6 +1737,10 @@ impl Session<'_> {
                     };
                     let resolution = match check {
                         PinCheck::ExactInLock => exact(),
+                        PinCheck::AtLeastTarget if pin.cooldown_fallback => exact(),
+                        PinCheck::AtLeastTarget if !pin.is_lockfile_only() => exact(),
+                        PinCheck::AtLeastTarget => exact()
+                            .or_else(|| not_older_resolution(formatter, &evidence, &pin.target)),
                         // A cooldown-fallback target is deliberately below the newest release, so a
                         // newer satisfying version would be the very release the cooldown excludes.
                         PinCheck::SatisfiesInLock if pin.cooldown_fallback => exact(),
@@ -1785,7 +1811,7 @@ impl Session<'_> {
             .parent()
             .unwrap_or_else(|| Path::new(""));
         DisplayLockPath {
-            shown: display_dir.join(relative_route(&from, &to)),
+            shown: lexically_normalized(&display_dir.join(relative_route(&from, &to))),
             real: to,
         }
     }
@@ -1835,6 +1861,23 @@ fn satisfying_version(
         .map(|version| (*version).clone())
 }
 
+/// The first of `evidence` that equals or exceeds `target` by the ecosystem's own ordering.
+///
+/// An unordered pair (`None`) fails closed.
+fn not_older_resolution(
+    formatter: &dyn EcosystemFormatter,
+    evidence: &[&ConcreteVersion],
+    target: &ConcreteVersion,
+) -> Option<PinResolution> {
+    evidence.iter().find_map(
+        |version| match formatter.compare_versions(version, target)? {
+            std::cmp::Ordering::Equal => Some(PinResolution::Exact),
+            std::cmp::Ordering::Greater => Some(PinResolution::Newer((*version).clone())),
+            std::cmp::Ordering::Less => None,
+        },
+    )
+}
+
 fn unsupported(lockfile: Option<DisplayLockPath>, reason: UnsupportedReason) -> LockfileOutcome {
     LockfileOutcome::Unsupported { lockfile, reason }
 }
@@ -1876,6 +1919,26 @@ fn relative_route(from: &Path, to: &Path) -> PathBuf {
     }
     route.extend(to_components.iter().skip(common));
     route
+}
+
+/// `path` with `.` dropped and every `x/..` pair collapsed, without touching the filesystem.
+///
+/// A `..` with no normal component before it (leading, or right after the root) is kept.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Whether pnpm's workspace directory is set in the environment (read through `env_var`).

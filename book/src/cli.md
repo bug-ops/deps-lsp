@@ -531,8 +531,8 @@ the fresh lockfile against every applied version:
 | PyPI (`pdm.lock`) | `pdm lock --update-reuse` (manifest edits), then `pdm update --no-sync <names>` (lock-file-only fixes) | same as Poetry |
 | Composer (`composer.lock`) | `composer update <vendor/name...> --no-install --no-scripts --no-plugins --no-interaction` with `COMPOSER=composer.json` | same as Poetry |
 | Dart / Flutter (`pubspec.lock`) | `dart pub get --no-example` (manifest edits), then `dart pub upgrade --no-example <names>` (lock-file-only fixes); `flutter pub` instead when a dependency comes from the Flutter SDK | same as Poetry |
-| NuGet (`packages.lock.json`) | `dotnet restore <project> --use-lock-file --no-dependencies --force --disable-build-servers` (plus `--locked-mode` for the final check of a floating lock-file-only pin) | same as Poetry |
-| Gradle (`gradle.lockfile`, `*.lockfile`) | `gradle --no-daemon --console=plain :<path>:dependencies ... --update-locks <group:artifact,...>` at the build root, one task per project directory that owns a lock file | the lockfile holds exactly the target |
+| NuGet (`packages.lock.json`) | `dotnet restore <project> --use-lock-file --no-dependencies --force --disable-build-servers -p:RestoreLockedMode=false` (the final check of a floating lock-file-only pin runs `--locked-mode` instead of the property) | same as Poetry |
+| Gradle (`gradle.lockfile`, `*.lockfile`) | `gradle --no-daemon --console=plain :<path>:dependencies ... --update-locks <group:artifact,...>` at the build root, one task per project directory that owns a lock file | the lockfile holds the target (a lock-file-only pin may hold a newer version) |
 | SwiftPM (`Package.resolved`) | `swift package resolve` (manifest edits), then `swift package update <identity>` (lock-file-only fixes) | same as Poetry |
 
 For PyPI, Bundler, Deno, Composer, Dart and Swift the lock file must sit beside the manifest, and for
@@ -590,7 +590,8 @@ Composer, Dart, Swift, NuGet, Gradle and Pipenv refuse a fallback target.
   locked-mode restore (`--locked-mode`) proves the manifest and lock file agree. A pin whose declared
   floor already equals the fix needs only the restore. Any other lock-file-only pin stays untouched and
   `requires-lockfile-update`; a plan made of such pins alone reports `lockfile-only-update-unsupported`
-  before any tool runs. A manifest edit makes `dotnet restore` re-resolve every floating dependency of
+  before any tool runs. The resolving restore sets `-p:RestoreLockedMode=false`, so a project that sets
+  `RestoreLockedMode` in its project file no longer fails with `NU1004`. A manifest edit makes `dotnet restore` re-resolve every floating dependency of
   the project, which would bypass the release-age window, so a floating or bounded requirement of any
   other package refuses the run as `other-floating-requirements`. The check reads the manifest and the
   lock file, so floating requirements that come from `Directory.Build.props`, a `ProjectReference` or
@@ -613,11 +614,14 @@ Composer, Dart, Swift, NuGet, Gradle and Pipenv refuse a fallback target.
   `A-Za-z0-9-_.` components, otherwise the run is refused; the directory name is assumed to be the
   project name, so a build that remaps `projectDir` in `settings.gradle` fails verification and the
   lock files are restored. Every lock file of the build is snapshotted and, with `--open-pr`,
-  published. Verification is exact: the lock file must hold exactly the target, so a version raised by
-  conflict resolution, or a lock-file-only dynamic requirement (`32.+`) that resolves newer than the
-  target, fails with `version-mismatch` and the lock files are restored. `--update-locks` creates a
-  `gradle.lockfile` for a locked project that had none; the run snapshots that file as absent and
-  removes it again if the run fails.
+  published. Verification is exact for a pin made by a manifest edit and for a cooldown-fallback pin. A
+  lock-file-only pin (a dynamic requirement such as `32.+` that already admits the fix) may instead
+  hold a newer version than the target by Gradle's own ordering, so a security-only fix that resolves
+  newer is accepted. A version below the target, or one that cannot be ordered, fails with `version-mismatch` and the lock files are restored. Every
+  other coordinate must stay as it was: if `--update-locks` gains or loses a coordinate of another
+  module, the run fails as `lock-state-drift` and the lock files are restored. This includes a lock file that lacks a configuration holding other modules, because `--update-locks` would resolve and lock those modules anew. `--update-locks` creates a
+  `gradle.lockfile` for a locked project that had none; the run snapshots that file as absent,
+  includes it in the drift check, reports it as created and removes it again if the run fails.
 
   **Legacy lock layout.** Gradle 7 and later cannot write `gradle/dependency-locks`, so `update`
   migrates it to `gradle.lockfile` before pinning. It then compares the migrated state with the legacy
@@ -756,8 +760,8 @@ operation and path instead of `manifest-changed` or `spawn`; an unreadable lock 
 the lock snapshot as well. `lockfile-pin-not-kept` means the
 lock file could not be put back to the declared requirement after an exact pin (NuGet: the lock holds no
 unambiguous entry or no original request to restore, or does not parse), and the lock file is restored.
-`lock-state-drift` means a Gradle layout migration would have changed the locked coordinates of a
-configuration beyond the requested update. `fallback-pin-not-kept` means a cooldown-fallback pin could not be kept in
+`lock-state-drift` means a Gradle lock regeneration or layout migration would have changed the locked
+coordinates of a module other than the pinned ones. `fallback-pin-not-kept` means a cooldown-fallback pin could not be kept in
 the lock (Yarn Berry or Deno re-key refused or failed), and the lock file is restored.
 `cooldown-held-version` means the tool locked a version inside the freshness cooldown window and
 the single retry without the held pins held again, or the manifest changed during the run or could not be rewritten; the
@@ -765,6 +769,19 @@ lock files are restored.
 The report carries the first held package as `package` and its version as `found`, and a `held`
 array with one `{"package", "found"}` entry per held pin, the first included; `held` is omitted for
 every other failure kind. The message lists any further held pins.
+
+The `package`, `expected` and `found` fields of a failed `lockfile` object depend on the kind:
+
+| Kind | `package` | `expected` | `found` |
+|---|---|---|---|
+| `version-mismatch` | the package | expected version | locked version, or `null` |
+| `cooldown-held-version` | first held package | `null` | first held version |
+| `lockfile-pin-not-kept`, `fallback-pin-not-kept` | the pinned package | the pinned target version | `null` |
+| `lock-state-drift` | the drifted `group:artifact:version` coordinate | `null` | `null` |
+| any other kind | `null` | `null` | `null` |
+
+`lock-state-drift` adds two fields that appear for no other kind: `configuration` (the Gradle
+configuration that changed) and `change` (`gained` or `lost`).
 
 **Known limits.** `go get` may raise indirect requirements and the `go` directive in `go.mod`, and
 download a newer toolchain to satisfy it. Deno always reads and writes `./deno.lock` beside the

@@ -9,8 +9,8 @@
 use super::DryRun;
 use crate::report::{Category, CheckReport};
 use crate::update::regen::{
-    Companion, DisplayLockPath, LockfileOutcome, NotApplicableReason, PinResolution, Program,
-    RegenerationError, Removal, SkipCause, UnsupportedReason,
+    Companion, DisplayLockPath, LockStateChange, LockfileOutcome, NotApplicableReason,
+    PinResolution, Program, RegenerationError, Removal, SkipCause, UnsupportedReason,
 };
 use deps_core::EcosystemId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -605,18 +605,122 @@ pub enum LockfileDocument {
         kind: FailureKind,
         /// The sanitized error message.
         message: String,
-        /// The package of a `version-mismatch`, else `null`.
+        /// The package of a `version-mismatch`, `lockfile-pin-not-kept` or
+        /// `fallback-pin-not-kept`, the first held package of a `cooldown-held-version`, or the
+        /// `group:artifact:version` coordinate of a `lock-state-drift`, else `null`.
         package: Option<String>,
-        /// The expected version of a `version-mismatch`, else `null`.
+        /// The expected version of a `version-mismatch`, or the pinned target of a
+        /// `lockfile-pin-not-kept` or `fallback-pin-not-kept`, else `null`.
         expected: Option<String>,
         /// The lockfile's version of a `version-mismatch` or, for a `cooldown-held-version`, the
         /// first held pin's version, else `null`.
         found: Option<String>,
+        /// The Gradle configuration of a `lock-state-drift`; omitted for every other kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration: Option<String>,
+        /// Whether the drifted coordinate was gained or lost; omitted unless `lock-state-drift`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change: Option<LockStateChangeToken>,
         /// Every held pin of a `cooldown-held-version`, the first included; omitted for every
         /// other kind.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         held: Vec<HeldPinDocument>,
     },
+}
+
+/// Wire token of a [`LockStateChange`].
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockStateChangeToken {
+    /// The run added a coordinate the lock did not hold.
+    Gained,
+    /// The run dropped a coordinate the lock held.
+    Lost,
+}
+
+/// The typed detail fields of a failed lockfile step; every field absent unless the failure
+/// kind defines it.
+#[derive(Default)]
+struct FailureDetail {
+    package: Option<String>,
+    expected: Option<String>,
+    found: Option<String>,
+    configuration: Option<String>,
+    change: Option<LockStateChangeToken>,
+    held: Vec<HeldPinDocument>,
+}
+
+impl FailureDetail {
+    fn of(error: &RegenerationError) -> Self {
+        let clean = crate::sanitize::sanitize_message_for_display;
+        match error {
+            RegenerationError::VersionMismatch {
+                package,
+                expected,
+                found,
+            } => Self {
+                package: Some(clean(package.as_str())),
+                expected: Some(clean(expected.as_str())),
+                found: found.as_ref().map(|version| clean(version.as_str())),
+                ..Self::default()
+            },
+            RegenerationError::LockfilePinNotKept {
+                package, target, ..
+            }
+            | RegenerationError::FallbackPinNotKept {
+                package, target, ..
+            } => Self {
+                package: Some(clean(package.as_str())),
+                expected: Some(clean(target.as_str())),
+                ..Self::default()
+            },
+            RegenerationError::LockStateDrift {
+                configuration,
+                change,
+                ..
+            } => {
+                let (token, coordinate) = match change {
+                    LockStateChange::Gained(coordinate) => {
+                        (LockStateChangeToken::Gained, coordinate)
+                    }
+                    LockStateChange::Lost(coordinate) => (LockStateChangeToken::Lost, coordinate),
+                };
+                Self {
+                    package: Some(clean(coordinate.as_str())),
+                    configuration: Some(clean(configuration.as_str())),
+                    change: Some(token),
+                    ..Self::default()
+                }
+            }
+            RegenerationError::CooldownHeldVersion { first, rest } => Self {
+                package: Some(clean(first.package.as_str())),
+                found: Some(clean(first.version.as_str())),
+                held: std::iter::once(first)
+                    .chain(rest)
+                    .map(|pin| HeldPinDocument {
+                        package: clean(pin.package.as_str()),
+                        found: clean(pin.version.as_str()),
+                    })
+                    .collect(),
+                ..Self::default()
+            },
+            RegenerationError::ToolchainMissing { .. }
+            | RegenerationError::Spawn { .. }
+            | RegenerationError::Interrupted
+            | RegenerationError::TimedOut { .. }
+            | RegenerationError::ToolFailed { .. }
+            | RegenerationError::UnexpectedProbeOutput { .. }
+            | RegenerationError::UnsafeArgument { .. }
+            | RegenerationError::UnrecognizedLockfile { .. }
+            | RegenerationError::ManifestReparseFailed { .. }
+            | RegenerationError::LockfileUnreadable { .. }
+            | RegenerationError::SnapshotFailed { .. }
+            | RegenerationError::RestoreFailed { .. }
+            | RegenerationError::FallbackPinRejected { .. }
+            | RegenerationError::ManifestChanged { .. }
+            | RegenerationError::Io { .. } => Self::default(),
+        }
+    }
 }
 
 /// The lock files a legacy-to-unified layout migration created and deleted.
@@ -787,55 +891,16 @@ impl From<&LockfileOutcome> for LockfileDocument {
                 }
             }
             LockfileOutcome::Failed(error) => {
-                let (package, expected, found, held) = match error.root_cause() {
-                    RegenerationError::VersionMismatch {
-                        package,
-                        expected,
-                        found,
-                    } => (
-                        Some(clean(package.as_str())),
-                        Some(clean(expected.as_str())),
-                        found.as_ref().map(|version| clean(version.as_str())),
-                        Vec::new(),
-                    ),
-                    RegenerationError::ToolchainMissing { .. }
-                    | RegenerationError::Spawn { .. }
-                    | RegenerationError::Interrupted
-                    | RegenerationError::TimedOut { .. }
-                    | RegenerationError::ToolFailed { .. }
-                    | RegenerationError::UnexpectedProbeOutput { .. }
-                    | RegenerationError::UnsafeArgument { .. }
-                    | RegenerationError::UnrecognizedLockfile { .. }
-                    | RegenerationError::ManifestReparseFailed { .. }
-                    | RegenerationError::LockfileUnreadable { .. }
-                    | RegenerationError::SnapshotFailed { .. }
-                    | RegenerationError::RestoreFailed { .. }
-                    | RegenerationError::FallbackPinRejected { .. }
-                    | RegenerationError::ManifestChanged { .. }
-                    | RegenerationError::Io { .. }
-                    | RegenerationError::FallbackPinNotKept { .. }
-                    | RegenerationError::LockfilePinNotKept { .. }
-                    | RegenerationError::LockStateDrift { .. } => (None, None, None, Vec::new()),
-                    RegenerationError::CooldownHeldVersion { first, rest } => (
-                        Some(clean(first.package.as_str())),
-                        None,
-                        Some(clean(first.version.as_str())),
-                        std::iter::once(first)
-                            .chain(rest)
-                            .map(|pin| HeldPinDocument {
-                                package: clean(pin.package.as_str()),
-                                found: clean(pin.version.as_str()),
-                            })
-                            .collect(),
-                    ),
-                };
+                let detail = FailureDetail::of(error.root_cause());
                 Self::Failed {
                     kind: error.into(),
                     message: clean(&error.to_string()),
-                    package,
-                    expected,
-                    found,
-                    held,
+                    package: detail.package,
+                    expected: detail.expected,
+                    found: detail.found,
+                    configuration: detail.configuration,
+                    change: detail.change,
+                    held: detail.held,
                 }
             }
         }
@@ -1409,6 +1474,99 @@ mod tests {
             ),
         };
         insta::assert_json_snapshot!(update_to_document(&run, DryRun::No));
+    }
+
+    fn failed_lockfile_json(error: crate::update::regen::RegenerationError) -> serde_json::Value {
+        let document =
+            LockfileDocument::from(&crate::update::regen::LockfileOutcome::Failed(error));
+        serde_json::to_value(document).expect("serialize")
+    }
+
+    #[test]
+    fn test_pin_not_kept_failures_carry_package_and_pinned_target() {
+        use crate::update::regen::{RegenerationError, RekeyRefusal};
+        let path = PathBuf::from("packages.lock.json");
+        let lockfile = RegenerationError::LockfilePinNotKept {
+            package: "Newtonsoft.Json".into(),
+            target: deps_core::ConcreteVersion::from("13.0.3"),
+            path: path.clone(),
+            reason: RekeyRefusal::PinnedEntryMissing,
+        };
+        let fallback = RegenerationError::FallbackPinNotKept {
+            package: "left-pad".into(),
+            target: deps_core::ConcreteVersion::from("1.3.0"),
+            path,
+            reason: RekeyRefusal::UnparsableLock,
+        };
+
+        let lockfile = failed_lockfile_json(lockfile);
+        let fallback = failed_lockfile_json(fallback);
+
+        assert_eq!(lockfile["kind"], "lockfile-pin-not-kept");
+        assert_eq!(lockfile["package"], "Newtonsoft.Json");
+        assert_eq!(lockfile["expected"], "13.0.3");
+        assert!(lockfile["found"].is_null());
+        assert!(lockfile.get("configuration").is_none());
+        assert!(lockfile.get("change").is_none());
+        assert_eq!(fallback["kind"], "fallback-pin-not-kept");
+        assert_eq!(fallback["package"], "left-pad");
+        assert_eq!(fallback["expected"], "1.3.0");
+    }
+
+    #[test]
+    fn test_lock_state_drift_carries_configuration_coordinate_and_change() {
+        use crate::update::regen::{LockStateChange, RegenerationError};
+        let drift = |change: fn(crate::update::regen::LockedCoordinate) -> LockStateChange| {
+            RegenerationError::lock_state_drift_for_test(
+                PathBuf::from("gradle.lockfile"),
+                "compileClasspath",
+                "com.google.guava:guava:32.1.2-jre",
+                change,
+            )
+            .expect("valid configuration and coordinate")
+        };
+
+        let lost = failed_lockfile_json(drift(LockStateChange::Lost));
+        let gained = failed_lockfile_json(drift(LockStateChange::Gained));
+
+        assert_eq!(lost["kind"], "lock-state-drift");
+        assert_eq!(lost["package"], "com.google.guava:guava:32.1.2-jre");
+        assert_eq!(lost["configuration"], "compileClasspath");
+        assert_eq!(lost["change"], "lost");
+        assert!(lost["expected"].is_null());
+        assert!(lost["found"].is_null());
+        assert_eq!(gained["change"], "gained");
+    }
+
+    #[test]
+    fn test_version_mismatch_carries_package_expected_and_found() {
+        use crate::update::regen::RegenerationError;
+        let mismatch = |found| RegenerationError::VersionMismatch {
+            package: "serde".into(),
+            expected: deps_core::ConcreteVersion::from("1.0.200"),
+            found,
+        };
+
+        let locked =
+            failed_lockfile_json(mismatch(Some(deps_core::ConcreteVersion::from("1.0.190"))));
+        let absent = failed_lockfile_json(mismatch(None));
+
+        assert_eq!(locked["kind"], "version-mismatch");
+        assert_eq!(locked["package"], "serde");
+        assert_eq!(locked["expected"], "1.0.200");
+        assert_eq!(locked["found"], "1.0.190");
+        assert!(locked.get("configuration").is_none());
+        assert!(absent["found"].is_null());
+    }
+
+    #[test]
+    fn test_untyped_failure_leaves_detail_fields_null() {
+        let json = failed_lockfile_json(crate::update::regen::RegenerationError::Interrupted);
+
+        assert!(json["package"].is_null());
+        assert!(json["expected"].is_null());
+        assert!(json["found"].is_null());
+        assert!(json.get("configuration").is_none());
     }
 
     /// #1626 tester gap 1: an unrecognized `ecosystem` token must be a hard deserialize error.

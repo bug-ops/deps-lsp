@@ -74,7 +74,7 @@ version before the first registry fetch completes.
 
 With `deps-cli update --lockfile regenerate`, a build on the legacy `gradle/dependency-locks` layout is
 migrated to `gradle.lockfile`, because Gradle 7 and later cannot write the legacy layout. If the migration would
-move unrelated modules, the run fails as `lock-state-drift` and restores every file. A version update on such a build works in one
+move unrelated modules, the run fails as `lock-state-drift` and restores every file; the same check applies to every `--update-locks` run, so a regeneration that gains or loses a coordinate other than the pinned ones is refused. A lock-file-only pin that Gradle locks at or above the fix version (a dynamic declaration resolving newer) is accepted; a pin made by a manifest edit must lock exactly the target. A version update on such a build works in one
 run: the layout is migrated at the currently locked versions, then the edit is applied; a dependency locked at
 several versions, or without a single declaration, is refused (`legacy-lock-layout`) until you migrate once
 with `gradle :<project>:dependencies --update-locks <group:module>`, commit and rerun. Legacy lock files are then deleted

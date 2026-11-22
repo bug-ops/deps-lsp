@@ -353,7 +353,7 @@ fn yarn_sibling_dependency_range_changed_fails_and_restores_every_file() {
     let ran = run(&yarn_member_case(&body, "lockonly", MINIMIST_LOCK_ONLY));
 
     assert!(
-        ran.outcome.contains("ManifestChanged") && ran.outcome.contains("../b/package.json"),
+        ran.outcome.contains("ManifestChanged") && ran.outcome.contains("packages/b/package.json"),
         "{}",
         ran.outcome
     );

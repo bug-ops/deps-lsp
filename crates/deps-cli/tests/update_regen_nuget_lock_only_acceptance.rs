@@ -23,8 +23,7 @@ async fn regen_child() {
     harness::regen_child_main().await;
 }
 
-const RESOLVE_ARGV: &str =
-    "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers --force|";
+const RESOLVE_ARGV: &str = "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers --force -p:RestoreLockedMode=false|";
 const LOCKED_ARGV: &str = "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers --force --locked-mode|";
 const SERILOG_LOCK_ONLY: &str = "Serilog|Serilog|2.10.0|2.10.0|2.10.0|2.12.0";
 
