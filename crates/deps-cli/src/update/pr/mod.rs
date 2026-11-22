@@ -693,7 +693,7 @@ fn proposed_updates(
         .items
         .iter()
         .filter_map(|item| match &item.outcome {
-            Outcome::Applied { target, .. } | Outcome::RequiresLockfileUpdate { target } => {
+            Outcome::Applied { target, .. } | Outcome::RequiresLockfileUpdate { target, .. } => {
                 let normalized =
                     formatter.normalize_package_name(&PackageName::new(item.name.as_str()));
                 Some((normalized.into_string(), target.clone()))

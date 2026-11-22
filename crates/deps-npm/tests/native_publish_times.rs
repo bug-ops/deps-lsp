@@ -7,7 +7,7 @@
 //! `test-util` feature (`NpmRegistry::with_public_base_for_test`), enabled by `--all-features`.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::sync::Arc;
 

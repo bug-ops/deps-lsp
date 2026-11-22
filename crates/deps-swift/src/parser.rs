@@ -70,7 +70,7 @@ const ARGS_END: &str = r"(?:\s*,\s*traits\s*:|\s*,?\s*\))";
 /// pattern between the URL and [`ARGS_END`].
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 fn url_package_regex(requirement: &str) -> Regex {
     Regex::new(&format!(
         r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}url\s*:\s*"([^"]+)"\s*,\s*{requirement}{ARGS_END}"#
@@ -80,7 +80,7 @@ fn url_package_regex(requirement: &str) -> Regex {
 
 /// Compiles a `.package(url: "<url>" | id: "<id>", <requirement>)` pattern for the forms valid
 /// with a registry requirement; the head is captured as named group `url` or `id`.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 fn registry_package_regex(requirement: &str) -> Regex {
     Regex::new(&format!(
         r#"(?s)\.package\s*\(\s*(?:{LEGACY_LABEL}url\s*:\s*"(?P<url>[^"]+)"|id\s*:\s*"(?P<id>[^"]+)")\s*,\s*{requirement}{ARGS_END}"#
@@ -133,7 +133,7 @@ static RE_URL_REVISION_LABELLED: LazyLock<Regex> =
     LazyLock::new(|| url_package_regex(r#"revision\s*:\s*"([^"]+)""#));
 
 // Same guarantee as `url_package_regex` above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}path\s*:\s*"([^"]+)"{ARGS_END}"#
@@ -485,7 +485,11 @@ struct RequiredGroup<'a> {
 // `ver`/`lower`/`upper` and numbered groups are mandatory (never `?`-optional), so their
 // `unwrap()` is always `Some`. The alternative `url`/`id` head is optional per group and goes
 // through `locate` instead.
-#[allow(clippy::string_slice, clippy::unwrap_used)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "the regex groups read here are mandatory, so always `Some`"
+)]
+#[allow(clippy::string_slice)]
 fn required<'a>(group: Option<regex::Match<'_>>, content: &'a str) -> RequiredGroup<'a> {
     let range = group.unwrap().range();
     RequiredGroup {

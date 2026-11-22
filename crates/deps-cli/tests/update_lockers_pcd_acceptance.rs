@@ -6,7 +6,7 @@
 //! Composer, Dart and Flutter accept the argv and rewrite their lock files as assumed.
 
 #![cfg(all(unix, feature = "pypi", feature = "composer", feature = "dart"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

@@ -2,8 +2,6 @@
 //! pre-commit flavor of the git-tags ecosystem into manifest routing, and shares one registry
 //! with GitHub Actions when both are enabled.
 
-#![allow(clippy::expect_used)]
-
 use std::sync::Arc;
 
 use deps_core::{

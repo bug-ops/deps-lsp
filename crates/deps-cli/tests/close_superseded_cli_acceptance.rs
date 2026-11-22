@@ -5,7 +5,7 @@
 //! developer's in-module `pr/acceptance_tests.rs`, because the close step has no public entry
 //! point in the plan. Written tests-first; the flag does not exist yet.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::process::Output;
 

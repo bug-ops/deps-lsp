@@ -4,7 +4,7 @@
 // now reaches this integration test's separate crate root. `clippy.toml`'s
 // `allow-unwrap-in-tests` already exempts `#[test]` functions, so this covers only the
 // non-`#[test]` helper (`fixture_uri`) calling `unwrap()` on a known-good path.
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::LockFileProvider;
 use deps_nuget::{

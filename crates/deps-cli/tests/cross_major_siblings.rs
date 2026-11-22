@@ -8,7 +8,8 @@
 //! Both a mock GitHub tags API and a mock OSV server are `mockito`-backed.
 
 #![cfg(feature = "github-actions")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

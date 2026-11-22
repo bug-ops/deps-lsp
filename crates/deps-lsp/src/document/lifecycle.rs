@@ -420,7 +420,10 @@ async fn run_document_open_background_task(
     // fetch; this bounds documents fetching at once).
     // `state.fetch_permits` is never `.close()`d anywhere in deps-lsp, so `acquire()`
     // cannot return `Closed`.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "`fetch_permits` is never closed, so `acquire` cannot fail"
+    )]
     let fetch_permit = state
         .fetch_permits
         .acquire()
@@ -1831,7 +1834,10 @@ async fn run_document_change_task(
     // there is no permit-holder-awaits-permit-taker deadlock shape here.
     // `state.fetch_permits` is never `.close()`d anywhere in deps-lsp, so `acquire()`
     // cannot return `Closed`.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "`fetch_permits` is never closed, so `acquire` cannot fail"
+    )]
     let fetch_permit = state
         .fetch_permits
         .acquire()

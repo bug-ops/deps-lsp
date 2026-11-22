@@ -66,6 +66,12 @@ deno = ["deps-engine/deno"]
 # `deps-gradle`/`deps-npm`'s identical `fuzzing` feature.
 fuzzing = []
 
+# Lets `main.rs` read `DEPS_CLI_TEST_NPM_PUBLIC_BASE` and point npm's public registry tier at a
+# local mock for the binary-level acceptance tests (#2119). Never enable outside tests: CI's
+# `--all-features` jobs build it, but no release or deps-lsp dependency edge does (the
+# test-util leak guard in `.github/workflows/ci.yml` runs on the non-dev tree).
+test-util = ["deps-engine/test-util"]
+
 [dependencies]
 deps-core.workspace = true
 deps-engine.workspace = true

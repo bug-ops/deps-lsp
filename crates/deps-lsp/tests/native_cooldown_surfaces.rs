@@ -9,7 +9,8 @@
 //! hours around day-sized windows.
 
 #![cfg(feature = "cargo")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

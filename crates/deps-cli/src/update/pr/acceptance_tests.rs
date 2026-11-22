@@ -9,7 +9,8 @@
 //! The two `PrSignals` tests raise a real SIGINT in the test process and rely on nextest's
 //! process-per-test isolation (the project's runner).
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::collections::HashSet;
@@ -485,6 +486,7 @@ async fn test_branch_for_requires_lockfile_update_item_counts_as_proposed() {
             "1.0.0",
             Outcome::RequiresLockfileUpdate {
                 target: ConcreteVersion::from("1.0.5"),
+                ecosystem: EcosystemId::Cargo,
             },
         )],
     };
@@ -766,6 +768,7 @@ fn test_readiness_with_only_a_held_lock_only_fix_is_nothing_settled() {
             "1.0.0",
             Outcome::RequiresLockfileUpdate {
                 target: ConcreteVersion::from("1.5.0"),
+                ecosystem: EcosystemId::Cargo,
             },
         )],
     };

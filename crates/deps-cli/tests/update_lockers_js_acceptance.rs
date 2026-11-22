@@ -8,7 +8,7 @@
 //! the tools' real flag acceptance and their real re-resolution behaviour.
 
 #![cfg(all(unix, feature = "npm", feature = "bundler"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

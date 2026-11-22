@@ -3,7 +3,8 @@
 //! The shims answer by argv glob, log every call and never touch a network; the real hosts are
 //! never contacted.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use deps_core::EcosystemId;
 use deps_engine::setup::CargoFormatter;
@@ -435,6 +436,7 @@ async fn test_gitlab_closes_a_covered_merge_request_with_a_note() {
             json!([{"iid": 7, "source_branch": "deps-cli/cargo/serde-1.1.0-00000007"}]),
         )
         .reply("mr view 7 ", gitlab_mr(7, "octo", 1, 1, &old_body))
+        .reply("api --method POST", "")
         .reply("api ", json!([{"id": "a"}]))
         .reply("mr close 7", "")
         .install();
@@ -462,6 +464,45 @@ async fn test_gitlab_closes_a_covered_merge_request_with_a_note() {
         log.iter()
             .any(|c| c.starts_with("api projects/:id/merge_requests/7/commits"))
     );
+}
+
+#[tokio::test]
+async fn test_gitlab_a_failed_note_keeps_the_merge_request_closed_and_is_reported() {
+    let fx = Fixture::new();
+    let ctx = fx.ctx("Cargo.toml").await;
+    let new = marker(&ctx, &[("serde", "1.0.0", "1.2.0")]);
+    let old_body = body_with(&marker(&ctx, &[("serde", "1.0.0", "1.1.0")]));
+    Shim::new(&fx, "glab")
+        .reply(
+            &format!("mr view {NEW_URL} "),
+            gitlab_mr(9, "octo", 1, 1, ""),
+        )
+        .reply(
+            "mr list ",
+            json!([{"iid": 7, "source_branch": "deps-cli/cargo/serde-1.1.0-00000007"}]),
+        )
+        .reply("mr view 7 ", gitlab_mr(7, "octo", 1, 1, &old_body))
+        .fail("api --method POST")
+        .reply("api ", json!([{"id": "a"}]))
+        .reply("mr close 7", "")
+        .install();
+
+    let report = sweep(PrHost::Gitlab, &new, &ctx).await;
+
+    assert_eq!(report.closed.len(), 1);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    let message = report.failures[0].to_string();
+    assert!(
+        message.contains("while closing"),
+        "a closing step failed, not a read: {message}"
+    );
+    let log = calls(&fx, "glab");
+    assert_eq!(
+        log.last().map(String::as_str),
+        Some(format!("api --method POST projects/:id/merge_requests/7/notes -f body=Superseded by {NEW_URL}.").as_str()),
+        "the note was the last, failing step after the close: {log:?}"
+    );
+    assert!(log.contains(&"mr close 7".to_owned()));
 }
 
 #[tokio::test]

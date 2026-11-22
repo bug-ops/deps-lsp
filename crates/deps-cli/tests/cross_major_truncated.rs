@@ -9,7 +9,8 @@
 //! `cross_major_siblings.rs`.
 
 #![cfg(feature = "github-actions")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::sync::Arc;
 

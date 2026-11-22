@@ -6,7 +6,8 @@
 //! The fixture captures the `textDocument/publishDiagnostics` notifications the server sends.
 
 #![cfg(feature = "npm")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

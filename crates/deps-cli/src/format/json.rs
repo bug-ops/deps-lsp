@@ -600,9 +600,23 @@ pub enum LockfileDocument {
         package: Option<String>,
         /// The expected version of a `version-mismatch`, else `null`.
         expected: Option<String>,
-        /// The lockfile's version of a `version-mismatch`, else `null`.
+        /// The lockfile's version of a `version-mismatch` or, for a `cooldown-held-version`, the
+        /// first held pin's version, else `null`.
         found: Option<String>,
+        /// Every held pin of a `cooldown-held-version`, the first included; omitted for every
+        /// other kind.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        held: Vec<HeldPinDocument>,
     },
+}
+
+/// One pin a regeneration left on a version inside the freshness cooldown window.
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct HeldPinDocument {
+    /// The held package.
+    pub package: String,
+    /// The version the lock file would hold, which is inside the window.
+    pub found: String,
 }
 
 impl From<&LockfileOutcome> for LockfileDocument {
@@ -695,7 +709,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                 }
             }
             LockfileOutcome::Failed(error) => {
-                let (package, expected, found) = match error.root_cause() {
+                let (package, expected, found, held) = match error.root_cause() {
                     RegenerationError::VersionMismatch {
                         package,
                         expected,
@@ -704,6 +718,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                         Some(clean(package.as_str())),
                         Some(clean(expected.as_str())),
                         found.as_ref().map(|version| clean(version.as_str())),
+                        Vec::new(),
                     ),
                     RegenerationError::ToolchainMissing { .. }
                     | RegenerationError::Spawn { .. }
@@ -720,11 +735,20 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::FallbackPinRejected { .. }
                     | RegenerationError::ManifestChanged { .. }
                     | RegenerationError::Io { .. }
-                    | RegenerationError::FallbackPinNotKept { .. } => (None, None, None),
-                    RegenerationError::CooldownHeldVersion { first, .. } => (
+                    | RegenerationError::FallbackPinNotKept { .. } => {
+                        (None, None, None, Vec::new())
+                    }
+                    RegenerationError::CooldownHeldVersion { first, rest } => (
                         Some(clean(first.package.as_str())),
                         None,
                         Some(clean(first.version.as_str())),
+                        std::iter::once(first)
+                            .chain(rest)
+                            .map(|pin| HeldPinDocument {
+                                package: clean(pin.package.as_str()),
+                                found: clean(pin.version.as_str()),
+                            })
+                            .collect(),
                     ),
                 };
                 Self::Failed {
@@ -733,6 +757,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     package,
                     expected,
                     found,
+                    held,
                 }
             }
         }
@@ -1217,6 +1242,7 @@ mod tests {
             (
                 crate::update::Outcome::RequiresLockfileUpdate {
                     target: deps_core::ConcreteVersion::from("1.2.0"),
+                    ecosystem: deps_core::EcosystemId::Cargo,
                 },
                 "requires-lockfile-update",
             ),

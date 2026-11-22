@@ -6,7 +6,8 @@
 //! `3.9.0` (published 3 days before `T0`) and `3.8.0` (long ago).
 
 #![cfg(feature = "lsp-responses")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::collections::HashMap;

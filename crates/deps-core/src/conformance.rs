@@ -1,6 +1,3 @@
-// No `.unwrap()` call in this module actually triggers `unwrap_used`; kept as a plain
-// `#[allow]` rather than `#[expect]`.
-#![allow(clippy::unwrap_used)]
 #![expect(
     clippy::expect_used,
     reason = "fixture/helper infrastructure exercised only from test binaries (see the module \

@@ -2,8 +2,6 @@
 //! deps-cli's `config::parse` (plan N2): same acceptance, two error variants, redacted and
 //! bounded messages built at construction.
 
-#![allow(clippy::expect_used)]
-
 use deps_core::parser::{TomlDeserializeError, deserialize_toml_checked};
 use serde::Deserialize;
 use std::assert_matches;

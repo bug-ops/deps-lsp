@@ -3,7 +3,8 @@
 //! Assumed seam: `NpmParseContext::with_native_cooldown(NativeCooldownMode)`, mirroring
 //! `deps_cargo::parser::CargoParseContext::with_native_cooldown`.
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

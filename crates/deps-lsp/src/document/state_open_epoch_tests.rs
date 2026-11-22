@@ -4,12 +4,6 @@
 //! Declared from `state.rs` as a child module (`#[cfg(test)] #[path = "state_open_epoch_tests.rs"]`),
 //! so it can read the private `tasks` registry.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test code; clippy's allow-*-in-tests does not see this `cfg(test)` module"
-)]
-
 use super::*;
 use deps_core::EcosystemId;
 use std::time::Duration;

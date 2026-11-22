@@ -1,7 +1,5 @@
 //! #2072: every GitLab CI `include:` reference is a production dependency.
 
-#![allow(clippy::expect_used)]
-
 use std::sync::{Arc, RwLock};
 
 use deps_core::net_policy::RegistryAccessPolicy;

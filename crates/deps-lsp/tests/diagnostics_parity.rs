@@ -14,7 +14,7 @@
 //! injected environment, so both adapters fetch from it.
 
 #![cfg(any(feature = "cargo", feature = "npm", feature = "github-actions"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use deps_cli::report::{CheckContext, CheckFinding, check_manifest};
 use deps_cli::walk::{self, DiscoveredManifest};

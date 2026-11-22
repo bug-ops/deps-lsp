@@ -1,7 +1,5 @@
 //! #2072: every Go requirement is a production dependency (`tool` lines are not parsed).
 
-#![allow(clippy::expect_used)]
-
 use deps_core::{DependencyKind, ParseResult};
 
 #[test]

@@ -5,9 +5,8 @@
 //! Declared from `lifecycle.rs` as a child module (`#[cfg(all(test, feature = "npm"))]
 //! #[path = "lifecycle_open_epoch_tests.rs"]`).
 
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "test code; clippy's allow-*-in-tests does not see this `cfg(all(test, ..))` module"
 )]
 

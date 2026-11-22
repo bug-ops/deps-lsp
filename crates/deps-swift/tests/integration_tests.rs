@@ -4,7 +4,7 @@
 // now reaches this integration test's separate crate root. `clippy.toml`'s
 // `allow-unwrap-in-tests` already exempts `#[test]` functions, so this covers only the
 // non-`#[test]` helper (`fixture_uri`/`load_fixture`) calling `unwrap()` on a known-good path.
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::Dependency;
 use deps_core::lsp_helpers::LineOffsetTable;
@@ -16,7 +16,8 @@ use url::Url;
 /// just that some range exists.
 // `position_to_byte_offset` returns char-boundary offsets by construction (same guarantee
 // `parse_package_swift` itself relies on for its own slicing).
-#[allow(clippy::string_slice, clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "test code")]
+#[allow(clippy::string_slice)]
 fn version_range_text<'a>(content: &'a str, dep: &dyn Dependency) -> &'a str {
     let range = dep.version_range().unwrap();
     let table = LineOffsetTable::new(content);

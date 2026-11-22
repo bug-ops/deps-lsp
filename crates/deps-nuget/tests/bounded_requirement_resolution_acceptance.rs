@@ -4,7 +4,6 @@
 //! The planner half (`Some(true)` from the matcher at the `NoOpRewrite` arm becomes
 //! `Unfixable(UnsupportedRequirementShape)`) is asserted by the developer's updated in-module
 //! `FloorLikeFormatter` test in `deps-cli`, which has no public planner seam without OSV.
-#![allow(clippy::expect_used)]
 
 use deps_core::lsp_helpers::RequirementGate;
 use deps_core::{ConcreteVersion, VersionReq};

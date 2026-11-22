@@ -2,7 +2,7 @@
 //! (docs.astral.sh/uv/concepts/configuration-files), never a per-key merge with a farther
 //! directory, and a workspace member reads its root's file alone.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::Path;
 use std::sync::Arc;

@@ -5,7 +5,7 @@
 //! `20-24-32-architect` and `20-32-28-architect` (M2, M10). Assumed seam:
 //! `PypiEcosystem::with_native_cooldown_toggle(Arc<AtomicToggle<NativeCooldownMode>>)`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 use std::assert_matches;
 
 use std::path::{Path, PathBuf};

@@ -1,8 +1,6 @@
 //! #2072: every NuGet `PackageReference` is a production dependency (`PrivateAssets` is not
 //! stored).
 
-#![allow(clippy::expect_used)]
-
 use deps_core::{DependencyKind, ParseResult};
 
 #[test]

@@ -6,7 +6,7 @@
 //! crate) — `serde-sarif` only uses this schema at its own build time to generate Rust
 //! types, it does not expose runtime schema validation itself.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use deps_cli::format::sarif::to_sarif;
 use deps_cli::report::{AdvisoryFacts, Category, CheckFinding, CheckReport};

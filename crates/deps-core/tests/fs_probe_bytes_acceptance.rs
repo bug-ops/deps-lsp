@@ -1,8 +1,6 @@
 //! #2071 acceptance: byte-level lock snapshot primitives in `deps_core::fs_probe`
 //! (`read_capped_no_follow`, `write_atomic_bytes`). Written tests-first; neither exists yet.
 
-#![allow(clippy::expect_used)]
-
 use std::io::ErrorKind;
 
 use deps_core::fs_probe::{read_capped_no_follow, write_atomic_bytes};

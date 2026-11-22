@@ -420,7 +420,10 @@ impl MavenCentralRegistry {
 
         // `urls.is_empty()` was checked and returned on above, so the loop ran at least once
         // and `last_err` is `Some` here.
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "`urls` is non-empty, so the loop ran and set `last_err`"
+        )]
         let e = last_err.expect("urls is non-empty");
         tracing::warn!(package = %redacted_name, error = %e, "all metadata URLs failed");
         Err(e)
@@ -765,7 +768,10 @@ where
     }
     // `SEARCH_ATTEMPT_TIMEOUTS` is a compile-time non-empty array, so the loop above always
     // runs at least once.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "the attempt array is non-empty, so `last_err` is set"
+    )]
     let e = last_err
         .expect("SEARCH_ATTEMPT_TIMEOUTS is non-empty, so at least one attempt always runs");
     Err(e)

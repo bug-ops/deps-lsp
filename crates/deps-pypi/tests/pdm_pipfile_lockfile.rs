@@ -1,6 +1,6 @@
 //! Acceptance tests for the `pdm.lock` and `Pipfile.lock` providers (#1926, spec 093).
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::assert_matches;
 use std::path::Path;

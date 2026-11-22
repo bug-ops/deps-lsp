@@ -6,7 +6,7 @@
 //! to the Docker verification): real flag acceptance by `dotnet` and `gradle`.
 
 #![cfg(all(unix, feature = "nuget", feature = "gradle", feature = "swift"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

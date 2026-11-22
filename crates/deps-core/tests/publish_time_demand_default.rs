@@ -3,7 +3,6 @@
 //! `honors_publish_time_demand` / `get_versions_from_with_demand` pairing).
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used)]
 
 use deps_core::test_util::{MockRegistry, MockVersion};
 use deps_core::{DependencySource, FreshnessSettings, PackageName, PublishTimeDemand, Registry};

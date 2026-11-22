@@ -98,23 +98,23 @@ pub fn parse_go_mod_with_context(
 
     // Compile-time-constant patterns; a malformed literal is a build-visible programmer
     // error, not attacker-influenceable input.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static MODULE_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*module\s+(\S+)").unwrap());
     // Same guarantee as MODULE_PATTERN above.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static GO_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*go\s+(\S+)").unwrap());
     // Same guarantee as MODULE_PATTERN above.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static REQUIRE_SINGLE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s+(\S+)\s+(\S+)").unwrap());
     // Same guarantee as MODULE_PATTERN above.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static REQUIRE_BLOCK_START: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s*\(").unwrap());
     // Same guarantee as MODULE_PATTERN above.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     // Trailing `(?:\s+(\S+))?` (group 4, the replacement's own version) is optional: a
     // filesystem replacement (`replace X => ./local/path`) carries no version at all (#1202)
     // — a mandatory version there previously made the whole line fail to match, silently
@@ -123,7 +123,7 @@ pub fn parse_go_mod_with_context(
         Regex::new(r"^\s*replace\s+(\S+)\s+(?:(\S+)\s+)?=>\s+(\S+)(?:\s+(\S+))?").unwrap()
     });
     // Same guarantee as MODULE_PATTERN above.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static EXCLUDE_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*exclude\s+(\S+)\s+(\S+)").unwrap());
 

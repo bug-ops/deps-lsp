@@ -4,7 +4,7 @@
 //! is never allowed to suppress findings (spec 062 F1).
 
 #![cfg(feature = "npm")]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::path::Path;
 

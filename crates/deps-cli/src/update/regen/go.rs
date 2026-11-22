@@ -194,16 +194,10 @@ impl Session<'_> {
         self.verify_vendored(&scratch.path.join("modules.txt"), modules)?;
 
         let old = scratch.sibling(".old");
-        std::fs::rename(vendor, &old)
-            .map_err(io_failed(IoOperation::MoveVendorAside, &vendor_shown))?;
-        if let Err(source) = std::fs::rename(&scratch.path, vendor) {
-            if let Err(error) = std::fs::rename(&old, vendor) {
-                tracing::warn!(%error, path = %old.display(), "could not put the previous vendor tree back");
-            }
-            return Err(io_failed(IoOperation::MoveVendorIntoPlace, &vendor_shown)(
-                source,
-            ));
-        }
+        swap_vendor(vendor, &scratch.path, &old, |from, to| {
+            std::fs::rename(from, to)
+        })
+        .map_err(|failure| io_failed(failure.operation, &vendor_shown)(failure.source))?;
         if let Err(error) = std::fs::remove_dir_all(&old) {
             tracing::warn!(%error, path = %old.display(), "could not remove the previous vendor tree");
         }
@@ -238,11 +232,41 @@ impl Session<'_> {
     }
 }
 
+/// The rename that failed while swapping a refreshed vendor tree in.
+struct VendorSwapFailure {
+    operation: IoOperation,
+    source: std::io::Error,
+}
+
+/// Moves `vendor` to `old`, then `scratch` to `vendor`; when the second move fails the first is
+/// undone so the previous tree stays in place. `rename` is the file-system seam.
+fn swap_vendor(
+    vendor: &Path,
+    scratch: &Path,
+    old: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), VendorSwapFailure> {
+    rename(vendor, old).map_err(|source| VendorSwapFailure {
+        operation: IoOperation::MoveVendorAside,
+        source,
+    })?;
+    if let Err(source) = rename(scratch, vendor) {
+        if let Err(error) = rename(old, vendor) {
+            tracing::warn!(%error, path = %old.display(), "could not put the previous vendor tree back");
+        }
+        return Err(VendorSwapFailure {
+            operation: IoOperation::MoveVendorIntoPlace,
+            source,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{non_empty_or_dot, vendored_version};
+    use super::{IoOperation, non_empty_or_dot, swap_vendor, vendored_version};
 
     const MODULES: &str = "# golang.org/x/text v0.31.0\n## explicit; go 1.24\ngolang.org/x/text/unicode\n# example.com/dep v1.0.0 => ../dep\n## explicit; go 1.21\nexample.com/dep\n";
 
@@ -250,6 +274,58 @@ mod tests {
     fn an_empty_display_directory_is_shown_as_dot() {
         assert_eq!(non_empty_or_dot(PathBuf::new()), PathBuf::from("."));
         assert_eq!(non_empty_or_dot(PathBuf::from("sub")), PathBuf::from("sub"));
+    }
+
+    #[test]
+    fn a_failed_second_rename_reports_the_move_into_place_and_restores_the_old_tree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (vendor, scratch, old) = (
+            dir.path().join("vendor"),
+            dir.path().join("scratch"),
+            dir.path().join("old"),
+        );
+        std::fs::create_dir(&vendor).expect("vendor");
+        std::fs::write(vendor.join("marker"), "previous").expect("marker");
+        std::fs::create_dir(&scratch).expect("scratch");
+        let mut calls = 0;
+
+        let failure = swap_vendor(&vendor, &scratch, &old, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                Err(std::io::Error::other("denied"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        })
+        .expect_err("the second rename fails");
+
+        assert_eq!(failure.operation, IoOperation::MoveVendorIntoPlace);
+        assert_eq!(calls, 3, "the aside move is undone");
+        assert_eq!(
+            std::fs::read_to_string(vendor.join("marker")).expect("marker"),
+            "previous"
+        );
+        assert!(
+            scratch.exists(),
+            "the refreshed tree stays in its scratch directory"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_rename_reports_the_move_aside() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (vendor, scratch, old) = (
+            dir.path().join("vendor"),
+            dir.path().join("scratch"),
+            dir.path().join("old"),
+        );
+
+        let failure = swap_vendor(&vendor, &scratch, &old, |_, _| {
+            Err(std::io::Error::other("denied"))
+        })
+        .expect_err("the first rename fails");
+
+        assert_eq!(failure.operation, IoOperation::MoveVendorAside);
     }
 
     #[test]

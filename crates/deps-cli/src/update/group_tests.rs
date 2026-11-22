@@ -5,7 +5,7 @@
 //! `Outcome`/`SkipReason`/`UnfixableReason` variant after it becomes an exhaustive `match`.
 //! Declared in `update/mod.rs` as `#[cfg(test)] mod group_tests;`.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::str::FromStr;
@@ -13,7 +13,7 @@ use std::str::FromStr;
 use clap::Parser;
 use deps_core::edit::{ManifestEdit, UnplannableReason, UpdateKind};
 use deps_core::position::Range;
-use deps_core::{ConcreteVersion, NormalizedName};
+use deps_core::{ConcreteVersion, EcosystemId, NormalizedName};
 
 use super::group::{UpdateGroup, demote_outside_group};
 use super::regen::{LockfileOutcome, NotApplicableReason, RegenerationError};
@@ -222,6 +222,7 @@ fn test_demote_outside_group_demotes_only_applied_items_outside_the_group() {
             "1.0.0",
             Outcome::RequiresLockfileUpdate {
                 target: ConcreteVersion::from("2.0.0"),
+                ecosystem: EcosystemId::Cargo,
             },
         ),
         item(
@@ -324,7 +325,7 @@ fn test_update_exit_code_every_outcome_variant_keeps_its_pre_change_code() {
     let rows: Vec<(&str, Outcome, i32)> = vec![
         ("applied",                applied("2.0.0"),                                         EXIT_CLEAN),
         ("applied-via-lockfile",   Outcome::AppliedViaLockfile { target: target() },         EXIT_CLEAN),
-        ("requires-lockfile",      Outcome::RequiresLockfileUpdate { target: target() },     EXIT_POLICY_VIOLATION),
+        ("requires-lockfile",      Outcome::RequiresLockfileUpdate { target: target(), ecosystem: EcosystemId::Cargo },     EXIT_POLICY_VIOLATION),
         ("unfixable-no-fix",       Outcome::Unfixable(UnfixableReason::NoVerifiedFix),       EXIT_POLICY_VIOLATION),
         ("unfixable-fetch",        Outcome::Unfixable(UnfixableReason::FetchFailedOrAbsent), EXIT_POLICY_VIOLATION),
         ("unfixable-yanked",       Outcome::Unfixable(UnfixableReason::Yanked { target: target() }), EXIT_POLICY_VIOLATION),

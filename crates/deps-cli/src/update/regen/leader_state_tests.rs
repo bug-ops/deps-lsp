@@ -5,7 +5,7 @@
 //! Declared in `regen/mod.rs` as `#[cfg(all(test, unix))] mod leader_state_tests;`.
 
 #![cfg(unix)]
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::time::{Duration, Instant};

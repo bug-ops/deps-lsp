@@ -1,8 +1,6 @@
 //! #2099 acceptance (conditional on the S0 pipenv probe passing): `Program::Pipenv` has the
 //! `pipenv` wire token, so a too-old Pipenv is reported like the other lockers.
 
-#![allow(clippy::expect_used)]
-
 use deps_cli::format::DryRun;
 use deps_cli::format::json::update_to_document;
 use deps_cli::update::regen::{LockfileOutcome, Program, UnsupportedReason};

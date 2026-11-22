@@ -1,7 +1,7 @@
 //! Regression test for #1684 / #1719: the release that stands in for a floating `@v4` in an OSV
 //! scan is never reported as the pin's in-use version.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::collections::HashMap;
 use std::sync::Arc;

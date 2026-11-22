@@ -1,7 +1,7 @@
 //! #1982: `native_cooldowns_by_name`, the by-name view of a manifest's native windows the CLI's
 //! cooldown-fallback view reads. Kills the mutant that replaces it with an empty map.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::sync::Arc;
 

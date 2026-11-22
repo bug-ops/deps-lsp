@@ -2,7 +2,7 @@
 //! `CONTRIBUTING.md` carries the MSRV policy. Written tests-first; `CONTRIBUTING.md` still says
 //! 1.85 and `deps-precommit`'s README has no requires-Rust line.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::path::PathBuf;
 

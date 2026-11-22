@@ -6,7 +6,7 @@
 //! Written tests-first against plans `2026-11-17T18-35-26-architect`, `20-24-32-architect`
 //! (D5) and `20-32-28-architect`. Fixtures live in `tests/common/mod.rs`.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 use std::assert_matches;
 
 mod common;

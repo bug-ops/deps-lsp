@@ -7,7 +7,7 @@
 //! returning `Result<ExemptionList, _>` (error variants are not asserted), `ExemptionList::lookup(&str) -> Exemption`,
 //! all in `deps_core::native_cooldown`.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 use std::assert_matches;
 
 use std::time::{Duration, Instant};

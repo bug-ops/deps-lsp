@@ -8,7 +8,7 @@
 // allow-*-in-tests exemptions only cover `#[test]` functions, and this module is all
 // non-`#[test]` helpers (`LspClient` and friends) unwrapping/expecting known-good
 // process/protocol state, so the allow is needed here.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};

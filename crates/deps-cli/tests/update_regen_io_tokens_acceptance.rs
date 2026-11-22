@@ -4,7 +4,7 @@
 //! The verb phrase of `IoOperation` is not pinned (only that it is a non-empty, distinct phrase
 //! per operation); the `kind` tokens `io` and `fallback-pin-not-kept` are the wire contract.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::collections::HashSet;
 use std::path::PathBuf;

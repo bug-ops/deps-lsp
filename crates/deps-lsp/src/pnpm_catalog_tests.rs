@@ -2,11 +2,8 @@
 //! dependency document of its own, and it is also a watched config of the `package.json`
 //! documents that reference its catalogs, so a change on disk refreshes both (FR-003, FR-023).
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::string_slice,
-    reason = "test code over ASCII fixtures"
-)]
+#![expect(clippy::unwrap_used, reason = "test code over ASCII fixtures")]
+#![allow(clippy::string_slice, reason = "test code over ASCII fixtures")]
 
 use std::path::Path;
 

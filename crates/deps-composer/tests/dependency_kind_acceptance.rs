@@ -2,8 +2,6 @@
 //! mapping). Written tests-first; `Dependency::kind` and `deps_core::DependencyKind` do not
 //! exist yet.
 
-#![allow(clippy::expect_used)]
-
 use deps_core::{DependencyKind, ParseResult};
 
 const MANIFEST: &str = r#"{

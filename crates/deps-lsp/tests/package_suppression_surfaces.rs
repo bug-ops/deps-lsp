@@ -7,7 +7,7 @@
 //! reached through the fixture's `.npmrc`; settings go through the real `DepsConfig` parse.
 
 #![cfg(feature = "npm")]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::sync::Arc;
 use std::time::Duration;

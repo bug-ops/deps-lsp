@@ -4,7 +4,7 @@
 //! Every case here must fail before any network access or write, so none needs a registry:
 //! the real binary refuses at the CLI boundary, in the preflight, or after the manifest walk.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::path::Path;
 use std::process::Output;

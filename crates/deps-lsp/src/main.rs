@@ -58,7 +58,10 @@ fn main() {
     }
 
     // No fallback: startup failure before any LSP traffic is unrecoverable anyway.
-    #[allow(clippy::expect_used)]
+    #[expect(
+        clippy::expect_used,
+        reason = "a failed runtime build at startup is unrecoverable"
+    )]
     tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .enable_all()

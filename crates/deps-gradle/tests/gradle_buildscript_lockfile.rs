@@ -1,7 +1,7 @@
 //! `buildscript-gradle.lockfile` support (#2034): classpath dependencies resolve from the
 //! build-script lock file, project dependencies from `gradle.lockfile`, never crossed.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::Path;
 

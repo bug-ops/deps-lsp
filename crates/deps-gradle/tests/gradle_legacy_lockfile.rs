@@ -6,7 +6,7 @@
 //! Written tests-first. Assumed seam: `LockFileProvider::lock_set_root(&Path) -> Option<&Path>`
 //! (default `path.parent()`; Gradle legacy files return the project directory).
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

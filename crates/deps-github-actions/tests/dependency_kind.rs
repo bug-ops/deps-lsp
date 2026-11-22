@@ -1,7 +1,5 @@
 //! #2072: every GitHub Actions `uses:` reference is a production dependency.
 
-#![allow(clippy::expect_used)]
-
 use deps_core::{DependencyKind, ParseResult};
 
 #[test]

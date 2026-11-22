@@ -1,8 +1,6 @@
 //! #2041 / spec 099 FR-014: a malformed release-age value warns once per file change, not on
 //! every `package.json` parse (impl-critic M9).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 mod common;
 
 use std::sync::Arc;

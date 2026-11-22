@@ -9,7 +9,7 @@
 //! and must keep passing.
 
 #![cfg(all(unix, feature = "npm", feature = "go"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;
@@ -90,6 +90,13 @@ fn read_only_dir_is_enforced(project: &Project) -> bool {
 fn run_with_lock(case: &Case<'_>, lock_first: bool) -> Option<(Project, String)> {
     let project = prepare(case);
     if !read_only_dir_is_enforced(&project) {
+        const WHY: &str =
+            "a read-only directory does not stop this process from writing (running as root?)";
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{WHY}: this test would silently test nothing in CI"
+        );
+        eprintln!("SKIPPED: {WHY}; nothing was tested");
         return None;
     }
     let _unlock = Unlock(project.root.clone());

@@ -689,7 +689,6 @@ impl KeychainStore {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 pub(crate) mod fake {
     use std::sync::atomic::AtomicUsize;
 
@@ -794,7 +793,7 @@ pub(crate) mod fake {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::fake::Fake;
     use super::*;

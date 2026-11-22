@@ -147,7 +147,7 @@ impl SanitizedRegistryError {
     /// loopback port), for tests of code that classifies errors by origin.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "test-only constructor: a setup failure must abort the test"
     )]
