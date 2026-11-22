@@ -41,8 +41,14 @@ no update edit, so its diagnostic reads `Newer version outside the declared rang
 bounds manually)` instead of promising a quick fix. Under `deps-cli update --security-only`, a bounded
 interval resolves to the fix only at its inclusive lower bound (`[1.5.2,)` with target `1.5.2`); any
 other bounded range is reported `unfixable` rather than `requires-lockfile-update`. With
-`--lockfile regenerate`, a plan that mixes manifest edits and lock-file-only pins regenerates for the
-edit pins and leaves the others untouched (see the CLI chapter).
+`--lockfile regenerate`, a lock-file-only pin on a floating (`*`) declaration, or on a declaration whose
+floor already equals the fix, is regenerated without a release-age bypass: the run pins the exact version,
+restores, resets the lock file's `requested` field to the declared requirement and verifies it with a
+locked-mode restore (`--force-evaluate` is never used). If any other dependency has a floating
+requirement, including one inherited from `Directory.Build.props`, a `ProjectReference` or central
+package management, the run is refused as `other-floating-requirements`. If the lock file cannot be put back to the declared requirement, the run fails as
+`lockfile-pin-not-kept` and restores it. Other lock-file-only pins stay
+untouched (see the CLI chapter).
 
 ## Private/Custom Feeds
 

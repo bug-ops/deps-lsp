@@ -72,6 +72,16 @@ layout supplies the lock set (every file merged; `buildscript-*` files count as 
 scope, `settings-*` files are skipped). Known limitation: classpath dependencies show no lock-file
 version before the first registry fetch completes.
 
+With `deps-cli update --lockfile regenerate`, a build on the legacy `gradle/dependency-locks` layout is
+migrated to `gradle.lockfile`, because Gradle 7 and later cannot write the legacy layout. If the migration would
+move unrelated modules, the run fails as `lock-state-drift` and restores every file. A version update on such a build works in one
+run: the layout is migrated at the currently locked versions, then the edit is applied; a dependency locked at
+several versions, or without a single declaration, is refused (`legacy-lock-layout`) until you migrate once
+with `gradle :<project>:dependencies --update-locks <group:module>`, commit and rerun. Legacy lock files are then deleted
+and reported as migrated or stale, and `--open-pr` commits the new `gradle.lockfile` and the deletions. A
+legacy directory beside an existing `gradle.lockfile`, or one holding a `settings-*` lock, is refused with
+an actionable message (see the CLI chapter).
+
 ## Non-Registry Dependency Sources (Maven)
 
 A Maven `<dependency>` with `<scope>system</scope>` and a `<systemPath>` — an explicit

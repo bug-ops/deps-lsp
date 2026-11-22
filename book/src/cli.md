@@ -531,7 +531,7 @@ the fresh lockfile against every applied version:
 | PyPI (`pdm.lock`) | `pdm lock --update-reuse` (manifest edits), then `pdm update --no-sync <names>` (lock-file-only fixes) | same as Poetry |
 | Composer (`composer.lock`) | `composer update <vendor/name...> --no-install --no-scripts --no-plugins --no-interaction` with `COMPOSER=composer.json` | same as Poetry |
 | Dart / Flutter (`pubspec.lock`) | `dart pub get --no-example` (manifest edits), then `dart pub upgrade --no-example <names>` (lock-file-only fixes); `flutter pub` instead when a dependency comes from the Flutter SDK | same as Poetry |
-| NuGet (`packages.lock.json`) | `dotnet restore <project> --use-lock-file --no-dependencies --disable-build-servers` | same as Poetry |
+| NuGet (`packages.lock.json`) | `dotnet restore <project> --use-lock-file --no-dependencies --force --disable-build-servers` (plus `--locked-mode` for the final check of a floating lock-file-only pin) | same as Poetry |
 | Gradle (`gradle.lockfile`, `*.lockfile`) | `gradle --no-daemon --console=plain :<path>:dependencies ... --update-locks <group:artifact,...>` at the build root, one task per project directory that owns a lock file | the lockfile holds exactly the target |
 | SwiftPM (`Package.resolved`) | `swift package resolve` (manifest edits), then `swift package update <identity>` (lock-file-only fixes) | same as Poetry |
 
@@ -584,25 +584,28 @@ Composer, Dart, Swift, NuGet, Gradle and Pipenv refuse a fallback target.
   `bun install --lockfile-only` runs again, leaving the declaration untouched and the lock moved. A
   Bun older than the one that accepts `--lockfile-only` for `update` ends as `tool-failed`, restored.
   A Bun workspace member reports `workspace-member-lockfile`.
-- **NuGet:** a plan with manifest edits regenerates for the edit pins only; its lock-file-only pins
-  are left untouched and stay `requires-lockfile-update`. A plan of lock-file-only pins alone reports
-  `lockfile-only-update-unsupported` before any tool runs (NuGet resolves the lowest applicable
-  version, and only `--force-evaluate` would move it, which bypasses the cooldown); a floating
-  requirement of a package that is not edited, a lock-file-only one included, refuses the run as
-  `other-floating-requirements`. A project using `Directory.Packages.props` reports
-  `central-package-versions`; `packages.config` has no regeneration (`no-lockfile-present`). A
-  manifest edit makes `dotnet restore` re-resolve every floating dependency of the project. That
-  bypasses the release-age window, so a project with any other `*` requirement or bounded range is
-  refused as `other-floating-requirements`. Pin those dependencies to exact versions to enable
-  regeneration.
+- **NuGet:** lock-file-only pins regenerate without a cooldown bypass, and never with
+  `--force-evaluate`. A pin on a floating declaration (`*`) is pinned exactly for one restore, then the
+  declared requirement is put back, the `requested` field in `packages.lock.json` is reset to it, and a
+  locked-mode restore (`--locked-mode`) proves the manifest and lock file agree. A pin whose declared
+  floor already equals the fix needs only the restore. Any other lock-file-only pin stays untouched and
+  `requires-lockfile-update`; a plan made of such pins alone reports `lockfile-only-update-unsupported`
+  before any tool runs. A manifest edit makes `dotnet restore` re-resolve every floating dependency of
+  the project, which would bypass the release-age window, so a floating or bounded requirement of any
+  other package refuses the run as `other-floating-requirements`. The check reads the manifest and the
+  lock file, so floating requirements that come from `Directory.Build.props`, a `ProjectReference` or
+  central package management are caught too. Pin those dependencies to exact versions to enable
+  regeneration. A project using `Directory.Packages.props` as the edited manifest reports
+  `central-package-versions`; `packages.config` has no regeneration (`no-lockfile-present`).
 - **Gradle:** the lock files of the build are found by a bounded walk from the build root (the nearest
   ancestor with `settings.gradle[.kts]`, otherwise the project directory); under `--open-pr` the
   build root must lie inside the repository (an outer `settings.gradle` reports
   `lockfile-outside-repository`). A build with more than 512 lock files reports
   `lockfile-set-too-large`. A build with locks in `buildSrc/` or in an included build is refused
   (`lockfile-ownership-mismatch`): Gradle applies `--update-locks` to the buildSrc build as well, so
-  the lock set cannot be updated consistently. Run the regeneration inside that build instead. The legacy layout
-  (`gradle/dependency-locks`) reports `legacy-lock-layout`. The tool is the `gradle` on `PATH`; the
+  the lock set cannot be updated consistently. Run the regeneration inside that build instead. A build on the legacy
+  `gradle/dependency-locks` layout is migrated to `gradle.lockfile` first (see *Legacy lock layout*
+  below). The tool is the `gradle` on `PATH`; the
   Gradle wrapper is never used, so a build pinned to a wrapper version needs a compatible `gradle` on
   `PATH`. The tool runs once at the build root with one `:<path>:dependencies` task per distinct
   project directory that owns a lock file (the root project is `:dependencies`). The project path is
@@ -613,8 +616,27 @@ Composer, Dart, Swift, NuGet, Gradle and Pipenv refuse a fallback target.
   published. Verification is exact: the lock file must hold exactly the target, so a version raised by
   conflict resolution, or a lock-file-only dynamic requirement (`32.+`) that resolves newer than the
   target, fails with `version-mismatch` and the lock files are restored. `--update-locks` creates a
-  `gradle.lockfile` for a locked project that had none. Such files are outside the snapshot and are
-  not removed on failure.
+  `gradle.lockfile` for a locked project that had none; the run snapshots that file as absent and
+  removes it again if the run fails.
+
+  **Legacy lock layout.** Gradle 7 and later cannot write `gradle/dependency-locks`, so `update`
+  migrates it to `gradle.lockfile` before pinning. It then compares the migrated state with the legacy
+  one for every configuration the legacy files held. If the migration would move unrelated modules,
+  the run fails as `lock-state-drift` and every file is restored. Legacy lock files are deleted afterwards and reported as
+  `migrated` (the configuration moved into `gradle.lockfile`), `stale-empty` or `stale-dropped` (Gradle no
+  longer resolves the configuration; `stale-dropped` also discards locked coordinates, so a task that
+  still resolves it runs unlocked). When the same run also edits a version, the
+  migration happens first at the currently locked versions and the edit is applied afterwards, so a
+  version update on a legacy project works in one run. The migration holds each edited dependency
+  at its single legacy-locked version, so the drift guard stays exact; a dependency that no relevant
+  legacy lock holds keeps its edited declaration. An edited dependency locked at several versions, or
+  without a single declaration carrying a version, is refused before anything runs as `legacy-lock-layout`.
+  The message advises migrating once with `gradle :<project>:dependencies --update-locks <group:module>`,
+  committing the result and rerunning. A `gradle/dependency-locks` directory holding no `*.lockfile` file is
+  ignored. Two layouts are refused with `legacy-lock-layout` and a message saying what to do: a legacy
+  directory beside an existing `gradle.lockfile` (Gradle ignores the directory; delete it; the message
+  names the project's own lock file and directory), and a legacy
+  `settings-*.lockfile` (not migrated automatically).
 - **Yarn Classic:** always `unsupported` (`yarn-classic`).
 - **Any ecosystem:** a lock file that is a symlink reports `lockfile-symlink`, and one whose real path
   is outside the repository root reports `lockfile-outside-repository`.
@@ -694,6 +716,11 @@ killed with SIGKILL between the two renames can leave a `.deps-cli-vendor-*` dir
 `vendor/`. A `vendor` that is a symlink or not a directory reports
 `lockfile-symlink`; one outside the repository reports `lockfile-outside-repository`.
 
+A regeneration that migrated a legacy Gradle layout adds a `migration` object to the `regenerated`
+lockfile object: `created` (the new lock files) and `removed` (each deleted legacy file with its
+`removal`: `migrated`, `stale-empty` or `stale-dropped`). The table output prints a matching summary line.
+The key is omitted when no migration happened.
+
 The JSON report always has a `lockfile` object tagged by `status` (`regenerated`, `skipped`,
 `not-applicable`, `unsupported`, `failed`). A failed regeneration prints the full report and
 exits `2`; the manifest edit stays on disk, and the lock files the run touched are restored (see
@@ -726,7 +753,11 @@ dependencies) and has no option to disable that.
 **Failure kinds.** A failed regeneration carries a typed kind. File operations of the run (rewriting a lock
 file, moving a vendor directory, creating a scratch directory) fail as `io` with the
 operation and path instead of `manifest-changed` or `spawn`; an unreadable lock file still reports `lockfile-unreadable`. A failed manifest write-back restores
-the lock snapshot as well. `fallback-pin-not-kept` means a cooldown-fallback pin could not be kept in
+the lock snapshot as well. `lockfile-pin-not-kept` means the
+lock file could not be put back to the declared requirement after an exact pin (NuGet: the lock holds no
+unambiguous entry or no original request to restore, or does not parse), and the lock file is restored.
+`lock-state-drift` means a Gradle layout migration would have changed the locked coordinates of a
+configuration beyond the requested update. `fallback-pin-not-kept` means a cooldown-fallback pin could not be kept in
 the lock (Yarn Berry or Deno re-key refused or failed), and the lock file is restored.
 `cooldown-held-version` means the tool locked a version inside the freshness cooldown window and
 the single retry without the held pins held again, or the manifest changed during the run or could not be rewritten; the
@@ -864,16 +895,21 @@ unless you pass `--close-superseded`.
 
 Publishing first lists the tracked files that differ from `HEAD`. Only the manifest, the lock file a
 `regenerated` outcome names (its real path, even when it lies above the manifest's directory) and the
-companion files and directories it reports (Gradle's other lock files and a Go `vendor` tree, whose
-contents are not listed) may differ: any other changed tracked file (an editor autosave,
+companion files and directories it reports (Gradle's other lock files, the `gradle.lockfile` and
+deleted legacy lock files of a layout migration, and a Go `vendor` tree, whose contents are not listed)
+may differ: any other changed tracked file (an editor autosave,
 a formatter, another tool running during the update) stops the run with exit `2` naming up to 10 of
 them, with nothing committed or pushed. Otherwise the run creates the branch, stages exactly those
 files and trees (an untracked or ignored lock file is never added), commits, pushes with upstream, creates
 the request against the branch `HEAD` was on, prints its URL on stderr and only then switches back.
+A Gradle layout migration is published whole: the created `gradle.lockfile` is staged and the deleted
+legacy lock files are committed as deletions.
 
 The title is `Bump <name> from <a> to <b>`, `Bump <n> dependencies in <manifest>` or
 `Bump the <group> group with <n> updates in <manifest>`, at most 250 bytes; the body is a table of
-at most 50 updates with every name and version rendered as code. When nothing changed on disk it
+at most 50 updates with every name and version rendered as code. A layout migration adds a
+"Lock layout migration" section (the migrated files) and, when state was discarded, a "Dropped lock
+state" section; each lists the first 10 entries, then "and N more". When nothing changed on disk it
 prints `nothing to commit`.
 
 If no item was settled (for example a `--security-only` run whose only fix stays

@@ -245,6 +245,46 @@ pub fn find_last_prop<'a, 'b>(object: &'a Object<'b>, key: &str) -> Option<&'a O
         .find(|prop| prop.name.as_str() == key)
 }
 
+/// Byte range of the quoted string literal at `path` in a JSON document, escapes included.
+///
+/// `None` when the document does not parse, an intermediate key is missing or not an object, or
+/// the final value is not a string. The last duplicate key wins, like [`find_last_prop`], and an
+/// empty `path` has no string to address, so it is `None` too.
+///
+/// The range lets a caller replace a value byte for byte without re-serializing the document.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::json_ast::string_literal_span;
+///
+/// let content = r#"{"a": {"b": "[2.*, )"}}"#;
+/// let range = string_literal_span(content, &["a", "b"]).unwrap();
+/// assert_eq!(&content[range], r#""[2.*, )""#);
+/// assert!(string_literal_span(content, &["a", "x"]).is_none());
+/// ```
+#[must_use]
+pub fn string_literal_span(content: &str, path: &[&str]) -> Option<std::ops::Range<usize>> {
+    let (last, parents) = path.split_last()?;
+    let Ok(Some(Value::Object(mut object))) = parse_jsonc_ast_checked(content, "json") else {
+        return None;
+    };
+    for key in parents {
+        let Value::Object(next) = find_last_prop(&object, key)?.value.clone() else {
+            return None;
+        };
+        object = next;
+    }
+    match &find_last_prop(&object, last)?.value {
+        Value::StringLit(literal) => Some(literal.range.start..literal.range.end),
+        Value::Object(_)
+        | Value::Array(_)
+        | Value::NumberLit(_)
+        | Value::BooleanLit(_)
+        | Value::NullKeyword(_) => None,
+    }
+}
+
 /// A parsed JSON/JSONC document, used only to recover a named top-level section's exact
 /// source positions — never a substitute for a caller's own `serde_json` parse of the
 /// document's semantic content.

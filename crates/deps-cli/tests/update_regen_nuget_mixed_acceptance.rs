@@ -116,19 +116,35 @@ fn nuget_mixed_plan_regenerates_for_the_edit_pins_and_leaves_the_lock_only_pin_u
 }
 
 #[test]
-fn nuget_mixed_plan_with_a_floating_lock_only_requirement_is_refused_without_a_spawn() {
+fn nuget_mixed_plan_with_a_floating_lock_only_pin_regenerates() {
     let csproj = CSPROJ.replace("Version=\"2.10.0\"", "Version=\"2.*\"");
-    let old = lock("13.0.1", "2.10.0");
+    let old = lock("13.0.1", "2.10.0").replace("[2.10.0, )", "[2.*, )");
+    let resolved = lock("13.0.3", "2.12.0").replace("[2.12.0, )", "[2.12.0, 2.12.0]");
+    let body = format!(
+        "case \"$*\" in\n*--locked-mode*)\ngrep -q 'Version=\"2\\.\\*\"' ROOT/App.csproj || exit 8\n;;\n*)\ngrep -q 'Version=\"\\[2\\.12\\.0\\]\"' ROOT/App.csproj || exit 7\ncat > ROOT/packages.lock.json <<'EOF'\n{resolved}EOF\n;;\nesac\n"
+    );
     let bumps = format!("{NEWTONSOFT_EDIT}\n{SERILOG_LOCK_ONLY}");
 
-    let ran = run(&mixed_case(&csproj, &old, "exit 0", &bumps));
+    let ran = run(&mixed_case(&csproj, &old, &body, &bumps));
 
-    assert!(
-        ran.outcome.contains("OtherFloatingRequirements"),
+    assert!(ran.outcome.starts_with("Regenerated"), "{}", ran.outcome);
+    let calls = restore_calls(&ran);
+    assert_eq!(calls.len(), 2, "{:?}", ran.calls);
+    assert!(!calls[0].contains("--locked-mode"), "{}", calls[0]);
+    assert!(calls[1].contains("--locked-mode"), "{}", calls[1]);
+    assert_eq!(
+        reported_pins(&ran.outcome),
+        ["Newtonsoft.Json", "Serilog"],
         "{}",
         ran.outcome
     );
-    assert!(ran.calls.is_empty(), "{:?}", ran.calls);
+    assert_eq!(
+        String::from_utf8(ran.read("App.csproj")).expect("utf-8"),
+        csproj.replace("13.0.1", "13.0.3"),
+        "only the planned edit remains in the manifest"
+    );
+    let final_lock = String::from_utf8(ran.read("packages.lock.json")).expect("utf-8");
+    assert_eq!(final_lock, resolved.replace("[2.12.0, 2.12.0]", "[2.*, )"));
 }
 
 async fn mixed_child_main() {

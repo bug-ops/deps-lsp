@@ -20,6 +20,8 @@ mod acceptance_tests;
 #[cfg(all(test, unix))]
 mod close_superseded_tests;
 #[cfg(all(test, unix))]
+mod lock_migration_tests;
+#[cfg(all(test, unix))]
 mod publish_safety_tests;
 
 use std::fmt::Write as _;
@@ -34,7 +36,9 @@ use deps_core::{ConcreteVersion, PackageName};
 
 use self::git::{Runner, Step, Tool};
 use super::group::UpdateGroup;
-use super::regen::{Companion, Interrupts, LockfileOutcome, ProcessGroup};
+use super::regen::{
+    Companion, DisplayLockPath, Interrupts, LockfileOutcome, ProcessGroup, Removal,
+};
 use super::{Outcome, UpdatePlan, UpdateRun};
 
 const BRANCH_PREFIX: &str = "deps-cli/";
@@ -43,6 +47,8 @@ const TITLE_MAX_BYTES: usize = 250;
 const TITLE_NAME_MAX_CHARS: usize = 80;
 const BODY_NAME_MAX_CHARS: usize = 200;
 const BODY_MAX_ROWS: usize = 50;
+/// Most migrated lock files one request body lists before it counts the rest.
+const BODY_MIGRATION_ROWS: usize = 10;
 const BODY_MAX_BYTES: usize = 60_000;
 /// Bound on the bytes of every file-list argv, under Windows' 32,767-character command line.
 const PUBLISH_ARGV_MAX_BYTES: usize = 24_000;
@@ -87,9 +93,19 @@ impl RepoPath {
     /// The route from `root` to `path`, both canonicalized; `None` when `path` is not below
     /// `root` or is not UTF-8.
     fn below(root: &Path, path: &Path) -> Option<Self> {
+        Self::route(root, &std::fs::canonicalize(path).ok()?)
+    }
+
+    /// Like [`Self::below`] for a file the run deleted: its parent directory is canonicalized and
+    /// the file name appended.
+    fn below_deleted(root: &Path, path: &Path) -> Option<Self> {
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        Self::route(root, &parent.join(path.file_name()?))
+    }
+
+    fn route(root: &Path, canonical: &Path) -> Option<Self> {
         let root = std::fs::canonicalize(root).ok()?;
-        let path = std::fs::canonicalize(path).ok()?;
-        let parts = path
+        let parts = canonical
             .strip_prefix(root)
             .ok()?
             .components()
@@ -112,6 +128,8 @@ impl RepoPath {
 struct PublishScope {
     files: Vec<RepoPath>,
     trees: Vec<RepoPath>,
+    /// Files the run created: untracked until staged, removed again on restore.
+    created: Vec<RepoPath>,
 }
 
 impl PublishScope {
@@ -122,7 +140,7 @@ impl PublishScope {
     fn of(ctx: &RepoContext, lockfile: &LockfileOutcome) -> Self {
         let mut scope = Self {
             files: vec![RepoPath(ctx.manifest_path())],
-            trees: Vec::new(),
+            ..Self::default()
         };
         if let LockfileOutcome::Regenerated {
             lockfile,
@@ -136,6 +154,12 @@ impl PublishScope {
             for companion in companions {
                 match companion {
                     Companion::File(path) => scope.files.extend(RepoPath::below(&ctx.root, path)),
+                    Companion::Removed { path, .. } => {
+                        scope.files.extend(RepoPath::below_deleted(&ctx.root, path));
+                    }
+                    Companion::Created(path) => {
+                        scope.created.extend(RepoPath::below(&ctx.root, path));
+                    }
                     Companion::Tree(path) => scope.trees.extend(RepoPath::below(&ctx.root, path)),
                 }
             }
@@ -148,6 +172,7 @@ impl PublishScope {
             .files
             .iter()
             .chain(&self.trees)
+            .chain(&self.created)
             .map(|path| path.0.len())
             .sum();
         if bytes > PUBLISH_ARGV_MAX_BYTES {
@@ -488,7 +513,12 @@ fn cleanup_hint(step: Step) -> &'static str {
              with `git switch <base branch>`, then delete the branch with `git branch -D <branch>` \
              and `git push origin --delete <branch>`"
         }
-        Step::Stage | Step::Commit => {
+        Step::Stage => {
+            "; staging a created lock file is restored automatically, but after any other staging \
+             failure HEAD may still be on the update branch: switch back with \
+             `git switch <base branch>` and delete the branch with `git branch -D <branch>`"
+        }
+        Step::Commit => {
             "; HEAD may still be on the update branch: switch back with \
              `git switch <base branch>` and delete the branch with `git branch -D <branch>`"
         }
@@ -931,7 +961,11 @@ async fn tracked_among(
 ///
 /// [`PrError::PublishSetTooLarge`] or a failed git step.
 pub async fn restore(ctx: &RepoContext, run: &UpdateRun) -> Result<(), PrError> {
-    let scope = PublishScope::of(ctx, &run.lockfile);
+    restore_scope(ctx, &PublishScope::of(ctx, &run.lockfile)).await
+}
+
+/// [`restore`] for an already computed publish scope.
+async fn restore_scope(ctx: &RepoContext, scope: &PublishScope) -> Result<(), PrError> {
     scope.check_bound()?;
     let runner = ctx.runner();
     let tracked = tracked_among(&runner, ctx, &scope.files).await?;
@@ -961,6 +995,32 @@ pub async fn restore(ctx: &RepoContext, run: &UpdateRun) -> Result<(), PrError> 
                 Step::Restore,
                 &ctx.root,
                 ["clean", "-f", "-d", "-q", "--", tree.literal().as_str()],
+            )
+            .await?;
+    }
+    for file in &scope.created {
+        // A `git add` that failed on a later path may have staged this one already.
+        runner
+            .succeed(
+                Tool::Git,
+                Step::Restore,
+                &ctx.root,
+                [
+                    "rm",
+                    "--cached",
+                    "-q",
+                    "--ignore-unmatch",
+                    "--",
+                    file.literal().as_str(),
+                ],
+            )
+            .await?;
+        runner
+            .succeed(
+                Tool::Git,
+                Step::Restore,
+                &ctx.root,
+                ["clean", "-f", "-x", "-q", "--", file.literal().as_str()],
             )
             .await?;
     }
@@ -1097,7 +1157,70 @@ fn title_for(ctx: &RepoContext, bumps: &[Bump<'_>], group: Option<&UpdateGroup>)
     title
 }
 
-fn body_for(run: &UpdateRun, bumps: &[Bump<'_>]) -> String {
+/// Writes `heading` and one bullet per entry of `lines` (the first `BODY_MIGRATION_ROWS`, then a
+/// count of the rest); nothing when `lines` is empty.
+fn write_bullets(body: &mut String, heading: &str, intro: &str, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let _ = writeln!(body, "\n**{heading}**\n\n{intro}\n");
+    for line in lines.iter().take(BODY_MIGRATION_ROWS) {
+        let _ = writeln!(body, "- {line}");
+    }
+    if lines.len() > BODY_MIGRATION_ROWS {
+        let _ = writeln!(body, "- and {} more", lines.len() - BODY_MIGRATION_ROWS);
+    }
+}
+
+/// The "Lock layout migration" and "Dropped lock state" sections of a run that migrated a legacy
+/// lock layout; empty text for any other run.
+fn migration_sections(
+    ctx: &RepoContext,
+    lockfile: &DisplayLockPath,
+    companions: &[Companion],
+) -> String {
+    let shown = |path: &Path, deleted: bool| {
+        let route = if deleted {
+            RepoPath::below_deleted(&ctx.root, path)
+        } else {
+            RepoPath::below(&ctx.root, path)
+        };
+        code_span(&route.map_or_else(
+            || lockfile.display_of(path).display().to_string(),
+            |route| route.0,
+        ))
+    };
+    let mut migrated = Vec::new();
+    let mut dropped = Vec::new();
+    for companion in companions {
+        match companion {
+            Companion::Created(path) => migrated.push(format!("created {}", shown(path, false))),
+            Companion::Removed { path, removal } => {
+                migrated.push(format!("removed {}", shown(path, true)));
+                if *removal == Removal::StaleDropped {
+                    dropped.push(shown(path, true));
+                }
+            }
+            Companion::File(_) | Companion::Tree(_) => {}
+        }
+    }
+    let mut section = String::new();
+    write_bullets(
+        &mut section,
+        "Lock layout migration",
+        "The legacy `gradle/dependency-locks` layout was migrated to unified lock files, and the migrated state was verified equal to the legacy one before the update.",
+        &migrated,
+    );
+    write_bullets(
+        &mut section,
+        "Dropped lock state",
+        "These configurations are no longer resolved by Gradle; their locked coordinates are dropped, so a task that still resolves them runs unlocked.",
+        &dropped,
+    );
+    section
+}
+
+fn body_for(ctx: &RepoContext, run: &UpdateRun, bumps: &[Bump<'_>]) -> String {
     let mut body = String::from("| Package | From | To | Kind |\n|---|---|---|---|\n");
     for bump in bumps.iter().take(BODY_MAX_ROWS) {
         let from = if bump.from.is_empty() {
@@ -1117,13 +1240,19 @@ fn body_for(run: &UpdateRun, bumps: &[Bump<'_>]) -> String {
         let _ = writeln!(body, "\nand {} more", bumps.len() - BODY_MAX_ROWS);
     }
     match &run.lockfile {
-        LockfileOutcome::Regenerated { lockfile, tool, .. } => {
+        LockfileOutcome::Regenerated {
+            lockfile,
+            tool,
+            companions,
+            ..
+        } => {
             let _ = writeln!(
                 body,
                 "\nThe lock file {} was regenerated with {}.",
                 code_span(&lockfile.to_string()),
                 code_span(&tool.to_string())
             );
+            body.push_str(&migration_sections(ctx, lockfile, companions));
         }
         LockfileOutcome::Skipped(_)
         | LockfileOutcome::NotApplicable(_)
@@ -1185,7 +1314,7 @@ pub fn describe(
     let bumps = applied_bumps(run);
     PullRequestText {
         title: title_for(ctx, &bumps, group),
-        body: body_for(run, &bumps),
+        body: body_for(ctx, run, &bumps),
         commit_body: commit_body_for(&bumps),
         scope: PublishScope::of(ctx, &run.lockfile),
     }
@@ -1263,6 +1392,16 @@ pub async fn open(
     }
 
     let git = |step, args: Vec<String>| runner.succeed(Tool::Git, step, root, args);
+    if !text.scope.created.is_empty() {
+        // Before the branch exists, so a created file git refuses (an ignored one) leaves nothing
+        // to undo but the work tree and index, which are put back like any abandoned run.
+        let mut stage_created = vec!["add".to_owned(), "--".to_owned()];
+        stage_created.extend(text.scope.created.iter().map(RepoPath::literal));
+        if let Err(error) = git(Step::Stage, stage_created).await {
+            restore_scope(ctx, &text.scope).await?;
+            return Err(error);
+        }
+    }
     git(
         Step::Switch,
         vec!["switch".into(), "--create".into(), name.into()],

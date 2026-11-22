@@ -750,16 +750,29 @@ jobs:
           echo "Release type: ${release_type} (baseline major ${base_major:-unknown}, head major ${head_major:-unknown})"
           echo "release_type=${release_type}" >> "$GITHUB_OUTPUT"
 
-          # A crate added after the baseline has nothing to compare against, and cargo-semver-checks
-          # aborts the whole run with "package not found" instead of skipping it (#2126).
-          workspace_root=$(pwd)
+          # A package absent from the baseline has nothing to compare against, and cargo-semver-checks
+          # aborts the whole run with "package not found" instead of skipping it (#2126). Packages are
+          # matched by name, since cargo-semver-checks resolves them by name: a moved crate keeps its
+          # baseline and a renamed one has none (#2127).
+          baseline_dir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/semver-baseline.XXXXXX")
+          trap 'rm -rf "$baseline_dir"' EXIT
+          (set -o pipefail; git archive --format=tar "$rev" | tar -x -C "$baseline_dir")
+          # Plain assignments, so a failure aborts the step instead of excluding every package.
+          baseline_meta=$(cargo metadata --no-deps --format-version 1 --manifest-path "${baseline_dir}/Cargo.toml")
+          baseline_names=$(jq -r '.packages[].name' <<< "$baseline_meta")
+          head_meta=$(cargo metadata --no-deps --format-version 1)
+          head_names=$(jq -r '.packages[].name' <<< "$head_meta")
+          if [ -z "$baseline_names" ]; then
+            echo "::error::No packages found in the baseline revision ${rev}"
+            exit 1
+          fi
           exclude=""
-          while IFS=$'\t' read -r name manifest; do
-            if ! git cat-file -e "${rev}:${manifest#"${workspace_root}"/}" 2>/dev/null; then
+          while IFS= read -r name; do
+            if ! grep -qxF -- "$name" <<< "$baseline_names"; then
               exclude="${exclude:+${exclude},}${name}"
             fi
-          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | [.name, .manifest_path] | @tsv')
-          echo "Excluded (new since baseline): ${exclude:-none}"
+          done <<< "$head_names"
+          echo "Excluded (no package of that name at the baseline): ${exclude:-none}"
           echo "exclude=${exclude}" >> "$GITHUB_OUTPUT"
 
       - name: Check semver against the baseline revision

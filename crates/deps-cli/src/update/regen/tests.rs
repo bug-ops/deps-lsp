@@ -2900,7 +2900,9 @@ fn expected_restore(error: &RegenerationError) -> bool {
         | RegenerationError::FallbackPinRejected { .. }
         | RegenerationError::ManifestChanged { .. }
         | RegenerationError::Io { .. }
-        | RegenerationError::FallbackPinNotKept { .. } => true,
+        | RegenerationError::FallbackPinNotKept { .. }
+        | RegenerationError::LockfilePinNotKept { .. }
+        | RegenerationError::LockStateDrift { .. } => true,
     }
 }
 

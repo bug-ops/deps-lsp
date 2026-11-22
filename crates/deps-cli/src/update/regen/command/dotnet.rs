@@ -39,19 +39,39 @@ const DOTNET_ENV: &[(&str, &str)] = &[
     ("MSBUILDDISABLENODEREUSE", "1"),
 ];
 
+/// How a `dotnet restore` treats the lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::update::regen) enum RestoreMode {
+    /// Re-resolves the project against the manifest and rewrites the lock file.
+    Resolve,
+    /// Additionally fails when the restore would change the lock file.
+    Locked,
+}
+
 impl Invocation {
-    /// `dotnet restore <project> --use-lock-file --no-dependencies --disable-build-servers`.
+    /// `dotnet restore <project> --use-lock-file --no-dependencies --disable-build-servers
+    /// --force`, plus `--locked-mode` for [`RestoreMode::Locked`].
     ///
-    /// `--no-dependencies` keeps referenced projects' lock files untouched; `--force-evaluate`
-    /// is deliberately never passed, because it re-resolves every floating dependency.
-    pub(in crate::update::regen) fn dotnet_restore(cwd: &Path, project: &ProjectFileArg) -> Self {
+    /// `--force` makes restore re-resolve although the project looks up to date, which is how a
+    /// package already locked moves to a newly pinned version. `--no-dependencies` keeps
+    /// referenced projects' lock files untouched; `--force-evaluate` is deliberately never
+    /// passed, because it re-resolves every floating dependency.
+    pub(in crate::update::regen) fn dotnet_restore(
+        cwd: &Path,
+        project: &ProjectFileArg,
+        mode: RestoreMode,
+    ) -> Self {
         let mut args = Self::strs(&["restore"]);
         args.push(project.0.as_str().into());
         args.extend(Self::strs(&[
             "--use-lock-file",
             "--no-dependencies",
             "--disable-build-servers",
+            "--force",
         ]));
+        if mode == RestoreMode::Locked {
+            args.extend(Self::strs(&["--locked-mode"]));
+        }
         let mut invocation = Self::new(Program::Dotnet, cwd, args);
         invocation.env = DOTNET_ENV;
         invocation
@@ -86,21 +106,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_uses_the_lock_file_without_dependencies_or_force_evaluate() {
+    const RESOLVE_ARGS: [&str; 6] = [
+        "restore",
+        "App.csproj",
+        "--use-lock-file",
+        "--no-dependencies",
+        "--disable-build-servers",
+        "--force",
+    ];
+
+    fn restore(mode: RestoreMode) -> Invocation {
         let project = ProjectFileArg::parse("App.csproj").expect("project");
-        let invocation = Invocation::dotnet_restore(Path::new("."), &project);
+        Invocation::dotnet_restore(Path::new("."), &project, mode)
+    }
+
+    #[test]
+    fn resolve_restore_forces_the_lock_file_without_dependencies_or_force_evaluate() {
+        let invocation = restore(RestoreMode::Resolve);
+
         assert_eq!(invocation.program(), Program::Dotnet);
-        assert_eq!(
-            invocation.args(),
-            [
-                "restore",
-                "App.csproj",
-                "--use-lock-file",
-                "--no-dependencies",
-                "--disable-build-servers"
-            ]
-        );
+        assert_eq!(invocation.args(), RESOLVE_ARGS);
         assert!(
             invocation
                 .args()
@@ -108,5 +133,14 @@ mod tests {
                 .all(|arg| arg != "--force-evaluate")
         );
         assert_eq!(invocation.env(), DOTNET_ENV);
+    }
+
+    #[test]
+    fn locked_restore_is_the_resolve_restore_plus_locked_mode() {
+        let invocation = restore(RestoreMode::Locked);
+
+        let mut expected = RESOLVE_ARGS.to_vec();
+        expected.push("--locked-mode");
+        assert_eq!(invocation.args(), expected);
     }
 }
