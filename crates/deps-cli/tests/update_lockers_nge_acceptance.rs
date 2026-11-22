@@ -88,7 +88,7 @@ fn nuget_manifest_edit_restores_the_project_with_the_lock_file_and_verifies() {
 
     let restores = calls_starting(
         &ran,
-        "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers --force|",
+        "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers --force -p:RestoreLockedMode=false|",
     );
     assert_eq!(restores.len(), 1, "{:?}", ran.calls);
     assert_eq!(cwd_of(restores[0]), ran.root.display().to_string());

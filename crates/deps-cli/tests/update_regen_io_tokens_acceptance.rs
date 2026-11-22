@@ -96,8 +96,8 @@ fn fallback_pin_not_kept_serializes_its_token_and_names_package_target_lock_and_
 
     assert_eq!(json["status"], "failed");
     assert_eq!(json["kind"], "fallback-pin-not-kept");
-    assert_eq!(json["package"], serde_json::Value::Null);
-    assert_eq!(json["expected"], serde_json::Value::Null);
+    assert_eq!(json["package"], "minimist");
+    assert_eq!(json["expected"], "1.2.8");
     assert_eq!(json["found"], serde_json::Value::Null);
     let message = json["message"].as_str().expect("message");
     for needle in ["minimist", "1.2.8", "yarn.lock"] {

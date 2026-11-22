@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking
 - **deps-cli**: `Outcome::RequiresLockfileUpdate` carries the ecosystem, `LockfileFix::ecosystem` is removed and `LockfileDocument::Failed` gains an additive `held` array (#2116, #2120, #2128)
 - **deps-cli**: lock-only regeneration and Gradle legacy-layout migration add `Companion::{Created, Removed}`, `Removal`, `IoOperation::RemoveLegacyLockfile`, `RekeyRefusal::OriginalRequestMissing`, `RegenerationError::{LockfilePinNotKept, LockStateDrift}`, a `LegacyLayoutConflict` payload on `UnsupportedReason::LegacyLockLayout`, an additive `migration` key in the JSON lockfile document, and drop `LockfileOnlyMove` (#2113, #2102, #2134)
+- **deps-cli**: JSON lockfile `failed` entries for `lockfile-pin-not-kept`, `fallback-pin-not-kept` and `lock-state-drift` fill `package`/`expected` and add optional `configuration`/`change` (#2132, #2136)
 
 ### Added
 - **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #2134)
@@ -17,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #2134)
 
 ### Fixed
+- **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a non-pinned coordinate moves, and a security-only pin accepts a locked version at or above the target (#2130, #2133, #2136)
+- **deps-cli**: NuGet regeneration passes `-p:RestoreLockedMode=false` so projects that set locked mode no longer fail with NU1004 (#2129, #2136)
+- **deps-cli**: lock file report paths are lexically normalized, dropping `x/..` segments in multi-project runs (#2131, #2136)
 - **workspace**: `semver` job excludes crates by package name present at the baseline, so renamed or moved crates are handled (#2127, #2134)
 - **deps-cli**: `update --lockfile regenerate` writes a manifest edit held only in the retry back out of the manifest, and holds default-mode edits inside the cooldown window as `skipped` (#2115, #2117, #2128)
 - **workspace**: scheduled `semver` job excludes crates new since the baseline and allows the just-published baseline version (#2126, #2128)

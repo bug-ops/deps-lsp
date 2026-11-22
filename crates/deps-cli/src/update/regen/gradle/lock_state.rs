@@ -55,6 +55,13 @@ impl LockedCoordinate {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The `group:artifact` part, which is what an update pin names.
+    pub(super) fn module(&self) -> &str {
+        self.0
+            .rsplit_once(':')
+            .map_or(&self.0, |(module, _)| module)
+    }
 }
 
 impl fmt::Display for LockedCoordinate {
@@ -99,6 +106,13 @@ impl LockScope {
             Self::Project => "gradle.lockfile",
             Self::Buildscript => "buildscript-gradle.lockfile",
         }
+    }
+
+    /// The scope of a unified lock file name.
+    pub(super) fn of_unified_file_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|scope| scope.unified_file_name() == name)
     }
 
     /// The scope and configuration a legacy `<configuration>.lockfile` file name stands for.
@@ -160,6 +174,21 @@ pub(super) fn parse_unified(scope: LockScope, text: &str) -> Option<LockState> {
         }
     }
     Some(state)
+}
+
+/// `state` without the coordinates of the given `group:artifact` modules.
+pub(super) fn without_modules(state: &LockState, modules: &[&str]) -> LockState {
+    state
+        .iter()
+        .map(|(key, coordinates)| {
+            let kept = coordinates
+                .iter()
+                .filter(|coordinate| !modules.contains(&coordinate.module()))
+                .cloned()
+                .collect();
+            (key.clone(), kept)
+        })
+        .collect()
 }
 
 /// The first configuration of `migrated` whose coordinates differ from `legacy`, and how.
@@ -276,6 +305,26 @@ mod tests {
             first_drift(&legacy, &lost).map(|(_, _, change)| change),
             Some(LockStateChange::Lost(coordinate("g:a:1")))
         );
+    }
+
+    #[test]
+    fn module_and_without_modules_drop_only_the_named_modules() {
+        let key = (LockScope::Project, configuration("compile"));
+        let state = LockState::from([(
+            key.clone(),
+            BTreeSet::from([coordinate("g:a:1"), coordinate("g:b:1")]),
+        )]);
+
+        assert_eq!(coordinate("g:a:1").module(), "g:a");
+        assert_eq!(
+            without_modules(&state, &["g:a"])[&key],
+            BTreeSet::from([coordinate("g:b:1")])
+        );
+        assert_eq!(
+            LockScope::of_unified_file_name("buildscript-gradle.lockfile"),
+            Some(LockScope::Buildscript)
+        );
+        assert!(LockScope::of_unified_file_name("compile.lockfile").is_none());
     }
 
     #[test]
