@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 - **deps-cli**: `Outcome::RequiresLockfileUpdate` carries the ecosystem, `LockfileFix::ecosystem` is removed and `LockfileDocument::Failed` gains an additive `held` array (#2116, #2120, #2128)
-- **deps-cli**: lock-only regeneration and Gradle legacy-layout migration add `Companion::{Created, Removed}`, `Removal`, `IoOperation::RemoveLegacyLockfile`, `RekeyRefusal::OriginalRequestMissing`, `RegenerationError::{LockfilePinNotKept, LockStateDrift}`, a `LegacyLayoutConflict` payload on `UnsupportedReason::LegacyLockLayout`, an additive `migration` key in the JSON lockfile document, and drop `LockfileOnlyMove` (#2113, #2102, #PRNUM)
+- **deps-cli**: lock-only regeneration and Gradle legacy-layout migration add `Companion::{Created, Removed}`, `Removal`, `IoOperation::RemoveLegacyLockfile`, `RekeyRefusal::OriginalRequestMissing`, `RegenerationError::{LockfilePinNotKept, LockStateDrift}`, a `LegacyLayoutConflict` payload on `UnsupportedReason::LegacyLockLayout`, an additive `migration` key in the JSON lockfile document, and drop `LockfileOnlyMove` (#2113, #2102, #2134)
 
 ### Added
-- **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #PRNUM)
-- **deps-cli**: `update --lockfile regenerate` migrates the legacy Gradle `gradle/dependency-locks` layout to `gradle.lockfile` behind an exact lock-state drift guard, reporting created and removed lock files (also in `--open-pr`) (#2102, #PRNUM)
-- **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #PRNUM)
+- **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #2134)
+- **deps-cli**: `update --lockfile regenerate` migrates the legacy Gradle `gradle/dependency-locks` layout to `gradle.lockfile` behind an exact lock-state drift guard, reporting created and removed lock files (also in `--open-pr`) (#2102, #2134)
+- **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #2134)
 
 ### Fixed
-- **workspace**: `semver` job excludes crates by package name present at the baseline, so renamed or moved crates are handled (#2127, #PRNUM)
+- **workspace**: `semver` job excludes crates by package name present at the baseline, so renamed or moved crates are handled (#2127, #2134)
 - **deps-cli**: `update --lockfile regenerate` writes a manifest edit held only in the retry back out of the manifest, and holds default-mode edits inside the cooldown window as `skipped` (#2115, #2117, #2128)
 - **workspace**: scheduled `semver` job excludes crates new since the baseline and allows the just-published baseline version (#2126, #2128)
 
