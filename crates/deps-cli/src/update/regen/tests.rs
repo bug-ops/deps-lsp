@@ -11,7 +11,7 @@
 //!
 //! Real `go`/`npm`/`pnpm` runs against live registries belong to the live-tester.
 
-#![allow(clippy::expect_used, clippy::panic, clippy::too_many_lines)]
+#![allow(clippy::panic, clippy::too_many_lines)]
 // Helpers serve the feature-gated cargo/npm/go tests; a partial feature build leaves them unused.
 #![cfg_attr(
     not(all(feature = "cargo", feature = "npm", feature = "go")),
@@ -2867,4 +2867,175 @@ mod interrupted {
             assert!(!alive(pid), "pid {pid} survived the interrupt");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// restore_after: which failures put the lock files back (#2118)
+// ---------------------------------------------------------------------------------------------
+
+fn held(package: &str) -> super::HeldVersion {
+    super::HeldVersion {
+        package: deps_core::PackageName::new(package),
+        version: ConcreteVersion::from("1.0.1"),
+        target: ConcreteVersion::from("1.0.0"),
+    }
+}
+
+/// The decision `restore_after` must make for `error`. The match has no wildcard arm, so a new
+/// [`RegenerationError`] variant fails to compile here until its decision is stated.
+fn expected_restore(error: &RegenerationError) -> bool {
+    match error {
+        RegenerationError::SnapshotFailed { .. } | RegenerationError::RestoreFailed { .. } => false,
+        RegenerationError::TimedOut { .. } | RegenerationError::Interrupted => cfg!(unix),
+        RegenerationError::ToolchainMissing { .. }
+        | RegenerationError::Spawn { .. }
+        | RegenerationError::ToolFailed { .. }
+        | RegenerationError::UnexpectedProbeOutput { .. }
+        | RegenerationError::UnsafeArgument { .. }
+        | RegenerationError::UnrecognizedLockfile { .. }
+        | RegenerationError::ManifestReparseFailed { .. }
+        | RegenerationError::LockfileUnreadable { .. }
+        | RegenerationError::VersionMismatch { .. }
+        | RegenerationError::CooldownHeldVersion { .. }
+        | RegenerationError::FallbackPinRejected { .. }
+        | RegenerationError::ManifestChanged { .. }
+        | RegenerationError::Io { .. }
+        | RegenerationError::FallbackPinNotKept { .. } => true,
+    }
+}
+
+#[test]
+fn test_restore_after_pins_every_regeneration_error_variant() {
+    let path = || PathBuf::from("Cargo.lock");
+    let io = || std::io::Error::other("denied");
+    let program = Program::Cargo;
+    let package = || deps_core::PackageName::new("x");
+    let version = || ConcreteVersion::from("1.0.0");
+    let samples = [
+        RegenerationError::ToolchainMissing { program },
+        RegenerationError::Spawn {
+            program,
+            source: io(),
+        },
+        RegenerationError::Interrupted,
+        RegenerationError::TimedOut {
+            after: Duration::from_secs(1),
+        },
+        RegenerationError::ToolFailed {
+            program,
+            code: Some(1),
+        },
+        RegenerationError::UnexpectedProbeOutput { program },
+        RegenerationError::UnsafeArgument {
+            package: "x".into(),
+        },
+        RegenerationError::UnrecognizedLockfile { path: path() },
+        RegenerationError::ManifestReparseFailed { path: path() },
+        RegenerationError::LockfileUnreadable { path: path() },
+        RegenerationError::VersionMismatch {
+            package: package(),
+            expected: version(),
+            found: None,
+        },
+        RegenerationError::CooldownHeldVersion {
+            first: held("x"),
+            rest: Vec::new(),
+        },
+        RegenerationError::SnapshotFailed { path: path() },
+        RegenerationError::RestoreFailed {
+            cause: Box::new(RegenerationError::Interrupted),
+            path: path(),
+            source: io(),
+        },
+        RegenerationError::FallbackPinRejected {
+            package: package(),
+            target: version(),
+            code: Some(1),
+        },
+        RegenerationError::ManifestChanged { path: path() },
+        RegenerationError::Io {
+            operation: super::IoOperation::RewriteLockfile,
+            path: path(),
+            source: io(),
+        },
+        RegenerationError::FallbackPinNotKept {
+            package: package(),
+            target: version(),
+            path: path(),
+            reason: super::RekeyRefusal::PinnedEntryMissing,
+        },
+    ];
+    for error in &samples {
+        assert_eq!(
+            super::restore_after(error),
+            expected_restore(error),
+            "{error:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// rekey_lock: the lock rewrite fails after the rename succeeded (#2112)
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(feature = "npm")]
+#[test]
+fn test_rekey_lock_write_failure_is_reported_as_the_lockfile_rewrite() {
+    use super::fallback::DescriptorLock;
+    use super::rekey::LockRekey;
+    use super::{IoOperation, Session};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lockfile = dir.path().join("yarn.lock");
+    let original = "\"x@npm:1.2.8\":\n  version: 1.2.8\n";
+    std::fs::write(&lockfile, original).expect("write lock");
+    let ecosystem = ecosystem(EcosystemId::Npm);
+    let manifest = dir.path().join("package.json");
+    let uri = Url::from_file_path(&manifest).expect("file url");
+    let display_path = PathBuf::from("package.json");
+    let target = ManifestTarget {
+        ecosystem: &ecosystem,
+        manifest_path: &manifest,
+        display_path: &display_path,
+        uri: &uri,
+        original: super::OriginalManifest::new(""),
+    };
+    let runner = inherit_runner();
+    let snapshot = std::sync::OnceLock::new();
+    let session = Session {
+        target: &target,
+        runner: &runner,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+        pins: &[],
+        manifest_dir: dir.path(),
+        snapshot: &snapshot,
+        scope: LockfileScope::Unrestricted,
+    };
+    let rekeys = [LockRekey {
+        package: deps_core::PackageName::new("x"),
+        pinned: ConcreteVersion::from("1.2.8"),
+        declared: deps_core::VersionReq::new("^1.2.5"),
+    }];
+    let mut attempted = None;
+
+    let error = session
+        .rekey_lock(DescriptorLock::YarnBerry, &lockfile, &rekeys, |_, bytes| {
+            attempted = Some(String::from_utf8_lossy(bytes).into_owned());
+            Err(std::io::Error::other("denied"))
+        })
+        .expect_err("the write fails");
+
+    assert_matches!(
+        error,
+        RegenerationError::Io {
+            operation: IoOperation::RewriteLockfile,
+            ..
+        }
+    );
+    assert_eq!(
+        attempted.as_deref(),
+        Some("\"x@npm:^1.2.5\":\n  version: 1.2.8\n"),
+        "the rename succeeded before the write failed"
+    );
+    assert_eq!(std::fs::read_to_string(&lockfile).expect("read"), original);
 }

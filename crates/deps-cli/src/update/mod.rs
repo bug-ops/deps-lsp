@@ -205,15 +205,15 @@ pub struct PlannedUpdateItem {
     /// The dependency's role in its manifest; `None` when unknown.
     pub dependency_kind: Option<deps_core::DependencyKind>,
     /// Evidence for regenerating and settling a [`Outcome::RequiresLockfileUpdate`] item; written
-    /// only by the security planner (`affected`, `cooldown_held`, `ecosystem`) and the
+    /// by the planners (`affected` by the security planner, `cooldown_held` by both) and the
     /// regeneration settlement (`lockfile`), and meaningful only for that outcome.
     pub(crate) lockfile_fix: LockfileFix,
 }
 
 /// What a regeneration may do to a [`Outcome::RequiresLockfileUpdate`] item.
 ///
-/// Meaningful only for [`Outcome::RequiresLockfileUpdate`] items and, for `cooldown_held`,
-/// `cooldown_window` and `ecosystem`, `--security-only` [`Outcome::Applied`] items; every other
+/// Meaningful only for [`Outcome::RequiresLockfileUpdate`] items and, for `cooldown_held`
+/// and `cooldown_window`, [`Outcome::Applied`] items; every other
 /// outcome keeps the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockfileFix {
@@ -228,11 +228,22 @@ pub struct LockfileFix {
     /// The cooldown window [`Self::cooldown_held`] was judged against; `None` when freshness is
     /// disabled.
     pub cooldown_window: Option<deps_core::CooldownWindow>,
-    /// The dependency's ecosystem, which decides the tools the reason may name; `None` until the
-    /// planner records it.
-    pub ecosystem: Option<deps_core::EcosystemId>,
+    /// What an `Applied` item becomes when a regeneration resolves it inside the cooldown window.
+    pub held_edit: HeldEdit,
     /// Where the regenerated lock file left the dependency.
     pub lockfile: LockfileState,
+}
+
+/// What a regeneration turns an `Applied` item into when the tool resolves it to a version inside
+/// the freshness cooldown window, set by the planner that made the item.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HeldEdit {
+    /// `--security-only`: [`UnfixableReason::ResolvesWithinCooldown`], which fails the run.
+    #[default]
+    Unfixable,
+    /// Default mode: [`SkipReason::WithinFreshnessCooldown`], the same exit-0 pause the planner
+    /// reports for a release it sees inside the window.
+    Skip,
 }
 
 /// Where a regeneration left a [`Outcome::RequiresLockfileUpdate`] item's lock-file entry.
@@ -247,6 +258,51 @@ pub enum LockfileState {
     /// The tool resolved it to this newer in-range version, which is inside the cooldown
     /// window, so the lock file was not moved to it.
     HeldByCooldown(deps_core::ConcreteVersion),
+}
+
+/// The published versions of `key` that are inside the cooldown window at `analysis.now`, by the
+/// shared precedence rule (an active GOSSIP finding when the analysis has any, else the local
+/// window).
+///
+/// A version without a known publish time is never held, matching the freshness signal elsewhere.
+/// Without per-version publish times only `latest` can be judged.
+pub(crate) fn cooldown_held_versions(
+    analysis: &ManifestAnalysis,
+    key: &PackageKey,
+    freshness: deps_core::FreshnessSettings,
+) -> Vec<deps_core::ConcreteVersion> {
+    let Some(cooldown) = freshness.cooldown() else {
+        return Vec::new();
+    };
+    let Some(versions) = analysis.cached_versions.get(key.normalized()) else {
+        return Vec::new();
+    };
+    let published: Vec<_> = if versions.publish_times.len() == versions.available.len() {
+        versions
+            .available
+            .iter()
+            .zip(versions.publish_times.iter().copied())
+            .collect()
+    } else {
+        vec![(&versions.latest, versions.published_at)]
+    };
+    published
+        .into_iter()
+        .filter(|(version, published_at)| {
+            matches!(
+                deps_core::lsp_helpers::cooldown_precedence(
+                    Some(&analysis.gossip_findings),
+                    key.normalized(),
+                    version.as_str(),
+                    *published_at,
+                    cooldown,
+                    analysis.now,
+                ),
+                deps_core::lsp_helpers::CooldownPrecedence::Blocked(_)
+            )
+        })
+        .map(|(version, _)| version.clone())
+        .collect()
 }
 
 /// Why a fix was withheld: the tool resolved `version`, which is inside the cooldown window.
@@ -264,24 +320,36 @@ fn held_reason(
 }
 
 impl LockfileFix {
+    /// Records the versions of `key` inside the cooldown window and the window they were judged
+    /// against.
+    pub(crate) fn record_cooldown(
+        &mut self,
+        analysis: &ManifestAnalysis,
+        key: &PackageKey,
+        freshness: deps_core::FreshnessSettings,
+        held_edit: HeldEdit,
+    ) {
+        self.cooldown_held = cooldown_held_versions(analysis, key, freshness);
+        self.cooldown_window = freshness.cooldown();
+        self.held_edit = held_edit;
+    }
+
     /// The reason text of a [`Outcome::RequiresLockfileUpdate`] item, given the generic `base`
     /// reason. Names only the tools of the item's ecosystem that can move a lock file alone, and
     /// no tool when there are none.
-    fn reason(&self, base: &str) -> String {
+    fn reason(&self, base: &str, ecosystem: deps_core::EcosystemId) -> String {
         match &self.lockfile {
             LockfileState::MovedTo(version) => format!(
                 "the lock file now resolves {version}, a newer in-range version that could not be \
                  confirmed outside the advisory's affected ranges; review it manually"
             ),
             LockfileState::HeldByCooldown(version) => held_reason(version, self.cooldown_window),
-            LockfileState::Untouched => {
-                match self.ecosystem.and_then(regen::lockfile_only_tools_text) {
-                    Some(tools) => format!(
-                        "{base} (deps-cli can do it with --lockfile regenerate for {tools})"
-                    ),
-                    None => base.to_owned(),
+            LockfileState::Untouched => match regen::lockfile_only_tools_text(ecosystem) {
+                Some(tools) => {
+                    format!("{base} (deps-cli can do it with --lockfile regenerate for {tools})")
                 }
-            }
+                None => base.to_owned(),
+            },
         }
     }
 }
@@ -370,6 +438,8 @@ pub enum Outcome {
     RequiresLockfileUpdate {
         /// The already-admitted fix target.
         target: ConcreteVersion,
+        /// The dependency's ecosystem, which decides the lock-file tools the reason may name.
+        ecosystem: deps_core::EcosystemId,
     },
     /// (`--security-only` only) No verified fix could be written, for [`UnfixableReason`].
     /// Contributes to exit 1.
@@ -470,9 +540,10 @@ pub enum UnfixableReason {
         /// The fix target that has no release tag.
         target: ConcreteVersion,
     },
-    /// (`--lockfile regenerate`) Writing the fix edit made the package manager resolve a newer
-    /// version inside the freshness cooldown window, so the edit was withheld and the manifest
-    /// written back without it.
+    /// (`--lockfile regenerate`, `--security-only`) Writing the fix edit made the package manager
+    /// resolve a newer version inside the freshness cooldown window, so the edit was withheld and
+    /// the manifest written back without it. Default mode reports the same hold as
+    /// [`SkipReason::WithinFreshnessCooldown`] instead.
     ResolvesWithinCooldown {
         /// The fix target whose edit was withheld.
         target: ConcreteVersion,
@@ -504,7 +575,7 @@ impl Outcome {
         match self {
             Self::Applied { target, .. }
             | Self::AppliedViaLockfile { target }
-            | Self::RequiresLockfileUpdate { target } => Some(target),
+            | Self::RequiresLockfileUpdate { target, .. } => Some(target),
             Self::Skipped { target, .. } => target.as_ref(),
             Self::Unfixable(
                 UnfixableReason::Yanked { target }
@@ -607,6 +678,29 @@ impl PlannedUpdateItem {
                 SkipReason::NotSafelyEditable(_) => true,
             },
             Outcome::RequiresLockfileUpdate { .. } | Outcome::Unfixable(_) => true,
+        }
+    }
+
+    /// The reason text of this item's outcome given the generic `base` reason: the lock-file
+    /// evidence replaces `base` where the outcome carries any.
+    fn outcome_reason(&self, base: &str) -> String {
+        match &self.outcome {
+            Outcome::RequiresLockfileUpdate { ecosystem, .. } => {
+                self.lockfile_fix.reason(base, *ecosystem)
+            }
+            Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown { resolved, .. }) => {
+                held_reason(resolved, self.lockfile_fix.cooldown_window)
+            }
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            } => match &self.lockfile_fix.lockfile {
+                LockfileState::HeldByCooldown(held) => {
+                    held_reason(held, self.lockfile_fix.cooldown_window)
+                }
+                LockfileState::Untouched | LockfileState::MovedTo(_) => base.to_owned(),
+            },
+            _ => base.to_owned(),
         }
     }
 
@@ -724,13 +818,7 @@ impl PlannedUpdateItem {
                 "the fix edit was withheld: the package manager would resolve a version inside the freshness cooldown window"
             }
         };
-        let mut reason = match &self.outcome {
-            Outcome::RequiresLockfileUpdate { .. } => self.lockfile_fix.reason(base),
-            Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown { resolved, .. }) => {
-                held_reason(resolved, self.lockfile_fix.cooldown_window)
-            }
-            _ => base.to_string(),
-        };
+        let mut reason = self.outcome_reason(base);
         if self.ignore_rule_overridden {
             reason.push_str(" (a matching [update].ignore rule was overridden by --security-only)");
         }
@@ -1100,7 +1188,7 @@ pub fn plan_updates(
          key: OccurrenceKey,
          dep: Option<&dyn FormattedDependency<'_>>,
          fallback_by_key: &mut HashMap<OccurrenceKey, UpdateCandidate>| {
-            resolve_occurrence(
+            let item = resolve_occurrence(
                 candidate,
                 key,
                 fallback_by_key,
@@ -1114,7 +1202,8 @@ pub fn plan_updates(
                 freshness,
                 &vuln_keys,
                 now,
-            )
+            );
+            with_cooldown_held(item, dep, analysis, freshness)
         };
     analysis
         .parse_result
@@ -1377,6 +1466,22 @@ fn writable_fallback_edit(
     let retry =
         fallback_edit_excludes_newer(formatter, reparse, content, dep, &exact, target, available);
     matches!(retry, FallbackEditVerdict::Writable).then_some(exact)
+}
+
+/// Records, on a default-mode `Applied` item, the versions inside the cooldown window that the
+/// package manager could still resolve past its target (#2115), so a regeneration rejects them.
+fn with_cooldown_held(
+    mut item: PlannedUpdateItem,
+    dep: Option<&dyn FormattedDependency<'_>>,
+    analysis: &ManifestAnalysis,
+    freshness: deps_core::FreshnessSettings,
+) -> PlannedUpdateItem {
+    if let (Some(dep), Outcome::Applied { .. }) = (dep, &item.outcome) {
+        let key = PackageKey::new(dep.dependency().name(), analysis.parse_result.formatter());
+        item.lockfile_fix
+            .record_cooldown(analysis, &key, freshness, HeldEdit::Skip);
+    }
+    item
 }
 
 /// Spec 075 FR-007: the unified per-occurrence planner pipeline. Builds `latest_candidate`'s
@@ -2215,6 +2320,59 @@ mod tests {
             crate::exit::EXIT_CLEAN,
             "an automatic freshness-cooldown pause must not fail the run"
         );
+    }
+
+    /// #2115: a default-mode `Applied` item records the versions inside the cooldown window that
+    /// the package manager could still resolve past its target, so a regeneration can reject them.
+    #[test]
+    fn test_plan_updates_applied_item_records_the_cooldown_held_versions() {
+        let content = "serde = \"1.0.0\"\n";
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let window = deps_core::CooldownWindow::from_secs(2_000);
+        let mut versions = cached("serde", "1.0.1");
+        versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::new(
+                ConcreteVersion::from("1.0.1"),
+                std::sync::Arc::from(vec![
+                    ConcreteVersion::from("1.0.2"),
+                    ConcreteVersion::from("1.0.1"),
+                ]),
+            )
+            .with_published_at(deps_core::PublishTime::from_unix_secs(1_000))
+            .with_publish_times(std::sync::Arc::from(vec![
+                Some(deps_core::PublishTime::from_unix_secs(9_500)),
+                Some(deps_core::PublishTime::from_unix_secs(1_000)),
+            ])),
+        );
+        let mut analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+        analysis.now = now;
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &never_reparse,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings::Enabled { cooldown: window },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
+        assert_eq!(
+            plan.items[0].lockfile_fix.cooldown_held,
+            vec![ConcreteVersion::from("1.0.2")]
+        );
+        assert_eq!(plan.items[0].lockfile_fix.cooldown_window, Some(window));
+        assert_eq!(plan.items[0].lockfile_fix.held_edit, HeldEdit::Skip);
     }
 
     /// The same fixture, but `freshness.enabled = false`: the cooldown filter must be a

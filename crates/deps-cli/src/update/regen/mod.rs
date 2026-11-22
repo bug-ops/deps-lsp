@@ -54,8 +54,8 @@ pub(in crate::update) use run::{ChildGuard, ProcessGroup};
 use run::{SearchPath, ToolRunner};
 
 use super::{
-    CooldownFallbackNote, CurrentVersion, LockfileState, Outcome, UnfixableReason, UpdatePlan,
-    UpdateRun,
+    CooldownFallbackNote, CurrentVersion, HeldEdit, LockfileState, Outcome, SkipReason,
+    UnfixableReason, UpdatePlan, UpdateRun,
 };
 use crate::format::DryRun;
 
@@ -765,7 +765,7 @@ fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<Lo
     for item in &plan.items {
         let (target, origin) = match &item.outcome {
             Outcome::Applied { target, .. } => (target, PinOrigin::ManifestEdit),
-            Outcome::RequiresLockfileUpdate { target } => (
+            Outcome::RequiresLockfileUpdate { target, .. } => (
                 target,
                 PinOrigin::LockfileOnly {
                     locked: match &item.current {
@@ -886,8 +886,9 @@ async fn regenerate_planned(
 }
 
 /// Withholds every fix `held` names: an `Applied` item becomes `Unfixable(ResolvesWithinCooldown)`
-/// (its edit is written back out of the manifest), a lock-file-only item stays as it is; both
-/// record the version the tool resolved.
+/// (`--security-only`) or `Skipped(WithinFreshnessCooldown)` (default mode), per its
+/// [`HeldEdit`], and its edit is written back out of the manifest; a lock-file-only item stays as
+/// it is; both record the version the tool resolved.
 fn withhold(plan: &mut UpdatePlan, held: &[HeldVersion], formatter: &dyn EcosystemFormatter) {
     for item in &mut plan.items {
         let Outcome::Applied { target, .. } = &item.outcome else {
@@ -895,10 +896,18 @@ fn withhold(plan: &mut UpdatePlan, held: &[HeldVersion], formatter: &dyn Ecosyst
         };
         if let Some(entry) = held_entry(held, formatter, item.name.as_str(), target) {
             item.lockfile_fix.lockfile = LockfileState::HeldByCooldown(entry.version.clone());
-            item.outcome = Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown {
-                target: target.clone(),
-                resolved: entry.version.clone(),
-            });
+            item.outcome = match item.lockfile_fix.held_edit {
+                HeldEdit::Unfixable => {
+                    Outcome::Unfixable(UnfixableReason::ResolvesWithinCooldown {
+                        target: target.clone(),
+                        resolved: entry.version.clone(),
+                    })
+                }
+                HeldEdit::Skip => Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    target: Some(target.clone()),
+                },
+            };
         }
     }
     mark_held(plan, held, formatter);
@@ -908,7 +917,7 @@ fn withhold(plan: &mut UpdatePlan, held: &[HeldVersion], formatter: &dyn Ecosyst
 /// resolved it to a version inside the cooldown window.
 fn mark_held(plan: &mut UpdatePlan, held: &[HeldVersion], formatter: &dyn EcosystemFormatter) {
     for item in &mut plan.items {
-        let Outcome::RequiresLockfileUpdate { target } = &item.outcome else {
+        let Outcome::RequiresLockfileUpdate { target, .. } = &item.outcome else {
             continue;
         };
         if let Some(entry) = held_entry(held, formatter, item.name.as_str(), target) {
@@ -983,7 +992,7 @@ fn settle_lockfile_only(
         return;
     };
     for item in &mut plan.items {
-        let Outcome::RequiresLockfileUpdate { target } = &item.outcome else {
+        let Outcome::RequiresLockfileUpdate { target, .. } = &item.outcome else {
             continue;
         };
         let name = formatter.normalize_package_name(&PackageName::new(item.name.as_str()));
@@ -1067,8 +1076,9 @@ async fn regenerate_run_with(
 /// The outcome of [`regenerate_until`], with the pins it left out of a retry.
 struct RegenerationRun {
     lockfile: LockfileOutcome,
-    /// Lock-file-only pins the first attempt resolved inside the cooldown window; the retry
-    /// regenerated without them.
+    /// Pins left out of the manifest or lock file because a tool resolved them inside the
+    /// cooldown window: the lock-file-only ones and the edits of the first attempt, which the
+    /// retry regenerated without, and the edits the retry held again.
     retried: Vec<HeldVersion>,
 }
 
@@ -1110,12 +1120,7 @@ async fn regenerate_until(
         return RegenerationRun::plain(first);
     };
     let held: Vec<HeldVersion> = std::iter::once(held).chain(rest).cloned().collect();
-    let is_held = |pin: &LockPin| {
-        held.iter().any(|entry| {
-            entry.target == pin.target
-                && formatter.normalize_package_name(&entry.package) == pin.normalized
-        })
-    };
+    let is_held = |pin: &LockPin| names_pin(&held, formatter, pin);
     let mut retry_plan = plan.clone();
     withhold(&mut retry_plan, &held, formatter);
     if pins
@@ -1144,9 +1149,60 @@ async fn regenerate_until(
         interrupt.as_mut(),
     )
     .await;
+    let mut withheld = held;
+    withheld.extend(retry_held_edits(
+        &second,
+        &remaining,
+        target,
+        &retry_plan,
+        formatter,
+    ));
     RegenerationRun {
         lockfile: second,
-        retried: held,
+        retried: withheld,
+    }
+}
+
+/// Whether `held` names the pin's package at the pin's fix target.
+fn names_pin(held: &[HeldVersion], formatter: &dyn EcosystemFormatter, pin: &LockPin) -> bool {
+    held.iter().any(|entry| {
+        entry.target == pin.target
+            && formatter.normalize_package_name(&entry.package) == pin.normalized
+    })
+}
+
+/// The manifest edits the retry held again, written back out of the manifest like the first
+/// attempt's; empty when the retry did not hold an edit or the manifest could not be rewritten.
+fn retry_held_edits(
+    second: &LockfileOutcome,
+    remaining: &[LockPin],
+    target: &ManifestTarget<'_>,
+    retry_plan: &UpdatePlan,
+    formatter: &dyn EcosystemFormatter,
+) -> Vec<HeldVersion> {
+    let LockfileOutcome::Failed(RegenerationError::CooldownHeldVersion { first, rest }) = second
+    else {
+        return Vec::new();
+    };
+    let edits: Vec<HeldVersion> = std::iter::once(first)
+        .chain(rest)
+        .filter(|entry| {
+            let held = std::slice::from_ref(*entry);
+            remaining
+                .iter()
+                .any(|pin| !pin.is_lockfile_only() && names_pin(held, formatter, pin))
+        })
+        .cloned()
+        .collect();
+    if edits.is_empty() {
+        return edits;
+    }
+    let mut final_plan = retry_plan.clone();
+    withhold(&mut final_plan, &edits, formatter);
+    if rewrite_without_held_edits(target, retry_plan, &final_plan) {
+        edits
+    } else {
+        Vec::new()
     }
 }
 

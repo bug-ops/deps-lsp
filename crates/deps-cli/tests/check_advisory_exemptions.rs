@@ -8,7 +8,8 @@
 //! `advisory_exemptions: Arc<OperatorExemptions>`.
 
 #![cfg(feature = "cargo")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::Path;
 use std::sync::Arc;

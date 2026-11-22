@@ -1,7 +1,7 @@
 //! Pipfile.lock edge cases (#1926, spec 093): an entry that is not an exact `==` pin is skipped,
 //! never fabricated, and never fails the whole file.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::{LockFileProvider, ResolvedPackages};
 use deps_pypi::PypiLockParser;

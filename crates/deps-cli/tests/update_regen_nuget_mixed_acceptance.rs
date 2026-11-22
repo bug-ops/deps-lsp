@@ -9,7 +9,7 @@
 //! `dotnet` records its calls (see `common/regen_harness.rs`).
 
 #![cfg(all(unix, feature = "nuget"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;
@@ -58,6 +58,17 @@ fn mixed_case<'a>(csproj: &'a str, old_lock: &'a str, body: &'a str, bumps: &'a 
     }
 }
 
+const PINS_LINE: &str = "reported pins: ";
+
+/// The packages of the regenerated lock file's pin reports, as the child listed them.
+fn reported_pins(outcome: &str) -> Vec<&str> {
+    outcome
+        .lines()
+        .find_map(|line| line.strip_prefix(PINS_LINE))
+        .map(|names| names.split(',').filter(|name| !name.is_empty()).collect())
+        .expect("the child lists the reported pins")
+}
+
 fn restore_calls(ran: &Ran) -> Vec<&String> {
     ran.calls_of("dotnet")
         .into_iter()
@@ -91,8 +102,9 @@ fn nuget_mixed_plan_regenerates_for_the_edit_pins_and_leaves_the_lock_only_pin_u
         ran.calls
     );
     assert!(ran.outcome.contains("Newtonsoft.Json"), "{}", ran.outcome);
-    assert!(
-        !ran.outcome.contains("Serilog"),
+    assert_eq!(
+        reported_pins(&ran.outcome),
+        ["Newtonsoft.Json"],
         "the lock-only pin is not reported as applied: {}",
         ran.outcome
     );
@@ -150,6 +162,7 @@ async fn mixed_child_main() {
             let outcome = if kind == "lock" {
                 Outcome::RequiresLockfileUpdate {
                     target: ConcreteVersion::from(target),
+                    ecosystem: id,
                 }
             } else {
                 let (line_no, text) = content
@@ -211,8 +224,20 @@ async fn mixed_child_main() {
     };
     let gate = RegenerationGate::new(LockfileMode::Regenerate, DryRun::No, NetworkMode::Online);
     let run = regenerate_lockfile(plan, &target, gate).await;
+    use deps_cli::update::regen::LockfileOutcome;
+    let reported = match &run.lockfile {
+        LockfileOutcome::Regenerated { pins, .. } => pins
+            .iter()
+            .map(|pin| pin.package.as_str().to_owned())
+            .collect::<Vec<_>>()
+            .join(","),
+        LockfileOutcome::Skipped(_)
+        | LockfileOutcome::NotApplicable(_)
+        | LockfileOutcome::Unsupported { .. }
+        | LockfileOutcome::Failed(_) => String::new(),
+    };
     println!(
-        "{}{:?}{}",
+        "{}{:?}\n{PINS_LINE}{reported}{}",
         harness::OUTCOME_OPEN,
         run.lockfile,
         harness::OUTCOME_CLOSE

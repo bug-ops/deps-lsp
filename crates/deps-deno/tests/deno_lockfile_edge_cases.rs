@@ -1,6 +1,6 @@
 //! deno.lock edge cases (#1924, spec 091).
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::{LockFileProvider, ResolvedPackages};
 use deps_deno::DenoLockParser;

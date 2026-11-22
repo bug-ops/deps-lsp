@@ -11,7 +11,8 @@
 //! and OSV is asked about it.
 
 #![cfg(feature = "npm")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

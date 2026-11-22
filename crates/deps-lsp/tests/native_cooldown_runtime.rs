@@ -6,7 +6,8 @@
 //! registry is a `mockito` sparse index reached through `[source.crates-io] replace-with`.
 
 #![cfg(feature = "cargo")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::PathBuf;
 use std::time::Duration;

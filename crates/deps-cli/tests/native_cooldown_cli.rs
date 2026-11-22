@@ -9,7 +9,8 @@
 //! kept and annotated; the OSV request count never changes (NFR-004).
 
 #![cfg(feature = "cargo")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

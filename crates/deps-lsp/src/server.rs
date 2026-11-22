@@ -6981,7 +6981,7 @@ let package = Package(
 /// `gradle/dependency-locks/<configuration>.lockfile` set through `workspace/didChangeWatchedFiles`.
 #[cfg(all(test, feature = "gradle"))]
 mod gradle_legacy_watch_tests {
-    #![allow(clippy::unwrap_used, reason = "test code")]
+    #![expect(clippy::unwrap_used, reason = "test code")]
 
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};

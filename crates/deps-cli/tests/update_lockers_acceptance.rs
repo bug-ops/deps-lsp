@@ -18,7 +18,7 @@
     feature = "deno",
     feature = "go"
 ))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

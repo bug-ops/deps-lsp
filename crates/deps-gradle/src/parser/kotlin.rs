@@ -15,27 +15,27 @@ use url::Url;
 /// (optional whitespace between the configuration word and the opening paren)
 // Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_WITH_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(\w+)\s*\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)"#).expect("RE_WITH_VERSION")
 });
 /// Matches: implementation("group:artifact") — no version
 /// (optional whitespace between the configuration word and the opening paren)
 // Same guarantee as RE_WITH_VERSION above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(\w+)\s*\(\s*"([^:"\s]+):([^:"\s]+)"\s*\)"#).expect("RE_NO_VERSION")
 });
 /// Matches: implementation(platform("group:artifact:version")) / enforcedPlatform(...)
 // Same guarantee as RE_WITH_VERSION above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_PLATFORM_WITH_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(\w+)\s*\(\s*(?:platform|enforcedPlatform)\s*\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)\s*\)"#)
         .expect("RE_PLATFORM_WITH_VERSION")
 });
 /// Matches: implementation(platform("group:artifact")) — no version
 // Same guarantee as RE_WITH_VERSION above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(\w+)\s*\(\s*(?:platform|enforcedPlatform)\s*\(\s*"([^:"\s]+):([^:"\s]+)"\s*\)\s*\)"#,

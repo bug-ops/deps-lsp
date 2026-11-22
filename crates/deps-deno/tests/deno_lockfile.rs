@@ -4,7 +4,7 @@
 //! requests merged into one key), so resolution must match by package name, never by the
 //! exact manifest specifier.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::assert_matches;
 use std::path::Path;

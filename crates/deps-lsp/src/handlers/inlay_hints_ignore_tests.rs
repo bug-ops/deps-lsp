@@ -2,7 +2,6 @@
 //! the plain version label is dropped, never an in-use advisory flag or a flagged latest.
 
 #![cfg(all(test, feature = "cargo"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
 use crate::test_utils::test_helpers::{ADVISORY_ID, advisory_state, create_test_client_and_config};

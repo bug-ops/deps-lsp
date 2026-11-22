@@ -148,8 +148,10 @@ jobs:
         include:
           - name: workspace
             # `--no-dev-deps` keeps this 15-crate sweep fast; crates below that need their
-            # test targets linted per feature get a dedicated `--all-targets` leg.
-            run: cargo hack clippy --workspace --each-feature --no-dev-deps --keep-going -- -D warnings
+            # test targets linted per feature get a dedicated `--all-targets` leg. Stripping dev-deps
+            # makes cargo warn about unused workspace dependencies, which `build.warnings = "deny"`
+            # (.cargo/config.toml) would turn into an error; `-D warnings` still denies lints.
+            run: CARGO_BUILD_WARNINGS=warn cargo hack clippy --workspace --each-feature --no-dev-deps --keep-going -- -D warnings
           - name: deps-lsp
             # #998/#1001: its `#[cfg(test)]` module and helpers must compile and lint clean
             # under every reduced feature set.
@@ -748,17 +750,34 @@ jobs:
           echo "Release type: ${release_type} (baseline major ${base_major:-unknown}, head major ${head_major:-unknown})"
           echo "release_type=${release_type}" >> "$GITHUB_OUTPUT"
 
+          # A crate added after the baseline has nothing to compare against, and cargo-semver-checks
+          # aborts the whole run with "package not found" instead of skipping it (#2126).
+          workspace_root=$(pwd)
+          exclude=""
+          while IFS=$'\t' read -r name manifest; do
+            if ! git cat-file -e "${rev}:${manifest#"${workspace_root}"/}" 2>/dev/null; then
+              exclude="${exclude:+${exclude},}${name}"
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | [.name, .manifest_path] | @tsv')
+          echo "Excluded (new since baseline): ${exclude:-none}"
+          echo "exclude=${exclude}" >> "$GITHUB_OUTPUT"
+
       - name: Check semver against the baseline revision
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239  # v2.9
         with:
           feature-group: all-features
           baseline-rev: ${{ steps.baseline.outputs.rev }}
+          exclude: ${{ steps.baseline.outputs.exclude }}
           release-type: ${{ steps.baseline.outputs.release_type }}
 
       # Build health only: `release-type: major` allows every break, so this fails solely when
-      # the workspace no longer builds its rustdoc against the published 2.x line.
+      # the workspace no longer builds its rustdoc against the published release line.
+      # `.cargo/config.toml` sets `global-min-publish-age`, which rejects a just-published
+      # `=X.Y.Z` baseline; the baseline is a fixed release, so the age gate is lifted (#2123).
       - name: Check the published crates still build as a baseline
         if: ${{ !cancelled() && github.event_name == 'schedule' }}
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239  # v2.9
         with:
           feature-group: all-features
@@ -1166,7 +1185,9 @@ jobs:
         if: matrix.use_cross_tool
         env:
           CROSS_CONFIG: .github/Cross.toml
-        run: cross build --workspace --target ${{ matrix.target }}
+        # The cross linker wrapper prints to stderr, which rustc reports as a `linker_messages`
+        # warning; `--config` reaches cargo inside the container, an env var would not.
+        run: cross build --workspace --target ${{ matrix.target }} --config 'build.warnings="warn"'
 
       # Populates the cache path for the `actions/cache` step above to pick up and
       # upload at job end (its automatic post-step). Skipped on a cache hit (no new

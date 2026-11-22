@@ -212,7 +212,12 @@ impl Session<'_> {
             },
         )?;
         if let Relax::Rekey(lock) = run.relax {
-            self.rekey_lock(lock, run.lockfile, &pinned.rekeys)?;
+            self.rekey_lock(
+                lock,
+                run.lockfile,
+                &pinned.rekeys,
+                deps_core::fs_probe::write_atomic_bytes,
+            )?;
         }
         self.runner.run(run.install, self.deadline).await?;
         self.restore_formatting(std::iter::once(&original).chain(run.siblings))?;
@@ -226,12 +231,13 @@ impl Session<'_> {
     /// # Errors
     ///
     /// [`RegenerationError::FallbackPinNotKept`] for the first pin the lock does not hold in a
-    /// renameable form, and [`RegenerationError::Io`] when the lock file cannot be rewritten.
-    fn rekey_lock(
+    /// renameable form, and [`RegenerationError::Io`] when `write` cannot rewrite the lock file.
+    pub(super) fn rekey_lock(
         &self,
         lock: DescriptorLock,
         lockfile: &Path,
         rekeys: &[LockRekey],
+        write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
     ) -> Result<(), RegenerationError> {
         if rekeys.is_empty() {
             return Ok(());
@@ -246,26 +252,20 @@ impl Session<'_> {
         .ok_or_else(|| RegenerationError::LockfileUnreadable {
             path: display.clone(),
         })?;
-        let mut renamed = text;
-        for rekey in rekeys {
-            let one = std::slice::from_ref(rekey);
-            renamed = match lock {
-                DescriptorLock::YarnBerry => rekey::yarn(&renamed, one),
-                DescriptorLock::Deno => rekey::deno(&renamed, one),
-            }
-            .map_err(|reason| RegenerationError::FallbackPinNotKept {
-                package: rekey.package.clone(),
-                target: rekey.pinned.clone(),
-                path: display.clone(),
-                reason,
-            })?;
+        let renamed = match lock {
+            DescriptorLock::YarnBerry => rekey::yarn(&text, rekeys),
+            DescriptorLock::Deno => rekey::deno(&text, rekeys),
         }
-        deps_core::fs_probe::write_atomic_bytes(lockfile, renamed.as_bytes()).map_err(|source| {
-            RegenerationError::Io {
-                operation: IoOperation::RewriteLockfile,
-                path: display,
-                source,
-            }
+        .map_err(|refused| RegenerationError::FallbackPinNotKept {
+            package: refused.rekey.package.clone(),
+            target: refused.rekey.pinned.clone(),
+            path: display.clone(),
+            reason: refused.reason,
+        })?;
+        write(lockfile, renamed.as_bytes()).map_err(|source| RegenerationError::Io {
+            operation: IoOperation::RewriteLockfile,
+            path: display,
+            source,
         })
     }
 

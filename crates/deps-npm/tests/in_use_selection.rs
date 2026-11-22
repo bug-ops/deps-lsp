@@ -12,7 +12,7 @@
 //! is covered in `owner_aware_selection.rs`.
 
 // Test code: workspace-level `clippy::unwrap_used` is meant for library code (#689).
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::LockFileProvider;
 use deps_core::{EcosystemId, PackageKey};

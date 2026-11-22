@@ -1,11 +1,6 @@
 //! Regression test for #2022: a `didChange` that started under one open of a document must not
 //! commit over a later open of the same URI.
 #![cfg(feature = "npm")]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test code; clippy's allow-*-in-tests does not see this integration test crate"
-)]
 
 use std::sync::Arc;
 

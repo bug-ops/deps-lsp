@@ -5,13 +5,15 @@
 //! `serde_json::Value`, because key order depends on serde_json's `preserve_order` feature, which
 //! only some feature combinations enable.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::path::PathBuf;
 
 use deps_cli::format::DryRun;
 use deps_cli::format::json::update_to_document;
-use deps_cli::update::regen::{LockfileOutcome, Program, RegenerationError, UnsupportedReason};
+use deps_cli::update::regen::{
+    HeldVersion, LockfileOutcome, Program, RegenerationError, UnsupportedReason,
+};
 use deps_cli::update::{UpdatePlan, UpdateRun};
 use deps_core::{ConcreteVersion, PackageName};
 use serde_json::json;
@@ -188,4 +190,41 @@ fn manifest_changed_token() {
             "found": null
         })
     );
+}
+
+fn held(package: &str, version: &str) -> HeldVersion {
+    HeldVersion {
+        package: PackageName::new(package),
+        version: ConcreteVersion::from(version),
+        target: ConcreteVersion::from("1.0.0"),
+    }
+}
+
+#[test]
+fn cooldown_held_version_lists_every_held_pin_first_included() {
+    let document = lockfile_json(LockfileOutcome::Failed(
+        RegenerationError::CooldownHeldVersion {
+            first: held("react", "16.2.0"),
+            rest: vec![held("lodash", "4.17.22")],
+        },
+    ));
+
+    assert_eq!(document["package"], json!("react"));
+    assert_eq!(document["found"], json!("16.2.0"));
+    assert_eq!(
+        document["held"],
+        json!([
+            {"package": "react", "found": "16.2.0"},
+            {"package": "lodash", "found": "4.17.22"}
+        ])
+    );
+}
+
+#[test]
+fn held_is_omitted_for_every_other_failure_kind() {
+    let document = lockfile_json(LockfileOutcome::Failed(RegenerationError::SnapshotFailed {
+        path: PathBuf::from("Cargo.lock"),
+    }));
+
+    assert!(document.get("held").is_none(), "{document}");
 }

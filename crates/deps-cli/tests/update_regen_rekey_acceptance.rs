@@ -10,7 +10,7 @@
 //! a real Yarn, so the harness cannot produce it).
 
 #![cfg(all(unix, feature = "npm", feature = "deno"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

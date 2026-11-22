@@ -2,7 +2,6 @@
 //! makes the manifest a member (Deno would write the root `deno.lock`).
 
 #![cfg(all(unix, feature = "deno"))]
-#![allow(clippy::expect_used)]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

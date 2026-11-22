@@ -684,7 +684,10 @@ pub async fn fetch_latest_versions_parallel(
     }
 
     let failure_summary = NonZeroUsize::new(failed_count).map(|count| {
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "every branch that counts a failure also sets a message"
+        )]
         let message = priority_message.or(fallback_message).expect(
             "every branch that increments failed_count also sets fallback_message \
              in the same match arm",

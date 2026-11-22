@@ -2,7 +2,7 @@
 //! assign a window to a name that some dependency declares without one, and the user's home
 //! `.cargo/config.toml` must stay excluded when the manifest is reached through a symlink.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::Path;
 use std::sync::Arc;

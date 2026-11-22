@@ -12,7 +12,7 @@ use url::Url;
 /// Matches: id "plugin.id" version "1.0.0" (Groovy) or id("plugin.id") version "1.0.0" (Kotlin DSL)
 // Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"id\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s+version\s+['"]([^'"]+)['"]"#)
         .expect("RE_PLUGIN")

@@ -2,7 +2,7 @@
 //! runtime handles (architect v2 Q5: even `--offline` runs), exits 2 on an invalid value, and a
 //! valid value prints one stderr notice. Written tests-first; the variable is ignored today.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::process::Output;
 

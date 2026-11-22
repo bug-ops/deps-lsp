@@ -14,7 +14,7 @@
 // `allow-unwrap-in-tests` already exempts `#[tokio::test]` functions, so this covers
 // only the non-`#[test]` helper (`write_manifest`) calling `unwrap()` on known-good
 // fixture data.
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_cargo::config::ConfigFileCache;
 use deps_cargo::parser::CargoParseContext;

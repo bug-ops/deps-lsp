@@ -6,7 +6,7 @@
 //! handed its own entry even where the other member's entry is higher.
 
 // Test code: workspace-level `clippy::unwrap_used` is meant for library code (#689).
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::{ImporterPath, LockFileProvider};
 use deps_core::{EcosystemId, PackageKey};

@@ -1,8 +1,6 @@
 //! #2072 acceptance: `Dependency::kind()` for Gemfile groups (architect v2 S5 mapping).
 //! Written tests-first; `Dependency::kind` and `deps_core::DependencyKind` do not exist yet.
 
-#![allow(clippy::expect_used)]
-
 use deps_core::{DependencyKind, ParseResult};
 
 const GEMFILE: &str = r"source 'https://rubygems.org'

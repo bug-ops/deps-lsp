@@ -5,7 +5,7 @@
 //! payload shape of `ExemptionFileError`.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use deps_core::lsp_helpers::exemption::{ExemptionFile, ExemptionFileError, OperatorExemptions};
 use std::assert_matches;

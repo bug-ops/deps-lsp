@@ -5,7 +5,7 @@
 //! developer can adapt them in one place): `CargoParseContext::with_native_cooldown(mode)` and the
 //! test-only `CargoParseContext::with_user_home_for_test(UserHome)`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

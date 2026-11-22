@@ -5,7 +5,7 @@
 //! this seeds licenses, typosquats, GOSSIP findings, `latest_status` and `candidate_status` too,
 //! so a prune or survivor path that forgets one of them fails here.
 
-#![allow(
+#![expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test code; clippy's allow-*-in-tests does not see this `cfg(all(test, ..))` module"

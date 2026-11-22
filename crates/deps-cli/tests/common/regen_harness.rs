@@ -8,7 +8,8 @@
 //! Included with `#[path = "common/regen_harness.rs"] mod harness;` by each acceptance file,
 //! which also declares the `regen_child` test calling [`regen_child_main`].
 
-#![allow(dead_code, clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(dead_code, clippy::panic)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -211,6 +212,7 @@ pub(crate) async fn regen_child_main() {
             let outcome = if lock_only {
                 Outcome::RequiresLockfileUpdate {
                     target: ConcreteVersion::from(target),
+                    ecosystem: id,
                 }
             } else {
                 let (line_no, text) = content

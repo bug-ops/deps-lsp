@@ -26,7 +26,6 @@
 // `allow-unwrap-in-tests` already exempts `#[test]`/`#[tokio::test]` functions, so this
 // covers only the non-`#[test]` helper (`test_index`) calling `unwrap()` on known-good
 // fixture data.
-#![allow(clippy::unwrap_used)]
 
 use deps_cargo::config::{ConfigFileCache, RegistryTrust};
 use deps_cargo::{CargoConfig, CargoRegistry, DependencySource};

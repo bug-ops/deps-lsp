@@ -6,7 +6,8 @@
 //! `WithinNativeCooldown` (exit 0) with the same note `check` prints.
 
 #![cfg(feature = "pypi")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -6,7 +6,8 @@
 //! Assumed seams: `NativeCooldown::new(NativeLimit, NativeCooldownSource)`,
 //! `NativeCutoff` and `PypiPackageLabel` living in `deps_core::native_cooldown`.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use deps_core::native_cooldown::{
     NativeCooldown, NativeCooldownSource, NativeCutoff, NativeHold, NativeLimit, NativeTimeSpan,

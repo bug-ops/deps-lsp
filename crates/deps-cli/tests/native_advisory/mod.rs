@@ -1,7 +1,8 @@
 //! Shared fixtures for the native-window CLI suites that need a counting-free, advisory-aware
 //! OSV mock next to a registry reached through the public tier (#2053).
 
-#![allow(dead_code, clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(dead_code)]
 
 use serde_json::json;
 

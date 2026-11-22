@@ -2,7 +2,7 @@
 //! flight must not lose that fetch. Each test drives the real open/change handlers and
 //! `ServerState::spawn_background_task` (the abort path) against a mock registry.
 
-#![allow(
+#![expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test code; clippy's allow-*-in-tests does not see this `cfg(all(test, ..))` module"

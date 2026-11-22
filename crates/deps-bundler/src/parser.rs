@@ -56,7 +56,7 @@ impl std::fmt::Debug for BundlerParseResult {
 // call (#1021) — before this fix, `\s+` between `gem` and the opening quote was mandatory, so a
 // parenthesized call (top-level or nested inside any block) never matched at all and silently
 // produced no dependency, no diagnostic, no hover, and no completion.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GEM_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*gem(?:\s+|\s*\(\s*)['"]([^'"]+)['"]"#).expect("Invalid regex")
 });
@@ -65,7 +65,7 @@ static GEM_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// trailing comment after the closing quote (`"~> 7.0" # pinned for Rails 7 compat`, #988) —
 /// mirroring the comment-tolerance already added to the block-tracking regexes in #986.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|(?:#.*)?$)"#).expect("Invalid regex")
 });
@@ -79,7 +79,7 @@ static VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// use this pattern only once they know the call itself opened with `(` (see `is_paren_call` in
 /// [`parse_gemfile`]/[`PendingGem`]).
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static VERSION_PATTERN_PAREN_TERMINATED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"['"]([~>=<!\d][^'"]*)['"]\s*(?:,|\)|(?:#.*)?$)"#).expect("Invalid regex")
 });
@@ -91,7 +91,7 @@ static VERSION_PATTERN_PAREN_TERMINATED: LazyLock<Regex> = LazyLock::new(|| {
 /// version-shaped literal in the condition either gets reported as a phantom version constraint
 /// on a gem that declares none, or shadows a real version constraint earlier in the same call.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static STATEMENT_MODIFIER_KEYWORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:if|unless)\b").expect("Invalid regex"));
 
@@ -108,7 +108,7 @@ static STATEMENT_MODIFIER_KEYWORD: LazyLock<Regex> =
 /// other two boundary keywords, so a call-shaped substring *inside* an already-quoted value
 /// (part of the real version string's own content) is never mistaken for one.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static NESTED_CALL_OPEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[[:alpha:]_][[:alnum:]_]*[!?]?\s*\(").expect("Invalid regex"));
 
@@ -118,19 +118,19 @@ static NESTED_CALL_OPEN: LazyLock<Regex> =
 /// open bracket: a well-formed Gemfile never has a hash/array value that's simply empty like
 /// this, so it's treated as broken/mid-edit content, same as a genuinely mismatched closer.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static DANGLING_VALUE_BEFORE_CLOSER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r":\s*([\]}\)])").expect("Invalid regex"));
 
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static SOURCE_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*source\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
 /// Matches the `source\s+` keyword prefix of a `source "..." do` block opener — the fixed part
 /// [`parse_source_block_start`] anchors on before hand-scanning the URL literal itself.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static SOURCE_BLOCK_PREFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*source\s+").expect("Invalid regex"));
 
@@ -139,7 +139,7 @@ static SOURCE_BLOCK_PREFIX: LazyLock<Regex> =
 /// finding S2: without this, the block never opens and every gem inside it silently resolves
 /// against the file-level source.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static SOURCE_BLOCK_SUFFIX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s+do\s*(#.*)?$").expect("Invalid regex"));
 
@@ -208,7 +208,7 @@ fn option_pattern(key: &str, value_pattern: &str) -> String {
 /// a value regex built on `['"][^'"]+['"]` truncates at the first embedded quote of the
 /// *other* kind, e.g. an unescaped `'` inside a `"`-delimited value).
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static SOURCE_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&option_key_pattern("source")).expect("Invalid regex"));
 
@@ -221,7 +221,7 @@ static SOURCE_OPTION: LazyLock<Regex> =
 /// (#1021): its value is commonly a lambda (`install_if: -> { ... }`) that can itself contain a
 /// version-shaped quoted string, which must not be scanned as this gem's version either.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static ANY_OPTION_KEY: LazyLock<Regex> = LazyLock::new(|| {
     let alternation = [
         "source",
@@ -254,7 +254,7 @@ static ANY_OPTION_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// Does not itself exclude `::` (Ruby's namespace separator); callers must check the byte after
 /// the match (`regex` has no lookahead) — see [`looks_like_generic_option_key`].
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GENERIC_OPTION_KEY_SHAPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[[:alpha:]_][[:alnum:]_]*[!?]?:").expect("Invalid regex"));
 
@@ -283,13 +283,13 @@ fn looks_like_generic_option_key(stripped: &str) -> bool {
 }
 
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RUBY_VERSION_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*ruby\s+['"]([^'"]+)['"]\s*$"#).expect("Invalid regex"));
 
 // Same guarantee as GEM_PATTERN above. Comment-tolerant for the same reason as
 // SOURCE_BLOCK_SUFFIX (`parse_source_block_start`).
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GROUP_BLOCK_START: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*group\s+(.+?)\s+do\s*(#.*)?$").expect("Invalid regex"));
 
@@ -304,7 +304,7 @@ static GROUP_BLOCK_START: LazyLock<Regex> =
 /// also matches a `do` occurring only inside a trailing comment (`gem "rails" # lots to do`),
 /// which would silently drop the whole line as a false block opener instead of parsing it.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GENERIC_BLOCK_START: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[^#]*\bdo\s*(\|[^|]*\|)?\s*(#.*)?$").expect("Invalid regex"));
 
@@ -321,7 +321,7 @@ static GENERIC_BLOCK_START: LazyLock<Regex> =
 /// Ruby construct. The assignment-prefix extension closes the residual `flag = if ... end`
 /// case impl-critic flagged after the initial fix (validated fix, same leak direction).
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static BARE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:\S+\s*=\s*)?(if|unless|case|begin|def|class|module|while|until|for)\b")
         .expect("Invalid regex")
@@ -332,14 +332,14 @@ static BARE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| {
 /// rest of the file is mis-classified as `CustomRegistry` (safe direction, but a functional
 /// regression for every later gem's hover/diagnostics).
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static BLOCK_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*end\s*(#.*)?$").expect("Invalid regex"));
 
 /// Matches the per-gem inline `group:` option, e.g. `gem "x", group: [:test]` or the
 /// hash-rocket form `gem "x", :group => [:test]`.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GROUP_OPTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&option_pattern("group", r"(\[.+?\]|:\w+)")).expect("Invalid regex")
 });
@@ -347,21 +347,21 @@ static GROUP_OPTION: LazyLock<Regex> = LazyLock::new(|| {
 /// Matches the per-gem inline `git:` option's *key* alone. See [`SOURCE_OPTION`] for why
 /// the value is not part of this pattern.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GIT_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&option_key_pattern("git")).expect("Invalid regex"));
 
 /// Matches the per-gem inline `path:` option's *key* alone. See [`SOURCE_OPTION`] for why
 /// the value is not part of this pattern.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static PATH_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&option_key_pattern("path")).expect("Invalid regex"));
 
 /// Matches the per-gem inline `github:` option's *key* alone. See [`SOURCE_OPTION`] for
 /// why the value is not part of this pattern.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static GITHUB_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&option_key_pattern("github")).expect("Invalid regex"));
 
@@ -371,14 +371,14 @@ static GITHUB_OPTION: LazyLock<Regex> =
 /// [`extract_require`] parses its value directly rather than through
 /// [`option_string_value`].
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static REQUIRE_OPTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&option_key_pattern("require")).expect("Invalid regex"));
 
 /// Matches the per-gem inline `platforms:` option, e.g. `gem "x", platforms: :ruby` or the
 /// hash-rocket form `gem "x", :platforms => :ruby`.
 // Same guarantee as GEM_PATTERN above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static PLATFORMS_OPTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&option_pattern("platforms", r"(\[.+?\]|:\w+)")).expect("Invalid regex")
 });
@@ -936,7 +936,11 @@ fn finalize_pending_gem(
 /// erroring. Returns `Result` for interface consistency with other ecosystem parsers.
 // The `caps.get(0).unwrap().end()` offset is a regex match end, always a char boundary.
 // Group 1 is mandatory in `GEM_PATTERN` and group 0 always exists on a successful match.
-#[allow(clippy::string_slice, clippy::unwrap_used)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "regex group 0 and the mandatory group 1 always exist on a match"
+)]
+#[allow(clippy::string_slice)]
 #[expect(
     clippy::too_many_lines,
     reason = "gem, group, source and git branches share one line-loop state"
@@ -1286,7 +1290,11 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
 /// attempted here to avoid over-engineering a rare, safe-direction gap.
 // Group 1 is mandatory in both version patterns; `key_match.start()`/`modifier_match.start()`/
 // `nested_call_match.start()` are regex match-start offsets, always char boundaries.
-#[allow(clippy::unwrap_used, clippy::string_slice)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "regex group 1 is mandatory in both version patterns"
+)]
+#[allow(clippy::string_slice)]
 fn extract_version(
     lines: &[(&str, usize)],
     content: &str,

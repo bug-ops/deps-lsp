@@ -1,6 +1,6 @@
 //! gradle.lockfile edge cases (#1925, spec 092): only valid three-part coordinates count.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::{LockFileProvider, ResolvedPackages};
 use deps_gradle::GradleLockParser;

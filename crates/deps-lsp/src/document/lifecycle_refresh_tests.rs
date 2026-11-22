@@ -2,9 +2,8 @@
 //! outcome is already committed when the server asks the client for `workspace/inlayHint/refresh`,
 //! so the `textDocument/inlayHint` request served at refresh time carries the `⚠` marker.
 
-#![allow(
+#![expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "test code; clippy's allow-*-in-tests does not see this `cfg(all(test, ..))` module"
 )]
 

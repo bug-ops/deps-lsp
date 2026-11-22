@@ -462,7 +462,7 @@ explicit choice.
     declared requirement is too large to safely evaluate, or a commit (SHA) pin's fix version
     has no matching release in the repository's complete tag list (GitHub Actions, GitLab CI;
     for a GitLab `component:` include, its release list), so the pin cannot be rewritten and
-    still points at the vulnerable commit, or (`--lockfile regenerate`) the package manager would
+    still points at the vulnerable commit, or (`--lockfile regenerate` with `--security-only`) the package manager would
     resolve a version inside the freshness cooldown window once the edit is written, so the edit
     is withheld. A missing, cold or truncated tag list cannot prove that, and is reported as no verified fix instead. For the
     last five causes (a yanked, confirmed-unsupported-requirement-shape, oversized-requirement,
@@ -639,8 +639,10 @@ lands inside it, `update` restores the lock files from the snapshot and withhold
 
 - A held lock-file-only pin stays `requires-lockfile-update` (exit `1`), with a reason that names
   the resolved version and the window.
-- A held pin that edits the manifest is not written: the item is `unfixable` (exit `1`), with a
-  reason naming the resolved version and the window, and its target shows in the `target` column.
+- A held pin that edits the manifest is not written: the edit is removed from the manifest and the
+  reason names the resolved version and the window. In the default mode the item is `skipped`
+  (exit `0`), like any release the cooldown window holds back. With `--security-only` it is
+  `unfixable` (exit `1`) and its target shows in the `target` column.
 - The tool runs once more for the remaining pins, and their fixes apply.
 - When every pin is held, nothing is rerun: the manifest and the lock files stay unchanged and the
   table's lockfile line reads `not applicable — every fix resolved to a version inside the
@@ -651,7 +653,7 @@ With `--open-pr`, a withheld fix and its version never reach the proposal; a run
 nothing opens none.
 
 The run fails with `cooldown-held-version` (exit `2`, lock files restored) only when the manifest
-changed during the run (or cannot be rewritten), or when the single retry lands inside the window again. A version without
+changed during the run (or cannot be rewritten), or when the single retry lands inside the window again. A manifest edit that the retry holds is written back out of the manifest before the run fails, so it is not left applied. A version without
 a known publish time, or any version with freshness disabled, is not held back, and a
 cooldown-fallback target is unaffected because it is pinned exactly. `update` checks the window
 itself; the package manager's own cooldown setting is not consulted.
@@ -729,8 +731,9 @@ the lock (Yarn Berry or Deno re-key refused or failed), and the lock file is res
 `cooldown-held-version` means the tool locked a version inside the freshness cooldown window and
 the single retry without the held pins held again, or the manifest changed during the run or could not be rewritten; the
 lock files are restored.
-The report carries the first held package as `package` and its version as `found`; the message
-lists any further held pins.
+The report carries the first held package as `package` and its version as `found`, and a `held`
+array with one `{"package", "found"}` entry per held pin, the first included; `held` is omitted for
+every other failure kind. The message lists any further held pins.
 
 **Known limits.** `go get` may raise indirect requirements and the `go` directive in `go.mod`, and
 download a newer toolchain to satisfy it. Deno always reads and writes `./deno.lock` beside the

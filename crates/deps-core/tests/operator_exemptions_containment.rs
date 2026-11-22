@@ -5,7 +5,8 @@
 //! `WorkspaceRoots::new`, `UserConfigLookup`.
 
 #![cfg(feature = "test-util")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::path::{Path, PathBuf};

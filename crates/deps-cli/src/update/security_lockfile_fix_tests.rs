@@ -2,11 +2,12 @@
 //! `RequiresLockfileUpdate` item, driven through a real npm ecosystem against `mockito`
 //! registry and OSV servers.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "../../tests/native_advisory/mod.rs"]
 mod native_advisory;
 
+use std::assert_matches;
 use std::sync::Arc;
 
 use deps_core::lsp_helpers::exemption::OperatorExemptions;
@@ -128,7 +129,13 @@ async fn test_plan_security_updates_records_the_cooldown_held_versions_and_ecosy
         item.lockfile_fix.cooldown_held,
         vec![ConcreteVersion::from("1.0.2")]
     );
-    assert_eq!(item.lockfile_fix.ecosystem, Some(EcosystemId::Npm));
+    assert_matches!(
+        item.outcome,
+        Outcome::RequiresLockfileUpdate {
+            ecosystem: EcosystemId::Npm,
+            ..
+        }
+    );
 }
 
 #[tokio::test]
@@ -136,5 +143,4 @@ async fn test_plan_security_updates_records_no_held_versions_when_freshness_is_d
     let item = lockfile_only_item(false).await;
 
     assert!(item.lockfile_fix.cooldown_held.is_empty());
-    assert_eq!(item.lockfile_fix.ecosystem, Some(EcosystemId::Npm));
 }

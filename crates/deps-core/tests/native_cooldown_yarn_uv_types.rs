@@ -4,7 +4,8 @@
 //! Written tests-first against plan revision 3 (`.local/handoff/2026-11-18T00-57-21-architect.md`);
 //! the API they name does not exist yet.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use deps_core::native_cooldown::{
     GateOrigin, NativeCooldown, NativeCooldownSource, NativeLimit, NpmScopeLabel, TimeSpanError,

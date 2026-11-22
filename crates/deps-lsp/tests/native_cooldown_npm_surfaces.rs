@@ -11,7 +11,8 @@
 //! are relative to the real clock with hour-sized margins around day-sized windows.
 
 #![cfg(feature = "npm")]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

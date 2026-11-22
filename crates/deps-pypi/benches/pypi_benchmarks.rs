@@ -9,7 +9,7 @@
 
 // #689: workspace-level `clippy::unwrap_used` now reaches this bench's separate crate
 // root; unwrap() on known-good fixture data is fine here, unlike production code.
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_pypi::parser::PypiParser;

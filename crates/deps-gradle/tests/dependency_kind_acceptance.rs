@@ -3,8 +3,6 @@
 //! `*implementation|api|compileOnly|runtimeOnly|compile|runtime` -> Normal; else unknown).
 //! Written tests-first; `Dependency::kind` and `deps_core::DependencyKind` do not exist yet.
 
-#![allow(clippy::expect_used)]
-
 use deps_core::{DependencyKind, ParseResult};
 
 const BUILD_GRADLE: &str = r"dependencies {

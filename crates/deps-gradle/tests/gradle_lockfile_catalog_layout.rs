@@ -1,7 +1,7 @@
 //! A version catalog consults the project root's `gradle.lockfile` only in the standard
 //! `<project>/gradle/libs.versions.toml` layout, never a sibling project's lock file.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lockfile::LockFileProvider;
 use deps_gradle::GradleLockParser;

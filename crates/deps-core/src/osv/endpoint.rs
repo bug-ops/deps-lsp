@@ -125,7 +125,6 @@ impl OsvEndpoint {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
 
     use super::*;
     use crate::net_policy::MapEnv;

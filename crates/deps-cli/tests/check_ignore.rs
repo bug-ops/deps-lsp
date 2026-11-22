@@ -4,7 +4,7 @@
 //! and its dropped `ignore` is reported.
 
 #![cfg(feature = "npm")]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::path::Path;
 

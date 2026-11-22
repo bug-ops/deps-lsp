@@ -2,5 +2,9 @@
 t = "nextest run"
 tc = "llvm-cov nextest"
 
+[build]
+# Escape hatch while iterating: `--config build.warnings=warn`.
+warnings = "deny"
+
 [registry]
 global-min-publish-age = "3 days"

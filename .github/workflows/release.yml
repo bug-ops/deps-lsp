@@ -13,6 +13,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # A toolchain newer than the last CI run must not fail a release on a new warning.
+  CARGO_BUILD_WARNINGS: warn
 
 permissions:
   contents: read

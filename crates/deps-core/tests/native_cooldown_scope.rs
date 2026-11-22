@@ -6,7 +6,7 @@
 //! Assumed seam: `RepositoryScope::new(&Path, &Path, Option<&Path>)` and
 //! `config_dirs()` yielding paths closest-first, in `deps_core::native_cooldown`.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::{Path, PathBuf};
 

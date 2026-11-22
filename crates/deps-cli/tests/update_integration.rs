@@ -22,7 +22,7 @@
 //! `update/security.rs`, which construct a real [`deps_core::ParseResult`] and a real
 //! `cached_versions` map without needing a live registry.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use deps_cli::format::DryRun;
 #[cfg(unix)]

@@ -7,7 +7,7 @@
 #![cfg(all(feature = "npm", feature = "go"))]
 // #689: `clippy.toml`'s `allow-unwrap-in-tests` covers the `#[test]` function, not the setup
 // helpers, which unwrap known-good temp-directory I/O.
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::collections::HashMap;
 use std::sync::Arc;

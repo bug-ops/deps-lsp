@@ -9,7 +9,8 @@
 // #689: workspace-level `clippy::unwrap_used`/`string_slice` (moved from a per-crate
 // lib.rs attribute) now reach this bench's separate crate root; benches slice/unwrap
 // known-good fixture data, which is idiomatic outside production parsing code.
-#![allow(clippy::unwrap_used, clippy::string_slice)]
+#![expect(clippy::unwrap_used, reason = "test code")]
+#![allow(clippy::string_slice)]
 
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};

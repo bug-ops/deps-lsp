@@ -14,7 +14,8 @@
 //! no-kill-after-reap case has no test.
 
 #![cfg(unix)]
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::os::unix::fs::PermissionsExt;

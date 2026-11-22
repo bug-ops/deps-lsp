@@ -1,7 +1,7 @@
 //! Acceptance tests for the `gradle.lockfile` provider (#1925, spec 092 as amended:
 //! `gradle.lockfile` only, manifest's own directory only).
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::Path;
 use std::sync::Arc;

@@ -4,7 +4,7 @@
 //! file case lives in `update_lockers_pcd_acceptance.rs`.
 
 #![cfg(all(unix, feature = "pypi"))]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 #[path = "common/regen_harness.rs"]
 mod harness;

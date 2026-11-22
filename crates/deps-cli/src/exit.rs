@@ -648,6 +648,7 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![update_item(Outcome::RequiresLockfileUpdate {
                 target: deps_core::ConcreteVersion::from("1.2.0"),
+                ecosystem: deps_core::EcosystemId::Cargo,
             })],
         };
         assert_eq!(update_exit_code(&run_of(&plan)), EXIT_POLICY_VIOLATION);

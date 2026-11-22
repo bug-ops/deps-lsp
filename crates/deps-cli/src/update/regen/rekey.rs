@@ -5,6 +5,8 @@
 //! manifest goes back, the lock key is renamed from the pinned descriptor to the declared one so
 //! the second install keeps the pinned resolution.
 
+use std::collections::HashSet;
+
 use deps_core::{ConcreteVersion, PackageName, VersionReq};
 
 /// Why a cooldown-fallback pin could not be kept in the lock file after the manifest write-back.
@@ -49,57 +51,85 @@ pub(super) fn is_plain_range(declared: &str) -> bool {
         })
 }
 
+/// A refusal bound to the [`LockRekey`] that caused it.
+#[derive(Debug)]
+pub(super) struct RekeyRefused<'a> {
+    pub(super) rekey: &'a LockRekey,
+    pub(super) reason: RekeyRefusal,
+}
+
+impl<'a> RekeyRefused<'a> {
+    const fn new(rekey: &'a LockRekey, reason: RekeyRefusal) -> Self {
+        Self { rekey, reason }
+    }
+}
+
 /// Renames `<name>@npm:<pinned>` to `<name>@npm:<declared>` inside exactly one Yarn Berry entry
-/// header per rekey; every other byte is unchanged.
+/// header per rekey; every other byte is unchanged. The lock text is split once for all rekeys.
 ///
 /// # Errors
 ///
 /// [`RekeyRefusal::PinnedEntryMissing`] when no header holds the pinned descriptor,
 /// [`RekeyRefusal::PinnedEntryAmbiguous`] when several do, and
-/// [`RekeyRefusal::DeclaredRangeAlreadyLocked`] when a header already holds the declared one.
-pub(super) fn yarn(text: &str, rekeys: &[LockRekey]) -> Result<String, RekeyRefusal> {
-    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_owned).collect();
+/// [`RekeyRefusal::DeclaredRangeAlreadyLocked`] when a header already holds the declared one,
+/// each bound to the first rekey that is refused.
+pub(super) fn yarn<'a>(text: &str, rekeys: &'a [LockRekey]) -> Result<String, RekeyRefused<'a>> {
+    let mut lines: Vec<Line> = text.split_inclusive('\n').map(Line::parse).collect();
     for rekey in rekeys {
         let pinned = format!("{}@npm:{}", rekey.package.as_str(), rekey.pinned.as_str());
         let declared = format!("{}@npm:{}", rekey.package.as_str(), rekey.declared.as_str());
-        let holding = |lines: &[String], descriptor: &str| -> Vec<usize> {
+        let holding = |descriptor: &str| {
             lines
                 .iter()
-                .enumerate()
-                .filter(|(_, line)| {
-                    Header::parse(line).is_some_and(|header| header.holds(descriptor))
-                })
-                .map(|(index, _)| index)
-                .collect()
+                .filter_map(|line| line.header.as_ref())
+                .filter(|header| header.holds(descriptor))
+                .count()
         };
-        let pinned_at = match holding(&lines, &pinned).as_slice() {
-            [] => return Err(RekeyRefusal::PinnedEntryMissing),
-            [only] => *only,
-            _ => return Err(RekeyRefusal::PinnedEntryAmbiguous),
-        };
-        if !holding(&lines, &declared).is_empty() {
-            return Err(RekeyRefusal::DeclaredRangeAlreadyLocked);
+        match holding(&pinned) {
+            0 => return Err(RekeyRefused::new(rekey, RekeyRefusal::PinnedEntryMissing)),
+            1 => {}
+            _ => return Err(RekeyRefused::new(rekey, RekeyRefusal::PinnedEntryAmbiguous)),
         }
-        let line = lines
-            .get_mut(pinned_at)
-            .ok_or(RekeyRefusal::PinnedEntryMissing)?;
-        let renamed = Header::parse(line)
-            .ok_or(RekeyRefusal::PinnedEntryMissing)?
-            .renamed(&pinned, &declared);
-        *line = renamed;
+        if holding(&declared) > 0 {
+            return Err(RekeyRefused::new(
+                rekey,
+                RekeyRefusal::DeclaredRangeAlreadyLocked,
+            ));
+        }
+        for line in &mut lines {
+            if let Some(header) = line.header.as_mut().filter(|header| header.holds(&pinned)) {
+                header.rename(&pinned, &declared);
+                line.text = header.render();
+            }
+        }
     }
-    Ok(lines.concat())
+    Ok(lines.into_iter().map(|line| line.text).collect())
+}
+
+/// One line of a Yarn Berry lock file, with its parsed header when it is an entry header.
+struct Line {
+    text: String,
+    header: Option<Header>,
+}
+
+impl Line {
+    fn parse(text: &str) -> Self {
+        Self {
+            header: Header::parse(text),
+            text: text.to_owned(),
+        }
+    }
 }
 
 /// A Yarn Berry lock entry header: `"a@npm:1, b@npm:2":`.
-struct Header<'a> {
-    descriptors: Vec<&'a str>,
+struct Header {
+    descriptors: Vec<String>,
     quoted: bool,
-    ending: &'a str,
+    ending: String,
 }
 
-impl<'a> Header<'a> {
-    fn parse(line: &'a str) -> Option<Self> {
+impl Header {
+    fn parse(line: &str) -> Option<Self> {
         if line.starts_with([' ', '\t', '#']) || line.starts_with("__metadata") {
             return None;
         }
@@ -111,23 +141,26 @@ impl<'a> Header<'a> {
             None => (key, false),
         };
         Some(Self {
-            descriptors: key.split(", ").collect(),
+            descriptors: key.split(", ").map(str::to_owned).collect(),
             quoted,
-            ending,
+            ending: ending.to_owned(),
         })
     }
 
     fn holds(&self, descriptor: &str) -> bool {
-        self.descriptors.contains(&descriptor)
+        self.descriptors.iter().any(|held| held == descriptor)
     }
 
-    fn renamed(&self, from: &str, to: &str) -> String {
-        let joined = self
-            .descriptors
-            .iter()
-            .map(|descriptor| if *descriptor == from { to } else { descriptor })
-            .collect::<Vec<_>>()
-            .join(", ");
+    fn rename(&mut self, from: &str, to: &str) {
+        for descriptor in &mut self.descriptors {
+            if descriptor == from {
+                to.clone_into(descriptor);
+            }
+        }
+    }
+
+    fn render(&self) -> String {
+        let joined = self.descriptors.join(", ");
         let quote = if self.quoted { "\"" } else { "" };
         format!("{quote}{joined}{quote}:{}", self.ending)
     }
@@ -137,22 +170,29 @@ impl<'a> Header<'a> {
 const DENO_SCHEMES: [&str; 2] = ["npm", "jsr"];
 
 /// Renames every occurrence of the JSON string `"<scheme>:<name>@<pinned>"` to the declared
-/// specifier: the `specifiers` key and its `workspace.dependencies` value.
+/// specifier: the `specifiers` key and its `workspace.dependencies` value. The lock is parsed
+/// once for all rekeys.
 ///
 /// # Errors
 ///
-/// [`RekeyRefusal::UnparsableLock`] when the input or the result is not JSON,
-/// [`RekeyRefusal::PinnedEntryMissing`] when `specifiers` has no pinned key (or the package name
-/// has no scheme), and [`RekeyRefusal::DeclaredRangeAlreadyLocked`] when the declared key already exists.
-pub(super) fn deno(text: &str, rekeys: &[LockRekey]) -> Result<String, RekeyRefusal> {
+/// [`RekeyRefusal::UnparsableLock`] when the input (bound to the first rekey) or the result
+/// (bound to the last) is not JSON, [`RekeyRefusal::PinnedEntryMissing`] when `specifiers` has
+/// no pinned key (or the package name has no scheme), and
+/// [`RekeyRefusal::DeclaredRangeAlreadyLocked`] when the declared key already exists.
+pub(super) fn deno<'a>(text: &str, rekeys: &'a [LockRekey]) -> Result<String, RekeyRefused<'a>> {
+    let (Some(first), Some(last)) = (rekeys.first(), rekeys.last()) else {
+        return Ok(text.to_owned());
+    };
+    let lock: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| RekeyRefused::new(first, RekeyRefusal::UnparsableLock))?;
+    let mut specifiers: HashSet<String> = lock
+        .get("specifiers")
+        .and_then(serde_json::Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .ok_or_else(|| RekeyRefused::new(first, RekeyRefusal::PinnedEntryMissing))?;
     let mut out = text.to_owned();
     for rekey in rekeys {
-        let lock: serde_json::Value =
-            serde_json::from_str(&out).map_err(|_| RekeyRefusal::UnparsableLock)?;
-        let specifiers = lock
-            .get("specifiers")
-            .and_then(serde_json::Value::as_object)
-            .ok_or(RekeyRefusal::PinnedEntryMissing)?;
+        let refuse = |reason| RekeyRefused::new(rekey, reason);
         // Deno package names always carry their scheme (`npm:chalk`).
         let name = rekey.package.as_str();
         let (scheme, bare) = DENO_SCHEMES
@@ -162,21 +202,22 @@ pub(super) fn deno(text: &str, rekeys: &[LockRekey]) -> Result<String, RekeyRefu
                     .and_then(|rest| rest.strip_prefix(':'))
                     .map(|bare| (scheme, bare))
             })
-            .ok_or(RekeyRefusal::PinnedEntryMissing)?;
+            .ok_or_else(|| refuse(RekeyRefusal::PinnedEntryMissing))?;
         let key = |version: &str| format!("{scheme}:{bare}@{version}");
-        if !specifiers.contains_key(&key(rekey.pinned.as_str())) {
-            return Err(RekeyRefusal::PinnedEntryMissing);
+        let pinned_key = key(rekey.pinned.as_str());
+        if !specifiers.contains(&pinned_key) {
+            return Err(refuse(RekeyRefusal::PinnedEntryMissing));
         }
         let declared_key = key(rekey.declared.as_str());
-        if specifiers.contains_key(&declared_key) {
-            return Err(RekeyRefusal::DeclaredRangeAlreadyLocked);
+        if specifiers.contains(&declared_key) {
+            return Err(refuse(RekeyRefusal::DeclaredRangeAlreadyLocked));
         }
-        out = out.replace(
-            &json_literal(&key(rekey.pinned.as_str())),
-            &json_literal(&declared_key),
-        );
+        out = out.replace(&json_literal(&pinned_key), &json_literal(&declared_key));
+        specifiers.remove(&pinned_key);
+        specifiers.insert(declared_key);
     }
-    serde_json::from_str::<serde_json::Value>(&out).map_err(|_| RekeyRefusal::UnparsableLock)?;
+    serde_json::from_str::<serde_json::Value>(&out)
+        .map_err(|_| RekeyRefused::new(last, RekeyRefusal::UnparsableLock))?;
     Ok(out)
 }
 
@@ -194,6 +235,10 @@ mod tests {
             pinned: ConcreteVersion::from(pinned),
             declared: VersionReq::new(declared),
         }
+    }
+
+    fn reason(result: Result<String, RekeyRefused<'_>>) -> Result<String, RekeyRefusal> {
+        result.map_err(|refused| refused.reason)
     }
 
     const YARN: &str = "__metadata:\n  version: 8\n\n\"a@npm:^2.0.0\":\n  version: 2.0.1\n\n\"x@npm:1.2.8\":\n  version: 1.2.8\n";
@@ -231,12 +276,15 @@ mod tests {
         let r = [rekey("x", "1.2.8", "^1.2.5")];
 
         assert_eq!(
-            yarn(YARN, &[rekey("x", "9.9.9", "^1")]),
+            reason(yarn(YARN, &[rekey("x", "9.9.9", "^1")])),
             Err(RekeyRefusal::PinnedEntryMissing)
         );
-        assert_eq!(yarn(both, &r), Err(RekeyRefusal::PinnedEntryAmbiguous));
         assert_eq!(
-            yarn(declared, &r),
+            reason(yarn(both, &r)),
+            Err(RekeyRefusal::PinnedEntryAmbiguous)
+        );
+        assert_eq!(
+            reason(yarn(declared, &r)),
             Err(RekeyRefusal::DeclaredRangeAlreadyLocked)
         );
     }
@@ -246,7 +294,7 @@ mod tests {
         let text = "\"x@npm:1.2.8, x@npm:^1.2.5\":\n  v: 1\n";
 
         assert_eq!(
-            yarn(text, &[rekey("x", "1.2.8", "^1.2.5")]),
+            reason(yarn(text, &[rekey("x", "1.2.8", "^1.2.5")])),
             Err(RekeyRefusal::DeclaredRangeAlreadyLocked)
         );
     }
@@ -256,7 +304,10 @@ mod tests {
         let r = [rekey("x", "1.2.8", "^1.2.5")];
         let once = yarn(YARN, &r).expect("rekeyed");
 
-        assert_eq!(yarn(&once, &r), Err(RekeyRefusal::PinnedEntryMissing));
+        assert_eq!(
+            reason(yarn(&once, &r)),
+            Err(RekeyRefusal::PinnedEntryMissing)
+        );
     }
 
     const DENO: &str = "{\n  \"specifiers\": {\n    \"jsr:@std/path@1.0.0\": \"1.0.0\",\n    \"npm:b@^1\": \"1.1.0\"\n  },\n  \"workspace\": {\n    \"dependencies\": [\n      \"jsr:@std/path@1.0.0\"\n    ]\n  }\n}\n";
@@ -277,10 +328,16 @@ mod tests {
         let r = [rekey("jsr:@std/path", "1.0.0", "^1.0.0")];
         let locked = DENO.replace("\"npm:b@^1\"", "\"jsr:@std/path@^1.0.0\"");
 
-        assert_eq!(deno("{ nope", &r), Err(RekeyRefusal::UnparsableLock));
-        assert_eq!(deno("{}", &r), Err(RekeyRefusal::PinnedEntryMissing));
         assert_eq!(
-            deno(&locked, &r),
+            reason(deno("{ nope", &r)),
+            Err(RekeyRefusal::UnparsableLock)
+        );
+        assert_eq!(
+            reason(deno("{}", &r)),
+            Err(RekeyRefusal::PinnedEntryMissing)
+        );
+        assert_eq!(
+            reason(deno(&locked, &r)),
             Err(RekeyRefusal::DeclaredRangeAlreadyLocked)
         );
     }
@@ -293,12 +350,61 @@ mod tests {
 
         assert_eq!(out, "{\"specifiers\":{\"npm:x@^1\":\"1.0.0\"}}");
         assert_eq!(
-            deno(text, &[rekey("jsr:x", "1.0.0", "^1")]),
+            reason(deno(text, &[rekey("jsr:x", "1.0.0", "^1")])),
             Err(RekeyRefusal::PinnedEntryMissing)
         );
         assert_eq!(
-            deno(text, &[rekey("x", "1.0.0", "^1")]),
+            reason(deno(text, &[rekey("x", "1.0.0", "^1")])),
             Err(RekeyRefusal::PinnedEntryMissing)
+        );
+    }
+
+    #[test]
+    fn yarn_attributes_a_refusal_to_the_pin_that_caused_it() {
+        let rekeys = [rekey("x", "1.2.8", "^1.2.5"), rekey("a", "9.9.9", "^2.0.0")];
+
+        let refused = yarn(YARN, &rekeys).expect_err("second pin is not locked");
+
+        assert_eq!(refused.rekey.package.as_str(), "a");
+        assert_eq!(refused.reason, RekeyRefusal::PinnedEntryMissing);
+    }
+
+    #[test]
+    fn yarn_renames_every_pin_of_one_call() {
+        let text = "\"x@npm:1.2.8\":\n  v: 1\n\n\"y@npm:2.0.1\":\n  v: 2\n";
+        let rekeys = [rekey("x", "1.2.8", "^1.2.5"), rekey("y", "2.0.1", "^2.0.0")];
+
+        let out = yarn(text, &rekeys).expect("rekeyed");
+
+        assert_eq!(
+            out,
+            "\"x@npm:^1.2.5\":\n  v: 1\n\n\"y@npm:^2.0.0\":\n  v: 2\n"
+        );
+    }
+
+    #[test]
+    fn deno_attributes_a_refusal_to_the_pin_that_caused_it() {
+        let rekeys = [
+            rekey("jsr:@std/path", "1.0.0", "^1.0.0"),
+            rekey("npm:b", "9.9.9", "^1"),
+        ];
+
+        let refused = deno(DENO, &rekeys).expect_err("second pin is not locked");
+
+        assert_eq!(refused.rekey.package.as_str(), "npm:b");
+        assert_eq!(refused.reason, RekeyRefusal::PinnedEntryMissing);
+    }
+
+    #[test]
+    fn deno_renames_every_pin_of_one_call() {
+        let text = "{\"specifiers\":{\"npm:x@1.0.0\":\"1.0.0\",\"npm:y@2.0.0\":\"2.0.0\"}}";
+        let rekeys = [rekey("npm:x", "1.0.0", "^1"), rekey("npm:y", "2.0.0", "^2")];
+
+        let out = deno(text, &rekeys).expect("rekeyed");
+
+        assert_eq!(
+            out,
+            "{\"specifiers\":{\"npm:x@^1\":\"1.0.0\",\"npm:y@^2\":\"2.0.0\"}}"
         );
     }
 }

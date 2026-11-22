@@ -8,7 +8,8 @@
 //! Needs the test-only constructor `DisplayLockPath::for_test(&str)` (`pub(in crate::update)`).
 //! Shares `acceptance_tests`'s fixture.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::assert_matches;
 use std::path::{Path, PathBuf};
@@ -116,6 +117,7 @@ fn requires_lockfile_item(name: &str) -> PlannedUpdateItem {
         "1.0.0",
         Outcome::RequiresLockfileUpdate {
             target: ConcreteVersion::from("1.0.5"),
+            ecosystem: EcosystemId::Cargo,
         },
     )
 }

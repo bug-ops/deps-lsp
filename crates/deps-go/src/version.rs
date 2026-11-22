@@ -104,7 +104,7 @@ pub fn escape_version(version: &str) -> String {
 pub fn is_pseudo_version(version: &str) -> bool {
     // Compile-time-constant pattern; a malformed literal is a build-visible programmer
     // error, not attacker-influenceable input.
-    #[allow(clippy::unwrap_used)]
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static PSEUDO_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"^v[0-9]+\.(0\.0-|\d+\.\d+-([^+]*\.)?0\.)\d{14}-[A-Za-z0-9]+(\+.*)?$").unwrap()
     });

@@ -5,7 +5,8 @@
 //! asserted per flavor, `Actions` behaves exactly like `new`, and the shared pieces
 //! (`refresh_events`, `lockfile_filenames`) stay identical.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::sync::Arc;
 

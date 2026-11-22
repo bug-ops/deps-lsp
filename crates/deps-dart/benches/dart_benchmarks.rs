@@ -8,7 +8,7 @@
 //! when a developer runs `cargo bench -p deps-dart` before and after a change on the same
 //! machine. Nothing prompts that automatically.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use deps_dart::parse_pubspec_yaml;

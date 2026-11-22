@@ -486,7 +486,11 @@ fn join_tokens(tokens: &[Token]) -> String {
 // `i` is decremented only after the `i == 0` break, so `i < bytes.len()`. Every byte
 // written is an ASCII digit and the input was an ASCII digit run, so the buffer is always
 // valid UTF-8.
-#[allow(clippy::indexing_slicing, clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "digits are ASCII, so the buffer is valid UTF-8"
+)]
+#[allow(clippy::indexing_slicing)]
 fn increment_digits(digits: &str) -> String {
     let mut bytes = digits.as_bytes().to_vec();
     let mut i = bytes.len();
@@ -554,7 +558,7 @@ fn bump_string(requirement: &str) -> Option<String> {
 /// may itself have any number of further dot-separated segments.
 // Compile-time-constant pattern; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RUBYGEMS_VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
         .expect("Invalid regex")

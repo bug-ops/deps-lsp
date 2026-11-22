@@ -6,7 +6,7 @@
 //! `GroupRule::dependency_type`, `deps_core::DependencyKind`, the third `contains` parameter,
 //! `PlannedUpdateItem::with_dependency_kind`.
 
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::assert_matches;
 use std::str::FromStr;

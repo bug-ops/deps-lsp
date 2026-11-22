@@ -322,18 +322,18 @@ pub(crate) struct RepositoryContentRestriction {
 
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_INCLUDE_GROUP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"includeGroup\s*\(\s*["']([^"']+)["']\s*\)"#).expect("RE_INCLUDE_GROUP")
 });
 // Same guarantee as RE_INCLUDE_GROUP above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_INCLUDE_GROUP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"includeGroupByRegex\s*\(\s*["']([^"']+)["']\s*\)"#)
         .expect("RE_INCLUDE_GROUP_REGEX")
 });
 // Same guarantee as RE_INCLUDE_GROUP above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_INCLUDE_MODULE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"includeModule\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)"#)
         .expect("RE_INCLUDE_MODULE")
@@ -343,7 +343,7 @@ static RE_INCLUDE_MODULE: LazyLock<Regex> = LazyLock::new(|| {
 /// matches `setUrl("...")` and the Gradle 7/8 lazy-property idiom `url.set("...")`/
 /// `url.set(uri("..."))` (impl-critic #3 follow-up to #1212).
 // Same guarantee as RE_INCLUDE_GROUP above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_REPOSITORY_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?:\burl\s*=?\s*(?:uri\()?|\bsetUrl\s*\(\s*|\burl\.set\s*\(\s*(?:uri\()?)["']([^"']+)["']\)?"#,
@@ -357,7 +357,7 @@ static RE_REPOSITORY_URL: LazyLock<Regex> = LazyLock::new(|| {
 /// (via [`extract_call_paren_url`]'s own extraction, not this pattern) so an unexpected extra
 /// argument fails closed (no url) rather than guessing.
 // Same guarantee as RE_INCLUDE_GROUP above.
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used, reason = "constant regex literal")]
 static RE_REPO_CALL_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(?:url\s*=\s*)?["']([^"']+)["']\s*$"#).expect("RE_REPO_CALL_URL")
 });

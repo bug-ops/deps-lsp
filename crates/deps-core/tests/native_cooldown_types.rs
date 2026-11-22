@@ -5,7 +5,8 @@
 //! Written tests-first against plan v4 (`.local/handoff/2026-11-17T13-20-11-architect.md`); the
 //! API they name does not exist yet.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::sync::Arc;
 

@@ -142,6 +142,30 @@ impl Drop for EgressNoticeOnExit {
     }
 }
 
+/// Variable naming the npm public registry base for acceptance tests (feature `test-util`).
+#[cfg(all(feature = "test-util", feature = "npm"))]
+const TEST_NPM_PUBLIC_BASE_ENV: &str = "DEPS_CLI_TEST_NPM_PUBLIC_BASE";
+
+/// Points npm's public tier at the URL in [`TEST_NPM_PUBLIC_BASE_ENV`], so a binary-level test can
+/// serve packuments from a local mock. An unset variable leaves `runtime` unchanged; an unusable
+/// value is reported and ignored.
+#[cfg(all(feature = "test-util", feature = "npm"))]
+fn with_test_npm_public_base(
+    runtime: EcosystemRuntime,
+    source: &impl EnvSource,
+) -> EcosystemRuntime {
+    let Some(raw) = source.var_os(TEST_NPM_PUBLIC_BASE_ENV) else {
+        return runtime;
+    };
+    match raw.to_str().map(url::Url::parse) {
+        Some(Ok(base)) => runtime.with_npm_public_base_for_test(base),
+        _ => {
+            eprintln!("deps-cli: ignoring unusable {TEST_NPM_PUBLIC_BASE_ENV}");
+            runtime
+        }
+    }
+}
+
 fn build_runtime_handles(
     policy: &PolicyConfig,
     source: &impl EnvSource,
@@ -158,6 +182,8 @@ fn build_runtime_handles(
     let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
     let ecosystem_runtime = EcosystemRuntime::from_policy(policy, &environment)
         .with_lockfile_cache(Arc::clone(&lockfile_cache));
+    #[cfg(all(feature = "test-util", feature = "npm"))]
+    let ecosystem_runtime = with_test_npm_public_base(ecosystem_runtime, source);
     #[cfg(feature = "swift")]
     ecosystem_runtime.wait_for_scm_to_registry();
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(

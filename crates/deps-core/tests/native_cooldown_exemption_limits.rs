@@ -1,7 +1,6 @@
 //! Security regression (impl-critic / security M1, M2): exemption lists come from
 //! repository-controlled files, so memory and time stay bounded on hostile input.
 
-#![allow(clippy::expect_used)]
 use std::assert_matches;
 
 use std::sync::Arc;

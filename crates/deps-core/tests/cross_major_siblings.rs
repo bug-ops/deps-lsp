@@ -4,7 +4,8 @@
 //! Assumption (plan N3): the floating-pin "scan targets" built from the commit's full
 //! releases are observable through `ResolvedPin::siblings()`.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![expect(clippy::expect_used, reason = "test code")]
+#![allow(clippy::panic)]
 
 use std::sync::Arc;
 

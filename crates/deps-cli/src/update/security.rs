@@ -17,7 +17,7 @@ use deps_core::osv::{OsvClient, OsvId, ScanOutcome};
 use crate::analyze::ManifestAnalysis;
 use crate::update::ignore::IgnoreRules;
 use crate::update::{
-    CurrentVersion, Outcome, PlannedUpdateItem, UnfixableReason, UpdatePlan, is_requested,
+    CurrentVersion, HeldEdit, Outcome, PlannedUpdateItem, UnfixableReason, UpdatePlan, is_requested,
 };
 
 /// Ceiling on the phase-B `check_candidates` timeout, mirroring `analyze.rs`'s own OSV scan
@@ -236,59 +236,13 @@ pub async fn plan_security_updates(
                 item.outcome,
                 Outcome::RequiresLockfileUpdate { .. } | Outcome::Applied { .. }
             ) {
-                item.lockfile_fix.cooldown_held = cooldown_held_versions(analysis, &key, freshness);
-                item.lockfile_fix.cooldown_window = freshness.cooldown();
-                item.lockfile_fix.ecosystem = Some(ecosystem_id);
+                item.lockfile_fix
+                    .record_cooldown(analysis, &key, freshness, HeldEdit::Unfixable);
             }
             items.push(item);
         });
 
     UpdatePlan { items }
-}
-
-/// The published versions of `key` that are inside the cooldown window at `analysis.now`, by the
-/// shared precedence rule (an active GOSSIP finding when the analysis has any, else the local
-/// window).
-///
-/// A version without a known publish time is never held, matching the freshness signal elsewhere.
-/// Without per-version publish times only `latest` can be judged.
-fn cooldown_held_versions(
-    analysis: &ManifestAnalysis,
-    key: &PackageKey,
-    freshness: deps_core::FreshnessSettings,
-) -> Vec<deps_core::ConcreteVersion> {
-    let Some(cooldown) = freshness.cooldown() else {
-        return Vec::new();
-    };
-    let Some(versions) = analysis.cached_versions.get(key.normalized()) else {
-        return Vec::new();
-    };
-    let published: Vec<_> = if versions.publish_times.len() == versions.available.len() {
-        versions
-            .available
-            .iter()
-            .zip(versions.publish_times.iter().copied())
-            .collect()
-    } else {
-        vec![(&versions.latest, versions.published_at)]
-    };
-    published
-        .into_iter()
-        .filter(|(version, published_at)| {
-            matches!(
-                deps_core::lsp_helpers::cooldown_precedence(
-                    Some(&analysis.gossip_findings),
-                    key.normalized(),
-                    version.as_str(),
-                    *published_at,
-                    cooldown,
-                    analysis.now,
-                ),
-                deps_core::lsp_helpers::CooldownPrecedence::Blocked(_)
-            )
-        })
-        .map(|(version, _)| version.clone())
-        .collect()
 }
 
 /// The affected ranges of every advisory in `dv`, for settling a lock-file-only fix.
@@ -425,6 +379,7 @@ fn classify_vulnerable_dependency(
             dep,
             current,
             deps_core::ConcreteVersion::new(version_native),
+            analysis.ecosystem_id,
             &fix.advisory_ids,
             ignore_rule_overridden,
         );
@@ -435,6 +390,7 @@ fn classify_vulnerable_dependency(
             dep,
             current,
             deps_core::ConcreteVersion::new(version_native),
+            analysis.ecosystem_id,
             &fix.advisory_ids,
             ignore_rule_overridden,
         );
@@ -499,6 +455,7 @@ fn classify_vulnerable_dependency(
             dep,
             current,
             deps_core::ConcreteVersion::new(version_native),
+            analysis.ecosystem_id,
             &fix.advisory_ids,
             ignore_rule_overridden,
         ),
@@ -536,6 +493,7 @@ fn classify_vulnerable_dependency(
                     dep,
                     current,
                     fix_concrete,
+                    analysis.ecosystem_id,
                     &fix.advisory_ids,
                     ignore_rule_overridden,
                 )
@@ -700,13 +658,14 @@ fn requires_lockfile_update_item(
     dep: &dyn deps_core::Dependency,
     current: CurrentVersion,
     target: deps_core::ConcreteVersion,
+    ecosystem: deps_core::EcosystemId,
     advisory_ids: &[OsvId],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        Outcome::RequiresLockfileUpdate { target },
+        Outcome::RequiresLockfileUpdate { target, ecosystem },
         advisory_ids.to_vec(),
         ignore_rule_overridden,
         None,
@@ -719,6 +678,7 @@ fn requires_lockfile_update_item(
 mod tests {
     use super::*;
     use crate::config::IgnoreRule;
+    use crate::update::cooldown_held_versions;
     use deps_core::licenses::LicensePolicy;
     use deps_core::lsp_helpers::{
         DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming,

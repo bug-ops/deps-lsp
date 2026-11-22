@@ -21,7 +21,7 @@
 
 // `allow-expect-in-tests` only recognizes `#[test]` bodies, not the plain helper functions
 // (`offline_context`/`run_pipeline`) every test here calls.
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use deps_cli::exit::{EXIT_CLEAN, ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, OsvCoverage, check_manifest};

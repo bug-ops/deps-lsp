@@ -1,7 +1,7 @@
 //! `diagnostics.ignore` (#1967, spec 094 FR-010 as amended): the typed config surface and how
 //! it resolves per package. Exercised through npm's real name normalization.
 
-#![allow(clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use deps_core::lsp_helpers::{PackageSuppression, SuppressionKind};
 use deps_core::policy_config::DiagnosticsConfig;

@@ -8,7 +8,7 @@
 //!
 //! Written tests-first against plan revision 3 (`.local/handoff/2026-11-18T00-57-21-architect.md`).
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::path::Path;
 use std::sync::Arc;

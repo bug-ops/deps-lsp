@@ -1,7 +1,10 @@
 // `unwrap_used` only fires inside this module's own `#[cfg(all(test, feature = "test-util"))]
 // mod tests`, which isn't compiled in a plain `--lib` build, so `#[expect]` would be
 // unfulfilled there; kept as a plain `#[allow]`.
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::unwrap_used,
+    reason = "fires only in test builds with the test-util feature"
+)]
 #![expect(
     clippy::expect_used,
     reason = "this entire module is test-only fixture/helper infrastructure (most of it gated \
