@@ -20,6 +20,8 @@ pub enum RekeyRefusal {
     DeclaredRangeAlreadyLocked,
     /// The lock file does not parse.
     UnparsableLock,
+    /// The original lock file holds no request to restore for the pinned entry.
+    OriginalRequestMissing,
 }
 
 impl std::fmt::Display for RekeyRefusal {
@@ -29,6 +31,7 @@ impl std::fmt::Display for RekeyRefusal {
             Self::PinnedEntryAmbiguous => "several lock entries hold the pinned version",
             Self::DeclaredRangeAlreadyLocked => "the lock file already holds the declared range",
             Self::UnparsableLock => "the lock file could not be parsed",
+            Self::OriginalRequestMissing => "the original lock file holds no request to restore",
         })
     }
 }
@@ -221,6 +224,79 @@ pub(super) fn deno<'a>(text: &str, rekeys: &'a [LockRekey]) -> Result<String, Re
     Ok(out)
 }
 
+/// Puts the `requested` literal the `original` NuGet lock held back on every `Direct` entry of
+/// each rekeyed package in `current`; every other byte is unchanged.
+///
+/// A restore against a manifest with an exact pin locks the package under that pin's request
+/// (`[2.12.0, 2.12.0]`). The declared requirement went back into the manifest, so the lock must
+/// say what a restore of the manifest says, or `--locked-mode` would reject it.
+///
+/// # Errors
+///
+/// [`RekeyRefusal::UnparsableLock`] when `current` (bound to the first rekey) or the result
+/// (bound to the last) is not JSON, [`RekeyRefusal::PinnedEntryMissing`] when no `Direct` entry
+/// of a package (matched by ASCII case-insensitive id) holds the pinned version in some
+/// framework section, and [`RekeyRefusal::OriginalRequestMissing`] when `original` has no
+/// `requested` literal for that section's entry.
+pub(super) fn nuget<'a>(
+    current: &str,
+    original: &str,
+    rekeys: &'a [LockRekey],
+) -> Result<String, RekeyRefused<'a>> {
+    let (Some(first), Some(last)) = (rekeys.first(), rekeys.last()) else {
+        return Ok(current.to_owned());
+    };
+    let lock: serde_json::Value = serde_json::from_str(current)
+        .map_err(|_| RekeyRefused::new(first, RekeyRefusal::UnparsableLock))?;
+    let frameworks = lock
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| RekeyRefused::new(first, RekeyRefusal::PinnedEntryMissing))?;
+
+    let mut replacements: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    for rekey in rekeys {
+        let refuse = |reason| RekeyRefused::new(rekey, reason);
+        let mut found = false;
+        for (framework, entries) in frameworks {
+            let Some(entries) = entries.as_object() else {
+                continue;
+            };
+            for (name, entry) in entries {
+                let direct =
+                    entry.get("type").and_then(serde_json::Value::as_str) == Some("Direct");
+                if !direct || !name.eq_ignore_ascii_case(rekey.package.as_str()) {
+                    continue;
+                }
+                found = true;
+                let resolved = entry.get("resolved").and_then(serde_json::Value::as_str);
+                if resolved != Some(rekey.pinned.as_str()) {
+                    return Err(refuse(RekeyRefusal::PinnedEntryMissing));
+                }
+                let path = ["dependencies", framework, name, "requested"];
+                let span = deps_core::json_ast::string_literal_span(current, &path)
+                    .ok_or_else(|| refuse(RekeyRefusal::PinnedEntryMissing))?;
+                let declared = deps_core::json_ast::string_literal_span(original, &path)
+                    .and_then(|range| original.get(range))
+                    .ok_or_else(|| refuse(RekeyRefusal::OriginalRequestMissing))?;
+                replacements.push((span, declared));
+            }
+        }
+        if !found {
+            return Err(refuse(RekeyRefusal::PinnedEntryMissing));
+        }
+    }
+
+    replacements.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+    replacements.dedup_by_key(|(span, _)| span.start);
+    let mut out = current.to_owned();
+    for (span, declared) in replacements {
+        out.replace_range(span, declared);
+    }
+    serde_json::from_str::<serde_json::Value>(&out)
+        .map_err(|_| RekeyRefused::new(last, RekeyRefusal::UnparsableLock))?;
+    Ok(out)
+}
+
 fn json_literal(value: &str) -> String {
     serde_json::Value::String(value.to_owned()).to_string()
 }
@@ -405,6 +481,85 @@ mod tests {
         assert_eq!(
             out,
             "{\"specifiers\":{\"npm:x@^1\":\"1.0.0\",\"npm:y@^2\":\"2.0.0\"}}"
+        );
+    }
+
+    fn nuget_lock(sections: &[(&str, &str, &str)]) -> String {
+        let body: Vec<String> = sections
+            .iter()
+            .map(|(framework, requested, resolved)| {
+                format!(
+                    "\"{framework}\": {{\"Serilog\": {{\"type\": \"Direct\", \"requested\": {requested}, \"resolved\": \"{resolved}\"}}}}"
+                )
+            })
+            .collect();
+        format!(
+            "{{\"version\": 1, \"dependencies\": {{{}}}}}",
+            body.join(", ")
+        )
+    }
+
+    #[test]
+    fn nuget_restores_the_original_requested_literal_in_every_framework_section() {
+        let original = nuget_lock(&[
+            ("net6.0", "\"[2.*, )\"", "2.10.0"),
+            ("net8.0", "\"[2.*, )\"", "2.10.0"),
+        ]);
+        let current = nuget_lock(&[
+            ("net6.0", "\"[2.12.0, 2.12.0]\"", "2.12.0"),
+            ("net8.0", "\"[2.12.0, 2.12.0]\"", "2.12.0"),
+        ]);
+
+        let out =
+            nuget(&current, &original, &[rekey("serilog", "2.12.0", "2.*")]).expect("rekeyed");
+
+        assert_eq!(out, current.replace("[2.12.0, 2.12.0]", "[2.*, )"));
+    }
+
+    #[test]
+    fn nuget_keeps_an_escaped_original_literal_byte_for_byte() {
+        let original = nuget_lock(&[("net8.0", r#""[2.*, )\u0020""#, "2.10.0")]);
+        let current = nuget_lock(&[("net8.0", "\"[2.12.0, 2.12.0]\"", "2.12.0")]);
+
+        let out =
+            nuget(&current, &original, &[rekey("Serilog", "2.12.0", "2.*")]).expect("rekeyed");
+
+        assert!(out.contains(r#""[2.*, )\u0020""#), "{out}");
+    }
+
+    #[test]
+    fn nuget_refuses_a_missing_pinned_entry_a_missing_original_and_a_broken_lock() {
+        let original = nuget_lock(&[("net8.0", "\"[2.*, )\"", "2.10.0")]);
+        let current = nuget_lock(&[("net8.0", "\"[2.12.0, 2.12.0]\"", "2.12.0")]);
+        let widened = nuget_lock(&[
+            ("net6.0", "\"[2.12.0, 2.12.0]\"", "2.12.0"),
+            ("net8.0", "\"[2.12.0, 2.12.0]\"", "2.12.0"),
+        ]);
+        let r = [rekey("Serilog", "2.12.0", "2.*")];
+
+        assert_eq!(
+            reason(nuget(
+                &current,
+                &original,
+                &[rekey("Serilog", "2.11.0", "2.*")]
+            )),
+            Err(RekeyRefusal::PinnedEntryMissing)
+        );
+        assert_eq!(
+            reason(nuget(
+                &current,
+                &original,
+                &[rekey("Other", "2.12.0", "2.*")]
+            )),
+            Err(RekeyRefusal::PinnedEntryMissing)
+        );
+        assert_eq!(
+            reason(nuget(&widened, &original, &r)),
+            Err(RekeyRefusal::OriginalRequestMissing)
+        );
+        assert_eq!(
+            reason(nuget("not json", &original, &r)),
+            Err(RekeyRefusal::UnparsableLock)
         );
     }
 }

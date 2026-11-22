@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 
 pub(crate) const OUTCOME_OPEN: &str = "OUTCOME<<";
 pub(crate) const OUTCOME_CLOSE: &str = ">>";
+pub(crate) const JSON_OPEN: &str = "JSON<<";
 
 /// One scenario: project files, fake tools, and the update to regenerate for.
 pub(crate) struct Case<'a> {
@@ -39,6 +40,8 @@ pub(crate) struct Ran {
     pub(crate) root: PathBuf,
     /// The child's `Debug` rendering of the `LockfileOutcome`.
     pub(crate) outcome: String,
+    /// The `lockfile` section of the child's JSON update document, when the child printed it.
+    pub(crate) lockfile_json: Option<serde_json::Value>,
     /// One entry per fake-tool call: `tool argv|cwd|selected env`.
     pub(crate) calls: Vec<String>,
     _keep: Project,
@@ -146,6 +149,12 @@ pub(crate) fn outcome_of(stdout: &str) -> String {
     outcome.to_owned()
 }
 
+pub(crate) fn lockfile_json_of(stdout: &str) -> Option<serde_json::Value> {
+    let (_, rest) = stdout.split_once(JSON_OPEN)?;
+    let (json, _) = rest.split_once(OUTCOME_CLOSE)?;
+    serde_json::from_str(json).ok()
+}
+
 pub(crate) fn prepare(case: &Case<'_>) -> Project {
     let project = Project::new();
     for (rel, bytes) in &case.files {
@@ -168,6 +177,7 @@ pub(crate) fn run(case: &Case<'_>) -> Ran {
     );
     Ran {
         outcome: outcome_of(&String::from_utf8_lossy(&output.stdout)),
+        lockfile_json: lockfile_json_of(&String::from_utf8_lossy(&output.stdout)),
         calls: project.calls(),
         root: project.root.clone(),
         _keep: project,
@@ -282,7 +292,15 @@ pub(crate) async fn regen_child_main() {
     } else {
         regenerate_lockfile(plan, &target, gate).await
     };
-    println!("{OUTCOME_OPEN}{:?}{OUTCOME_CLOSE}", run.lockfile);
+    let document = deps_cli::format::json::update_to_document(&run, DryRun::No);
+    let lockfile = serde_json::to_value(document)
+        .ok()
+        .and_then(|value| value.get("lockfile").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    println!(
+        "{OUTCOME_OPEN}{:?}{OUTCOME_CLOSE}\n{JSON_OPEN}{lockfile}{OUTCOME_CLOSE}",
+        run.lockfile
+    );
 }
 
 pub(crate) fn env(name: &str) -> String {

@@ -46,8 +46,9 @@ use deps_engine::classify::resolved::{LockfileLoad, load_resolved_versions};
 use tokio::time::Instant;
 use url::Url;
 
-use command::{ArgComponent, Invocation, LockfileOnlyMove, NpmPackageArg};
+use command::{ArgComponent, Invocation, NpmPackageArg};
 pub use command::{NpmClient, Program, PythonLocker};
+pub use gradle::{LockConfiguration, LockStateChange, LockedCoordinate};
 pub(in crate::update) use interrupt::Interrupts;
 pub use rekey::RekeyRefusal;
 pub(in crate::update) use run::{ChildGuard, ProcessGroup};
@@ -160,6 +161,15 @@ impl DisplayLockPath {
         &self.real
     }
 
+    /// The display path of `path`, a canonical path the same run wrote, in the way this lock
+    /// file's display path relates to its real one.
+    #[must_use]
+    pub fn display_of(&self, path: &Path) -> PathBuf {
+        let from = self.real.parent().unwrap_or_else(|| Path::new(""));
+        let shown_dir = self.shown.parent().unwrap_or_else(|| Path::new(""));
+        shown_dir.join(relative_route(from, path))
+    }
+
     /// Builds a display path for fixtures that stand in for a regeneration result.
     #[cfg(all(test, unix))]
     pub(in crate::update) fn for_test(shown: &str, real: &Path) -> Self {
@@ -184,6 +194,40 @@ pub enum Companion {
     File(PathBuf),
     /// A directory tree, tracked in `HEAD` when it reaches publishing.
     Tree(PathBuf),
+    /// A file the run created, to be staged and restored by removal.
+    Created(PathBuf),
+    /// A file the run deleted, to be staged as a removal and restored from `HEAD`.
+    Removed {
+        /// The deleted file.
+        path: PathBuf,
+        /// Why it was deleted.
+        removal: Removal,
+    },
+}
+
+/// Why a run deleted a legacy lock file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// The configuration was migrated into the unified lock file.
+    Migrated,
+    /// The configuration is no longer resolved and its legacy file held no coordinates.
+    StaleEmpty,
+    /// The configuration is no longer resolved and its legacy file held coordinates that are dropped.
+    StaleDropped,
+}
+
+/// Why a legacy `gradle/dependency-locks` layout cannot be migrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyLayoutConflict {
+    /// A unified lock file of the same project exists beside the legacy directory.
+    BesideUnifiedLock,
+    /// The legacy directory holds a settings lock file.
+    SettingsLock,
+    /// An edited dependency is locked at several versions in the legacy layout, so the migration
+    /// would move it.
+    EditedPinLockedAtSeveralVersions,
+    /// An edited dependency has no single declaration with a version the migration can hold fixed.
+    EditedPinWithoutSingleDeclaration,
 }
 
 /// How a pin's target compares with the version the regenerated lockfile holds.
@@ -259,7 +303,7 @@ pub enum UnsupportedReason {
     /// interpreter for the tool to run.
     SavedVirtualenv,
     /// The project uses a legacy lock layout the tool cannot update safely.
-    LegacyLockLayout,
+    LegacyLockLayout(LegacyLayoutConflict),
     /// The project centralizes package versions outside the edited manifest.
     CentralPackageVersions,
     /// The project has more lock files than one run handles.
@@ -288,6 +332,8 @@ pub enum IoOperation {
     MoveVendorAside,
     /// Moving the refreshed vendor directory into place.
     MoveVendorIntoPlace,
+    /// Deleting a legacy Gradle lock file after its migration.
+    RemoveLegacyLockfile,
 }
 
 impl fmt::Display for IoOperation {
@@ -299,6 +345,7 @@ impl fmt::Display for IoOperation {
             Self::CreateScratchDirectory => "create a scratch directory in",
             Self::MoveVendorAside => "move aside the vendor directory",
             Self::MoveVendorIntoPlace => "move the refreshed vendor directory into place at",
+            Self::RemoveLegacyLockfile => "remove the legacy lock file",
         })
     }
 }
@@ -461,6 +508,33 @@ pub enum RegenerationError {
         /// Why the lock file could not be re-keyed.
         reason: RekeyRefusal,
     },
+    /// A lock-only pin could not be kept in the lock file after the declared requirement was restored.
+    #[error(
+        "{} could not be kept at {} in {}: {reason}",
+        package.as_str(),
+        target.as_str(),
+        path.display()
+    )]
+    LockfilePinNotKept {
+        /// The package whose pin was not kept.
+        package: PackageName,
+        /// The pinned target.
+        target: ConcreteVersion,
+        /// The lock file's display path.
+        path: PathBuf,
+        /// Why the lock file could not be re-keyed.
+        reason: RekeyRefusal,
+    },
+    /// The run changed which coordinates a configuration locks beyond the requested update.
+    #[error("the migration changed the lock state of configuration {configuration} in {}: {change}", path.display())]
+    LockStateDrift {
+        /// The lock file's display path.
+        path: PathBuf,
+        /// The configuration that drifted.
+        configuration: LockConfiguration,
+        /// The coordinate that appeared or vanished.
+        change: LockStateChange,
+    },
 }
 
 impl RegenerationError {
@@ -560,9 +634,20 @@ ancestor declares a workspace, or the workspace directory is set through the env
             Self::LockfileOutsideRepository => {
                 f.write_str("the lockfile or a file the tool writes is outside the repository")
             }
-            Self::LegacyLockLayout => {
-                f.write_str("the project uses a legacy lock file layout")
-            }
+            Self::LegacyLockLayout(LegacyLayoutConflict::BesideUnifiedLock) => f.write_str(
+                "the project has both a gradle.lockfile and a legacy gradle/dependency-locks directory; Gradle reads gradle.lockfile and ignores the directory, so delete gradle/dependency-locks to continue",
+            ),
+            Self::LegacyLockLayout(LegacyLayoutConflict::SettingsLock) => f.write_str(
+                "the legacy gradle/dependency-locks directory holds a settings lock file, which is not migrated automatically",
+            ),
+            Self::LegacyLockLayout(LegacyLayoutConflict::EditedPinLockedAtSeveralVersions) => f
+                .write_str(
+                    "an edited dependency is locked at several versions in gradle/dependency-locks, so migrating the lock layout would move it; migrate the layout once with `gradle :<project>:dependencies --update-locks <group:module>`, commit the result, then rerun",
+                ),
+            Self::LegacyLockLayout(LegacyLayoutConflict::EditedPinWithoutSingleDeclaration) => f
+                .write_str(
+                    "an edited dependency has no single declaration with a version that can be held fixed during the lock layout migration; migrate the layout once with `gradle :<project>:dependencies --update-locks <group:module>`, commit the result, then rerun",
+                ),
             Self::CentralPackageVersions => f.write_str(
                 "package versions are centralized in Directory.Packages.props, which is not the edited manifest",
             ),
@@ -688,12 +773,11 @@ const fn strategy_tools(strategy: Strategy) -> &'static [(&'static str, Program)
 }
 
 /// The tools of `id`'s ecosystem that can move a lock file without a planned manifest edit, as prose
-/// (`npm, pnpm, Yarn 2+ and Bun`), derived from [`strategy`] and [`Program::lockfile_only_move`]
-/// so it cannot drift from what the tools accept; `None` when no tool can.
+/// (`npm, pnpm, Yarn 2+ and Bun`), derived from [`strategy`] so it cannot drift from the tools
+/// the strategy runs; `None` for an ecosystem without a lock file format.
 pub(super) fn lockfile_only_tools_text(id: EcosystemId) -> Option<String> {
     let mut tools: Vec<&str> = strategy_tools(strategy(id))
         .iter()
-        .filter(|(_, program)| program.lockfile_only_move() == LockfileOnlyMove::Supported)
         .map(|(label, _)| *label)
         .collect();
     let last = tools.pop()?;
@@ -1272,7 +1356,13 @@ struct LockSnapshot {
 struct SnapshotFile {
     path: PathBuf,
     display: PathBuf,
-    bytes: Vec<u8>,
+    state: SnapshotState,
+}
+
+/// What a snapshotted path held: a file to put back, or nothing (the run may create it).
+enum SnapshotState {
+    Present(Vec<u8>),
+    Absent,
 }
 
 /// Whether a failure leaves lock files that may need putting back.
@@ -1295,7 +1385,9 @@ const fn restore_after(error: &RegenerationError) -> bool {
         | RegenerationError::FallbackPinRejected { .. }
         | RegenerationError::ManifestChanged { .. }
         | RegenerationError::Io { .. }
-        | RegenerationError::FallbackPinNotKept { .. } => true,
+        | RegenerationError::FallbackPinNotKept { .. }
+        | RegenerationError::LockfilePinNotKept { .. }
+        | RegenerationError::LockStateDrift { .. } => true,
         RegenerationError::SnapshotFailed { .. } | RegenerationError::RestoreFailed { .. } => false,
     }
 }
@@ -1311,17 +1403,26 @@ fn restore_snapshot(
         return error;
     };
     for file in &snapshot.files {
-        let unchanged = matches!(
-            deps_core::fs_probe::read_capped_no_follow(
-                &file.path,
-                deps_core::lockfile::MAX_LOCKFILE_BYTES
-            ),
-            Ok(Some(current)) if current == file.bytes
-        );
-        if unchanged {
-            continue;
-        }
-        if let Err(source) = deps_core::fs_probe::write_atomic_bytes(&file.path, &file.bytes) {
+        let restored = match &file.state {
+            SnapshotState::Present(bytes) => {
+                let unchanged = matches!(
+                    deps_core::fs_probe::read_capped_no_follow(
+                        &file.path,
+                        deps_core::lockfile::MAX_LOCKFILE_BYTES
+                    ),
+                    Ok(Some(current)) if current == *bytes
+                );
+                if unchanged {
+                    continue;
+                }
+                deps_core::fs_probe::write_atomic_bytes(&file.path, bytes)
+            }
+            SnapshotState::Absent => match std::fs::remove_file(&file.path) {
+                Err(source) if source.kind() != std::io::ErrorKind::NotFound => Err(source),
+                Ok(()) | Err(_) => Ok(()),
+            },
+        };
+        if let Err(source) = restored {
             return RegenerationError::RestoreFailed {
                 cause: Box::new(error),
                 path: file.display.clone(),
@@ -1379,7 +1480,21 @@ impl Session<'_> {
     /// [`RegenerationError::SnapshotFailed`] when a file is unreadable, a symlink, or over the
     /// lock file size cap; nothing has been spawned yet.
     fn capture(&self, paths: &[&Path]) -> Result<(), RegenerationError> {
-        let files = paths
+        self.capture_creating(paths, &[])
+    }
+
+    /// Like [`Self::capture`], also recording `created`: paths that must not exist yet and are
+    /// removed again on restore.
+    ///
+    /// # Errors
+    ///
+    /// [`RegenerationError::SnapshotFailed`] as for `capture`, or when a `created` path exists.
+    fn capture_creating(
+        &self,
+        present: &[&Path],
+        created: &[&Path],
+    ) -> Result<(), RegenerationError> {
+        let mut files = present
             .iter()
             .map(|path| {
                 let display = self.display_lock_path(path).shown;
@@ -1392,11 +1507,26 @@ impl Session<'_> {
                 .map(|bytes| SnapshotFile {
                     path: (*path).to_path_buf(),
                     display: display.clone(),
-                    bytes,
+                    state: SnapshotState::Present(bytes),
                 })
                 .ok_or(RegenerationError::SnapshotFailed { path: display })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        for path in created {
+            let display = self.display_lock_path(path).shown;
+            let missing = matches!(
+                std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            if !missing {
+                return Err(RegenerationError::SnapshotFailed { path: display });
+            }
+            files.push(SnapshotFile {
+                path: (*path).to_path_buf(),
+                display,
+                state: SnapshotState::Absent,
+            });
+        }
         // A second capture in one run keeps the first: the earliest state is the one to restore.
         let _ = self.snapshot.set(LockSnapshot { files });
         Ok(())

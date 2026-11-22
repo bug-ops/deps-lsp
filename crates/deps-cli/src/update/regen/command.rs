@@ -128,41 +128,6 @@ impl Program {
     }
 }
 
-/// Whether a tool can move a lock file without a planned manifest edit (Go may still raise a `require` line).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LockfileOnlyMove {
-    /// The tool can update chosen pins in the lock file alone.
-    Supported,
-    /// The tool has no such mode: a plan of lock-file-only pins is reported `unsupported`.
-    Refused,
-}
-
-impl Program {
-    /// Whether the tool can move a lock file without a planned manifest edit.
-    pub(super) const fn lockfile_only_move(self) -> LockfileOnlyMove {
-        match self {
-            Self::Cargo
-            | Self::Go
-            | Self::Npm
-            | Self::Pnpm
-            | Self::Yarn
-            | Self::Uv
-            | Self::Bundle
-            | Self::Deno
-            | Self::Poetry
-            | Self::Pdm
-            | Self::Composer
-            | Self::Dart
-            | Self::Flutter
-            | Self::Gradle
-            | Self::Swift
-            | Self::Bun
-            | Self::Pipenv => LockfileOnlyMove::Supported,
-            Self::Dotnet => LockfileOnlyMove::Refused,
-        }
-    }
-}
-
 impl fmt::Display for Program {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

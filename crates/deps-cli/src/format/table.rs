@@ -2,9 +2,13 @@
 
 use super::{DryRun, severity_str};
 use crate::report::CheckReport;
-use crate::update::regen::{LockfileOutcome, NotApplicableReason, PinResolution, SkipCause};
+use crate::update::regen::{
+    Companion, DisplayLockPath, LockfileOutcome, NotApplicableReason, PinResolution, Removal,
+    SkipCause,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 /// Renders `report` as a table grouped by manifest path, then by severity
 /// (error > warning > information > hint) within each file.
@@ -139,13 +143,14 @@ fn write_lockfile_lines(out: &mut String, outcome: &LockfileOutcome) {
             lockfile,
             tool,
             pins,
-            ..
+            companions,
         } => {
             let _ = writeln!(
                 out,
                 "lockfile: regenerated {} via {tool}",
                 clean(&lockfile.to_string())
             );
+            write_migration_lines(out, lockfile, companions);
             for pin in pins {
                 let resolved = match &pin.resolution {
                     PinResolution::Exact => format!("{} (exact)", pin.target),
@@ -175,6 +180,43 @@ fn write_lockfile_lines(out: &mut String, outcome: &LockfileOutcome) {
         LockfileOutcome::Failed(error) => {
             let _ = writeln!(out, "lockfile: failed — {}", clean(&error.to_string()));
         }
+    }
+}
+
+/// Appends the notice of a legacy lock layout migration: the created and removed file counts, and
+/// the files whose lock state was dropped. Silent when the run migrated nothing.
+fn write_migration_lines(out: &mut String, lockfile: &DisplayLockPath, companions: &[Companion]) {
+    let clean = crate::sanitize::sanitize_message_for_display;
+    let created = companions
+        .iter()
+        .filter(|companion| matches!(companion, Companion::Created(_)))
+        .count();
+    let removed: Vec<(&Path, Removal)> = companions
+        .iter()
+        .filter_map(|companion| match companion {
+            Companion::Removed { path, removal } => Some((path.as_path(), *removal)),
+            Companion::File(_) | Companion::Tree(_) | Companion::Created(_) => None,
+        })
+        .collect();
+    if created == 0 && removed.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "  migrated legacy lock layout: created {created} file(s), removed {} file(s)",
+        removed.len()
+    );
+    let dropped: Vec<String> = removed
+        .iter()
+        .filter(|(_, removal)| *removal == Removal::StaleDropped)
+        .map(|(path, _)| clean(&lockfile.display_of(path).display().to_string()))
+        .collect();
+    if !dropped.is_empty() {
+        let _ = writeln!(
+            out,
+            "  dropped lock state of configurations Gradle no longer resolves: {}",
+            dropped.join(", ")
+        );
     }
 }
 

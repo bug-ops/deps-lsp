@@ -9,8 +9,8 @@
 use super::DryRun;
 use crate::report::{Category, CheckReport};
 use crate::update::regen::{
-    LockfileOutcome, NotApplicableReason, PinResolution, Program, RegenerationError, SkipCause,
-    UnsupportedReason,
+    Companion, DisplayLockPath, LockfileOutcome, NotApplicableReason, PinResolution, Program,
+    RegenerationError, Removal, SkipCause, UnsupportedReason,
 };
 use deps_core::EcosystemId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -520,6 +520,10 @@ pub enum FailureKind {
     Io,
     /// A cooldown-fallback pin could not be kept in the lock file after the manifest write-back.
     FallbackPinNotKept,
+    /// A lock-only pin could not be kept in the lock file.
+    LockfilePinNotKept,
+    /// The run changed the locked coordinates of a configuration beyond the requested update.
+    LockStateDrift,
 }
 
 impl From<&RegenerationError> for FailureKind {
@@ -543,6 +547,8 @@ impl From<&RegenerationError> for FailureKind {
             RegenerationError::ManifestChanged { .. } => Self::ManifestChanged,
             RegenerationError::Io { .. } => Self::Io,
             RegenerationError::FallbackPinNotKept { .. } => Self::FallbackPinNotKept,
+            RegenerationError::LockfilePinNotKept { .. } => Self::LockfilePinNotKept,
+            RegenerationError::LockStateDrift { .. } => Self::LockStateDrift,
         }
     }
 }
@@ -570,6 +576,9 @@ pub enum LockfileDocument {
         tool: ToolToken,
         /// One entry per applied pin.
         pins: Vec<LockfilePinDocument>,
+        /// The lock layout migration the run performed; omitted when it performed none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        migration: Option<MigrationDocument>,
     },
     /// Regeneration was gated off.
     Skipped {
@@ -610,6 +619,74 @@ pub enum LockfileDocument {
     },
 }
 
+/// The lock files a legacy-to-unified layout migration created and deleted.
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MigrationDocument {
+    /// The unified lock files the run created.
+    pub created: Vec<String>,
+    /// The legacy lock files the run deleted.
+    pub removed: Vec<RemovedLockDocument>,
+}
+
+/// One deleted legacy lock file and why it was deleted.
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RemovedLockDocument {
+    /// The deleted file.
+    pub path: String,
+    /// Whether its state was migrated or dropped.
+    pub removal: RemovalToken,
+}
+
+/// Wire token of a [`Removal`].
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemovalToken {
+    /// The configuration was migrated into the unified lock file.
+    Migrated,
+    /// The configuration is no longer resolved and its file held no coordinates.
+    StaleEmpty,
+    /// The configuration is no longer resolved and its coordinates are dropped.
+    StaleDropped,
+}
+
+impl From<Removal> for RemovalToken {
+    fn from(removal: Removal) -> Self {
+        match removal {
+            Removal::Migrated => Self::Migrated,
+            Removal::StaleEmpty => Self::StaleEmpty,
+            Removal::StaleDropped => Self::StaleDropped,
+        }
+    }
+}
+
+impl MigrationDocument {
+    /// The migration the `companions` record; `None` when they hold neither a created nor a
+    /// removed file.
+    fn of(lockfile: &DisplayLockPath, companions: &[Companion]) -> Option<Self> {
+        let clean = crate::sanitize::sanitize_message_for_display;
+        let created: Vec<String> = companions
+            .iter()
+            .filter_map(|companion| match companion {
+                Companion::Created(path) => {
+                    Some(clean(&lockfile.display_of(path).display().to_string()))
+                }
+                Companion::File(_) | Companion::Tree(_) | Companion::Removed { .. } => None,
+            })
+            .collect();
+        let removed: Vec<RemovedLockDocument> = companions
+            .iter()
+            .filter_map(|companion| match companion {
+                Companion::Removed { path, removal } => Some(RemovedLockDocument {
+                    path: clean(&lockfile.display_of(path).display().to_string()),
+                    removal: (*removal).into(),
+                }),
+                Companion::File(_) | Companion::Tree(_) | Companion::Created(_) => None,
+            })
+            .collect();
+        (!created.is_empty() || !removed.is_empty()).then_some(Self { created, removed })
+    }
+}
+
 /// One pin a regeneration left on a version inside the freshness cooldown window.
 #[derive(Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct HeldPinDocument {
@@ -627,10 +704,11 @@ impl From<&LockfileOutcome> for LockfileDocument {
                 lockfile,
                 tool,
                 pins,
-                ..
+                companions,
             } => Self::Regenerated {
                 path: clean(&lockfile.to_string()),
                 tool: (*tool).into(),
+                migration: MigrationDocument::of(lockfile, companions),
                 pins: pins
                     .iter()
                     .map(|pin| {
@@ -681,7 +759,7 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     UnsupportedReason::LockfileOutsideRepository => {
                         (UnsupportedToken::LockfileOutsideRepository, None)
                     }
-                    UnsupportedReason::LegacyLockLayout => {
+                    UnsupportedReason::LegacyLockLayout(_) => {
                         (UnsupportedToken::LegacyLockLayout, None)
                     }
                     UnsupportedReason::CentralPackageVersions => {
@@ -735,9 +813,9 @@ impl From<&LockfileOutcome> for LockfileDocument {
                     | RegenerationError::FallbackPinRejected { .. }
                     | RegenerationError::ManifestChanged { .. }
                     | RegenerationError::Io { .. }
-                    | RegenerationError::FallbackPinNotKept { .. } => {
-                        (None, None, None, Vec::new())
-                    }
+                    | RegenerationError::FallbackPinNotKept { .. }
+                    | RegenerationError::LockfilePinNotKept { .. }
+                    | RegenerationError::LockStateDrift { .. } => (None, None, None, Vec::new()),
                     RegenerationError::CooldownHeldVersion { first, rest } => (
                         Some(clean(first.package.as_str())),
                         None,

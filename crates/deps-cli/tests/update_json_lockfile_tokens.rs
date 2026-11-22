@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use deps_cli::format::DryRun;
 use deps_cli::format::json::update_to_document;
 use deps_cli::update::regen::{
-    HeldVersion, LockfileOutcome, Program, RegenerationError, UnsupportedReason,
+    HeldVersion, LegacyLayoutConflict, LockfileOutcome, Program, RegenerationError,
+    UnsupportedReason,
 };
 use deps_cli::update::{UpdatePlan, UpdateRun};
 use deps_core::{ConcreteVersion, PackageName};
@@ -107,7 +108,7 @@ fn new_unsupported_reasons_serialize_their_wire_tokens() {
             json!(null),
         ),
         (
-            UnsupportedReason::LegacyLockLayout,
+            UnsupportedReason::LegacyLockLayout(LegacyLayoutConflict::BesideUnifiedLock),
             "legacy-lock-layout",
             json!(null),
         ),

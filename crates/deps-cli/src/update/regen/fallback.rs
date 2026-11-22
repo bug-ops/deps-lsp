@@ -7,13 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
-use deps_core::NormalizeName;
 use deps_core::edit::{ManifestEdit, apply_edits};
+use deps_core::{ConcreteVersion, NormalizeName, PackageName};
 
 use super::rekey::{self, LockRekey};
 use super::{
-    Invocation, IoOperation, LockfileOutcome, PinCheck, Program, RegenerationError, Session,
-    UnsupportedReason, unsafe_argument, unsupported,
+    Invocation, IoOperation, LockfileOutcome, PinCheck, Program, RegenerationError, RekeyRefusal,
+    Session, UnsupportedReason, unsafe_argument, unsupported,
 };
 
 /// A manifest as it was before the first writing spawn.
@@ -23,12 +23,44 @@ pub(super) struct CapturedManifest {
     bytes: Vec<u8>,
 }
 
+impl CapturedManifest {
+    /// The manifest bytes as captured.
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The manifest's real path.
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The manifest's path as shown to the user.
+    pub(super) fn display(&self) -> &Path {
+        &self.display
+    }
+}
+
 /// Writes the captured manifest back when dropped while armed, so a run abandoned between the
 /// exact-pin write and the write-back (SIGINT under `--open-pr` drops the whole future) cannot
 /// leave the exact pins behind.
-struct ManifestGuard<'a> {
+pub(super) struct ManifestGuard<'a> {
     manifest: &'a CapturedManifest,
     armed: bool,
+}
+
+impl<'a> ManifestGuard<'a> {
+    /// Arms a guard that puts `manifest` back when dropped before [`Self::disarm`].
+    pub(super) const fn new(manifest: &'a CapturedManifest) -> Self {
+        Self {
+            manifest,
+            armed: true,
+        }
+    }
+
+    /// Keeps the manifest as it is now, once the run has written it back itself.
+    pub(super) const fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for ManifestGuard<'_> {
@@ -55,18 +87,51 @@ pub(super) struct ExactPinRun<'a> {
     /// Moves lockfile-only pins that are not cooldown fallbacks, when there are any.
     pub(super) update: Option<&'a Invocation>,
     /// How the lock file follows the manifest back to its declared requirements.
-    pub(super) relax: Relax,
+    pub(super) relax: Relax<'a>,
     /// Other manifests the tool may re-serialize, captured before the first writing spawn.
     pub(super) siblings: &'a [CapturedManifest],
 }
 
 /// How the lock file is brought back in line with the declared requirements.
 #[derive(Clone, Copy)]
-pub(super) enum Relax {
+pub(super) enum Relax<'a> {
     /// The second install re-resolves the declared range to the pinned version on its own.
     Reinstall,
     /// The lock is keyed by requirement, so its pinned keys are renamed before the second install.
     Rekey(DescriptorLock),
+    /// The pinned lock entries get the `requested` literal of the original lock back, then
+    /// `settle` replaces the second install and proves the lock agrees with the manifest.
+    ///
+    /// Selects the floating lock-only pins instead of the cooldown-fallback ones.
+    RestoreRequested {
+        /// A restore that fails when the lock file would still change.
+        settle: &'a Invocation,
+        /// The lock file as it was before the first writing spawn.
+        original: &'a [u8],
+    },
+}
+
+impl Relax<'_> {
+    /// Why a run of this kind ends before any write when a selected pin has no declaration to
+    /// pin.
+    const fn refusal(self, tool: Program) -> UnsupportedReason {
+        match self {
+            Self::Reinstall | Self::Rekey(_) => UnsupportedReason::CooldownFallbackTarget,
+            Self::RestoreRequested { .. } => UnsupportedReason::LockfileOnlyUpdateUnsupported(tool),
+        }
+    }
+
+    /// Whether `pin` is a candidate for an exact pin written into the manifest for the first
+    /// install.
+    ///
+    /// A floating lock-only pin is told apart from a fixed one by its declaration, so the
+    /// selection for [`Self::RestoreRequested`] is narrowed again while the declarations are read.
+    fn selects(self, pin: &super::LockPin) -> bool {
+        match self {
+            Self::Reinstall | Self::Rekey(_) => pin.cooldown_fallback,
+            Self::RestoreRequested { .. } => pin.is_lockfile_only(),
+        }
+    }
 }
 
 /// A lock file format keyed by the declared requirement.
@@ -178,14 +243,11 @@ impl Session<'_> {
         let Some(pinned) = self.exact_pinned_text(&original.bytes, run.relax)? else {
             return Ok(unsupported(
                 Some(self.display_lock_path(run.lockfile)),
-                UnsupportedReason::CooldownFallbackTarget,
+                run.relax.refusal(run.tool),
             ));
         };
 
-        let mut guard = ManifestGuard {
-            manifest: &original,
-            armed: true,
-        };
+        let mut guard = ManifestGuard::new(&original);
         deps_core::fs_probe::write_atomic_bytes(&original.path, pinned.text.as_bytes()).map_err(
             |source| RegenerationError::Io {
                 operation: IoOperation::WriteExactPinManifest,
@@ -194,10 +256,12 @@ impl Session<'_> {
             },
         )?;
         // Lockfile-only pins that are not fallbacks move through `update` alone.
-        if self
-            .pins
-            .iter()
-            .any(|pin| !pin.is_lockfile_only() || pin.cooldown_fallback)
+        let always_install = matches!(run.relax, Relax::RestoreRequested { .. });
+        if always_install
+            || self
+                .pins
+                .iter()
+                .any(|pin| !pin.is_lockfile_only() || pin.cooldown_fallback)
         {
             self.runner.run(run.install, self.deadline).await?;
         }
@@ -211,17 +275,25 @@ impl Session<'_> {
                 source,
             },
         )?;
-        if let Relax::Rekey(lock) = run.relax {
-            self.rekey_lock(
-                lock,
-                run.lockfile,
-                &pinned.rekeys,
-                deps_core::fs_probe::write_atomic_bytes,
-            )?;
-        }
-        self.runner.run(run.install, self.deadline).await?;
+        let second = match run.relax {
+            Relax::Reinstall => run.install,
+            Relax::Rekey(lock) => {
+                self.rekey_lock(
+                    lock,
+                    run.lockfile,
+                    &pinned.rekeys,
+                    deps_core::fs_probe::write_atomic_bytes,
+                )?;
+                run.install
+            }
+            Relax::RestoreRequested { settle, original } => {
+                self.restore_requested(run.lockfile, original, &pinned.rekeys)?;
+                settle
+            }
+        };
+        self.runner.run(second, self.deadline).await?;
         self.restore_formatting(std::iter::once(&original).chain(run.siblings))?;
-        guard.armed = false;
+        guard.disarm();
         self.verified(run.tool, run.lockfile, PinCheck::SatisfiesInLock)
             .await
     }
@@ -239,6 +311,64 @@ impl Session<'_> {
         rekeys: &[LockRekey],
         write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
     ) -> Result<(), RegenerationError> {
+        self.rewrite_lock(
+            lockfile,
+            rekeys,
+            |text| match lock {
+                DescriptorLock::YarnBerry => rekey::yarn(text, rekeys),
+                DescriptorLock::Deno => rekey::deno(text, rekeys),
+            },
+            |package, target, path, reason| RegenerationError::FallbackPinNotKept {
+                package,
+                target,
+                path,
+                reason,
+            },
+            write,
+        )
+    }
+
+    /// Puts the `requested` literals of the `original` lock file back on the pinned entries.
+    ///
+    /// # Errors
+    ///
+    /// [`RegenerationError::LockfilePinNotKept`] for the first pin the lock does not hold in a
+    /// restorable form, [`RegenerationError::LockfileUnreadable`] when `original` is not UTF-8,
+    /// and [`RegenerationError::Io`] when the lock file cannot be rewritten.
+    fn restore_requested(
+        &self,
+        lockfile: &Path,
+        original: &[u8],
+        rekeys: &[LockRekey],
+    ) -> Result<(), RegenerationError> {
+        let original =
+            std::str::from_utf8(original).map_err(|_| RegenerationError::LockfileUnreadable {
+                path: self.display_lock_path(lockfile).shown,
+            })?;
+        self.rewrite_lock(
+            lockfile,
+            rekeys,
+            |text| rekey::nuget(text, original, rekeys),
+            |package, target, path, reason| RegenerationError::LockfilePinNotKept {
+                package,
+                target,
+                path,
+                reason,
+            },
+            deps_core::fs_probe::write_atomic_bytes,
+        )
+    }
+
+    /// Reads the lock file, applies `rename` to its text and writes the result back; a refusal
+    /// becomes the error `refused` builds from the refused pin.
+    fn rewrite_lock<'r>(
+        &self,
+        lockfile: &Path,
+        rekeys: &'r [LockRekey],
+        rename: impl FnOnce(&str) -> Result<String, rekey::RekeyRefused<'r>>,
+        refused: impl FnOnce(PackageName, ConcreteVersion, PathBuf, RekeyRefusal) -> RegenerationError,
+        write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), RegenerationError> {
         if rekeys.is_empty() {
             return Ok(());
         }
@@ -252,15 +382,13 @@ impl Session<'_> {
         .ok_or_else(|| RegenerationError::LockfileUnreadable {
             path: display.clone(),
         })?;
-        let renamed = match lock {
-            DescriptorLock::YarnBerry => rekey::yarn(&text, rekeys),
-            DescriptorLock::Deno => rekey::deno(&text, rekeys),
-        }
-        .map_err(|refused| RegenerationError::FallbackPinNotKept {
-            package: refused.rekey.package.clone(),
-            target: refused.rekey.pinned.clone(),
-            path: display.clone(),
-            reason: refused.reason,
+        let renamed = rename(&text).map_err(|refusal| {
+            refused(
+                refusal.rekey.package.clone(),
+                refusal.rekey.pinned.clone(),
+                display.clone(),
+                refusal.reason,
+            )
         })?;
         write(lockfile, renamed.as_bytes()).map_err(|source| RegenerationError::Io {
             operation: IoOperation::RewriteLockfile,
@@ -276,7 +404,7 @@ impl Session<'_> {
     fn exact_pinned_text(
         &self,
         bytes: &[u8],
-        relax: Relax,
+        relax: Relax<'_>,
     ) -> Result<Option<ExactPins>, RegenerationError> {
         let content = std::str::from_utf8(bytes).map_err(|_| self.reparse_failed())?;
         let parsed = self.parse_manifest_text(content)?;
@@ -284,7 +412,7 @@ impl Session<'_> {
 
         let mut edits = Vec::new();
         let mut rekeys = Vec::new();
-        for pin in self.pins.iter().filter(|pin| pin.cooldown_fallback) {
+        for pin in self.pins.iter().filter(|pin| relax.selects(pin)) {
             if !pin.target.as_str().chars().all(is_version_char) {
                 return Err(unsafe_argument(pin));
             }
@@ -302,10 +430,26 @@ impl Session<'_> {
             ) else {
                 return Ok(None);
             };
-            let Some(new_text) =
-                formatter.format_version_exact_pin_replacing(&pin.target, current.as_str())
-            else {
-                return Ok(None);
+            let new_text = match relax {
+                Relax::RestoreRequested { .. } => {
+                    if !super::nuget::declares_float_pattern(current.as_str()) {
+                        continue;
+                    }
+                    rekeys.push(LockRekey {
+                        package: pin.package.clone(),
+                        pinned: pin.target.clone(),
+                        declared: current.clone(),
+                    });
+                    format!("[{}]", pin.target.as_str())
+                }
+                Relax::Reinstall | Relax::Rekey(_) => {
+                    let Some(text) =
+                        formatter.format_version_exact_pin_replacing(&pin.target, current.as_str())
+                    else {
+                        return Ok(None);
+                    };
+                    text
+                }
             };
             edits.push(ManifestEdit { range, new_text });
             if matches!(relax, Relax::Rekey(_)) {
@@ -329,7 +473,7 @@ impl Session<'_> {
 }
 
 /// A character a version may carry into a manifest string without any quoting concern.
-const fn is_version_char(c: char) -> bool {
+pub(super) const fn is_version_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_')
 }
 

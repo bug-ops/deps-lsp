@@ -350,13 +350,10 @@ fn test_requires_lockfile_update_reason_for_pypi_lists_pipenv_with_the_other_loc
 
 #[test]
 fn test_requires_lockfile_update_reason_omits_the_sentence_when_no_tool_can_move_the_lock() {
-    for reason in [
-        lockfile_only_in(EcosystemId::NuGet, "stuba").reason(),
-        lockfile_only_in(EcosystemId::Maven, "stuba").reason(),
-    ] {
-        assert!(!reason.contains("--lockfile regenerate"), "{reason}");
-        assert!(reason.ends_with("update the lock file"), "{reason}");
-    }
+    let reason = lockfile_only_in(EcosystemId::Maven, "stuba").reason();
+
+    assert!(!reason.contains("--lockfile regenerate"), "{reason}");
+    assert!(reason.ends_with("update the lock file"), "{reason}");
 }
 
 #[test]
@@ -489,51 +486,17 @@ fn test_cooldown_held_error_counts_the_other_held_pins_in_its_message() {
 }
 
 #[test]
-fn test_lockfile_only_move_table_pins_every_program() {
-    use super::Program::{
-        Bun, Bundle, Cargo, Composer, Dart, Deno, Dotnet, Flutter, Go, Gradle, Npm, Pdm, Pipenv,
-        Pnpm, Poetry, Swift, Uv, Yarn,
-    };
-    use super::command::LockfileOnlyMove::{Refused, Supported};
-
-    let expected = [
-        (Cargo, Supported),
-        (Go, Supported),
-        (Npm, Supported),
-        (Pnpm, Supported),
-        (Yarn, Supported),
-        (Uv, Supported),
-        (Bundle, Supported),
-        (Deno, Supported),
-        (Bun, Supported),
-        (Poetry, Supported),
-        (Pdm, Supported),
-        (Pipenv, Supported),
-        (Composer, Supported),
-        (Dart, Supported),
-        (Flutter, Supported),
-        (Dotnet, Refused),
-        (Gradle, Supported),
-        (Swift, Supported),
-    ];
-
-    for (program, move_kind) in expected {
-        assert_eq!(program.lockfile_only_move(), move_kind, "{program}");
-    }
-}
-
-#[test]
 fn test_lockfile_only_tools_text_is_none_for_ecosystems_without_a_capable_tool() {
-    for id in [
-        EcosystemId::NuGet,
-        EcosystemId::Maven,
-        EcosystemId::GithubActions,
-    ] {
+    for id in [EcosystemId::Maven, EcosystemId::GithubActions] {
         assert_eq!(super::lockfile_only_tools_text(id), None, "{id:?}");
     }
     assert_eq!(
         super::lockfile_only_tools_text(EcosystemId::Cargo).as_deref(),
         Some("Cargo")
+    );
+    assert_eq!(
+        super::lockfile_only_tools_text(EcosystemId::NuGet).as_deref(),
+        Some("NuGet")
     );
 }
 

@@ -88,7 +88,7 @@ fn nuget_manifest_edit_restores_the_project_with_the_lock_file_and_verifies() {
 
     let restores = calls_starting(
         &ran,
-        "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers|",
+        "dotnet restore App.csproj --use-lock-file --no-dependencies --disable-build-servers --force|",
     );
     assert_eq!(restores.len(), 1, "{:?}", ran.calls);
     assert_eq!(cwd_of(restores[0]), ran.root.display().to_string());
@@ -493,26 +493,6 @@ fn gradle_lock_only_pin_uses_the_same_update_locks_form() {
         "{:?}",
         ran.calls
     );
-}
-
-#[test]
-fn gradle_legacy_lock_layout_is_refused_without_a_spawn() {
-    let old = gradle_lock("32.1.2-jre");
-    let ran = run(&case(
-        "gradle",
-        "build.gradle",
-        vec![
-            ("build.gradle", BUILD_GRADLE),
-            ("gradle.lockfile", &old),
-            ("gradle/dependency-locks/compileClasspath.lockfile", &old),
-        ],
-        vec![("gradle", "exit 0")],
-        "edit",
-        GUAVA_EDIT,
-    ));
-
-    assert!(ran.outcome.contains("LegacyLockLayout"), "{}", ran.outcome);
-    assert!(ran.calls.is_empty(), "{:?}", ran.calls);
 }
 
 #[test]

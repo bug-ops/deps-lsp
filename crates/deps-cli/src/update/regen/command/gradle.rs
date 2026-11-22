@@ -81,6 +81,15 @@ impl GradleProjectPath {
 }
 
 impl Invocation {
+    /// The first spawn of a legacy-layout migration: `--update-locks` for a module that does not
+    /// exist, so Gradle writes the unified lock files without moving any real dependency.
+    pub(in crate::update::regen) fn gradle_migrate_locks(
+        cwd: &Path,
+        projects: &NonEmpty<GradleProjectPath>,
+    ) -> Self {
+        Self::gradle_with_update_locks(cwd, projects, "invalid.deps-cli:lock-layout-migration")
+    }
+
     /// `gradle --no-daemon --console=plain <:p:dependencies>... --update-locks <g:a,...>`, run at
     /// the build root: the report task runs only in the project it names, so each project that
     /// owns a lock file gets its own; only the named modules are re-resolved.
@@ -89,15 +98,23 @@ impl Invocation {
         projects: &NonEmpty<GradleProjectPath>,
         coordinates: &NonEmpty<GradleCoordArg>,
     ) -> Self {
-        let mut args = Self::strs(&["--no-daemon", "--console=plain"]);
-        args.extend(projects.iter().map(|project| project.task().into()));
-        args.push("--update-locks".into());
         let joined = coordinates
             .iter()
             .map(|coordinate| coordinate.0.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        args.push(joined.into());
+        Self::gradle_with_update_locks(cwd, projects, &joined)
+    }
+
+    fn gradle_with_update_locks(
+        cwd: &Path,
+        projects: &NonEmpty<GradleProjectPath>,
+        modules: &str,
+    ) -> Self {
+        let mut args = Self::strs(&["--no-daemon", "--console=plain"]);
+        args.extend(projects.iter().map(|project| project.task().into()));
+        args.push("--update-locks".into());
+        args.push(modules.into());
         Self::new(Program::Gradle, cwd, args)
     }
 }
@@ -148,6 +165,22 @@ mod tests {
                 "{relative}"
             );
         }
+    }
+
+    #[test]
+    fn migrate_locks_updates_a_module_that_does_not_exist() {
+        let projects = NonEmpty::new(vec![project("app")]).expect("non-empty");
+        let invocation = Invocation::gradle_migrate_locks(Path::new("."), &projects);
+        assert_eq!(
+            invocation.args(),
+            [
+                "--no-daemon",
+                "--console=plain",
+                ":app:dependencies",
+                "--update-locks",
+                "invalid.deps-cli:lock-layout-migration"
+            ]
+        );
     }
 
     #[test]
