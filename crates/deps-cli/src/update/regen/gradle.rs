@@ -3,7 +3,7 @@
 //! Gradle runs from the build root, so one run may rewrite the lock file of every project of the
 //! build. The whole lock set is snapshotted before the first spawn and reported as companions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use deps_core::NormalizeName;
@@ -14,8 +14,11 @@ mod lock_state;
 #[cfg(test)]
 mod legacy_tests;
 
+use lock_state::{
+    DroppedConfigurations, LockScope, LockState, first_drift, parse_legacy, parse_unified,
+    without_modules,
+};
 pub use lock_state::{LockConfiguration, LockStateChange, LockedCoordinate};
-use lock_state::{LockScope, LockState, first_drift, parse_legacy, parse_unified, without_modules};
 
 use super::command::NonEmpty;
 use super::command::gradle::{GradleCoordArg, GradleProjectPath};
@@ -283,12 +286,6 @@ fn missing_unified_locks(dirs: &[&Path], existing: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The parsed state of one unified lock file.
-struct UnifiedLock {
-    path: PathBuf,
-    state: LockState,
-}
-
 /// The legacy lock state of one project, read before the first spawn.
 struct LegacyState {
     state: LockState,
@@ -548,7 +545,9 @@ impl Session<'_> {
         let mut removals: Vec<(PathBuf, Removal)> = Vec::new();
         for (project, legacy) in set.legacy.iter().zip(&before) {
             let migrated = self.read_migrated_state(project)?;
-            if let Some((scope, configuration, change)) = first_drift(&legacy.state, &migrated) {
+            if let Some((scope, configuration, change)) =
+                first_drift(&legacy.state, &migrated, DroppedConfigurations::AllowStale)
+            {
                 return Err(RegenerationError::LockStateDrift {
                     path: self
                         .display_lock_path(&project.dir.join(scope.unified_file_name()))
@@ -615,8 +614,8 @@ impl Session<'_> {
     fn read_unified_states(
         &self,
         paths: &[PathBuf],
-    ) -> Result<Vec<UnifiedLock>, RegenerationError> {
-        let mut locks = Vec::new();
+    ) -> Result<BTreeMap<PathBuf, LockState>, RegenerationError> {
+        let mut locks = BTreeMap::new();
         for path in paths {
             let scope = path
                 .file_name()
@@ -633,38 +632,42 @@ impl Session<'_> {
                 }
             };
             let state = parse_unified(scope, &text).ok_or_else(|| self.unrecognized(path))?;
-            locks.push(UnifiedLock {
-                path: path.clone(),
-                state,
-            });
+            locks.insert(path.clone(), state);
         }
         Ok(locks)
     }
 
-    /// Refuses a run that moved a coordinate no pin names, in a configuration the lock already
-    /// held or one it was missing (which Gradle resolves fresh, past the cooldown).
+    /// Refuses a run that moved or dropped a coordinate no pin names, in a surviving
+    /// configuration, a dropped configuration, a newly added configuration, or a deleted lock
+    /// file, or that deleted any previously present unified lock file.
     ///
     /// The caller's snapshot restores the files on the returned error.
     fn ensure_only_pins_moved(
         &self,
-        before: &[UnifiedLock],
+        before: &BTreeMap<PathBuf, LockState>,
         paths: &[PathBuf],
     ) -> Result<(), RegenerationError> {
         let modules: Vec<&str> = self.pins.iter().map(|pin| pin.package.as_str()).collect();
+        let after_states = self.read_unified_states(paths)?;
         let empty = LockState::new();
-        for after in self.read_unified_states(paths)? {
-            let prior = before
-                .iter()
-                .find(|lock| lock.path == after.path)
-                .map_or(&empty, |lock| &lock.state);
+        let all_paths: BTreeSet<&PathBuf> = before.keys().chain(after_states.keys()).collect();
+        for path in all_paths {
+            let prior = before.get(path);
+            let after = after_states.get(path);
             if let Some((_, configuration, change)) = first_drift(
-                &without_modules(prior, &modules),
-                &without_modules(&after.state, &modules),
+                &without_modules(prior.unwrap_or(&empty), &modules),
+                &without_modules(after.unwrap_or(&empty), &modules),
+                DroppedConfigurations::Refuse,
             ) {
                 return Err(RegenerationError::LockStateDrift {
-                    path: self.display_lock_path(&after.path).shown,
+                    path: self.display_lock_path(path).shown,
                     configuration,
                     change,
+                });
+            }
+            if prior.is_some() && after.is_none() {
+                return Err(RegenerationError::LockfileUnreadable {
+                    path: self.display_lock_path(path).shown,
                 });
             }
         }
