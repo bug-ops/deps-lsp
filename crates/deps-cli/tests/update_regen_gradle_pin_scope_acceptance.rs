@@ -383,3 +383,189 @@ fn gradle_migration_spawn_that_creates_a_sibling_lock_in_a_unified_project_is_re
     assert!(ran.outcome.contains("LockStateDrift"), "{}", ran.outcome);
     assert!(!ran.root.join("lib/buildscript-gradle.lockfile").exists());
 }
+
+#[test]
+fn gradle_unified_run_that_drops_a_configuration_holding_a_non_pin_module_is_refused() {
+    let original = lock(&[
+        "commons-io:commons-io:2.11.0=compileClasspath",
+        "org.apache.commons:commons-lang3:3.17.0=compileClasspath,runtimeClasspath",
+        "empty=annotationProcessor",
+    ]);
+    let files = vec![
+        ("build.gradle", build_gradle("3.17.0")),
+        ("gradle.lockfile", original.clone()),
+    ];
+    let body = write_lock(&lock(&[
+        "org.apache.commons:commons-lang3:3.18.0=runtimeClasspath",
+        "empty=annotationProcessor",
+    ]));
+
+    let ran = run(&case(&files, &body, "edit", LANG3_BUMP));
+
+    assert!(
+        ran.outcome.contains("LockStateDrift") && ran.outcome.contains("Lost"),
+        "{}",
+        ran.outcome
+    );
+    let json = ran.lockfile_json.as_ref().expect("child printed the JSON");
+    assert_eq!(json["kind"], "lock-state-drift");
+    assert_eq!(json["configuration"], "compileClasspath");
+    assert_eq!(json["change"], "lost");
+    assert_eq!(json["package"], "commons-io:commons-io:2.11.0");
+    assert_lock_unchanged(&ran, &original);
+}
+
+#[test]
+fn gradle_unified_run_that_drops_an_empty_or_pin_only_configuration_is_accepted() {
+    let original = lock(&[
+        "commons-io:commons-io:2.11.0=compileClasspath",
+        "org.apache.commons:commons-lang3:3.17.0=compileClasspath,runtimeClasspath",
+        "empty=annotationProcessor",
+    ]);
+    let files = vec![
+        ("build.gradle", build_gradle("3.17.0")),
+        ("gradle.lockfile", original),
+    ];
+    let body = write_lock(&lock(&[
+        "commons-io:commons-io:2.11.0=compileClasspath",
+        "org.apache.commons:commons-lang3:3.18.0=compileClasspath",
+    ]));
+
+    let ran = run(&case(&files, &body, "edit", LANG3_BUMP));
+
+    assert!(ran.outcome.starts_with("Regenerated"), "{}", ran.outcome);
+}
+
+#[test]
+fn gradle_unified_run_that_deletes_a_sibling_lockfile_holding_a_non_pin_module_is_refused_and_restored()
+ {
+    let root_original = lock(&[
+        "org.apache.commons:commons-lang3:3.17.0=compileClasspath",
+        "empty=annotationProcessor",
+    ]);
+    let lib_original = lock(&["commons-io:commons-io:2.11.0=compileClasspath"]);
+    let files = vec![
+        ("build.gradle", build_gradle("3.17.0")),
+        ("gradle.lockfile", root_original.clone()),
+        ("lib/build.gradle", "plugins { id 'java' }\n".to_owned()),
+        ("lib/gradle.lockfile", lib_original.clone()),
+    ];
+    let body = format!(
+        "{}rm ROOT/lib/gradle.lockfile\n",
+        write_lock(&lock(&[
+            "org.apache.commons:commons-lang3:3.18.0=compileClasspath",
+            "empty=annotationProcessor",
+        ])),
+    );
+
+    let ran = run(&case(&files, &body, "edit", LANG3_BUMP));
+
+    assert!(
+        ran.outcome.contains("LockStateDrift")
+            && ran.outcome.contains("Lost")
+            && ran.outcome.contains("lib/gradle.lockfile"),
+        "{}",
+        ran.outcome
+    );
+    let json = ran.lockfile_json.as_ref().expect("child printed the JSON");
+    assert_eq!(json["kind"], "lock-state-drift");
+    assert_eq!(json["configuration"], "compileClasspath");
+    assert_eq!(json["change"], "lost");
+    assert_eq!(json["package"], "commons-io:commons-io:2.11.0");
+    assert_lock_unchanged(&ran, &root_original);
+    assert_eq!(ran.read("lib/gradle.lockfile"), lib_original.as_bytes());
+}
+
+#[test]
+fn gradle_unified_run_that_deletes_an_empty_or_pin_only_sibling_lockfile_is_refused_and_restored() {
+    let root_original = lock(&[
+        "org.apache.commons:commons-lang3:3.17.0=compileClasspath",
+        "empty=annotationProcessor",
+    ]);
+    let body = format!(
+        "{}rm ROOT/lib/gradle.lockfile\n",
+        write_lock(&lock(&[
+            "org.apache.commons:commons-lang3:3.18.0=compileClasspath",
+            "empty=annotationProcessor",
+        ])),
+    );
+
+    for (label, lib_original) in [
+        ("empty", lock(&["empty=annotationProcessor"])),
+        (
+            "pin-only",
+            lock(&["org.apache.commons:commons-lang3:3.17.0=compileClasspath"]),
+        ),
+    ] {
+        let files = vec![
+            ("build.gradle", build_gradle("3.17.0")),
+            ("gradle.lockfile", root_original.clone()),
+            ("lib/build.gradle", "plugins { id 'java' }\n".to_owned()),
+            ("lib/gradle.lockfile", lib_original.clone()),
+        ];
+
+        let ran = run(&case(&files, &body, "edit", LANG3_BUMP));
+
+        assert!(
+            ran.outcome.contains("LockfileUnreadable")
+                && ran.outcome.contains("lib/gradle.lockfile"),
+            "{label}: {}",
+            ran.outcome
+        );
+        let json = ran.lockfile_json.as_ref().expect("child printed the JSON");
+        assert_eq!(json["kind"], "lockfile-unreadable", "{label}");
+        assert_lock_unchanged(&ran, &root_original);
+        assert_eq!(
+            ran.read("lib/gradle.lockfile"),
+            lib_original.as_bytes(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn gradle_migrating_run_spawn_two_that_drops_a_configuration_is_refused_and_rolls_back() {
+    let compile_legacy = lock(&[
+        "commons-io:commons-io:2.11.0",
+        "org.apache.commons:commons-lang3:3.17.0",
+    ]);
+    let runtime_legacy = lock(&["org.apache.commons:commons-lang3:3.17.0"]);
+    let files = vec![
+        ("build.gradle", build_gradle("3.17.0")),
+        (
+            "gradle/dependency-locks/compileClasspath.lockfile",
+            compile_legacy.clone(),
+        ),
+        (
+            "gradle/dependency-locks/runtimeClasspath.lockfile",
+            runtime_legacy.clone(),
+        ),
+    ];
+    let migrated = lock(&[
+        "commons-io:commons-io:2.11.0=compileClasspath",
+        "org.apache.commons:commons-lang3:3.17.0=compileClasspath,runtimeClasspath",
+    ]);
+    let dropped = lock(&["org.apache.commons:commons-lang3:3.18.0=runtimeClasspath"]);
+    let body = format!(
+        "case \"$*\" in\n*{MIGRATION_MARKER}*)\n{}\n;;\n*)\n{}\n;;\nesac\n",
+        write_lock(&migrated),
+        write_lock(&dropped),
+    );
+
+    let ran = run(&case(&files, &body, "edit", LANG3_BUMP));
+
+    assert!(
+        ran.outcome.contains("LockStateDrift") && ran.outcome.contains("Lost"),
+        "{}",
+        ran.outcome
+    );
+    assert!(!ran.root.join("gradle.lockfile").exists());
+    assert_eq!(
+        ran.read("gradle/dependency-locks/compileClasspath.lockfile"),
+        compile_legacy.as_bytes()
+    );
+    assert_eq!(
+        ran.read("gradle/dependency-locks/runtimeClasspath.lockfile"),
+        runtime_legacy.as_bytes()
+    );
+}

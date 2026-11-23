@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #2134)
 
 ### Fixed
+- **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a run drops a configuration holding a non-pinned coordinate or deletes a previously present unified lock file (#2135)
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a non-pinned coordinate moves, and a security-only pin accepts a locked version at or above the target (#2130, #2133, #2136)
 - **deps-cli**: NuGet regeneration passes `-p:RestoreLockedMode=false` so projects that set locked mode no longer fail with NU1004 (#2129, #2136)
 - **deps-cli**: lock file report paths are lexically normalized, dropping `x/..` segments in multi-project runs (#2131, #2136)

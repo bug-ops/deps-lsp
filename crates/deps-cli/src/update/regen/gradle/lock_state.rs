@@ -191,29 +191,58 @@ pub(super) fn without_modules(state: &LockState, modules: &[&str]) -> LockState 
         .collect()
 }
 
-/// The first configuration of `migrated` whose coordinates differ from `legacy`, and how.
+/// How [`first_drift`] handles configurations present in `before` and absent from `after`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DroppedConfigurations {
+    /// Legacy-layout migration: legacy-only configurations are classified separately as
+    /// `Removal::StaleEmpty` or `Removal::StaleDropped`, not as drift.
+    AllowStale,
+    /// Unified regeneration: missing-in-after configurations compare against an empty set, so
+    /// dropping any non-empty configuration is [`LockStateChange::Lost`] drift.
+    Refuse,
+}
+
+fn configuration_drift(
+    before: &BTreeSet<LockedCoordinate>,
+    after: &BTreeSet<LockedCoordinate>,
+) -> Option<LockStateChange> {
+    after
+        .difference(before)
+        .next()
+        .map(|c| LockStateChange::Gained(c.clone()))
+        .or_else(|| {
+            before
+                .difference(after)
+                .next()
+                .map(|c| LockStateChange::Lost(c.clone()))
+        })
+}
+
+/// The first configuration whose coordinates differ between `before` and `after`, and how.
 ///
-/// A configuration `legacy` does not know compares as empty, so gaining an empty one is no drift.
+/// A configuration `before` does not know compares as empty, so gaining an empty one is no drift.
+/// Configurations present in `before` and absent from `after` are handled according to `dropped`.
 pub(super) fn first_drift(
-    legacy: &LockState,
-    migrated: &LockState,
+    before: &LockState,
+    after: &LockState,
+    dropped: DroppedConfigurations,
 ) -> Option<(LockScope, LockConfiguration, LockStateChange)> {
     let none = BTreeSet::new();
-    migrated.iter().find_map(|((scope, configuration), now)| {
-        let before = legacy
-            .get(&(*scope, configuration.clone()))
-            .unwrap_or(&none);
-        now.difference(before)
-            .next()
-            .map(|c| LockStateChange::Gained(c.clone()))
-            .or_else(|| {
-                before
-                    .difference(now)
-                    .next()
-                    .map(|c| LockStateChange::Lost(c.clone()))
+    match dropped {
+        DroppedConfigurations::AllowStale => after.iter().find_map(|(key, now)| {
+            let prior = before.get(key).unwrap_or(&none);
+            configuration_drift(prior, now).map(|change| (key.0, key.1.clone(), change))
+        }),
+        DroppedConfigurations::Refuse => {
+            let keys: BTreeSet<&(LockScope, LockConfiguration)> =
+                before.keys().chain(after.keys()).collect();
+            keys.into_iter().find_map(|key| {
+                let prior = before.get(key).unwrap_or(&none);
+                let now = after.get(key).unwrap_or(&none);
+                configuration_drift(prior, now).map(|change| (key.0, key.1.clone(), change))
             })
-            .map(|change| (*scope, configuration.clone(), change))
-    })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,15 +325,20 @@ mod tests {
         )]);
         let lost = LockState::from([(key, BTreeSet::new())]);
 
-        assert!(first_drift(&legacy, &legacy).is_none());
-        assert_eq!(
-            first_drift(&legacy, &gained).map(|(_, _, change)| change),
-            Some(LockStateChange::Gained(coordinate("g:b:1")))
-        );
-        assert_eq!(
-            first_drift(&legacy, &lost).map(|(_, _, change)| change),
-            Some(LockStateChange::Lost(coordinate("g:a:1")))
-        );
+        for dropped in [
+            DroppedConfigurations::AllowStale,
+            DroppedConfigurations::Refuse,
+        ] {
+            assert!(first_drift(&legacy, &legacy, dropped).is_none());
+            assert_eq!(
+                first_drift(&legacy, &gained, dropped).map(|(_, _, change)| change),
+                Some(LockStateChange::Gained(coordinate("g:b:1")))
+            );
+            assert_eq!(
+                first_drift(&legacy, &lost, dropped).map(|(_, _, change)| change),
+                Some(LockStateChange::Lost(coordinate("g:a:1")))
+            );
+        }
     }
 
     #[test]
@@ -332,7 +366,109 @@ mod tests {
         let migrated =
             LockState::from([((LockScope::Project, configuration("kapt")), BTreeSet::new())]);
 
-        assert!(first_drift(&LockState::new(), &migrated).is_none());
+        for dropped in [
+            DroppedConfigurations::AllowStale,
+            DroppedConfigurations::Refuse,
+        ] {
+            assert!(first_drift(&LockState::new(), &migrated, dropped).is_none());
+        }
+    }
+
+    #[test]
+    fn dropped_non_empty_configuration_is_lost_when_refused_and_ignored_when_stale_allowed() {
+        let before = LockState::from([
+            (
+                (LockScope::Project, configuration("compileClasspath")),
+                BTreeSet::from([coordinate("commons-io:commons-io:2.11.0")]),
+            ),
+            (
+                (LockScope::Project, configuration("runtimeClasspath")),
+                BTreeSet::from([coordinate("g:kept:1.0.0")]),
+            ),
+        ]);
+        let after = LockState::from([(
+            (LockScope::Project, configuration("runtimeClasspath")),
+            BTreeSet::from([coordinate("g:kept:1.0.0")]),
+        )]);
+
+        assert!(first_drift(&before, &after, DroppedConfigurations::AllowStale).is_none());
+        assert_eq!(
+            first_drift(&before, &after, DroppedConfigurations::Refuse),
+            Some((
+                LockScope::Project,
+                configuration("compileClasspath"),
+                LockStateChange::Lost(coordinate("commons-io:commons-io:2.11.0")),
+            ))
+        );
+    }
+
+    #[test]
+    fn dropped_empty_configuration_is_no_drift_under_either_policy() {
+        let before = LockState::from([(
+            (LockScope::Project, configuration("annotationProcessor")),
+            BTreeSet::new(),
+        )]);
+
+        for dropped in [
+            DroppedConfigurations::AllowStale,
+            DroppedConfigurations::Refuse,
+        ] {
+            assert!(first_drift(&before, &LockState::new(), dropped).is_none());
+        }
+    }
+
+    #[test]
+    fn first_drift_visits_union_of_configurations_in_sorted_scope_and_name_order() {
+        let before_earlier = LockState::from([(
+            (LockScope::Project, configuration("a_dropped")),
+            BTreeSet::from([coordinate("g:dropped:1.0.0")]),
+        )]);
+        let after_later = LockState::from([(
+            (LockScope::Project, configuration("b_gained")),
+            BTreeSet::from([coordinate("g:gained:1.0.0")]),
+        )]);
+        assert_eq!(
+            first_drift(&before_earlier, &after_later, DroppedConfigurations::Refuse),
+            Some((
+                LockScope::Project,
+                configuration("a_dropped"),
+                LockStateChange::Lost(coordinate("g:dropped:1.0.0")),
+            ))
+        );
+
+        let before_later = LockState::from([(
+            (LockScope::Project, configuration("b_dropped")),
+            BTreeSet::from([coordinate("g:dropped:1.0.0")]),
+        )]);
+        let after_earlier = LockState::from([(
+            (LockScope::Project, configuration("a_gained")),
+            BTreeSet::from([coordinate("g:gained:1.0.0")]),
+        )]);
+        assert_eq!(
+            first_drift(&before_later, &after_earlier, DroppedConfigurations::Refuse),
+            Some((
+                LockScope::Project,
+                configuration("a_gained"),
+                LockStateChange::Gained(coordinate("g:gained:1.0.0")),
+            ))
+        );
+
+        let before_scope = LockState::from([(
+            (LockScope::Project, configuration("z_project")),
+            BTreeSet::from([coordinate("g:proj:1.0.0")]),
+        )]);
+        let after_scope = LockState::from([(
+            (LockScope::Buildscript, configuration("a_buildscript")),
+            BTreeSet::from([coordinate("g:bs:1.0.0")]),
+        )]);
+        assert_eq!(
+            first_drift(&before_scope, &after_scope, DroppedConfigurations::Refuse),
+            Some((
+                LockScope::Project,
+                configuration("z_project"),
+                LockStateChange::Lost(coordinate("g:proj:1.0.0")),
+            ))
+        );
     }
 
     #[test]
