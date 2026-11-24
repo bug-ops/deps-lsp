@@ -16,6 +16,10 @@ const MAX_QUERY_VALUE_LEN: usize = 32;
 ///
 /// Closed on purpose: a new host needs an explicit variant, and
 /// self-hosted or IP hosts can never qualify.
+///
+/// Only hosts whose cached requests are fully identified by the URL belong here. `api.osv.dev`
+/// and `api.deps.dev` are excluded because their queries are POSTs whose response depends on the
+/// request body, which a URL-only [`PersistKey`] cannot name (#2141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum PersistableHost {
     /// `api.github.com`
@@ -50,14 +54,10 @@ pub(super) enum PersistableHost {
     JsrIo,
     /// `api.jsr.io`
     ApiJsrIo,
-    /// `api.deps.dev`
-    ApiDepsDev,
-    /// `api.osv.dev`
-    ApiOsvDev,
 }
 
 impl PersistableHost {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 16] = [
         Self::ApiGithubCom,
         Self::GitlabCom,
         Self::IndexCratesIo,
@@ -74,8 +74,6 @@ impl PersistableHost {
         Self::ApiNugetOrg,
         Self::JsrIo,
         Self::ApiJsrIo,
-        Self::ApiDepsDev,
-        Self::ApiOsvDev,
     ];
 
     /// Parses an exact, lowercase host name; anything else is `None`.
@@ -104,10 +102,18 @@ impl PersistableHost {
             Self::ApiNugetOrg => "api.nuget.org",
             Self::JsrIo => "jsr.io",
             Self::ApiJsrIo => "api.jsr.io",
-            Self::ApiDepsDev => "api.deps.dev",
-            Self::ApiOsvDev => "api.osv.dev",
         }
     }
+}
+
+/// Host names of every [`PersistableHost`], for tests that pin the allow-list against what the
+/// ecosystem crates fetch by default.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub fn persistable_hosts() -> impl Iterator<Item = &'static str> {
+    PersistableHost::ALL
+        .into_iter()
+        .map(PersistableHost::as_str)
 }
 
 /// A query parameter that may appear in a persisted URL.

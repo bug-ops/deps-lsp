@@ -5,6 +5,8 @@
 //! directory that another user could own or redirect: an existing cache root must be an
 //! owned directory, a missing root is created only directly under an owned `$HOME`, and the
 //! `deps-lsp/http/v1` components are created `0700` and verified without following symlinks.
+//! On Windows the root is `%LOCALAPPDATA%`, never created, and trust rests on its per-user
+//! ACL: components are verified as plain directories (no reparse points), without an owner check.
 //! Pruning bounds the store by age, file count and total size.
 
 use super::freshness::{DiskFreshness, ValidatedAt, classify};
@@ -347,6 +349,73 @@ pub(super) fn entry_file_trusted(meta: &std::fs::Metadata, uid: ProbeUid) -> boo
     meta.file_type().is_file()
         && meta.uid() == uid.as_raw()
         && meta.permissions().mode() & 0o022 == 0
+}
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT`, declared locally to avoid a `windows-sys` dependency.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+#[cfg(windows)]
+impl CacheDir {
+    /// Opens the store directory under `%LOCALAPPDATA%`.
+    ///
+    /// Trust rests on the per-user ACL of `%LOCALAPPDATA%` (NFR-004): the root is never
+    /// created, each store component is created with a plain `create_dir` (inheriting the
+    /// profile ACL) and verified to be a directory that is not a reparse point. Owner and DACL
+    /// verification is not performed. `env` is unused and kept for signature parity with the
+    /// Unix `open`.
+    ///
+    /// # Errors
+    ///
+    /// - [`DiskTierError::CreateFailed`]: the root is missing (it is never created) or a
+    ///   component could not be created.
+    /// - [`DiskTierError::InsecureDirectory`]: the root is not a directory, or a component is not
+    ///   a directory or is a reparse point.
+    /// - [`DiskTierError::Io`]: the root or a component could not be inspected.
+    pub(super) fn open(&self, _env: &impl EnvSource) -> Result<StoreDir, DiskTierError> {
+        match std::fs::metadata(&self.0) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(DiskTierError::InsecureDirectory),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DiskTierError::CreateFailed(err));
+            }
+            Err(err) => return Err(err.into()),
+        }
+        let mut dir = self.0.clone();
+        for component in STORE_COMPONENTS {
+            dir.push(component);
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(DiskTierError::CreateFailed(err)),
+            }
+            verify_plain_dir(&dir)?;
+        }
+        Ok(StoreDir(dir))
+    }
+}
+
+#[cfg(windows)]
+fn verify_plain_dir(path: &Path) -> Result<(), DiskTierError> {
+    use std::os::windows::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        Ok(())
+    } else {
+        Err(DiskTierError::InsecureDirectory)
+    }
+}
+
+/// Whether an entry file may be read: a regular file.
+///
+/// The owner check is skipped per NFR-004 (trust rests on the per-user `%LOCALAPPDATA%` ACL);
+/// owner/DACL verification is tracked in #2146. `meta` must come from the handle the entry is
+/// read through, as on Unix. An untrusted file is treated as a cache miss.
+#[cfg(windows)]
+#[must_use]
+pub(super) fn entry_file_trusted(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_file()
 }
 
 /// Bounds enforced by [`prune_dir`].

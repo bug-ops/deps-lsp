@@ -39,5 +39,5 @@ pub use ecosystem::BundlerEcosystem;
 pub use formatter::BundlerFormatter;
 pub use lockfile::GemfileLockParser;
 pub use parser::{BundlerParseResult, BundlerParser, parse_gemfile};
-pub use registry::{RubyGemsRegistry, gem_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, RubyGemsRegistry, gem_url};
 pub use types::{BundlerDependency, BundlerVersion, DependencyGroup, DependencySource, GemInfo};

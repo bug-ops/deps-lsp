@@ -46,7 +46,7 @@ pub use lockfile::CargoLockParser;
 #[doc(hidden)]
 pub use lockfile::fuzz_parse_cargo_lock;
 pub use parser::{CargoParseResult, CargoParser, parse_cargo_toml};
-pub use registry::{CargoRegistry, CratesIoRegistry, crate_url};
+pub use registry::{CargoRegistry, CratesIoRegistry, DEFAULT_REGISTRY_BASES, crate_url};
 pub use sparse::SparseIndexClient;
 pub use types::{
     CargoDependency, CargoDependencySection, CargoVersion, CrateInfo, DependencySource,

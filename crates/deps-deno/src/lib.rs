@@ -31,5 +31,5 @@ pub use lockfile::fuzz_parse_deno_lock;
 pub use parser::{
     DenoParseContext, DenoParseResult, parse_deno_json, parse_deno_json_with_context,
 };
-pub use registry::{DenoRegistry, JsrRegistry};
+pub use registry::{DEFAULT_REGISTRY_BASES, DenoRegistry, JsrRegistry};
 pub use types::{DenoDependency, DenoDependencySection, DenoMetadata, JsrPackage, JsrVersion};

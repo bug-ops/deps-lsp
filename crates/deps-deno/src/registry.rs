@@ -22,6 +22,13 @@ use std::sync::Arc;
 const JSR_BASE: &str = "https://jsr.io";
 const JSR_API_BASE: &str = "https://api.jsr.io";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[JSR_BASE, JSR_API_BASE];
+
 /// Display name for the JSR registry used in not-found error messages.
 pub const REGISTRY: &str = "jsr";
 

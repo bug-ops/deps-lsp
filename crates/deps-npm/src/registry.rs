@@ -26,6 +26,13 @@ use std::time::{Duration, Instant};
 
 const REGISTRY_BASE: &str = "https://registry.npmjs.org";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[REGISTRY_BASE];
+
 /// Returns `true` when `url` is the public npm registry itself (#1953): an explicit
 /// `registry=https://registry.npmjs.org/` is public content, not an unverified mirror.
 ///

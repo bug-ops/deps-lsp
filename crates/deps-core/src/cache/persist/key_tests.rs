@@ -9,7 +9,7 @@ use proptest::prelude::*;
 
 const ACCEPT: &str = "application/json";
 
-const ALL_HOSTS: [&str; 18] = [
+const ALL_HOSTS: [&str; 16] = [
     "api.github.com",
     "gitlab.com",
     "index.crates.io",
@@ -26,8 +26,6 @@ const ALL_HOSTS: [&str; 18] = [
     "api.nuget.org",
     "jsr.io",
     "api.jsr.io",
-    "api.deps.dev",
-    "api.osv.dev",
 ];
 
 fn baseline_anon(url: &str, role: Option<PageRole>) -> Option<PersistKey> {
@@ -60,6 +58,8 @@ fn persistable_host_from_host_refuses_unlisted_hosts() {
         "api.github.com.",
         "www.npmjs.com",
         "search.maven.org",
+        "api.osv.dev",
+        "api.deps.dev",
         "",
     ] {
         assert!(PersistableHost::from_host(host).is_none(), "{host:?}");
@@ -70,7 +70,7 @@ fn persistable_host_from_host_refuses_unlisted_hosts() {
 fn persist_key_new_accepts_listed_urls() {
     let listing = Some(PageRole::ListingPage);
     let standalone = Some(PageRole::Standalone);
-    let accepted: [(&str, Option<PageRole>); 11] = [
+    let accepted: [(&str, Option<PageRole>); 10] = [
         (
             "https://api.github.com/repos/o/r/tags?per_page=100&page=1",
             listing,
@@ -99,12 +99,33 @@ fn persist_key_new_accepts_listed_urls() {
         ("https://index.crates.io/se/rd/serde", None),
         ("https://registry.npmjs.org/left-pad", None),
         ("https://pypi.org/pypi/requests/json", None),
-        ("https://api.osv.dev/v1/query", None),
     ];
     for (url, role) in accepted {
         let key = baseline_anon(url, role).unwrap_or_else(|| panic!("{url} must be persistable"));
         assert_eq!(url_of(&key), url);
     }
+}
+
+#[test]
+fn persist_key_new_refuses_body_dependent_post_hosts() {
+    for url in [
+        "https://api.osv.dev/v1/query",
+        "https://api.osv.dev/v1/querybatch",
+        "https://api.osv.dev/v1/vulns/GHSA-xxxx-xxxx-xxxx",
+        "https://api.deps.dev/v3alpha/findingsbatch",
+    ] {
+        assert!(baseline_anon(url, None).is_none(), "{url} must be refused");
+    }
+}
+
+#[cfg(feature = "test-util")]
+#[test]
+fn persistable_hosts_yields_exactly_the_sixteen_planned_hosts() {
+    let mut actual: Vec<&str> = super::persistable_hosts().collect();
+    let mut expected = ALL_HOSTS.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 #[test]

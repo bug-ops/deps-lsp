@@ -31,6 +31,14 @@ const PYPI_BASE: &str = "https://pypi.org/pypi";
 /// Base URL for the PEP 691 Simple API, used by `get_versions`.
 const PYPI_SIMPLE_BASE: &str = "https://pypi.org/simple";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] =
+    &[PYPI_BASE, PYPI_SIMPLE_BASE, crate::search::SIMPLE_INDEX_URL];
+
 /// Returns `true` when `url` is the public PyPI simple index itself (#1947), so a chain made
 /// only of it is public content rather than an unverified mirror.
 pub(crate) fn is_public_registry_url(url: &crate::config::PypiIndexUrl) -> bool {

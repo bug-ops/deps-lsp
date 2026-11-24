@@ -135,7 +135,7 @@ pub use lockfile::PypiLockParser;
 #[doc(hidden)]
 pub use lockfile::{fuzz_parse_pdm_lock, fuzz_parse_pipfile_lock, fuzz_parse_pypi_lock};
 pub use parser::PypiParser;
-pub use registry::{PypiRegistry, package_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, PypiRegistry, package_url};
 pub use types::{
     PypiDependency, PypiDependencySection, PypiDependencySource, PypiPackage, PypiVersion,
 };

@@ -19,6 +19,13 @@ const PACKAGIST_BASE: &str = "https://repo.packagist.org";
 const PACKAGIST_SEARCH: &str = "https://packagist.org/search.json";
 const PACKAGIST_WEB: &str = "https://packagist.org/packages";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[PACKAGIST_BASE, PACKAGIST_SEARCH];
+
 /// Returns the URL for a package's page on packagist.org.
 ///
 /// Packagist names are `vendor/package`; each segment is percent-encoded

@@ -121,7 +121,7 @@ const RESTORED_FRESHNESS_WINDOW: Duration = Duration::from_mins(10);
 const MAX_PERSISTED_AGE: Duration = Duration::from_hours(168);
 ```
 
-`PersistableHost` (closed): api.github.com, gitlab.com, index.crates.io, crates.io, registry.npmjs.org, pypi.org, proxy.golang.org, rubygems.org, pub.dev, repo1.maven.org, dl.google.com, plugins.gradle.org, repo.packagist.org, api.nuget.org, jsr.io, api.jsr.io, api.deps.dev, api.osv.dev. A unit test pins the list against each crate's default-base constant. `PersistableQueryKey` (closed): `Page`, `PerPage`, `OrderBy`, `Sort`.
+`PersistableHost` (closed): api.github.com, gitlab.com, index.crates.io, crates.io, registry.npmjs.org, pypi.org, proxy.golang.org, rubygems.org, pub.dev, repo1.maven.org, dl.google.com, plugins.gradle.org, repo.packagist.org, api.nuget.org, jsr.io, api.jsr.io. The POST-only hosts api.osv.dev and api.deps.dev are excluded: their responses depend on the request body and their GETs never reach `HttpCache` (#2141). The deps-engine `persist_hosts` test pins the list against each crate's `DEFAULT_REGISTRY_BASES` (#2140). `PersistableQueryKey` (closed): `Page`, `PerPage`, `OrderBy`, `Sort`.
 
 **File layout**: `<cache root>/deps-lsp/http/v1/<fnv1a64(url) hex>.entry`; root is `$XDG_CACHE_HOME` (absolute) or `$HOME/.cache` on Linux and other Unix, `$HOME/Library/Caches` on macOS (`XDG_CACHE_HOME` is not honored there), `%LOCALAPPDATA%` on Windows. Header JSON uses `deny_unknown_fields`; the format version is part of the directory name.
 
@@ -161,7 +161,7 @@ deps-cli: `--cache-persistence <memory|disk>` on `check` and `update`, a CLI-loc
 - **Directory trust** per FR-014: probe uid from `temp_dir()` (root untouched), root ownership only, creation only under an owned `$HOME`, strict components, per-file owner check through the same handle, `O_NOFOLLOW | O_NONBLOCK`, writes refuse symlinked targets, temp files `create_new`.
 - **Restamp integrity**: stat, header check and `set_modified` through one `open_for_restamp` handle (write access, no truncate, `O_NOFOLLOW`; on Windows a symlink check immediately before the write-access open).
 - **Residual risk**: a co-group user can delete or rename our directory (DoS to memory), never forge an entry; documented.
-- Windows: per-user ACL, uid check skipped.
+- Windows: per-user ACL of `%LOCALAPPDATA%`; components verified as directory and not a reparse point; uid and owner check skipped (owner/DACL verification: follow-up #2146; `fs_probe` reparse race: #2147).
 
 ## 7. Testing Strategy
 

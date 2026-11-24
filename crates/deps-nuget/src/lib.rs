@@ -35,5 +35,5 @@ pub use lockfile::fuzz_parse_packages_lock_json;
 pub use parser::{
     NuGetParseResult, parse_directory_packages_props, parse_packages_config, parse_project_file,
 };
-pub use registry::{NuGetRegistry, package_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, NuGetRegistry, package_url};
 pub use types::{NuGetDependency, NuGetVersion, PackageInfo};

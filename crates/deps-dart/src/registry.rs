@@ -8,6 +8,13 @@ use std::sync::Arc;
 
 const PUB_DEV_API_BASE: &str = "https://pub.dev/api";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[PUB_DEV_API_BASE];
+
 /// Display name for pub.dev used in not-found and API-response error messages.
 pub const REGISTRY: &str = "pub.dev";
 

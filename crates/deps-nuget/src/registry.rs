@@ -74,6 +74,13 @@ fn declared_origin_of(service_index_url: &str) -> Option<TrustedPrefix> {
 /// private feed `"nuget.org"`).
 pub(crate) const NUGET_ORG_INDEX_URL: &str = "https://api.nuget.org/v3/index.json";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[NUGET_ORG_INDEX_URL];
+
 /// Safety bound on external (non-inline) registration page fetches per `get_versions_with`
 /// call. Real packages need at most one (§1.1); this only guards a pathological feed.
 const MAX_EXTERNAL_PAGE_FETCHES: usize = 2;

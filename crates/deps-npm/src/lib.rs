@@ -48,7 +48,7 @@ pub use lockfile::fuzz_parse_package_lock_json_content;
 #[doc(hidden)]
 pub use lockfile::fuzz_parse_pnpm_lock_yaml;
 pub use parser::{NpmParseResult, parse_package_json, parse_package_json_with_context};
-pub use registry::{NpmRegistry, package_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, NpmRegistry, package_url};
 pub use types::{
     CatalogId, CatalogName, CatalogSite, NpmDependency, NpmDependencyOrigin, NpmDependencySection,
     NpmManifestKind, NpmPackage, NpmVersion, OverrideSelector, OverrideValue,

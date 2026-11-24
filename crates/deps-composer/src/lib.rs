@@ -28,5 +28,5 @@ pub use lockfile::ComposerLockParser;
 #[doc(hidden)]
 pub use lockfile::fuzz_parse_composer_lock;
 pub use parser::{ComposerParseResult, parse_composer_json};
-pub use registry::{PackagistRegistry, package_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, PackagistRegistry, package_url};
 pub use types::{ComposerDependency, ComposerPackage, ComposerSection, ComposerVersion};

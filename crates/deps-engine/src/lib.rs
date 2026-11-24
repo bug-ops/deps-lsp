@@ -37,6 +37,8 @@ pub mod probe;
 pub mod progress;
 pub mod setup;
 
+#[cfg(test)]
+mod persist_hosts;
 /// Minimal, network-free test doubles for [`deps_core::ecosystem::Ecosystem`].
 ///
 /// See the module's own doc for what it exposes and why. Mirrors `deps-core`'s own
