@@ -1010,8 +1010,8 @@ async fn run_update<'a>(
     // Code review finding 2: a separate `symlink_metadata` check followed by a plain,
     // symlink-following read left a check-then-open TOCTOU gap of its own. Closed by
     // `read_to_string_capped_no_follow`, which passes `O_NOFOLLOW` to the single `open(2)`
-    // call itself on Linux/macOS — see that function's doc for the narrower (documented, not
-    // fully closed) fallback on other platforms.
+    // call itself on Linux/macOS, and `FILE_FLAG_OPEN_REPARSE_POINT` plus a handle check on
+    // Windows — see that function's doc for the narrower fallback on other platforms.
     let content = read_update_manifest(manifest)?;
 
     let ctx = CheckContext {

@@ -159,9 +159,9 @@ deps-cli: `--cache-persistence <memory|disk>` on `check` and `update`, a CLI-loc
 - **Eligibility** is a type-level rule (FR-001, FR-008, FR-009); `PersistKey::new` matches tier and auth exhaustively with no `_` arm and never panics.
 - **No credential, digest or token on disk**; credentialed requests (including `GITHUB_TOKEN`) are never persisted.
 - **Directory trust** per FR-014: probe uid from `temp_dir()` (root untouched), root ownership only, creation only under an owned `$HOME`, strict components, per-file owner check through the same handle, `O_NOFOLLOW | O_NONBLOCK`, writes refuse symlinked targets, temp files `create_new`.
-- **Restamp integrity**: stat, header check and `set_modified` through one `open_for_restamp` handle (write access, no truncate, `O_NOFOLLOW`; on Windows a symlink check immediately before the write-access open).
+- **Restamp integrity**: stat, header check and `set_modified` through one `open_for_restamp` handle (write access, no truncate, `O_NOFOLLOW`; on Windows the open uses `FILE_FLAG_OPEN_REPARSE_POINT` and refuses a symlink or junction through `file_type().is_symlink()` on the handle, #2147).
 - **Residual risk**: a co-group user can delete or rename our directory (DoS to memory), never forge an entry; documented.
-- Windows: per-user ACL of `%LOCALAPPDATA%`; components verified as directory and not a reparse point; uid and owner check skipped (owner/DACL verification: follow-up #2146; `fs_probe` reparse race: #2147).
+- Windows: per-user ACL of `%LOCALAPPDATA%`; components verified as directory and not a reparse point; uid and owner check skipped by design: a permanent limit with no owner/DACL verification, documented in the rustdoc of `CacheDir::open` (#2146, #2148); the `fs_probe` reparse race is closed in #2147.
 
 ## 7. Testing Strategy
 
