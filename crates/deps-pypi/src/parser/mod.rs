@@ -562,8 +562,8 @@ impl PypiParser {
         // #673 S4: fuzzing found `pep508_rs` 0.9.2 itself panics (rather than returning its
         // own `Err`) on certain malformed-but-tokenizable package names — e.g. a name
         // ending in `-`, such as `"D-"` — via an internal `PackageName` re-validation
-        // `.expect()` (`pep508_rs::lib.rs:477`; not yet reported upstream — see PR
-        // description for the tracking decision).
+        // `.expect()` (`pep508_rs::lib.rs:477`). Upstream is unmaintained, so the guard
+        // and `catch_unwind` below are permanent (#703).
         // Pre-validating the leading name token against PEP 508's own grammar rejects those
         // cleanly before ever reaching `pep508_rs`'s tokenizer, so a document with N
         // malformed names costs N cheap regex-shaped checks rather than N panic-unwind-log
