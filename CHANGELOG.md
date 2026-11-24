@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: std-only Windows `CacheDir::open` for the disk cache, relying on the per-user `%LOCALAPPDATA%` ACL, not yet wired into `HttpCache` (#2145, #2149)
 
 ### Fixed
-- **deps-core**: Windows `fs_probe` no-follow open uses `FILE_FLAG_OPEN_REPARSE_POINT` and checks the opened handle, closing the check-then-open race; the missing Windows owner/DACL check is documented as a permanent limit, and spec 051 NFR-004 is resolved (#2147, #2146, #2148)
+- **deps-core**: Windows `fs_probe` no-follow open uses `FILE_FLAG_OPEN_REPARSE_POINT` and checks the opened handle, closing the check-then-open race; the missing Windows owner/DACL check is documented as a permanent limit, and spec 051 NFR-004 is resolved (#2147, #2146, #2148, #2150)
 - **deps-core**: disk-cache eligibility excludes the body-dependent OSV and deps.dev POST hosts (#2141, #2149)
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a run drops a configuration holding a non-pinned coordinate or deletes a previously present unified lock file (#2135)
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a non-pinned coordinate moves, and a security-only pin accepts a locked version at or above the target (#2130, #2133, #2136)
