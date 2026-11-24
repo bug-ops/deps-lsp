@@ -71,7 +71,7 @@ deps-cli check --format json
 # SARIF 2.1.0 output for github/codeql-action/upload-sarif
 deps-cli check --format sarif > results.sarif
 
-# CI-friendly: never touch the network, use only what's already cached
+# Never touch the network; registry and vulnerability lookups are skipped and reported as offline
 deps-cli check --offline
 
 # Loosen the freshness window for this run only
