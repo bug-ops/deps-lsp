@@ -23,6 +23,7 @@ mod body;
 mod errors;
 mod fetch;
 mod guard;
+mod persist;
 mod pool;
 mod redirect;
 mod resolver;

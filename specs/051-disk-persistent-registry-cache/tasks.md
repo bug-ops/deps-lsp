@@ -25,12 +25,12 @@ related:
 ## Progress
 
 **PR-A (primitives, no behavior change)**
-- [ ] T001: Persist key types
-- [ ] T002: Freshness classification
-- [ ] T003: Entry format
-- [ ] T004: fs_probe additions
-- [ ] T005: Cache directory and ownership logic
-- [ ] T006: Config types and PR-A closeout
+- [x] T001: Persist key types
+- [x] T002: Freshness classification
+- [x] T003: Entry format
+- [x] T004: fs_probe additions
+- [x] T005: Cache directory and ownership logic
+- [x] T006: Config types and PR-A closeout
 
 **PR-B (HttpCache wiring, production still memory)**
 - [ ] T007: CachedResponse origin and PageRole threading
@@ -93,13 +93,13 @@ graph TD
 **Context**: A typed, closed eligibility rule so no token-bearing URL can reach disk and `page` handling is explicit.
 **Spec reference**: [[spec#FR-001]], [[spec#FR-008]], [[spec#FR-009]], [[spec#FR-013]]
 **Acceptance criteria**:
-- [ ] `PersistableHost` (closed enum, `from_host`/`as_str`) lists exactly the hosts in [[plan]] §3; a unit test pins it against each ecosystem crate's default-base constant
-- [ ] `PersistableQueryKey { Page, PerPage, OrderBy, Sort }`, `PageNumber(NonZeroU32)`, `PageRole::{ListingPage, Standalone}`
-- [ ] `PersistKey::new(url, tier, auth, accept, page_role) -> Option<PersistKey>` matches tier and auth exhaustively with no `_` arm; enforces https, no userinfo or fragment, default-port domain host, values `[A-Za-z0-9_.-]{1,32}`, no duplicate keys; `page` present with no declared role gives `None`
-- [ ] `PersistKey::sibling_page(n)` keeps query order and other pairs byte-identical; `None` when no `page` and `n > 1`
-- [ ] Table test: GitHub tags page, compare, releases and gitlab.com tags with `order_by`/`sort` admitted; `access_token=`, `private_token=`, unknown or duplicate keys, overlong value, userinfo, IP host, GHES host, `http`, non-default port, `Pinned`, `WorkspaceDeclared`, credentialed auth refused
-- [ ] proptest: `PersistKey::new` never panics on arbitrary strings
-- [ ] Every `pub` item documented with `///`; module docs describe responsibility
+- [ ] `PersistableHost` (closed enum, `from_host`/`as_str`) lists exactly the hosts in [[plan]] §3; a unit test pins it against each ecosystem crate's default-base constant (not met, deviation: deps-core has no ecosystem dependencies, so the unit test pins the literal [[plan]] §3 list; the constant pin is tracked in issue #2140)
+- [x] `PersistableQueryKey { Page, PerPage, OrderBy, Sort }`, `PageNumber(NonZeroU32)`, `PageRole::{ListingPage, Standalone}`
+- [x] `PersistKey::new(url, tier, auth, accept, page_role) -> Option<PersistKey>` matches tier and auth exhaustively with no `_` arm; enforces https, no userinfo or fragment, default-port domain host, values `[A-Za-z0-9_.-]{1,32}`, no duplicate keys; `page` present with no declared role gives `None`
+- [x] `PersistKey::sibling_page(n)` keeps query order and other pairs byte-identical; `None` when no `page` and `n > 1`
+- [x] Table test: GitHub tags page, compare, releases and gitlab.com tags with `order_by`/`sort` admitted; `access_token=`, `private_token=`, unknown or duplicate keys, overlong value, userinfo, IP host, GHES host, `http`, non-default port, `Pinned`, `WorkspaceDeclared`, credentialed auth refused
+- [x] proptest: `PersistKey::new` never panics on arbitrary strings
+- [x] Every `pub` item documented with `///`; module docs describe responsibility (deviation: no `# Examples` on `pub(super)` items, doctests do not run there)
 **Dependencies**: none
 **Files**: `crates/deps-core/src/cache/persist/key.rs`, `crates/deps-core/src/cache/persist/mod.rs` (module declarations only)
 **Complexity**: medium
@@ -111,11 +111,11 @@ graph TD
 **Context**: Pure, total age logic implementing the R2 window and the page-1 rule.
 **Spec reference**: [[spec#FR-003]], [[spec#FR-013]], [[spec#US-002: Bounded staleness *(restated, approved change)*|US-002]]
 **Acceptance criteria**:
-- [ ] `ValidatedAt(SystemTime)`, `DiskFreshness { Fresh, Revalidate, Expired, FromFuture }`, constants `RESTORED_FRESHNESS_WINDOW` (10 min) and `MAX_PERSISTED_AGE` (7 days), private and not configurable
-- [ ] `classify(validated_at, now)` is total and pure; expected values: age 0 and W-1 s give `Fresh`; W gives `Revalidate`; 7 days minus 1 s gives `Revalidate`; 7 days gives `Expired`; mtime now+1 s and now+60 s (future skew) give `Revalidate`, never `Fresh`; mtime now+61 s gives `FromFuture`
-- [ ] `classify_restored(entry, page1, now)`: `ListingPage` page above 1 with no fresh page-1 anchor or `validated_at < t1` never returns `Fresh`; `Standalone` and page 1 use `classify` only
-- [ ] A backward clock jump never produces `Fresh` for an old entry (test)
-- [ ] Docs with `# Examples` doctests
+- [x] `ValidatedAt(SystemTime)`, `DiskFreshness { Fresh, Revalidate, Expired, FromFuture }`, constants `RESTORED_FRESHNESS_WINDOW` (10 min) and `MAX_PERSISTED_AGE` (7 days), private and not configurable
+- [x] `classify(validated_at, now)` is total and pure; expected values: age 0 and W-1 s give `Fresh`; W gives `Revalidate`; 7 days minus 1 s gives `Revalidate`; 7 days gives `Expired`; mtime now+1 s and now+60 s (future skew) give `Revalidate`, never `Fresh`; mtime now+61 s gives `FromFuture`
+- [x] `classify_restored(entry, page1, now)`: `ListingPage` page above 1 with no fresh page-1 anchor or `validated_at < t1` never returns `Fresh`; `Standalone` and page 1 use `classify` only
+- [x] A backward clock jump never produces `Fresh` for an old entry (test)
+- [ ] Docs with `# Examples` doctests (not met, deviation: the items are `pub(super)`, doctests do not run for them)
 **Dependencies**: T001
 **Files**: `crates/deps-core/src/cache/persist/freshness.rs`
 **Complexity**: low
@@ -127,12 +127,12 @@ graph TD
 **Context**: Self-describing, checksummed, bounded file format with a fingerprint for safe restamping.
 **Spec reference**: [[spec#FR-004]], [[spec#FR-006]], [[spec#FR-012]], [[spec#NFR-003]]
 **Acceptance criteria**:
-- [ ] Layout: magic `DEPSLSPC`, `u16` format version, `u32` header length (at most 64 KiB), `serde_json` header with `deny_unknown_fields` {url, accept, etag, last_modified, link, body_len, body_fnv1a64}, then body
-- [ ] `EntryFingerprint { etag, last_modified, accept, body_len, body_fnv1a64 }` with a header-only read helper capped at 64 KiB plus prefix
-- [ ] `PersistedEntry::decode(bytes, expected_url, expected_accept, now)` with `DecodeError` (thiserror: `BadMagic`, `ForeignVersion`, `HeaderTooLarge`, `Header`, `Truncated`, `Checksum`, `UrlMismatch`, `AcceptMismatch`, `Oversized`); `# Errors` documented
-- [ ] Round-trip test; a test per `DecodeError` variant; oversize body rejected, never truncated
-- [ ] proptest: `decode` never panics on arbitrary bytes
-- [ ] File name is `<fnv1a64(url) hex>.entry`; all `u64` length fields go through `usize::try_from` (i686-safe)
+- [x] Layout: magic `DEPSLSPC`, `u16` format version, `u32` header length (at most 64 KiB), `serde_json` header with `deny_unknown_fields` {url, accept, etag, last_modified, link, body_len, body_fnv1a64}, then body
+- [x] `EntryFingerprint { etag, last_modified, accept, body_len, body_fnv1a64 }` with a header-only read helper capped at 64 KiB plus prefix
+- [x] `PersistedEntry::decode(bytes, expected_url, expected_accept, now)` with `DecodeError` (thiserror: `BadMagic`, `ForeignVersion`, `HeaderTooLarge`, `Header`, `Truncated`, `Checksum`, `UrlMismatch`, `AcceptMismatch`, `Oversized`); `# Errors` documented
+- [x] Round-trip test; a test per `DecodeError` variant; oversize body rejected, never truncated
+- [x] proptest: `decode` never panics on arbitrary bytes
+- [x] File name is `<fnv1a64(url) hex>.entry`; all `u64` length fields go through `usize::try_from` (i686-safe)
 **Dependencies**: T001
 **Files**: `crates/deps-core/src/cache/persist/format.rs`
 **Complexity**: medium
@@ -144,12 +144,12 @@ graph TD
 **Context**: Safe primitives for no-follow reads with metadata, atomic writes with explicit mode and mtime, and a single-handle restamp. Legacy behavior must be unchanged.
 **Spec reference**: [[spec#FR-007]], [[spec#FR-012]], [[spec#FR-014]], [[spec#NFR-004]]
 **Acceptance criteria**:
-- [ ] `AtomicWrite { mode: FileMode, modified: Option<SystemTime> }`, `FileMode { PreserveTarget, OwnerOnly }`; `OwnerOnly` never copies the target's permissions (0600 on Unix); `write_atomic_bytes_with` refuses a symlinked final component and sets the mtime on the temp handle before rename
-- [ ] `read_capped_no_follow_with_metadata` returns bytes plus `Metadata` from the same handle, opened `O_NOFOLLOW` and `O_NONBLOCK` on Unix, regular files only (a FIFO test must not block)
-- [ ] `open_for_restamp`: write access, no truncate, `O_NOFOLLOW` on Unix; on Windows a symlink check immediately before the write-access open; `NotFound` propagated
-- [ ] Existing `write_atomic`/`write_atomic_bytes` behavior and callers unchanged (existing tests pass; deps-cli `update` keeps `PreserveTarget`)
-- [ ] Unix tests: 0600 mode, symlink refusal, FIFO, mtime set; Windows rename-over-open-handle test compiles under `cfg(windows)`
-- [ ] No `unsafe`; docs and doctests for new `pub` items
+- [x] `AtomicWrite { mode: FileMode, modified: Option<SystemTime> }`, `FileMode { PreserveTarget, OwnerOnly }`; `OwnerOnly` never copies the target's permissions (0600 on Unix); `write_atomic_bytes_with` refuses a symlinked final component and sets the mtime on the temp handle before rename
+- [x] `read_capped_no_follow_with_metadata` returns bytes plus `Metadata` from the same handle, opened `O_NOFOLLOW` and `O_NONBLOCK` on Unix, regular files only (a FIFO test must not block)
+- [x] `open_for_restamp`: write access, no truncate, `O_NOFOLLOW` on Unix; on Windows a symlink check immediately before the write-access open; `NotFound` propagated
+- [x] Existing `write_atomic`/`write_atomic_bytes` behavior and callers unchanged (existing tests pass; deps-cli `update` keeps `PreserveTarget`)
+- [x] Unix tests: 0600 mode, symlink refusal, FIFO, mtime set; Windows rename-over-open-handle test compiles under `cfg(windows)`
+- [x] No `unsafe`; docs and doctests for new `pub` items
 **Dependencies**: none
 **Files**: `crates/deps-core/src/fs_probe.rs`
 **Complexity**: medium
@@ -161,12 +161,12 @@ graph TD
 **Context**: Env-injected directory resolution and the creation order that never makes foreign-owned directories.
 **Spec reference**: [[spec#FR-014]], [[spec#FR-015]], [[spec#FR-016]], [[spec#NFR-004]]
 **Acceptance criteria**:
-- [ ] `CacheDirEnvVar { XdgCacheHome, Home, LocalAppData }` (private, closed; `OperatorEnvVar` untouched); `CacheDir::user_default(&impl EnvSource)` per platform rules, no filesystem access, absolute path only, `Err(NoCacheDir)` for missing `HOME` or relative `XDG_CACHE_HOME`
-- [ ] Unix open: probe uid from a `create_new` 0600 file in `temp_dir()` then deleted; existing root must be an owned directory (symlink followed, no mode check); missing root created by one non-recursive `create_dir` 0700 only when its parent is `$HOME` and `$HOME` is owned by the probe uid; macOS `Library/Caches` and Windows `%LOCALAPPDATA%` never created; components `deps-lsp/`, `http/`, `v1/` created 0700 ignoring `AlreadyExists` and verified by `symlink_metadata` (directory, owned, no group or other bits)
-- [ ] Per-file read check helper: regular file owned by the probe uid, no group or other write bit; otherwise a miss
-- [ ] `DiskTierError { NoCacheDir, CreateFailed, InsecureDirectory, ProbeFailed, Io }`
-- [ ] Prune: scan capped at 16384 entries; remove `*.tmp` older than 1 h, then expired files, then least recently validated until within 64 MiB and 2048 files; `NotFound` ignored
-- [ ] Unix tests with tempdir HOME via a fake env: missing root with owned HOME created 0700; root whose parent is not HOME gives memory and creates nothing; foreign-owned root (probe-uid test seam) gives memory and creates nothing; planted g+w file discarded; read-only root (chmod 0500) degrades; `user_default` table (XDG set, unset, relative; no HOME; macOS; Windows)
+- [x] `CacheDirEnvVar { XdgCacheHome, Home, LocalAppData }` (private, closed; `OperatorEnvVar` untouched); `CacheDir::user_default(&impl EnvSource)` per platform rules, no filesystem access, absolute path only, `Err(NoCacheDir)` for missing `HOME` or relative `XDG_CACHE_HOME`
+- [x] Unix open: probe uid from a `create_new` 0600 file in `temp_dir()` then deleted; existing root must be an owned directory (symlink followed, no mode check); missing root created by one non-recursive `create_dir` 0700 only when its parent is `$HOME` and `$HOME` is owned by the probe uid; macOS `Library/Caches` and Windows `%LOCALAPPDATA%` never created; components `deps-lsp/`, `http/`, `v1/` created 0700 ignoring `AlreadyExists` and verified by `symlink_metadata` (directory, owned, no group or other bits)
+- [x] Per-file read check helper: regular file owned by the probe uid, no group or other write bit; otherwise a miss
+- [x] `DiskTierError { NoCacheDir, CreateFailed, InsecureDirectory, ProbeFailed, Io }`
+- [x] Prune: scan capped at 16384 entries; remove `*.tmp` older than 1 h, then expired files, then least recently validated until within 64 MiB and 2048 files; `NotFound` ignored
+- [x] Unix tests with tempdir HOME via a fake env: missing root with owned HOME created 0700; root whose parent is not HOME gives memory and creates nothing; foreign-owned root (probe-uid test seam) gives memory and creates nothing; planted g+w file discarded; read-only root (chmod 0500) degrades; `user_default` table (XDG set, unset, relative; no HOME; macOS; Windows)
 **Dependencies**: T003, T004
 **Files**: `crates/deps-core/src/cache/persist/dir.rs`
 **Complexity**: high
@@ -178,11 +178,11 @@ graph TD
 **Context**: Config enum without a default yet, target type, and the dead-code guard that PR-B removes.
 **Spec reference**: [[spec#FR-010]], [[spec#FR-018]]
 **Acceptance criteria**:
-- [ ] `CachePersistence { Memory, Disk }` (serde lowercase, unknown variants rejected, no `Default` impl yet); `PersistenceTarget { Memory, Disk(CacheDir) }` and `PersistenceTarget::from_config(CachePersistence, &impl EnvSource)` that returns `Memory` plus one warn when the directory cannot be resolved
-- [ ] `persist` module carries `#![cfg_attr(not(test), expect(dead_code, reason = "wired by PR-B, #700"))]`
-- [ ] No production behavior change: `HttpCache` untouched, workspace builds with `--all-features`
-- [ ] CHANGELOG: `### Added` one line for the deps-core primitives; the PR link is added in a follow-up commit once the PR exists (PR numbers do not exist while the three PRs are being implemented); PR text says "Part of #700"
-- [ ] Full check suite passes: fmt, clippy `-D warnings`, nextest, doc gate (both `-D warnings` variants), `cargo tree -p deps-lsp -e features,no-dev` guard unchanged
+- [x] `CachePersistence { Memory, Disk }` (serde lowercase, unknown variants rejected, no `Default` impl yet); `PersistenceTarget { Memory, Disk(CacheDir) }` and `PersistenceTarget::from_config(CachePersistence, &impl EnvSource)` that returns `Memory` plus one warn when the directory cannot be resolved
+- [x] `persist` module carries `#![cfg_attr(not(test), expect(dead_code, reason = "wired by PR-B, #700"))]` (met in spirit, deviation: an unconditional `#![expect(dead_code, reason = "wired by PR-B, #700")]` is used; the `cfg_attr` form fails under `-D warnings` in test builds)
+- [x] No production behavior change: `HttpCache` untouched, workspace builds with `--all-features`
+- [ ] CHANGELOG: `### Added` one line for the deps-core primitives; the PR link is added in a follow-up commit once the PR exists (PR numbers do not exist while the three PRs are being implemented); PR text says "Part of #700" (entry written; PR link pending until the PR exists)
+- [ ] Full check suite passes: fmt, clippy `-D warnings`, nextest, doc gate (both `-D warnings` variants), `cargo tree -p deps-lsp -e features,no-dev` guard unchanged (pending until CI is green)
 **Dependencies**: T002, T005
 **Files**: `crates/deps-core/src/policy_config.rs`, `crates/deps-core/src/cache/persist/mod.rs`, `CHANGELOG.md`
 **Complexity**: low
@@ -218,6 +218,9 @@ graph TD
 - [ ] Offline serves `Fresh` and `Revalidate`; `CacheMode::Disabled` bypasses the disk; `peek_cached` stays memory-only
 - [ ] On the first successful use of a target (tier `Ready` and first entry read or written) one `tracing::info!` names the directory, exactly once per process and target
 - [ ] A `#[cfg(test)]` disk-access counter exists in the store for the NFR tests below
+- [ ] Non-Unix (Windows) `CacheDir::open`: creates `deps-lsp/http/v1` under `%LOCALAPPDATA%` and never creates the `%LOCALAPPDATA%` root itself; PR-A has `CacheDir::open` only under `cfg(unix)`, so nothing builds a `StoreDir` on Windows until this lands
+- [ ] Decode errors are logged by `DecodeError` variant, never with `%error` (`DecodeError::Header` quotes file content); the degrade warning names the cache path ([[spec#FR-015]]); all file name, header and decode paths use `PersistKey::url()` (the normalized URL), see Implementation notes (PR-A); follow-up #2142
+- [ ] Entry trust checks use the metadata of the same handle that read the bytes (owner, mode, mtime), never a separate `stat`
 - [ ] Tests: open in progress then the read waits and hits (does not miss), including N concurrent first-wave reads that all hit disk (SC-002); open slower than 250 ms yields a miss without degrading; semaphore-wait timeout does not degrade; a blocking read slower than 250 ms (test seam delay) degrades the tier with exactly one warn and later reads are misses ([[spec#FR-015]]); the `info!` appears exactly once across several successful uses (captured tracing subscriber); NFR-001: `set_persistence(Disk(tmp))` leaves the directory absent until the first eligible op; NFR-002: the disk-access counter stays 0 across repeated in-memory hits even after the directory is made unreadable
 **Dependencies**: T007
 **Files**: `crates/deps-core/src/cache/persist/mod.rs`, `crates/deps-core/src/cache/fetch.rs`, `crates/deps-core/src/cache/store.rs`, `crates/deps-core/src/cache/tests/`
@@ -235,6 +238,9 @@ graph TD
 - [ ] An oversize 200 enqueues `Remove` (and marks `stale_on_disk`, T010); 304 on an eligible key enqueues `Validated`
 - [ ] `WriteFailure::{Persistent, Transient}`: `StorageFull`, `QuotaExceeded`, `ReadOnlyFilesystem` count toward the 8-failure breaker (then `Unavailable`, one warn); `PermissionDenied` and Windows raw 32 or 5 never count; a single failure logs at `debug`
 - [ ] Prune runs when the writer starts and every 64 puts
+- [ ] `open_for_restamp` handle is `fstat`ed (PR-A discards its metadata); the restamp decision and trust checks use that same-handle metadata; follow-up #2142
+- [ ] Persist only from the GET path: `PersistKey` has no method dimension, so the `api.osv.dev` POST path never enqueues a `DiskOp`; test with a POST to a persistable host; follow-up #2141
+- [ ] Before each prune pass and each write batch the writer re-verifies the store path component chain (`symlink_metadata`: directory, owned, no group or other bits) and degrades on mismatch; closes the symlink swap window after `open` when the cache root is group or other writable (security finding L1/F1, see the `[NEEDS CLARIFICATION]` on [[spec#NFR-004]])
 - [ ] Tests: dropped-Put scenario (v2 in memory, v1 on disk, 304 for v2 gives a full write of v2, never a restamp of v1); a file with a later mtime is not overwritten; queue overflow drops without blocking; a transient rename error does not trip the breaker; 8 persistent errors via a store write-failure seam give `Unavailable` with exactly one warn
 **Dependencies**: T008
 **Files**: `crates/deps-core/src/cache/persist/mod.rs`, `crates/deps-core/src/cache/store.rs`, `crates/deps-core/src/cache/fetch.rs`, `crates/deps-core/src/cache/tests/`
@@ -441,6 +447,23 @@ graph TD
 ---
 
 ## Implementation Notes
+
+### Implementation notes (PR-A)
+
+Deviations and additions approved during PR-A (T001-T006); PR-B builds on them.
+
+- `StoreDir::prune` is a forwarder to the prune logic in `dir.rs`.
+- `DecodeError::Io` added for read failures during decode.
+- `PersistKey::page_role()` accessor added.
+- `CachePlatform` test seam added so per-platform path rules are testable on any OS.
+- `PruneReport` returned by prune, including a `failed` count.
+- `EntryFingerprint` covers the full header, not only the five fields listed in T003.
+- `PersistedEntry::new` returns `EncodeError { HeaderTooLarge, Oversized }`, so oversized headers and bodies are rejected at construction.
+- An empty `XDG_CACHE_HOME` is treated as unset.
+- `PageNumber` rejects leading zeros (canonical decimal only).
+- `PersistKey::url()` returns the normalized URL; PR-B must use it for the file name, the header `url` and the `decode` expectation.
+- Trailing bytes after the body are ignored by `decode`; body integrity is covered by `body_len` and the checksum ([[plan]] §12 reworded to match).
+- Tracked in issues: #2140 (`PersistableHost` constant pin), #2141 (POST must never be persisted), #2142 (PR-B carry-overs: decode logging, path in degrade warning, restamp handle checks, `key.url()` everywhere).
 
 ### Order of execution
 PR-A tasks T001 and T004 can run in parallel; T002 and T003 follow T001; T005 needs T003 and T004. PR-B is strictly sequential through T012. In PR-C, T015 and T016 can run in parallel after T014.
