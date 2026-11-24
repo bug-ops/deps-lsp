@@ -4,7 +4,7 @@
 //! Limits are restated as literals so the tests also pin the constants: 64 MiB, 2048 files,
 //! scan cap 16384 entries, stale `*.tmp` after 1 hour, entries expire at 7 days.
 
-use super::dir::{CacheDir, CachePlatform, DiskTierError, NoCacheDir, PruneLimits, prune_dir};
+use super::dir::{CacheDir, CachePlatform, NoCacheDir, PruneLimits, prune_dir};
 use crate::net_policy::MapEnv;
 use std::assert_matches;
 use std::fs;
@@ -163,7 +163,7 @@ mod user_default_table {
 
 #[cfg(unix)]
 mod unix_open {
-    use super::super::dir::{ProbeUid, entry_file_trusted};
+    use super::super::dir::{DiskTierError, ProbeUid, entry_file_trusted};
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
