@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #2134)
 - **deps-cli**: `update --lockfile regenerate` migrates the legacy Gradle `gradle/dependency-locks` layout to `gradle.lockfile` behind an exact lock-state drift guard, reporting created and removed lock files (also in `--open-pr`) (#2102, #2134)
 - **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #2134)
-- **deps-core**: disk-cache primitives (persist key, freshness, entry format, secure cache directory, `CachePersistence` config type, `fs_probe` atomic-write and restamp helpers), not yet wired into `HttpCache`
+- **deps-core**: disk-cache primitives (persist key, freshness, entry format, secure cache directory, `CachePersistence` config type, `fs_probe` atomic-write and restamp helpers), not yet wired into `HttpCache` (#700, #2144)
 
 ### Fixed
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a run drops a configuration holding a non-pinned coordinate or deletes a previously present unified lock file (#2135)
