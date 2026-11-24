@@ -224,13 +224,153 @@ pub fn read_capped_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<Opt
     read_capped_bytes(file, max_bytes)
 }
 
+/// How [`write_atomic_bytes_with`] chooses the permissions of the replacement file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMode {
+    /// Copy the existing target's permissions, as [`write_atomic`] does.
+    PreserveTarget,
+    /// Owner-only access (`0600` on Unix); never copies the target's permissions.
+    OwnerOnly,
+}
+
+/// Options for [`write_atomic_bytes_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicWrite {
+    /// Permission policy for the replacement file.
+    pub mode: FileMode,
+    /// Modification time stamped on the temp file before the rename, if any.
+    pub modified: Option<std::time::SystemTime>,
+}
+
+/// Options that reproduce [`write_atomic`]'s historical behavior.
+const LEGACY_ATOMIC_WRITE: AtomicWrite = AtomicWrite {
+    mode: FileMode::PreserveTarget,
+    modified: None,
+};
+
+/// Atomically replaces `path` with `content` under explicit [`AtomicWrite`] options.
+///
+/// Same temp-file-then-rename flow as [`write_atomic`]: a symlinked final component is
+/// refused, the temp file is created `create_new` at `0600` on Unix, and it is removed on
+/// every error path. [`FileMode::OwnerOnly`] keeps the `0600` temp mode and never copies the
+/// target's permissions; [`FileMode::PreserveTarget`] copies them as [`write_atomic`] does.
+/// When `modified` is set it is applied to the temp handle before the rename, so the target
+/// is never observable with a mismatching mtime.
+///
+/// # Errors
+///
+/// Same conditions as [`write_atomic`], plus any failure to set the modification time.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fs_probe::{AtomicWrite, FileMode, write_atomic_bytes_with};
+///
+/// let dir = std::env::temp_dir().join(format!("deps-core-doc-{}", std::process::id()));
+/// std::fs::create_dir_all(&dir)?;
+/// let path = dir.join("entry");
+/// let options = AtomicWrite { mode: FileMode::OwnerOnly, modified: None };
+/// write_atomic_bytes_with(&path, b"payload", options)?;
+/// assert_eq!(std::fs::read(&path)?, b"payload");
+/// std::fs::remove_dir_all(&dir)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn write_atomic_bytes_with(
+    path: &Path,
+    content: &[u8],
+    options: AtomicWrite,
+) -> std::io::Result<()> {
+    write_atomic_impl(path, content, options)
+}
+
+/// Reads `path` without following a symlink, returning the bytes and the [`std::fs::Metadata`]
+/// of the very handle they were read from.
+///
+/// On Unix the file is opened `O_NOFOLLOW | O_NONBLOCK`, so a FIFO cannot block the open;
+/// anything that is not a regular file is then rejected. `Ok(None)` means the file is larger
+/// than `max_bytes`.
+///
+/// # Errors
+///
+/// Same conditions as [`read_capped_no_follow`], plus
+/// [`std::io::ErrorKind::InvalidInput`] when `path` is not a regular file.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fs_probe::read_capped_no_follow_with_metadata;
+///
+/// let dir = std::env::temp_dir().join(format!("deps-core-doc-read-{}", std::process::id()));
+/// std::fs::create_dir_all(&dir)?;
+/// let path = dir.join("entry");
+/// std::fs::write(&path, b"payload")?;
+///
+/// let (bytes, metadata) = read_capped_no_follow_with_metadata(&path, 1024)?
+///     .expect("under the cap");
+/// assert_eq!(bytes, b"payload");
+/// assert_eq!(metadata.len(), 7);
+/// assert!(read_capped_no_follow_with_metadata(&path, 3)?.is_none());
+/// std::fs::remove_dir_all(&dir)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn read_capped_no_follow_with_metadata(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<(Vec<u8>, std::fs::Metadata)>> {
+    #[cfg(any(test, feature = "test-util"))]
+    READ_COUNT.fetch_add(1, Ordering::Relaxed);
+    let mut read_only = std::fs::OpenOptions::new();
+    read_only.read(true);
+    let (file, metadata) = open_regular_no_follow(path, read_only)?;
+    Ok(read_capped_bytes(file, max_bytes)?.map(|bytes| (bytes, metadata)))
+}
+
+/// Opens `path` for reading and writing, without truncating, so its mtime can be restamped
+/// through the same handle that was used to validate it.
+///
+/// A symlinked final component is refused: atomically via `O_NOFOLLOW` on Unix, via a
+/// `symlink_metadata` check immediately before the write-access open elsewhere.
+///
+/// # Errors
+///
+/// Returns `NotFound` when `path` is missing, [`std::io::ErrorKind::InvalidInput`] when its
+/// final component is a symlink or the handle is not a regular file, or the underlying open
+/// error. On Unix the open is `O_NONBLOCK`, so a planted FIFO cannot hang it.
+///
+/// Callers that validate the file's metadata (owner, mode) must `fstat` the returned handle,
+/// not re-stat the path.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fs_probe::open_for_restamp;
+/// use std::time::{Duration, SystemTime};
+///
+/// let dir = std::env::temp_dir().join(format!("deps-core-doc-restamp-{}", std::process::id()));
+/// std::fs::create_dir_all(&dir)?;
+/// let path = dir.join("entry");
+/// std::fs::write(&path, b"payload")?;
+///
+/// let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+/// open_for_restamp(&path)?.set_modified(stamp)?;
+/// assert_eq!(std::fs::metadata(&path)?.modified()?, stamp);
+/// assert_eq!(std::fs::read(&path)?, b"payload");
+/// std::fs::remove_dir_all(&dir)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn open_for_restamp(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut read_write = std::fs::OpenOptions::new();
+    read_write.read(true).write(true);
+    open_regular_no_follow(path, read_write).map(|(file, _)| file)
+}
+
 /// Atomically replaces `path` with `content`, with the guarantees of [`write_atomic`].
 ///
 /// # Errors
 ///
 /// Same conditions as [`write_atomic`].
 pub fn write_atomic_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    write_atomic_impl(path, content)
+    write_atomic_impl(path, content, LEGACY_ATOMIC_WRITE)
 }
 
 /// `std::io::ErrorKind::FilesystemLoop` (the semantically exact kind for this) is still an
@@ -248,7 +388,37 @@ fn symlink_refused_error(path: &Path) -> std::io::Error {
 }
 
 #[cfg(unix)]
+const NON_BLOCKING: i32 = libc::O_NONBLOCK;
+#[cfg(not(unix))]
+const NON_BLOCKING: i32 = 0;
+
+fn open_regular_no_follow(
+    path: &Path,
+    options: std::fs::OpenOptions,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let file = open_no_follow_with(path, options, NON_BLOCKING)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    Ok((file, metadata))
+}
+
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut read_only = std::fs::OpenOptions::new();
+    read_only.read(true);
+    open_no_follow_with(path, read_only, 0)
+}
+
+#[cfg(unix)]
+fn open_no_follow_with(
+    path: &Path,
+    mut options: std::fs::OpenOptions,
+    extra_flags: i32,
+) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // The `O_NOFOLLOW` open itself is the atomic, race-free enforcement — it fails (ELOOP) if
@@ -257,9 +427,8 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     // classify the error into a specific, well-worded message; it is not security-load-bearing
     // (by this point nothing has been read either way) and cannot reintroduce the race this
     // function exists to close.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+    options
+        .custom_flags(libc::O_NOFOLLOW | extra_flags)
         .open(path)
         .map_err(|error| {
             if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -271,11 +440,15 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_no_follow_with(
+    path: &Path,
+    options: std::fs::OpenOptions,
+    _extra_flags: i32,
+) -> std::io::Result<std::fs::File> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(symlink_refused_error(path));
     }
-    std::fs::File::open(path)
+    options.open(path)
 }
 
 /// Atomically writes `content` to `path` (issue #1329, `deps-cli update`'s write path).
@@ -319,10 +492,10 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 /// be created (including because something already exists at the generated temp path) or
 /// written, or if the rename fails.
 pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    write_atomic_impl(path, content.as_bytes())
+    write_atomic_impl(path, content.as_bytes(), LEGACY_ATOMIC_WRITE)
 }
 
-fn write_atomic_impl(path: &Path, content: &[u8]) -> std::io::Result<()> {
+fn write_atomic_impl(path: &Path, content: &[u8], options: AtomicWrite) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -361,7 +534,7 @@ fn write_atomic_impl(path: &Path, content: &[u8]) -> std::io::Result<()> {
     }
     let mut file = open_options.open(&tmp_path)?;
 
-    let write_result = write_atomic_content(&mut file, path, content);
+    let write_result = write_atomic_content(&mut file, path, content, options);
     drop(file);
 
     match write_result {
@@ -386,15 +559,21 @@ fn write_atomic_content(
     file: &mut std::fs::File,
     original_path: &Path,
     content: &[u8],
+    options: AtomicWrite,
 ) -> std::io::Result<()> {
     #[cfg(unix)]
-    if let Ok(original_meta) = std::fs::metadata(original_path) {
+    if options.mode == FileMode::PreserveTarget
+        && let Ok(original_meta) = std::fs::metadata(original_path)
+    {
         file.set_permissions(original_meta.permissions())?;
     }
     #[cfg(not(unix))]
     let _ = original_path;
 
     file.write_all(content)?;
+    if let Some(modified) = options.modified {
+        file.set_modified(modified)?;
+    }
     file.sync_all()
 }
 

@@ -255,6 +255,9 @@ Corrupt, truncated or version-mismatched data SHALL degrade to a miss; a future 
 
 Security (Unix): directories 0700 and files 0600 (`FileMode::OwnerOnly` never copies the target's mode; deps-cli `update` keeps `PreserveTarget`); every component and every file is owner-checked; the root requires ownership only, because a group- or other-writable root can at most delete our directory (memory), never forge an entry, so umask-002 homes keep working. Windows relies on the per-user ACL of `%LOCALAPPDATA%` (uid check skipped, documented). `body_fnv1a64` is an integrity check, not an authenticity check.
 
+> [!question] Open
+> [NEEDS CLARIFICATION: the "at most delete our own directory" claim for a group- or other-writable root does not hold after `open`: such a root allows a symlink swap of a path component, so a later write batch or prune pass could act outside our directory. PR-B re-verifies the component chain before each prune pass and write batch (see T009), but does the user approve changing this wording and the root-ownership-only rule?]
+
 ### NFR-005
 
 Portability: the same OS matrix as CI (ubuntu, macos, windows, i686, musl and win-arm64 cross targets); std-only filesystem code, no new C dependency; `u64` length and time fields go through `try_from`.

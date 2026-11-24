@@ -2,6 +2,30 @@ use crate::diagnostic::Severity;
 use crate::lsp_helpers::{PackagePattern, SuppressionSet};
 use serde::Deserialize;
 
+/// Where the registry HTTP cache keeps its entries.
+///
+/// Deserialized from the lowercase strings `"memory"` and `"disk"`; any other value is rejected
+/// so a typo cannot silently select a tier. There is deliberately no `Default`: the default is
+/// chosen where the setting is wired into [`CacheConfig`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::CachePersistence;
+///
+/// let tier: CachePersistence = serde_json::from_str("\"disk\"").unwrap();
+/// assert_eq!(tier, CachePersistence::Disk);
+/// assert!(serde_json::from_str::<CachePersistence>("\"Disk\"").is_err());
+/// ```
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CachePersistence {
+    /// Entries live only in process memory.
+    Memory,
+    /// Entries are also persisted to the per-user cache directory.
+    Disk,
+}
+
 /// The policy-relevant subset of `deps-lsp`'s configuration.
 ///
 /// Diagnostic severities, HTTP caching, release-freshness, supply-chain trust,

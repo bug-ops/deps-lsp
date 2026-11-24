@@ -433,6 +433,40 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
 > slow packages from blocking others. Cold start support ensures LSP features work immediately
 > when your IDE restores previously opened files.
 
+### Registry response cache
+
+The server keeps registry responses in memory so that a package you already looked up is not
+downloaded again. The `cache` section controls it:
+
+| Option | Effect |
+| ------ | ------ |
+| `enabled` | `true` (default) stores responses; `false` fetches on every request and stores nothing |
+| `fetch_timeout_secs` | How long one package's lookup may take before the editor falls back to what it already has |
+| `max_concurrent_fetches` | How many registry requests one document runs in parallel |
+
+How the cache behaves today:
+
+- **A stored response is re-checked on every use.** There is no "fresh for N minutes" window. The
+  server asks the registry whether the data changed (a conditional request using the response's
+  `ETag` or `Last-Modified`); an unchanged answer is a small `304` reply and the stored body is
+  reused.
+- **A failed re-check does not blank the editor.** If the registry is slow or unreachable, the
+  last stored response is shown instead of an error.
+- **The cache is bounded.** It holds at most 1000 responses and 64 MiB in total; a single
+  response over 8 MiB is used but not stored. When full, the oldest entries are dropped first.
+- **It does not survive a restart.** The cache lives in the server process: closing the editor or
+  restarting the language server starts you with an empty cache, and the first lookups of the
+  session hit the registries. The same holds for every `deps-cli` run, so `--offline` there has no
+  stored responses to fall back on.
+- **Offline mode reads from it.** With `network.offline = true` nothing is fetched and only
+  responses stored earlier in the same session are shown (see the note above).
+
+```json
+{
+  "cache": { "enabled": true, "fetch_timeout_secs": 10 }
+}
+```
+
 ### Slow or unreachable registries
 
 Hover and code actions wait only a bounded time for a registry answer, then fall back to what is

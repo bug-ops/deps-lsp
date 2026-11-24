@@ -251,16 +251,36 @@ worker.
 
 ## Caching architecture
 
-**`HttpCache`** (`deps-core::cache`), shared server-lifetime by every ecosystem's registry
-client, wraps outbound registry requests with RFC 7232 conditional-request validation
-(`ETag`/`If-None-Match`, `Last-Modified`/`If-Modified-Since`) so unchanged registry data is
-served from a bounded in-memory cache instead of re-fetched. Two independent caps bound memory
-use under a long-running session: `MAX_CACHE_ENTRIES` (1000 entries) and a 64 MiB total-bytes
-budget across every cached response body — a single response can be as large as 32 MiB
-(`MAX_RESPONSE_BYTES`), so the entry cap alone doesn't bound worst-case memory. Eviction
-(`cache_policy::evict_expired_then_oldest`) always tries TTL-expired entries first, falling back
-to the single oldest entry by fetch time only if nothing has expired; a full cache evicts
-`CACHE_EVICTION_PERCENTAGE` (10%) of its capacity at once rather than one entry at a time.
+**`HttpCache`** (`deps-core::cache`) is the one registry-response cache, shared for the server's
+lifetime by every ecosystem's registry client. Today it lives only in process memory: it starts
+empty on every server (or `deps-cli`) start and is discarded on exit.
+
+- **Revalidate on every read.** There is no freshness window or TTL on an entry. A repeat request
+  for a stored URL always goes to the network as a conditional request (RFC 7232:
+  `If-None-Match` from the stored `ETag`, `If-Modified-Since` from `Last-Modified`). A `304 Not
+  Modified` serves the stored body without re-downloading it; a `200` replaces the entry. An entry
+  stored without either validator is re-fetched in full.
+- **Stale fallback.** If revalidation fails (network error, timeout, non-success status), the
+  stored body is served instead of the error. Callers that merge several pages into one answer
+  can opt out so a half-stale list is never produced, and a credentialed entry is evicted rather
+  than served after a `401`/`403`.
+- **Bounded memory.** Three independent caps apply: `MAX_CACHE_ENTRIES` (1000 entries), a 64 MiB
+  budget across all stored bodies, and an 8 MiB admission cap per body — a larger response is
+  returned to the caller but never stored (and drops any older entry for the same URL). A single
+  response can be as large as 32 MiB (`MAX_RESPONSE_BYTES`), so the entry cap alone would not
+  bound worst-case memory.
+- **Eviction.** Checked at the start of a request. Once the entry or byte cap is reached, the
+  oldest entries by fetch time are removed — at least 10% of the entry cap
+  (`CACHE_EVICTION_PERCENTAGE`) when the entry cap was hit, and as many as needed to get back
+  under the byte budget. `HttpCache` does not use `cache_policy::evict_expired_then_oldest`: that
+  helper serves the smaller per-entry-TTL memos (release dates, deps.dev), not this cache.
+- **Switches.** `cache.enabled = false` bypasses the entry map entirely (every request fetches,
+  nothing is stored). `network.offline` blocks every outbound request and serves stored entries
+  only; it also overrides `cache.enabled = false` so entries stored earlier stay servable.
+- **Keys.** An entry is keyed by URL, with separate namespaces for credentialed requests,
+  origin-pinned requests, and workspace-declared registries (partitioned by the active
+  `registries.workspace_registries` policy), so a body fetched under one trust state is never
+  served under another.
 
 **`dependency_cap`** bounds how many dependencies one open document tracks at all:
 `MAX_DEPENDENCIES_PER_DOCUMENT` (5000) — hardcoded, not a config option, mirroring the 10 MB
