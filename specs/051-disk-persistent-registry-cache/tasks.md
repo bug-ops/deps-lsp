@@ -146,7 +146,7 @@ graph TD
 **Acceptance criteria**:
 - [x] `AtomicWrite { mode: FileMode, modified: Option<SystemTime> }`, `FileMode { PreserveTarget, OwnerOnly }`; `OwnerOnly` never copies the target's permissions (0600 on Unix); `write_atomic_bytes_with` refuses a symlinked final component and sets the mtime on the temp handle before rename
 - [x] `read_capped_no_follow_with_metadata` returns bytes plus `Metadata` from the same handle, opened `O_NOFOLLOW` and `O_NONBLOCK` on Unix, regular files only (a FIFO test must not block)
-- [x] `open_for_restamp`: write access, no truncate, `O_NOFOLLOW` on Unix; on Windows a symlink check immediately before the write-access open; `NotFound` propagated
+- [x] `open_for_restamp`: write access, no truncate, `O_NOFOLLOW` on Unix; on Windows a symlink check immediately before the write-access open (the path pre-check is accepted for PR-A; replaced by `FILE_FLAG_OPEN_REPARSE_POINT` via `open_no_follow_with` and a handle-based check that refuses only a symlink or junction, `file_type().is_symlink()` on the handle, in #2147); `NotFound` propagated
 - [x] Existing `write_atomic`/`write_atomic_bytes` behavior and callers unchanged (existing tests pass; deps-cli `update` keeps `PreserveTarget`)
 - [x] Unix tests: 0600 mode, symlink refusal, FIFO, mtime set; Windows rename-over-open-handle test compiles under `cfg(windows)`
 - [x] No `unsafe`; docs and doctests for new `pub` items
@@ -218,7 +218,7 @@ graph TD
 - [ ] Offline serves `Fresh` and `Revalidate`; `CacheMode::Disabled` bypasses the disk; `peek_cached` stays memory-only
 - [ ] On the first successful use of a target (tier `Ready` and first entry read or written) one `tracing::info!` names the directory, exactly once per process and target
 - [ ] A `#[cfg(test)]` disk-access counter exists in the store for the NFR tests below
-- [x] Windows `CacheDir::open` (`cfg(windows)`, std only per [[spec#NFR-004]] and [[spec#NFR-005]]; delivered by the #2141/#2145 PR): creates `deps-lsp/http/v1` under `%LOCALAPPDATA%`, never creates the `%LOCALAPPDATA%` root itself, and verifies each component is a directory and not a reparse point; trust is the per-user `%LOCALAPPDATA%` ACL, with no owner check; owner/DACL verification is tracked in follow-up issue #2146, and the Windows `open_no_follow_with` reparse race in #2147
+- [x] Windows `CacheDir::open` (`cfg(windows)`, std only per [[spec#NFR-004]] and [[spec#NFR-005]]; delivered by the #2141/#2145 PR): creates `deps-lsp/http/v1` under `%LOCALAPPDATA%`, never creates the `%LOCALAPPDATA%` root itself, and verifies each component is a directory and not a reparse point; trust is the per-user `%LOCALAPPDATA%` ACL, with no owner check; owner/DACL verification is not done by design (permanent limit, documented in the rustdoc of `CacheDir::open`, #2146, #2148), and the Windows `open_no_follow_with` reparse race is closed in #2147
 - [ ] Decode errors are logged by `DecodeError` variant, never with `%error` (`DecodeError::Header` quotes file content); follow-up #2142
 - [ ] The open-failure degrade warning names the cache path and the reason ([[spec#FR-015]]); follow-up #2142
 - [ ] The read path's file name lookup and the `decode` `expected_url` use `PersistKey::url()` (the normalized URL), see Implementation notes (PR-A); follow-up #2142
@@ -247,7 +247,7 @@ graph TD
 - [ ] mtime on NFS/SMB: `write_atomic_content` calls `set_modified` before `sync_all`, and restamp-as-freshness may break on SMB and some NFS; verify that the mtime survives, or document the limit and reword [[plan]] "NFS-safe" (§ concurrency row); follow-up #2142
 - [x] POST hosts are removed from `PersistableHost` (`api.osv.dev` and `api.deps.dev`, issue #2141)
 - [ ] Keys are built only on the GET path; test: a POST to a still-persistable host (e.g. `registry.npmjs.org`) never enqueues a `DiskOp`
-- [ ] Before each prune pass and each write batch the writer re-verifies the store path component chain (`symlink_metadata`: directory, owned, no group or other bits) and degrades on mismatch; closes the symlink swap window after `open` when the cache root is group or other writable (security finding L1/F1, see the `[NEEDS CLARIFICATION]` on [[spec#NFR-004]])
+- [ ] Before each prune pass and each write batch the writer re-verifies the store path component chain (`symlink_metadata`: directory, owned, no group or other bits) and degrades on mismatch; closes the symlink swap window after `open` when the cache root is group or other writable (security finding L1/F1, see [[spec#NFR-004]])
 - [ ] Tests: dropped-Put scenario (v2 in memory, v1 on disk, 304 for v2 gives a full write of v2, never a restamp of v1); a file with a later mtime is not overwritten; queue overflow drops without blocking; a transient rename error does not trip the breaker; 8 persistent errors via a store write-failure seam give `Unavailable` with exactly one warn
 **Dependencies**: T008
 **Files**: `crates/deps-core/src/cache/persist/mod.rs`, `crates/deps-core/src/cache/store.rs`, `crates/deps-core/src/cache/fetch.rs`, `crates/deps-core/src/cache/tests/`
@@ -475,7 +475,7 @@ Deviations and additions approved during PR-A (T001-T006); PR-B builds on them.
 ### Implementation notes (PR-A follow-ups)
 
 - #2141: `ApiOsvDev` and `ApiDepsDev` are removed from `PersistableHost` (18 to 16 hosts): every POST in the workspace targets them and their responses depend on the body; their GET responses never reach `HttpCache`.
-- #2145: the Windows `CacheDir::open` is std-only per [[spec#NFR-004]] (per-user ACL, directory and non-reparse-point component checks, no owner check); owner/DACL verification is follow-up #2146 and the `fs_probe` Windows reparse race is follow-up #2147.
+- #2145: the Windows `CacheDir::open` is std-only per [[spec#NFR-004]] (per-user ACL, directory and non-reparse-point component checks, no owner check); owner/DACL verification is not done by design (permanent limit, documented in the rustdoc of `CacheDir::open`, #2146, #2148); the `fs_probe` Windows reparse race is closed in #2147.
 
 ### Order of execution
 PR-A tasks T001 and T004 can run in parallel; T002 and T003 follow T001; T005 needs T003 and T004. PR-B is strictly sequential through T012. In PR-C, T015 and T016 can run in parallel after T014.

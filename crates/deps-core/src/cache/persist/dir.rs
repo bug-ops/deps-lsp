@@ -359,11 +359,18 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 impl CacheDir {
     /// Opens the store directory under `%LOCALAPPDATA%`.
     ///
-    /// Trust rests on the per-user ACL of `%LOCALAPPDATA%` (NFR-004): the root is never
-    /// created, each store component is created with a plain `create_dir` (inheriting the
-    /// profile ACL) and verified to be a directory that is not a reparse point. Owner and DACL
-    /// verification is not performed. `env` is unused and kept for signature parity with the
-    /// Unix `open`.
+    /// The root is never created; each store component is created with a plain `create_dir`
+    /// (inheriting the profile ACL) and verified to be a directory that is not a reparse point.
+    /// `env` is unused and kept for signature parity with the Unix `open`.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// Only "is a directory" and "is not a reparse point" are verified. Trust rests on the
+    /// per-user ACL of `%LOCALAPPDATA%` (NFR-004, NFR-005); no owner or DACL check is made,
+    /// because `std` cannot express one and `unsafe_code` is forbidden. This limit is permanent
+    /// and no dependency is added to lift it. The threat model therefore requires an
+    /// attacker with a same-user or administrator foothold, who could tamper with the cache
+    /// regardless.
     ///
     /// # Errors
     ///
@@ -410,8 +417,8 @@ fn verify_plain_dir(path: &Path) -> Result<(), DiskTierError> {
 /// Whether an entry file may be read: a regular file.
 ///
 /// The owner check is skipped per NFR-004 (trust rests on the per-user `%LOCALAPPDATA%` ACL);
-/// owner/DACL verification is tracked in #2146. `meta` must come from the handle the entry is
-/// read through, as on Unix. An untrusted file is treated as a cache miss.
+/// owner/DACL verification is a permanent, documented limit. `meta` must come from the handle
+/// the entry is read through, as on Unix. An untrusted file is treated as a cache miss.
 #[cfg(windows)]
 #[must_use]
 pub(super) fn entry_file_trusted(meta: &std::fs::Metadata) -> bool {

@@ -59,6 +59,7 @@ Previously fetched public-registry responses survive a process restart, and a re
 - Changing the in-memory eviction policy (`MAX_CACHE_BYTES`, `MAX_CACHEABLE_ENTRY_BYTES`) or the conditional-request logic.
 - Persisting anything other than `HttpCache` responses (no parsed ASTs, no lockfile data, no per-ecosystem memo layers such as `RELEASE_DATES_TTL`).
 - A `getpwuid` fallback when `HOME` is unset (the result is memory).
+- Windows owner or DACL verification, and cross-checking `%LOCALAPPDATA%` against the Known Folder (non-goals; Windows trusts the per-user ACL, see NFR-004).
 
 ## 2. User Stories
 
@@ -253,10 +254,7 @@ Corrupt, truncated or version-mismatched data SHALL degrade to a miss; a future 
 
 ### NFR-004
 
-Security (Unix): directories 0700 and files 0600 (`FileMode::OwnerOnly` never copies the target's mode; deps-cli `update` keeps `PreserveTarget`); every component and every file is owner-checked; the root requires ownership only, because a group- or other-writable root can at most delete our directory (memory), never forge an entry, so umask-002 homes keep working. Windows relies on the per-user ACL of `%LOCALAPPDATA%` (uid and owner check skipped, documented; each store component is verified as a directory and not a reparse point; owner/DACL verification: follow-up #2146). `body_fnv1a64` is an integrity check, not an authenticity check.
-
-> [!question] Open
-> [NEEDS CLARIFICATION: the "at most delete our own directory" claim for a group- or other-writable root does not hold after `open`: such a root allows a symlink swap of a path component, so a later write batch or prune pass could act outside our directory. PR-B re-verifies the component chain before each prune pass and write batch (see T009), but does the user approve changing this wording and the root-ownership-only rule?]
+Security (Unix): directories 0700 and files 0600 (`FileMode::OwnerOnly` never copies the target's mode; deps-cli `update` keeps `PreserveTarget`); every component and every file is owner-checked; the root requires ownership only (no mode check), so umask-002 homes keep working. A group- or other-writable root allows a symlink swap of a path component after `open`; the writer therefore re-verifies the store component chain (`symlink_metadata`: directory, owned, no group or other bits) before each prune pass and write batch and degrades to memory on mismatch (T009). Entries are never trusted on the strength of the root alone: every file is owner-checked on read. Windows relies on the per-user ACL of `%LOCALAPPDATA%`: no owner or DACL verification and no new dependency (NFR-005 stays std-only); each store component is verified only as a directory and not a reparse point, and the open of a cache file uses `FILE_FLAG_OPEN_REPARSE_POINT` with a handle-based check that refuses only a symlink or junction (`file_type().is_symlink()` on the handle) instead of a path pre-check (#2147). This limit is permanent and documented in the rustdoc of `CacheDir::open` (#2146, #2148). `body_fnv1a64` is an integrity check, not an authenticity check.
 
 ### NFR-005
 

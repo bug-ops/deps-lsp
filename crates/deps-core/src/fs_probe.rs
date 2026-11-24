@@ -189,17 +189,17 @@ pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Opt
 /// this atomically via `libc::O_NOFOLLOW` on the `open(2)` call — a symlinked `path` fails the
 /// open outright, with no content ever read either way; this function then classifies that
 /// failure into the distinct, well-worded error described below rather than a generic read
-/// failure. On non-Unix platforms (Windows), std exposes no portable `O_NOFOLLOW` equivalent,
-/// so this falls back to a `symlink_metadata` check immediately before the open — not atomic,
-/// but narrows the window to the two syscalls happening back to back with no attacker-controlled
-/// work between them, rather than leaving it open across this function's entire caller-side
-/// read path.
+/// failure. On Windows the open passes `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink or junction
+/// is opened as itself rather than followed, and the opened handle's own metadata is checked —
+/// also race-free. Other platforms fall back to a `symlink_metadata` check immediately before
+/// the open — not atomic, but narrowed to two back-to-back syscalls.
 ///
 /// # Errors
 ///
 /// Returns an error under the same conditions as [`read_to_string_capped`], plus
 /// [`std::io::ErrorKind::InvalidInput`] (matching [`write_atomic`]'s own symlink-refusal
-/// error kind) when `path`'s final component is a symlink.
+/// error kind) when `path`'s final component is a symlink. On Windows a directory
+/// symlink or junction is still refused but may yield `PermissionDenied` instead.
 pub fn read_to_string_capped_no_follow(
     path: &Path,
     max_bytes: u64,
@@ -328,14 +328,16 @@ pub fn read_capped_no_follow_with_metadata(
 /// Opens `path` for reading and writing, without truncating, so its mtime can be restamped
 /// through the same handle that was used to validate it.
 ///
-/// A symlinked final component is refused: atomically via `O_NOFOLLOW` on Unix, via a
+/// A symlinked final component is refused: atomically via `O_NOFOLLOW` on Unix, via
+/// `FILE_FLAG_OPEN_REPARSE_POINT` plus a check of the opened handle on Windows, and via a
 /// `symlink_metadata` check immediately before the write-access open elsewhere.
 ///
 /// # Errors
 ///
 /// Returns `NotFound` when `path` is missing, [`std::io::ErrorKind::InvalidInput`] when its
 /// final component is a symlink or the handle is not a regular file, or the underlying open
-/// error. On Unix the open is `O_NONBLOCK`, so a planted FIFO cannot hang it.
+/// error. On Unix the open is `O_NONBLOCK`, so a planted FIFO cannot hang it. On Windows a
+/// directory symlink or junction is still refused but may yield `PermissionDenied` instead.
 ///
 /// Callers that validate the file's metadata (owner, mode) must `fstat` the returned handle,
 /// not re-stat the path.
@@ -439,7 +441,30 @@ fn open_no_follow_with(
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_no_follow_with(
+    path: &Path,
+    mut options: std::fs::OpenOptions,
+    _extra_flags: i32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // Opening with `FILE_FLAG_OPEN_REPARSE_POINT` yields a handle to the reparse point itself
+    // instead of following it, so the check on that same handle cannot race a swap. std reports
+    // only name-surrogate reparse points (symlinks, junctions) as `is_symlink`, so dedup/WOF/
+    // cloud placeholder files are not refused.
+    let file = options
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_type().is_symlink() {
+        return Err(symlink_refused_error(path));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_no_follow_with(
     path: &Path,
     options: std::fs::OpenOptions,
@@ -832,6 +857,31 @@ mod tests {
 
         assert!(result.is_err(), "a symlinked path must be refused");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_to_string_capped_no_follow_refuses_a_reparse_point() {
+        use std::os::windows::fs::symlink_file;
+
+        let _guard = snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "real content").unwrap();
+        let link = dir.path().join("Cargo.toml");
+        if symlink_file(&target, &link).is_err() {
+            return; // creating symlinks needs a privilege this runner lacks
+        }
+
+        let read = read_to_string_capped_no_follow(&link, 1000);
+        let restamp = open_for_restamp(&link);
+
+        assert!(read.is_err(), "a reparse point must be refused");
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            restamp.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[cfg(unix)]
