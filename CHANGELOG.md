@@ -17,8 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `update --lockfile regenerate` migrates the legacy Gradle `gradle/dependency-locks` layout to `gradle.lockfile` behind an exact lock-state drift guard, reporting created and removed lock files (also in `--open-pr`) (#2102, #2134)
 - **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #2134)
 - **deps-core**: disk-cache primitives (persist key, freshness, entry format, secure cache directory, `CachePersistence` config type, `fs_probe` atomic-write and restamp helpers), not yet wired into `HttpCache` (#700, #2144)
+- **deps-core**: std-only Windows `CacheDir::open` for the disk cache, relying on the per-user `%LOCALAPPDATA%` ACL, not yet wired into `HttpCache` (#2145)
 
 ### Fixed
+- **deps-core**: disk-cache eligibility excludes the body-dependent OSV and deps.dev POST hosts (#2141)
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a run drops a configuration holding a non-pinned coordinate or deletes a previously present unified lock file (#2135)
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a non-pinned coordinate moves, and a security-only pin accepts a locked version at or above the target (#2130, #2133, #2136)
 - **deps-cli**: NuGet regeneration passes `-p:RestoreLockedMode=false` so projects that set locked mode no longer fail with NU1004 (#2129, #2136)

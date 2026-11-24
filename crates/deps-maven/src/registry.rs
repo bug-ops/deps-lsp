@@ -31,6 +31,18 @@ const GOOGLE_MAVEN_BASE: &str = "https://dl.google.com/dl/android/maven2";
 const GRADLE_PLUGIN_PORTAL_BASE: &str = "https://plugins.gradle.org/m2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[
+    MAVEN_REPO_BASE,
+    GOOGLE_MAVEN_BASE,
+    GRADLE_PLUGIN_PORTAL_BASE,
+    MAVEN_SEARCH_BASE,
+];
+
 /// Per-attempt timeouts for `search`'s retry loop: first attempt, then second.
 ///
 /// `search.maven.org/solrsearch` fails intermittently as a silent, zero-byte hang

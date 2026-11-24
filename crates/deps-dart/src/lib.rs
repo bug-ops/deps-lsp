@@ -24,5 +24,5 @@ pub use ecosystem::DartEcosystem;
 pub use formatter::DartFormatter;
 pub use lockfile::PubspecLockParser;
 pub use parser::{DartParseResult, parse_pubspec_yaml};
-pub use registry::{PubDevRegistry, package_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, PubDevRegistry, package_url};
 pub use types::{DartDependency, DartVersion, DependencySection, DependencySource, PackageInfo};

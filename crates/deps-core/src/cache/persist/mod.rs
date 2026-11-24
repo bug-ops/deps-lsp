@@ -20,6 +20,9 @@ mod target_tests;
 use crate::net_policy::EnvSource;
 use crate::policy_config::CachePersistence;
 use dir::CacheDir;
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use key::persistable_hosts;
 
 /// The persistence tier resolved from configuration.
 ///

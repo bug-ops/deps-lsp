@@ -23,5 +23,5 @@ pub mod version;
 pub use ecosystem::MavenEcosystem;
 pub use formatter::MavenFormatter;
 pub use parser::{MavenParseResult, parse_pom_xml};
-pub use registry::{MavenCentralRegistry, package_url};
+pub use registry::{DEFAULT_REGISTRY_BASES, MavenCentralRegistry, package_url};
 pub use types::{ArtifactInfo, MavenDependency, MavenScope, MavenVersion};

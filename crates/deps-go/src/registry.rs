@@ -47,6 +47,13 @@ use std::sync::Arc;
 
 const PROXY_BASE: &str = "https://proxy.golang.org";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[PROXY_BASE, crate::config::GO_DEFAULT_PROXY_URL];
+
 /// Display name for the Go module proxy used in not-found and API-response
 /// error messages.
 pub const REGISTRY: &str = "Go proxy";

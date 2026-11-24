@@ -43,6 +43,13 @@ use std::sync::Arc;
 const SPARSE_INDEX_BASE: &str = "https://index.crates.io";
 const SEARCH_API_BASE: &str = "https://crates.io/api/v1";
 
+/// Default registry base URLs this crate fetches from.
+///
+/// Pinned by the `deps-engine` `persist_hosts` test against the disk-cache host allow-list, so a
+/// new default host cannot silently miss (or wrongly gain) persistence (#2140).
+#[doc(hidden)]
+pub const DEFAULT_REGISTRY_BASES: &[&str] = &[SPARSE_INDEX_BASE, SEARCH_API_BASE];
+
 /// Display name for crates.io used in not-found and API-response error messages.
 pub const REGISTRY: &str = "crates.io";
 

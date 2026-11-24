@@ -471,6 +471,124 @@ mod unix_open {
     }
 }
 
+#[cfg(windows)]
+mod windows_open {
+    use super::super::dir::{DiskTierError, entry_file_trusted};
+    use super::*;
+    use std::os::windows::fs::symlink_dir;
+
+    const COMPONENTS: [&str; 3] = ["deps-lsp", "http", "v1"];
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+    fn cache_dir(env: &MapEnv) -> CacheDir {
+        CacheDir::resolve(env, CachePlatform::Windows).expect("resolvable")
+    }
+
+    fn env_for(root: &Path) -> MapEnv {
+        env_var(MapEnv::new(), "LOCALAPPDATA", root)
+    }
+
+    #[test]
+    fn open_missing_root_is_create_failed_and_creates_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("missing");
+        let env = env_for(&root);
+        assert_matches!(
+            cache_dir(&env).open(&env),
+            Err(DiskTierError::CreateFailed(_))
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn open_existing_root_creates_plain_component_chain_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = env_for(tmp.path());
+        let store = cache_dir(&env).open(&env).expect("open");
+        let expected = COMPONENTS
+            .iter()
+            .fold(tmp.path().to_path_buf(), |dir, c| dir.join(c));
+        assert_eq!(store.path(), expected);
+        let mut dir = tmp.path().to_path_buf();
+        for component in COMPONENTS {
+            dir.push(component);
+            let meta = fs::symlink_metadata(&dir).expect("metadata");
+            assert!(meta.file_type().is_dir() && !meta.file_type().is_symlink());
+        }
+        assert!(cache_dir(&env).open(&env).is_ok());
+    }
+
+    #[test]
+    fn open_root_that_is_a_file_is_insecure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("file");
+        fs::write(&root, b"x").expect("file");
+        let env = env_for(&root);
+        assert_matches!(
+            cache_dir(&env).open(&env),
+            Err(DiskTierError::InsecureDirectory)
+        );
+    }
+
+    #[test]
+    fn open_component_that_is_a_file_is_insecure() {
+        for depth in 0..COMPONENTS.len() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut dir = tmp.path().to_path_buf();
+            for component in &COMPONENTS[..depth] {
+                dir.push(component);
+                fs::create_dir(&dir).expect("component");
+            }
+            fs::write(dir.join(COMPONENTS[depth]), b"x").expect("file");
+            let env = env_for(tmp.path());
+            assert_matches!(
+                cache_dir(&env).open(&env),
+                Err(DiskTierError::InsecureDirectory),
+                "component {depth}"
+            );
+        }
+    }
+
+    /// Covers the `is_dir()` refusal of name-surrogate reparse points only; std cannot create a
+    /// junction or a non-surrogate reparse directory, so the `0x400` attribute branch is untested.
+    #[test]
+    fn open_component_directory_symlink_is_insecure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).expect("real");
+        let root = tmp.path().join("root");
+        fs::create_dir(&root).expect("root");
+        match symlink_dir(&real, root.join(COMPONENTS[0])) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) =>
+            {
+                eprintln!("SKIPPED: symlink creation needs a privilege, the test is vacuous");
+                return;
+            }
+            Err(e) => panic!("symlink_dir: {e}"),
+        }
+        let env = env_for(&root);
+        assert_matches!(
+            cache_dir(&env).open(&env),
+            Err(DiskTierError::InsecureDirectory)
+        );
+        assert_eq!(fs::read_dir(&real).expect("read_dir").count(), 0);
+    }
+
+    #[test]
+    fn entry_file_trusted_accepts_regular_file_and_rejects_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("f");
+        fs::write(&file, b"x").expect("file");
+        assert!(entry_file_trusted(&fs::metadata(&file).expect("metadata")));
+        assert!(!entry_file_trusted(
+            &fs::metadata(tmp.path()).expect("metadata")
+        ));
+    }
+}
+
 mod prune {
     use super::*;
 
@@ -636,8 +754,8 @@ mod prune {
         };
         let report = s.prune(limits);
         assert_eq!(report.scanned, 3);
-        assert!(report.removed <= 3);
-        assert!(s.file_count() >= 2);
+        assert_eq!(report.removed, 3);
+        assert_eq!(s.file_count(), 2);
     }
 
     #[test]

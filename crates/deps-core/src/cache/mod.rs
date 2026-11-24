@@ -12,6 +12,9 @@ use crate::redact::RedactedUrl;
 pub use auth::{CredentialHeader, RateLimitRevocation, RequestAuth, RequestHeader};
 pub use body::BodyLimit;
 use dashmap::DashMap;
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use persist::persistable_hosts;
 pub use response::{CachedResponse, CredentialPartition, RevalidationFailure};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

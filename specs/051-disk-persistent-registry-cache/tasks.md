@@ -93,7 +93,7 @@ graph TD
 **Context**: A typed, closed eligibility rule so no token-bearing URL can reach disk and `page` handling is explicit.
 **Spec reference**: [[spec#FR-001]], [[spec#FR-008]], [[spec#FR-009]], [[spec#FR-013]]
 **Acceptance criteria**:
-- [ ] `PersistableHost` (closed enum, `from_host`/`as_str`) lists exactly the hosts in [[plan]] §3; a unit test pins it against each ecosystem crate's default-base constant (not met, deviation: deps-core has no ecosystem dependencies, so the unit test pins the literal [[plan]] §3 list; the constant pin is tracked in issue #2140)
+- [x] `PersistableHost` (closed enum, `from_host`/`as_str`) lists exactly the 16 GET-only hosts in [[plan]] §3 (`ApiOsvDev` and `ApiDepsDev` removed, issue #2141); a deps-core unit test pins the literal list, and the pin against each ecosystem crate's default-base constants is delivered by the deps-engine `persist_hosts` test (issue #2140), because deps-core has no ecosystem dependencies
 - [x] `PersistableQueryKey { Page, PerPage, OrderBy, Sort }`, `PageNumber(NonZeroU32)`, `PageRole::{ListingPage, Standalone}`
 - [x] `PersistKey::new(url, tier, auth, accept, page_role) -> Option<PersistKey>` matches tier and auth exhaustively with no `_` arm; enforces https, no userinfo or fragment, default-port domain host, values `[A-Za-z0-9_.-]{1,32}`, no duplicate keys; `page` present with no declared role gives `None`
 - [x] `PersistKey::sibling_page(n)` keeps query order and other pairs byte-identical; `None` when no `page` and `n > 1`
@@ -218,8 +218,11 @@ graph TD
 - [ ] Offline serves `Fresh` and `Revalidate`; `CacheMode::Disabled` bypasses the disk; `peek_cached` stays memory-only
 - [ ] On the first successful use of a target (tier `Ready` and first entry read or written) one `tracing::info!` names the directory, exactly once per process and target
 - [ ] A `#[cfg(test)]` disk-access counter exists in the store for the NFR tests below
-- [ ] Non-Unix (Windows) `CacheDir::open`: creates `deps-lsp/http/v1` under `%LOCALAPPDATA%` and never creates the `%LOCALAPPDATA%` root itself; PR-A has `CacheDir::open` only under `cfg(unix)`, so nothing builds a `StoreDir` on Windows until this lands
-- [ ] Decode errors are logged by `DecodeError` variant, never with `%error` (`DecodeError::Header` quotes file content); the degrade warning names the cache path ([[spec#FR-015]]); all file name, header and decode paths use `PersistKey::url()` (the normalized URL), see Implementation notes (PR-A); follow-up #2142
+- [x] Windows `CacheDir::open` (`cfg(windows)`, std only per [[spec#NFR-004]] and [[spec#NFR-005]]; delivered by the #2141/#2145 PR): creates `deps-lsp/http/v1` under `%LOCALAPPDATA%`, never creates the `%LOCALAPPDATA%` root itself, and verifies each component is a directory and not a reparse point; trust is the per-user `%LOCALAPPDATA%` ACL, with no owner check; owner/DACL verification is tracked in follow-up issue #2146, and the Windows `open_no_follow_with` reparse race in #2147
+- [ ] Decode errors are logged by `DecodeError` variant, never with `%error` (`DecodeError::Header` quotes file content); follow-up #2142
+- [ ] The open-failure degrade warning names the cache path and the reason ([[spec#FR-015]]); follow-up #2142
+- [ ] The read path's file name lookup and the `decode` `expected_url` use `PersistKey::url()` (the normalized URL), see Implementation notes (PR-A); follow-up #2142
+- [ ] Tests (#2142): a corrupt header with a secret-shaped marker in its content fails decode and the captured tracing output names the `DecodeError` variant without the marker; the degrade warning (open failure and first-read timeout) contains the cache path and the reason; a mixed-case host or `:443` URL written earlier is found on disk through `PersistKey::url()` with `decode` accepting it as `expected_url`
 - [ ] Entry trust checks use the metadata of the same handle that read the bytes (owner, mode, mtime), never a separate `stat`
 - [ ] Tests: open in progress then the read waits and hits (does not miss), including N concurrent first-wave reads that all hit disk (SC-002); open slower than 250 ms yields a miss without degrading; semaphore-wait timeout does not degrade; a blocking read slower than 250 ms (test seam delay) degrades the tier with exactly one warn and later reads are misses ([[spec#FR-015]]); the `info!` appears exactly once across several successful uses (captured tracing subscriber); NFR-001: `set_persistence(Disk(tmp))` leaves the directory absent until the first eligible op; NFR-002: the disk-access counter stays 0 across repeated in-memory hits even after the directory is made unreadable
 **Dependencies**: T007
@@ -239,7 +242,11 @@ graph TD
 - [ ] `WriteFailure::{Persistent, Transient}`: `StorageFull`, `QuotaExceeded`, `ReadOnlyFilesystem` count toward the 8-failure breaker (then `Unavailable`, one warn); `PermissionDenied` and Windows raw 32 or 5 never count; a single failure logs at `debug`
 - [ ] Prune runs when the writer starts and every 64 puts
 - [ ] `open_for_restamp` handle is `fstat`ed (PR-A discards its metadata); the restamp decision and trust checks use that same-handle metadata; follow-up #2142
-- [ ] Persist only from the GET path: `PersistKey` has no method dimension, so the `api.osv.dev` POST path never enqueues a `DiskOp`; test with a POST to a persistable host; follow-up #2141
+- [ ] The writer's file name and header `url` come from `PersistKey::url()` (the normalized URL); follow-up #2142
+- [ ] Tests (#2142): a mixed-case host or `:443` URL is written and read under the file name and header `url` of `PersistKey::url()` and hits on a fresh store; with a `Validated` op, a file whose same-handle metadata shows a foreign owner, non-regular type or later mtime is neither restamped nor overwritten
+- [ ] mtime on NFS/SMB: `write_atomic_content` calls `set_modified` before `sync_all`, and restamp-as-freshness may break on SMB and some NFS; verify that the mtime survives, or document the limit and reword [[plan]] "NFS-safe" (§ concurrency row); follow-up #2142
+- [x] POST hosts are removed from `PersistableHost` (`api.osv.dev` and `api.deps.dev`, issue #2141)
+- [ ] Keys are built only on the GET path; test: a POST to a still-persistable host (e.g. `registry.npmjs.org`) never enqueues a `DiskOp`
 - [ ] Before each prune pass and each write batch the writer re-verifies the store path component chain (`symlink_metadata`: directory, owned, no group or other bits) and degrades on mismatch; closes the symlink swap window after `open` when the cache root is group or other writable (security finding L1/F1, see the `[NEEDS CLARIFICATION]` on [[spec#NFR-004]])
 - [ ] Tests: dropped-Put scenario (v2 in memory, v1 on disk, 304 for v2 gives a full write of v2, never a restamp of v1); a file with a later mtime is not overwritten; queue overflow drops without blocking; a transient rename error does not trip the breaker; 8 persistent errors via a store write-failure seam give `Unavailable` with exactly one warn
 **Dependencies**: T008
@@ -463,7 +470,12 @@ Deviations and additions approved during PR-A (T001-T006); PR-B builds on them.
 - `PageNumber` rejects leading zeros (canonical decimal only).
 - `PersistKey::url()` returns the normalized URL; PR-B must use it for the file name, the header `url` and the `decode` expectation.
 - Trailing bytes after the body are ignored by `decode`; body integrity is covered by `body_len` and the checksum ([[plan]] §12 reworded to match).
-- Tracked in issues: #2140 (`PersistableHost` constant pin), #2141 (POST must never be persisted), #2142 (PR-B carry-overs: decode logging, path in degrade warning, restamp handle checks, `key.url()` everywhere).
+- Tracked in issues: #2140 (`PersistableHost` constant pin), #2141 (POST must never be persisted), #2142 (PR-B carry-overs: decode logging, path in degrade warning, restamp handle checks, `key.url()` everywhere, mtime on NFS/SMB).
+
+### Implementation notes (PR-A follow-ups)
+
+- #2141: `ApiOsvDev` and `ApiDepsDev` are removed from `PersistableHost` (18 to 16 hosts): every POST in the workspace targets them and their responses depend on the body; their GET responses never reach `HttpCache`.
+- #2145: the Windows `CacheDir::open` is std-only per [[spec#NFR-004]] (per-user ACL, directory and non-reparse-point component checks, no owner check); owner/DACL verification is follow-up #2146 and the `fs_probe` Windows reparse race is follow-up #2147.
 
 ### Order of execution
 PR-A tasks T001 and T004 can run in parallel; T002 and T003 follow T001; T005 needs T003 and T004. PR-B is strictly sequential through T012. In PR-C, T015 and T016 can run in parallel after T014.

@@ -1091,7 +1091,7 @@ fn goproxy_urls(raw: &str) -> Vec<&str> {
 
 /// The normalized public proxy URL of the go command's built-in `GOPROXY` default
 /// (`https://proxy.golang.org,direct`).
-const GO_DEFAULT_PROXY_URL: &str = "https://proxy.golang.org";
+pub(crate) const GO_DEFAULT_PROXY_URL: &str = "https://proxy.golang.org";
 
 /// The Go settings this crate reads, from the process environment and from `$GOENV`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
