@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: JSON lockfile `failed` entries for `lockfile-pin-not-kept`, `fallback-pin-not-kept` and `lock-state-drift` fill `package`/`expected` and add optional `configuration`/`change` (#2132, #2136)
 
 ### Added
+- **deps-gradle**: version catalogs are recognized by the `*.versions.toml` basename (any catalog name), not only `libs.versions.toml` (#2151, #2165)
 - **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #2134)
 - **deps-cli**: `update --lockfile regenerate` migrates the legacy Gradle `gradle/dependency-locks` layout to `gradle.lockfile` behind an exact lock-state drift guard, reporting created and removed lock files (also in `--open-pr`) (#2102, #2134)
 - **deps-core**: `json_ast::string_literal_span` locates a JSON string literal by key path (#2113, #2134)
@@ -20,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: std-only Windows `CacheDir::open` for the disk cache, relying on the per-user `%LOCALAPPDATA%` ACL, not yet wired into `HttpCache` (#2145, #2149)
 
 ### Fixed
+- **workflow**: `stale.yml` exempts `P0`, `P1`, `pinned`, `security` and `epic` issues and PRs from auto-close instead of non-existent `priority/*` labels (#2154, #2165)
+- **deps-cli**: `update` capped process output of exactly the cap size is no longer reported as truncated; both runners share one `read_capped` (#2155, #2165)
+- **deps-core**: disk-cache prune deletes and counts only cache-shaped files owned by the probing user (#2159, #2165)
 - **deps-core**: Windows `fs_probe` no-follow open uses `FILE_FLAG_OPEN_REPARSE_POINT` and checks the opened handle, closing the check-then-open race; the missing Windows owner/DACL check is documented as a permanent limit, and spec 051 NFR-004 is resolved (#2147, #2146, #2148, #2150)
 - **deps-core**: disk-cache eligibility excludes the body-dependent OSV and deps.dev POST hosts (#2141, #2149)
 - **deps-cli**: Gradle unified lock regeneration refuses and rolls back when a run drops a configuration holding a non-pinned coordinate or deletes a previously present unified lock file (#2135)
@@ -31,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workspace**: scheduled `semver` job excludes crates new since the baseline and allows the just-published baseline version (#2126, #2128)
 
 ### Changed
+- **deps-core**: disk-cache entry format and file naming accept only `PersistKey` (#2153, #2165)
+- **deps-core**: disk-cache primitives share `closed_str_enum!`, `EntryTrust`, `OpenBlocking` and one `deps_core::hash::fnv1a64` (#2156, #2165)
+- **workspace**: adopt `map_or_default` and `bool::ok_or` where the MSRV already allows them (#2157, #2165)
+- **workspace**: refresh 26 lock-only dependencies in `Cargo.lock` (#2152, #2165)
 - **workspace**: bumped `url` to 2.5.9 for RUSTSEC-2026-0592 and let the musl cross-compile legs build under `build.warnings = "deny"` (#2128)
 - **workspace**: `build.warnings = "deny"` for local builds and `#[expect]` with reasons instead of file-level `#[allow]` (#2125, #2128)
 - **deps-cli**: `update --format json` lists every held pin, rekey parses a lock file once, and a `test-util` feature backs new regeneration tests (#2111, #2112, #2116, #2118, #2119, #2128)

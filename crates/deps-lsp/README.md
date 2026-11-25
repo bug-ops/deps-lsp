@@ -12,7 +12,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ## Features
 
-- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, libs.versions.toml, Package.swift, composer.json, .csproj/.fsproj/.vbproj, deno.json/deno.jsonc, .github/workflows/*.yml, action.yml, .gitlab-ci.yml, .pre-commit-config.yaml
+- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, `*.versions.toml`, Package.swift, composer.json, .csproj/.fsproj/.vbproj, deno.json/deno.jsonc, .github/workflows/*.yml, action.yml, .gitlab-ci.yml, .pre-commit-config.yaml
 - **Inlay hints** — Show latest versions inline with loading indicators
 - **Hover info** — Package descriptions with resolved version from lock file
 - **License hover & policy** — SPDX license for the resolved and latest version in hover, plus an optional `license_policy` allow/deny-list diagnostic

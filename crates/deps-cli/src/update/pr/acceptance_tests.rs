@@ -279,12 +279,6 @@ fn assert_all_distinct(branches: &[String]) {
     }
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
-
 fn alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -432,13 +426,13 @@ async fn test_branch_for_shapes_label_dir_and_group() {
 /// over `<eco>\n<manifest path>\n<group or empty>\n` and the sorted `<name>\t<target>\n` lines.
 #[tokio::test]
 async fn test_branch_for_hash_is_fnv1a_over_ecosystem_path_group_and_sorted_items() {
-    assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-    assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    assert_eq!(deps_core::hash::fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+    assert_eq!(deps_core::hash::fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
     let fx = Fixture::new();
     let ctx = fx.ctx("app/Cargo.toml").await;
     let two = plan(&[("beta", "2.0.0", "2.1.0"), ("alpha", "1.0.0", "1.1.0")]);
     let group = group_from("[update.groups.minor-patch]\n", "minor-patch");
-    let h8 = |input: &str| format!("{:08x}", fnv1a64(input.as_bytes()) >> 32);
+    let h8 = |input: &str| format!("{:08x}", deps_core::hash::fnv1a64(input.as_bytes()) >> 32);
 
     let ungrouped = branch(&ctx, &two, None);
     let grouped = branch(&ctx, &two, Some(&group));

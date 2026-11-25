@@ -23,6 +23,8 @@ mod nuget;
 #[cfg(all(test, unix))]
 mod process_group_tests;
 mod python;
+#[cfg(test)]
+mod read_capped_tests;
 mod rekey;
 mod run;
 mod swift;
@@ -51,7 +53,7 @@ pub use command::{NpmClient, Program, PythonLocker};
 pub use gradle::{LockConfiguration, LockStateChange, LockedCoordinate};
 pub(in crate::update) use interrupt::Interrupts;
 pub use rekey::RekeyRefusal;
-pub(in crate::update) use run::{ChildGuard, ProcessGroup};
+pub(in crate::update) use run::{Capped, ChildGuard, ProcessGroup, read_capped};
 use run::{SearchPath, ToolRunner};
 
 use super::{

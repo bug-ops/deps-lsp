@@ -615,14 +615,12 @@ impl PypiParser {
     ) -> Result<PypiDependency> {
         use deps_core::position::{Position, Range};
 
-        let name_range = base_position
-            .map(|pos| {
-                Range::new(
-                    pos,
-                    Position::new(pos.line, pos.character + name.len() as u32),
-                )
-            })
-            .unwrap_or_default();
+        let name_range = base_position.map_or_default(|pos| {
+            Range::new(
+                pos,
+                Position::new(pos.line, pos.character + name.len() as u32),
+            )
+        });
 
         // Simple string version, optionally followed by a `; <marker>` suffix
         // mirroring PEP 508 syntax (not standard Poetry, but handled defensively).
@@ -696,12 +694,11 @@ impl PypiParser {
             let extras = table
                 .get("extras")
                 .and_then(|e| e.as_array())
-                .map(|arr| {
+                .map_or_default(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect()
-                })
-                .unwrap_or_default();
+                });
 
             let markers_value = table.get("markers").filter(|v| v.as_str().is_some());
             let markers = markers_value

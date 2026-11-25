@@ -2400,11 +2400,9 @@ mod tests {
             .iter()
             .map(|(version, published, listed)| {
                 let published_field = published
-                    .map(|p| format!(r#", "published": "{p}""#))
-                    .unwrap_or_default();
+                    .map_or_default(|p| format!(r#", "published": "{p}""#));
                 let listed_field = listed
-                    .map(|l| format!(r#", "listed": {l}"#))
-                    .unwrap_or_default();
+                    .map_or_default(|l| format!(r#", "listed": {l}"#));
                 format!(
                     r#"{{"catalogEntry": {{"version": "{version}"{published_field}{listed_field}}}}}"#
                 )

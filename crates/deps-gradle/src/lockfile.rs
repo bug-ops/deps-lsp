@@ -25,7 +25,6 @@ pub const LOCKFILE_NAME: &str = "gradle.lockfile";
 /// File name of the lock file Gradle writes for `buildscript { }` classpath dependencies.
 pub const BUILDSCRIPT_LOCKFILE_NAME: &str = "buildscript-gradle.lockfile";
 
-const CATALOG_FILE_NAME: &str = "libs.versions.toml";
 const CATALOG_DIR_NAME: &str = "gradle";
 
 const LEGACY_LOCKS_DIR_NAME: &str = "dependency-locks";
@@ -125,12 +124,18 @@ pub struct GradleLockParser;
 
 impl LockFileProvider for GradleLockParser {
     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
-        // Only the standard `<project>/gradle/libs.versions.toml` layout looks one level up;
+        // Only the standard `<project>/gradle/<name>.versions.toml` layout looks one level up;
         // Gradle locks per project, so any other catalog location must not borrow a
         // neighbouring project's lock file.
         let in_gradle_dir = resolve_manifest_file_path(manifest_uri).is_some_and(|path| {
             path.file_name()
-                .is_some_and(|name| name == CATALOG_FILE_NAME)
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| {
+                    deps_core::ecosystem_registry::manifest_pattern_matches(
+                        name,
+                        crate::CATALOG_PATTERN,
+                    )
+                })
                 && path
                     .parent()
                     .and_then(Path::file_name)

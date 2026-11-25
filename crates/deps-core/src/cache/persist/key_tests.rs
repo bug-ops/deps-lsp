@@ -9,25 +9,6 @@ use proptest::prelude::*;
 
 const ACCEPT: &str = "application/json";
 
-const ALL_HOSTS: [&str; 16] = [
-    "api.github.com",
-    "gitlab.com",
-    "index.crates.io",
-    "crates.io",
-    "registry.npmjs.org",
-    "pypi.org",
-    "proxy.golang.org",
-    "rubygems.org",
-    "pub.dev",
-    "repo1.maven.org",
-    "dl.google.com",
-    "plugins.gradle.org",
-    "repo.packagist.org",
-    "api.nuget.org",
-    "jsr.io",
-    "api.jsr.io",
-];
-
 fn baseline_anon(url: &str, role: Option<PageRole>) -> Option<PersistKey> {
     PersistKey::new(url, CacheTier::Baseline, KeyAuth::ANONYMOUS, ACCEPT, role)
 }
@@ -38,15 +19,6 @@ fn page(n: u32) -> PageNumber {
 
 fn url_of(key: &PersistKey) -> &str {
     key.url()
-}
-
-#[test]
-fn persistable_host_from_host_accepts_every_planned_host_and_round_trips() {
-    for host in ALL_HOSTS {
-        let parsed = PersistableHost::from_host(host)
-            .unwrap_or_else(|| panic!("{host} must be a persistable host"));
-        assert_eq!(parsed.as_str(), host);
-    }
 }
 
 #[test]
@@ -116,16 +88,6 @@ fn persist_key_new_refuses_body_dependent_post_hosts() {
     ] {
         assert!(baseline_anon(url, None).is_none(), "{url} must be refused");
     }
-}
-
-#[cfg(feature = "test-util")]
-#[test]
-fn persistable_hosts_yields_exactly_the_sixteen_planned_hosts() {
-    let mut actual: Vec<&str> = super::persistable_hosts().collect();
-    let mut expected = ALL_HOSTS.to_vec();
-    actual.sort_unstable();
-    expected.sort_unstable();
-    assert_eq!(actual, expected);
 }
 
 #[test]

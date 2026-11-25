@@ -34,7 +34,7 @@ resolved through a `${property}` reference, see below) is always the "in-use" ve
 
 **Gradle** manifests are `build.gradle` (Groovy DSL), `build.gradle.kts` (Kotlin DSL),
 `settings.gradle`/`settings.gradle.kts` (for `pluginManagement {}` dependencies), and
-`gradle/libs.versions.toml` (the Gradle **version catalog** format). A dependency declared in
+any `*.versions.toml` file (the Gradle **version catalog** format, for example `gradle/libs.versions.toml` or `gradle/plugins.versions.toml`). Catalogs declared in `settings.gradle(.kts)` under a name that does not end in `.versions.toml` are not recognized yet. A dependency declared in
 any Gradle configuration — `implementation`, `api`, `testImplementation`,
 `androidTestImplementation`, `compileOnly`, `classpath`, the legacy `compile`/`testCompile`/
 `provided`, and their variant-prefixed forms — is recognized:
@@ -62,7 +62,7 @@ unless a section says otherwise.
 
 Gradle's dependency locking (`gradle.lockfile`) supplies the in-use version, which is what
 outdated/up-to-date diagnostics compare against. The lock file is read from the manifest's own
-directory (a `gradle/libs.versions.toml` catalog also checks one level up, the project root),
+directory (a catalog in `gradle/*.versions.toml` also checks one level up, the project root),
 and a lock file in an ancestor directory is never used for a build script.
 `buildscript { dependencies { classpath(...) } }` dependencies resolve from
 `buildscript-gradle.lockfile` and every other dependency from `gradle.lockfile`, so the same
@@ -159,7 +159,7 @@ These fixes ensure hover's "Recent versions" list and completion sort order matc
 `version_satisfies_requirement` recognizes bracket-interval range syntax instead of only exact string equality, so a dependency pinned to a range no longer always renders as "outdated":
 
 - **Maven** (`pom.xml`): interval notation — `[1.0,2.0)`, `[1.0]` (exact pin), `[1.5,)`, `(,2.0]` — and top-level comma unions, e.g. `(,1.0),(1.2,)`. Bounds are compared with Maven's qualifier-aware ordering, so `[1.0-beta,2.0-rc)` orders correctly. A bare, non-bracketed requirement (`1.0`) is still Maven's "soft" recommended version and compared for plain equality, not as a range.
-- **Gradle** (`build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml`): the same bracket-interval syntax as Maven (no comma unions — Gradle's grammar doesn't have them), plus Gradle-specific forms: dynamic versions (`1.0+`, `2.10.+`), `latest.release`/`latest.integration` selectors, and Gradle's reversed-bracket exclusive notation (`]1.2,1.5]` for an exclusive lower bound, `[1.1,2.0[` for an exclusive upper bound).
+- **Gradle** (`build.gradle`, `build.gradle.kts`, `*.versions.toml`): the same bracket-interval syntax as Maven (no comma unions — Gradle's grammar doesn't have them), plus Gradle-specific forms: dynamic versions (`1.0+`, `2.10.+`), `latest.release`/`latest.integration` selectors, and Gradle's reversed-bracket exclusive notation (`]1.2,1.5]` for an exclusive lower bound, `[1.1,2.0[` for an exclusive upper bound).
 - **Malformed input fails closed**: an unparseable range (unbalanced/stray brackets, an extra comma-separated component, a mismatched no-comma pin like `[1.0)`, or any unparseable member of a Maven union) is rejected as a whole — `version_satisfies_requirement` returns `false` rather than matching on a corrupted or partial parse.
 
 ## Unresolved Requirements

@@ -598,14 +598,12 @@ impl PypiParser {
         };
 
         let name = requirement.name.to_string();
-        let name_range = base_position
-            .map(|pos| {
-                Range::new(
-                    pos,
-                    Position::new(pos.line, pos.character + name.len() as u32),
-                )
-            })
-            .unwrap_or_default();
+        let name_range = base_position.map_or_default(|pos| {
+            Range::new(
+                pos,
+                Position::new(pos.line, pos.character + name.len() as u32),
+            )
+        });
 
         // Version/extras text never extends past the marker section.
         let version_end = semicolon_idx.unwrap_or(requirement_str.len());

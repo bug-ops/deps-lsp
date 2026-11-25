@@ -5,9 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use deps_core::NormalizeName;
 use deps_core::edit::{ManifestEdit, apply_edits};
+use deps_core::{Ecosystem, NormalizeName};
 
 mod lock_state;
 
@@ -31,6 +32,18 @@ use super::{
 
 const SETTINGS_FILES: [&str; 2] = ["settings.gradle", "settings.gradle.kts"];
 const LOCK_FILES: [&str; 2] = ["gradle.lockfile", "buildscript-gradle.lockfile"];
+
+/// Whether `path`'s basename matches one of the ecosystem's own `manifest_patterns` (for Gradle,
+/// the version-catalog glob), so routing and this check share one source of truth.
+fn is_version_catalog(ecosystem: &Arc<dyn Ecosystem>, path: &Path) -> bool {
+    path.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| {
+            ecosystem.manifest_patterns().iter().any(|pattern| {
+                deps_core::ecosystem_registry::manifest_pattern_matches(name, pattern)
+            })
+        })
+}
 
 /// Most lock files one run snapshots, stages and restores.
 const MAX_LOCK_FILES: usize = 512;
@@ -299,9 +312,9 @@ impl Session<'_> {
         let physical = std::fs::canonicalize(self.manifest_dir).ok()?;
         let settings_dir = deps_core::fs_probe::config_ancestors(&physical)
             .find(|dir| SETTINGS_FILES.iter().any(|name| dir.join(name).is_file()));
-        let catalog_in_gradle_dir = self.target.manifest_path.file_name()
-            == Some(std::ffi::OsStr::new("libs.versions.toml"))
-            && physical.file_name() == Some(std::ffi::OsStr::new("gradle"));
+        let catalog_in_gradle_dir =
+            is_version_catalog(self.target.ecosystem, self.target.manifest_path)
+                && physical.file_name() == Some(std::ffi::OsStr::new("gradle"));
         Some(match settings_dir {
             Some(dir) => dir.to_path_buf(),
             None if catalog_in_gradle_dir => physical.parent()?.to_path_buf(),
@@ -696,8 +709,7 @@ impl Session<'_> {
         set: &LockSet,
         states: &'a [LegacyState],
     ) -> Vec<&'a LegacyState> {
-        let catalog = self.target.manifest_path.file_name()
-            == Some(std::ffi::OsStr::new("libs.versions.toml"));
+        let catalog = is_version_catalog(self.target.ecosystem, self.target.manifest_path);
         let own_dir = std::fs::canonicalize(self.manifest_dir).ok();
         set.legacy
             .iter()
@@ -1053,5 +1065,165 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).expect("symlink");
 
         assert!(lock_set(dir.path()).expect("lock set").unified.is_empty());
+    }
+
+    #[cfg(feature = "gradle")]
+    mod catalog_session {
+        use std::time::Duration;
+
+        use deps_core::net_policy::{MapEnv, RegistryEnvironment};
+        use deps_core::policy_config::PolicyConfig;
+        use deps_core::{EcosystemId, EcosystemRegistry, HttpCache};
+        use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
+        use url::Url;
+
+        use super::*;
+        use crate::update::regen::run::{ProcessGroup, SearchPath, ToolRunner};
+        use crate::update::regen::{LockfileScope, ManifestTarget, OriginalManifest};
+
+        fn gradle_ecosystem() -> Arc<dyn Ecosystem> {
+            let runtime = EcosystemRuntime::from_policy(
+                &PolicyConfig::default(),
+                &RegistryEnvironment::read(&MapEnv::new()),
+            );
+            let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+            let registry = EcosystemRegistry::new();
+            let _ = register_ecosystems(&registry, cache, &runtime);
+            registry
+                .get(EcosystemId::Gradle)
+                .expect("gradle registered")
+        }
+
+        /// Runs `check` against a session for `manifest_rel` under `root`.
+        fn with_session<T>(
+            root: &Path,
+            manifest_rel: &str,
+            check: impl FnOnce(&Session<'_>) -> T,
+        ) -> T {
+            let ecosystem = gradle_ecosystem();
+            let manifest = root.join(manifest_rel);
+            let display = PathBuf::from(manifest_rel);
+            let uri = Url::from_file_path(&manifest).expect("file url");
+            let target = ManifestTarget {
+                ecosystem: &ecosystem,
+                manifest_path: &manifest,
+                display_path: &display,
+                uri: &uri,
+                original: OriginalManifest::new(""),
+            };
+            let runner = ToolRunner {
+                deadline: Duration::from_mins(5),
+                search_path: SearchPath::Inherit,
+                group: ProcessGroup::Own,
+            };
+            let snapshot = std::sync::OnceLock::new();
+            let manifest_dir = manifest.parent().expect("manifest dir");
+            let session = Session {
+                target: &target,
+                runner: &runner,
+                deadline: tokio::time::Instant::now() + Duration::from_mins(1),
+                pins: &[],
+                manifest_dir,
+                snapshot: &snapshot,
+                scope: LockfileScope::Unrestricted,
+            };
+            check(&session)
+        }
+
+        #[test]
+        fn build_root_of_a_custom_named_catalog_is_the_parent_of_gradle() {
+            let dir = tempfile::tempdir().expect("dir");
+            touch(dir.path(), "gradle/plugins.versions.toml");
+            let expected = std::fs::canonicalize(dir.path()).expect("canonical");
+
+            let root = with_session(dir.path(), "gradle/plugins.versions.toml", |session| {
+                session.gradle_build_root()
+            });
+
+            assert_eq!(root, Some(expected));
+        }
+
+        #[test]
+        fn build_root_of_a_build_script_in_gradle_dir_stays_that_directory() {
+            let dir = tempfile::tempdir().expect("dir");
+            touch(dir.path(), "gradle/build.gradle.kts");
+            let expected = std::fs::canonicalize(dir.path().join("gradle")).expect("canonical");
+
+            let root = with_session(dir.path(), "gradle/build.gradle.kts", |session| {
+                session.gradle_build_root()
+            });
+
+            assert_eq!(root, Some(expected));
+        }
+
+        #[test]
+        fn is_version_catalog_matches_any_versions_toml_basename() {
+            let ecosystem = gradle_ecosystem();
+            let cases = [
+                ("gradle/libs.versions.toml", true),
+                ("gradle/plugins.versions.toml", true),
+                ("gradle/.versions.toml", true),
+                ("plugins.versions.toml", true),
+                ("gradle/versions.toml", false),
+                ("gradle/plugins.version.toml", false),
+                ("gradle/plugins.versions.toml.bak", false),
+                ("gradle/plugins.versions.tom", false),
+                ("gradle/plugins.versions", false),
+                ("build.gradle.kts", false),
+                ("gradle/plugins.versions.toml/build.gradle", false),
+                ("", false),
+            ];
+            for (path, expected) in cases {
+                assert_eq!(
+                    is_version_catalog(&ecosystem, Path::new(path)),
+                    expected,
+                    "{path}"
+                );
+            }
+        }
+
+        fn two_legacy_projects(root: &Path) -> (LockSet, Vec<LegacyState>) {
+            let own = std::fs::canonicalize(root.join("gradle")).expect("canonical");
+            let other = std::fs::canonicalize(root).expect("canonical");
+            let project = |dir: PathBuf| LegacyProject {
+                dir,
+                files: Vec::new(),
+            };
+            let set = LockSet {
+                unified: Vec::new(),
+                legacy: vec![project(own), project(other)],
+            };
+            let state = || LegacyState {
+                state: LockState::new(),
+                files: Vec::new(),
+            };
+            (set, vec![state(), state()])
+        }
+
+        #[test]
+        fn custom_named_catalog_sees_every_legacy_project() {
+            let dir = tempfile::tempdir().expect("dir");
+            touch(dir.path(), "gradle/plugins.versions.toml");
+            let (set, states) = two_legacy_projects(dir.path());
+
+            let relevant = with_session(dir.path(), "gradle/plugins.versions.toml", |session| {
+                session.relevant_legacy_states(&set, &states).len()
+            });
+
+            assert_eq!(relevant, 2);
+        }
+
+        #[test]
+        fn build_script_sees_only_its_own_legacy_project() {
+            let dir = tempfile::tempdir().expect("dir");
+            touch(dir.path(), "gradle/build.gradle.kts");
+            let (set, states) = two_legacy_projects(dir.path());
+
+            let relevant = with_session(dir.path(), "gradle/build.gradle.kts", |session| {
+                session.relevant_legacy_states(&set, &states).len()
+            });
+
+            assert_eq!(relevant, 1);
+        }
     }
 }

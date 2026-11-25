@@ -158,12 +158,14 @@ impl EcosystemRegistry {
                 "manifest pattern {pattern:?} must contain exactly one '*'"
             );
             debug_assert!(
-                self.patterns
-                    .iter()
-                    .all(|e| e.value().2 == id || *e.key() == pattern),
-                "pattern {pattern:?} would introduce a second ecosystem ({id:?}) into the \
-                 single-owner pattern set; the most-specific-wins selection in \
-                 for_filename assumes all patterns belong to one ecosystem"
+                self.patterns.iter().all(|e| {
+                    let (other_prefix, other_suffix, other_id) = *e.value();
+                    other_id == id
+                        || !patterns_overlap((prefix, suffix), (other_prefix, other_suffix))
+                }),
+                "pattern {pattern:?} of {id:?} overlaps a pattern of another ecosystem; \
+                 patterns of different ecosystems must be disjoint so for_filename's \
+                 most-specific-wins selection never arbitrates between ecosystems"
             );
             self.patterns.insert(pattern, (prefix, suffix, id));
         }
@@ -680,6 +682,17 @@ pub fn manifest_pattern_matches(filename: &str, pattern: &str) -> bool {
         _ => false,
     }
 }
+
+/// Whether two `(prefix, suffix)` manifest patterns can match the same basename: some filename
+/// starts with both prefixes and ends with both suffixes (the prefixes and suffixes must nest).
+fn patterns_overlap(a: (&str, &str), b: (&str, &str)) -> bool {
+    let ((prefix_a, suffix_a), (prefix_b, suffix_b)) = (a, b);
+    (prefix_a.starts_with(prefix_b) || prefix_b.starts_with(prefix_a))
+        && (suffix_a.ends_with(suffix_b) || suffix_b.ends_with(suffix_a))
+}
+
+#[cfg(test)]
+mod patterns_overlap_tests;
 
 #[cfg(test)]
 mod tests {

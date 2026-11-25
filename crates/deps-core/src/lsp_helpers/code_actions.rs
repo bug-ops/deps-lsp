@@ -280,8 +280,7 @@ where
                 gate.now(),
             )
         })
-        .map(|gate| format!("; inside {}", gate.cooldown()))
-        .unwrap_or_default();
+        .map_or_default(|gate| format!("; inside {}", gate.cooldown()));
     let title = if lockfile_hit {
         format!(
             "Update to {version_native} (fixes {fixes}; update lockfile to apply{inside_window})"

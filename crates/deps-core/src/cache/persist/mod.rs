@@ -7,20 +7,25 @@ mod dir;
 mod dir_tests;
 mod format;
 #[cfg(test)]
+mod format_acceptance_tests;
+#[cfg(test)]
 mod format_tests;
 mod freshness;
 #[cfg(test)]
 mod freshness_tests;
 mod key;
 #[cfg(test)]
+mod key_acceptance_tests;
+#[cfg(test)]
 mod key_tests;
+#[cfg(test)]
+mod prune_acceptance_tests;
 #[cfg(test)]
 mod target_tests;
 
 use crate::net_policy::EnvSource;
 use crate::policy_config::CachePersistence;
 use dir::CacheDir;
-#[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub use key::persistable_hosts;
 

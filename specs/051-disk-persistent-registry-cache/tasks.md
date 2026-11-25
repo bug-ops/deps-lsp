@@ -129,10 +129,10 @@ graph TD
 **Acceptance criteria**:
 - [x] Layout: magic `DEPSLSPC`, `u16` format version, `u32` header length (at most 64 KiB), `serde_json` header with `deny_unknown_fields` {url, accept, etag, last_modified, link, body_len, body_fnv1a64}, then body
 - [x] `EntryFingerprint { etag, last_modified, accept, body_len, body_fnv1a64 }` with a header-only read helper capped at 64 KiB plus prefix
-- [x] `PersistedEntry::decode(bytes, expected_url, expected_accept, now)` with `DecodeError` (thiserror: `BadMagic`, `ForeignVersion`, `HeaderTooLarge`, `Header`, `Truncated`, `Checksum`, `UrlMismatch`, `AcceptMismatch`, `Oversized`); `# Errors` documented
+- [x] `PersistedEntry::new(&PersistKey, StoredHeaders, body)` and `PersistedEntry::decode(bytes, &PersistKey)` (no `now`, no raw URL or `Accept` strings: the key is the only input that can name or check an entry; #2153, #2156) with `DecodeError` (thiserror: `BadMagic`, `ForeignVersion`, `HeaderTooLarge`, `Header`, `Truncated`, `Checksum`, `UrlMismatch`, `AcceptMismatch`, `Oversized`); `# Errors` documented
 - [x] Round-trip test; a test per `DecodeError` variant; oversize body rejected, never truncated
 - [x] proptest: `decode` never panics on arbitrary bytes
-- [x] File name is `<fnv1a64(url) hex>.entry`; all `u64` length fields go through `usize::try_from` (i686-safe)
+- [x] File name comes only from `PersistKey::file_name()` (`<fnv1a64(url) hex>.entry`, `fnv1a64` in `deps_core::hash`); all `u64` length fields go through `usize::try_from` (i686-safe)
 **Dependencies**: T001
 **Files**: `crates/deps-core/src/cache/persist/format.rs`
 **Complexity**: medium
@@ -162,10 +162,10 @@ graph TD
 **Spec reference**: [[spec#FR-014]], [[spec#FR-015]], [[spec#FR-016]], [[spec#NFR-004]]
 **Acceptance criteria**:
 - [x] `CacheDirEnvVar { XdgCacheHome, Home, LocalAppData }` (private, closed; `OperatorEnvVar` untouched); `CacheDir::user_default(&impl EnvSource)` per platform rules, no filesystem access, absolute path only, `Err(NoCacheDir)` for missing `HOME` or relative `XDG_CACHE_HOME`
-- [x] Unix open: probe uid from a `create_new` 0600 file in `temp_dir()` then deleted; existing root must be an owned directory (symlink followed, no mode check); missing root created by one non-recursive `create_dir` 0700 only when its parent is `$HOME` and `$HOME` is owned by the probe uid; macOS `Library/Caches` and Windows `%LOCALAPPDATA%` never created; components `deps-lsp/`, `http/`, `v1/` created 0700 ignoring `AlreadyExists` and verified by `symlink_metadata` (directory, owned, no group or other bits)
+- [x] Unix open: probe uid from a `create_new` 0600 file in `temp_dir()` then deleted, carried as `EntryTrust` by the returned `StoreDir` (`open_with(env, trust)`, `entry_file_trusted(meta, trust)`); existing root must be an owned directory (symlink followed, no mode check); missing root created by one non-recursive `create_dir` 0700 only when its parent is `$HOME` and `$HOME` is owned by the probe uid; macOS `Library/Caches` and Windows `%LOCALAPPDATA%` never created; components `deps-lsp/`, `http/`, `v1/` created 0700 ignoring `AlreadyExists` and verified by `symlink_metadata` (directory, owned, no group or other bits)
 - [x] Per-file read check helper: regular file owned by the probe uid, no group or other write bit; otherwise a miss
 - [x] `DiskTierError { NoCacheDir, CreateFailed, InsecureDirectory, ProbeFailed, Io }`
-- [x] Prune: scan capped at 16384 entries; remove `*.tmp` older than 1 h, then expired files, then least recently validated until within 64 MiB and 2048 files; `NotFound` ignored
+- [x] Prune: scan capped at 16384 entries; acts and budgets only on store-shaped files (`StoreFileKind::classify`: `<16hex>.entry` and the writer's temp name `<16hex>.entry.deps-cli-<pid>-<nanos>.tmp`) owned by the `EntryTrust`; other files are ignored, never removed (#2159); remove temp files older than 1 h, then expired files, then least recently validated until within 64 MiB and 2048 files; `NotFound` ignored; foreign or unclassified files still count toward the scan cap
 - [x] Unix tests with tempdir HOME via a fake env: missing root with owned HOME created 0700; root whose parent is not HOME gives memory and creates nothing; foreign-owned root (probe-uid test seam) gives memory and creates nothing; planted g+w file discarded; read-only root (chmod 0500) degrades; `user_default` table (XDG set, unset, relative; no HOME; macOS; Windows)
 **Dependencies**: T003, T004
 **Files**: `crates/deps-core/src/cache/persist/dir.rs`
@@ -221,7 +221,7 @@ graph TD
 - [x] Windows `CacheDir::open` (`cfg(windows)`, std only per [[spec#NFR-004]] and [[spec#NFR-005]]; delivered by the #2141/#2145 PR): creates `deps-lsp/http/v1` under `%LOCALAPPDATA%`, never creates the `%LOCALAPPDATA%` root itself, and verifies each component is a directory and not a reparse point; trust is the per-user `%LOCALAPPDATA%` ACL, with no owner check; owner/DACL verification is not done by design (permanent limit, documented in the rustdoc of `CacheDir::open`, #2146, #2148), and the Windows `open_no_follow_with` reparse race is closed in #2147
 - [ ] Decode errors are logged by `DecodeError` variant, never with `%error` (`DecodeError::Header` quotes file content); follow-up #2142
 - [ ] The open-failure degrade warning names the cache path and the reason ([[spec#FR-015]]); follow-up #2142
-- [ ] The read path's file name lookup and the `decode` `expected_url` use `PersistKey::url()` (the normalized URL), see Implementation notes (PR-A); follow-up #2142
+- [ ] The read path's file name lookup (`PersistKey::file_name()`) and `decode(bytes, &PersistKey)` use the key, so the normalized URL is type-enforced (PR-A hardening, #2153); remaining PR-B work: call sites and logging, follow-up #2142
 - [ ] Tests (#2142): a corrupt header with a secret-shaped marker in its content fails decode and the captured tracing output names the `DecodeError` variant without the marker; the degrade warning (open failure and first-read timeout) contains the cache path and the reason; a mixed-case host or `:443` URL written earlier is found on disk through `PersistKey::url()` with `decode` accepting it as `expected_url`
 - [ ] Entry trust checks use the metadata of the same handle that read the bytes (owner, mode, mtime), never a separate `stat`
 - [ ] Tests: open in progress then the read waits and hits (does not miss), including N concurrent first-wave reads that all hit disk (SC-002); open slower than 250 ms yields a miss without degrading; semaphore-wait timeout does not degrade; a blocking read slower than 250 ms (test seam delay) degrades the tier with exactly one warn and later reads are misses ([[spec#FR-015]]); the `info!` appears exactly once across several successful uses (captured tracing subscriber); NFR-001: `set_persistence(Disk(tmp))` leaves the directory absent until the first eligible op; NFR-002: the disk-access counter stays 0 across repeated in-memory hits even after the directory is made unreadable
@@ -242,12 +242,12 @@ graph TD
 - [ ] `WriteFailure::{Persistent, Transient}`: `StorageFull`, `QuotaExceeded`, `ReadOnlyFilesystem` count toward the 8-failure breaker (then `Unavailable`, one warn); `PermissionDenied` and Windows raw 32 or 5 never count; a single failure logs at `debug`
 - [ ] Prune runs when the writer starts and every 64 puts
 - [ ] `open_for_restamp` handle is `fstat`ed (PR-A discards its metadata); the restamp decision and trust checks use that same-handle metadata; follow-up #2142
-- [ ] The writer's file name and header `url` come from `PersistKey::url()` (the normalized URL); follow-up #2142
+- [ ] The writer builds the entry with `PersistedEntry::new(&PersistKey, ..)` and names the file with `PersistKey::file_name()` (normalized URL, type-enforced); it keeps using `write_atomic_bytes_with`, whose temp names already match `StoreFileKind::Tmp`, so no writer naming change is required; follow-up #2142
 - [ ] Tests (#2142): a mixed-case host or `:443` URL is written and read under the file name and header `url` of `PersistKey::url()` and hits on a fresh store; with a `Validated` op, a file whose same-handle metadata shows a foreign owner, non-regular type or later mtime is neither restamped nor overwritten
 - [ ] mtime on NFS/SMB: `write_atomic_content` calls `set_modified` before `sync_all`, and restamp-as-freshness may break on SMB and some NFS; verify that the mtime survives, or document the limit and reword [[plan]] "NFS-safe" (§ concurrency row); follow-up #2142
 - [x] POST hosts are removed from `PersistableHost` (`api.osv.dev` and `api.deps.dev`, issue #2141)
 - [ ] Keys are built only on the GET path; test: a POST to a still-persistable host (e.g. `registry.npmjs.org`) never enqueues a `DiskOp`
-- [ ] Before each prune pass and each write batch the writer re-verifies the store path component chain (`symlink_metadata`: directory, owned, no group or other bits) and degrades on mismatch; closes the symlink swap window after `open` when the cache root is group or other writable (security finding L1/F1, see [[spec#NFR-004]])
+- [ ] Before each prune pass and each write batch the writer re-verifies the store path component chain (`symlink_metadata`: directory, owned, no group or other bits) and degrades on mismatch; closes the symlink swap window after `open` when the cache root is group or other writable (security finding L1/F1, see [[spec#NFR-004]]); this re-verification also closes the same-user symlink-redirect scenario of #2159 (a symlinked `http/v1` pointing at victim-owned files named in cache shape), which the prune name-shape and owner filter alone cannot
 - [ ] Tests: dropped-Put scenario (v2 in memory, v1 on disk, 304 for v2 gives a full write of v2, never a restamp of v1); a file with a later mtime is not overwritten; queue overflow drops without blocking; a transient rename error does not trip the breaker; 8 persistent errors via a store write-failure seam give `Unavailable` with exactly one warn
 **Dependencies**: T008
 **Files**: `crates/deps-core/src/cache/persist/mod.rs`, `crates/deps-core/src/cache/store.rs`, `crates/deps-core/src/cache/fetch.rs`, `crates/deps-core/src/cache/tests/`
@@ -468,7 +468,7 @@ Deviations and additions approved during PR-A (T001-T006); PR-B builds on them.
 - `PersistedEntry::new` returns `EncodeError { HeaderTooLarge, Oversized }`, so oversized headers and bodies are rejected at construction.
 - An empty `XDG_CACHE_HOME` is treated as unset.
 - `PageNumber` rejects leading zeros (canonical decimal only).
-- `PersistKey::url()` returns the normalized URL; PR-B must use it for the file name, the header `url` and the `decode` expectation.
+- `PersistKey::url()` returns the normalized URL; since the hardening batch the file name, the header `url` and the `decode` expectation are derived from the key itself (`file_name()`, `new(&PersistKey, ..)`, `decode(bytes, &PersistKey)`), so PR-B cannot pass a raw URL.
 - Trailing bytes after the body are ignored by `decode`; body integrity is covered by `body_len` and the checksum ([[plan]] §12 reworded to match).
 - Tracked in issues: #2140 (`PersistableHost` constant pin), #2141 (POST must never be persisted), #2142 (PR-B carry-overs: decode logging, path in degrade warning, restamp handle checks, `key.url()` everywhere, mtime on NFS/SMB).
 
@@ -476,6 +476,17 @@ Deviations and additions approved during PR-A (T001-T006); PR-B builds on them.
 
 - #2141: `ApiOsvDev` and `ApiDepsDev` are removed from `PersistableHost` (18 to 16 hosts): every POST in the workspace targets them and their responses depend on the body; their GET responses never reach `HttpCache`.
 - #2145: the Windows `CacheDir::open` is std-only per [[spec#NFR-004]] (per-user ACL, directory and non-reparse-point component checks, no owner check); owner/DACL verification is not done by design (permanent limit, documented in the rustdoc of `CacheDir::open`, #2146, #2148); the `fs_probe` Windows reparse race is closed in #2147.
+
+### Implementation notes (disk cache hardening batch, #2153, #2156, #2159, #2157)
+
+- Format layer accepts only `&PersistKey`; `PersistKey` gains `accept()` and `file_name()`; `format::entry_file_name` and the format-local fnv are gone; `PersistedEntry::new(&PersistKey, StoredHeaders, body)` / `decode(bytes, &PersistKey)` drop `now` (#2156.1). `StoredHeaders` is a plain borrowed struct (`etag`, `last_modified`, `link`).
+- `fnv1a64` moved to `deps_core::hash` (public, doctest, output frozen: it names on-disk files and deps-cli branches); the deps-cli copies are removed.
+- `EntryTrust` (opaque Copy token, Unix wraps `ProbeUid`) is stored in `StoreDir` and replaces `ProbeUid` at call sites; `open`/`open_with`/`entry_file_trusted` have one signature on Unix and Windows.
+- `StoreFileKind::classify` in `key.rs` defines the store file shapes; the temp shape equals the output of the existing `fs_probe::atomic_temp_file_name` (extracted from `write_atomic_impl`, byte-identical), guarded by a proptest.
+- `persistable_hosts` is un-gated (`pub`, `#[doc(hidden)]`); `PersistableHost` and `PersistableQueryKey` are generated by the crate-private `closed_str_enum!`, which also replaces `ecosystem_ids!` for `EcosystemId`; `OpenBlocking` enum replaces the raw `i32` open flag; `PruneReport: Default`.
+- Deviation: `closed_str_enum!` `all:` takes a literal visibility pattern instead of `$vis` (macro_rules follow-set forbids `;` after `vis`); `ALL` is always generated, so `PersistableQueryKey` carries an unused `ALL` under `#[expect(dead_code)]`. Approved by architect.
+- Known limit: foreign or unclassified files still count toward the prune scan cap (reachable only inside an owned 0700 store).
+- Nothing in T007-T013 is ticked by this batch; the persist module is still unwired (PR-B/PR-C, #700).
 
 ### Order of execution
 PR-A tasks T001 and T004 can run in parallel; T002 and T003 follow T001; T005 needs T003 and T004. PR-B is strictly sequential through T012. In PR-C, T015 and T016 can run in parallel after T014.

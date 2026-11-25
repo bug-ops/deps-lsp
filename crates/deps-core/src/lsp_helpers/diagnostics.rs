@@ -1136,8 +1136,7 @@ where
 
     let suppression = versions
         .suppression
-        .map(|set| set.resolve(formatter))
-        .unwrap_or_default();
+        .map_or_default(|set| set.resolve(formatter));
 
     for (dep, key) in &keyed_deps {
         let suppressed = suppression.for_package(key.normalized()).kinds();

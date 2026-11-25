@@ -23,6 +23,8 @@ mod close_superseded_tests;
 mod lock_migration_tests;
 #[cfg(all(test, unix))]
 mod publish_safety_tests;
+#[cfg(all(test, unix))]
+mod read_capped_runner_tests;
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -705,8 +707,7 @@ pub async fn preflight(manifest: &Path) -> Result<RepoContext, PrError> {
         manifest_dir: RepoRelativeDir::from_prefix(&prefix),
         manifest_file: manifest
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+            .map_or_default(|name| name.to_string_lossy().into_owned()),
         base,
         group: runner.group,
         #[cfg(test)]
@@ -735,13 +736,6 @@ fn proposed_updates(
         .collect();
     proposed.sort_by(|a, b| (&a.0, a.1.as_str()).cmp(&(&b.0, b.1.as_str())));
     proposed
-}
-
-/// FNV-1a 64: stable across Rust versions and platforms, unlike `DefaultHasher`.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
 }
 
 /// Lossy, human-readable slice of a branch name; identity lives in the hash, not here.
@@ -799,7 +793,10 @@ pub fn branch_for(
     for (name, target) in &proposed {
         let _ = writeln!(identity, "{name}\t{target}");
     }
-    let hash = format!("{:08x}", fnv1a64(identity.as_bytes()) >> 32);
+    let hash = format!(
+        "{:08x}",
+        deps_core::hash::fnv1a64(identity.as_bytes()) >> 32
+    );
 
     let label = match (group, rest.is_empty()) {
         (Some(group), _) => sanitize_part(group.name().as_str()),

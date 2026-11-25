@@ -81,7 +81,7 @@ crates/deps-core/src/
 │   │   ├── mod.rs            # DiskTier state machine, writer, queue, breaker, stale_on_disk
 │   │   ├── key.rs            # PersistKey, PersistableHost, PersistableQueryKey, PageNumber, PageRole
 │   │   ├── freshness.rs      # ValidatedAt, DiskFreshness, classify, classify_restored
-│   │   ├── format.rs         # PersistedEntry, EntryFingerprint, DecodeError, fnv1a64
+│   │   ├── format.rs         # PersistedEntry, StoredHeaders, EntryFingerprint, DecodeError (key-typed API)
 │   │   └── dir.rs            # CacheDir, CacheDirEnvVar, open + ownership logic, prune
 │   └── tests/                # persistence integration + two-process tests
 ├── fs_probe.rs               # AtomicWrite, FileMode, read_capped_no_follow_with_metadata, open_for_restamp
@@ -116,14 +116,15 @@ enum DiskTierState { Unopened, Opening, Ready(Store), Unavailable(DiskTierError)
 enum DiskTierError { NoCacheDir, CreateFailed, InsecureDirectory, ProbeFailed, Io }
 enum WriteFailure { Persistent, Transient }
 enum FileMode { PreserveTarget, OwnerOnly }
-struct ProbeUid(u32);                                           // Unix only
+struct EntryTrust(..);                                          // opaque Copy token (Unix: wraps ProbeUid), held by StoreDir
+enum StoreFileKind { Entry, Tmp }                               // classifier of store file names, owned by key.rs
 const RESTORED_FRESHNESS_WINDOW: Duration = Duration::from_mins(10);
 const MAX_PERSISTED_AGE: Duration = Duration::from_hours(168);
 ```
 
 `PersistableHost` (closed): api.github.com, gitlab.com, index.crates.io, crates.io, registry.npmjs.org, pypi.org, proxy.golang.org, rubygems.org, pub.dev, repo1.maven.org, dl.google.com, plugins.gradle.org, repo.packagist.org, api.nuget.org, jsr.io, api.jsr.io. The POST-only hosts api.osv.dev and api.deps.dev are excluded: their responses depend on the request body and their GETs never reach `HttpCache` (#2141). The deps-engine `persist_hosts` test pins the list against each crate's `DEFAULT_REGISTRY_BASES` (#2140). `PersistableQueryKey` (closed): `Page`, `PerPage`, `OrderBy`, `Sort`.
 
-**File layout**: `<cache root>/deps-lsp/http/v1/<fnv1a64(url) hex>.entry`; root is `$XDG_CACHE_HOME` (absolute) or `$HOME/.cache` on Linux and other Unix, `$HOME/Library/Caches` on macOS (`XDG_CACHE_HOME` is not honored there), `%LOCALAPPDATA%` on Windows. Header JSON uses `deny_unknown_fields`; the format version is part of the directory name.
+**File layout**: `<cache root>/deps-lsp/http/v1/<fnv1a64(url) hex>.entry`, always produced by `PersistKey::file_name()` (`fnv1a64` lives in `deps_core::hash`); the only store file shapes are `Entry` = `^[0-9a-f]{16}\.entry$` and `Tmp` = `^[0-9a-f]{16}\.entry\.deps-cli-<pid>-<nanos>.tmp$`, classified by `StoreFileKind::classify`. `Tmp` is the temp name the existing `write_atomic_bytes_with` already builds for an entry path through `fs_probe::atomic_temp_file_name`; the writer needs no naming change; root is `$XDG_CACHE_HOME` (absolute) or `$HOME/.cache` on Linux and other Unix, `$HOME/Library/Caches` on macOS (`XDG_CACHE_HOME` is not honored there), `%LOCALAPPDATA%` on Windows. Header JSON uses `deny_unknown_fields`; the format version is part of the directory name.
 
 ### Migrations
 
@@ -213,7 +214,7 @@ Checked against [[constitution]] (active, principles 1 to 8) and `CLAUDE.md`. Pr
 | 5. Verify live | Planned | T021 live SC-001 and SC-002 runs, Registry Integration Gate with persistence `memory` |
 | 6. No secrets at rest | Compliant | FR-009: only anonymous Baseline entries persist; no credential, digest or token reaches disk; `Redacted<T>` unchanged |
 | 8. Post-1.0 breaking-change policy | Compliant | deps-core API additions are additive (`#[non_exhaustive]` types, no new variants on existing exhaustive enums); the default-on behavior change gets a labeled `### Breaking` `**behavior**:` line in PR-C; no per-crate major bump (shared workspace version, project policy) |
-| Type safety, illegal states unrepresentable | Compliant | Closed enums (`PersistableHost`, `PersistableQueryKey`, `PageRole`, `DiskFreshness`, `EntryOrigin`, `WriteFailure`), newtypes (`PageNumber`, `ValidatedAt`, `CacheDir`, `ProbeUid`), no `_ =>` arms |
+| Type safety, illegal states unrepresentable | Compliant | Closed enums (`PersistableHost`, `PersistableQueryKey`, `PageRole`, `DiskFreshness`, `EntryOrigin`, `WriteFailure`), newtypes (`PageNumber`, `ValidatedAt`, `CacheDir`, `EntryTrust`, `StoreFileKind`), no `_ =>` arms |
 | `unsafe_code = "forbid"` | Compliant | std-only uid and mtime handling |
 | Typed `thiserror` errors, `# Errors` docs | Compliant | `DecodeError`, `DiskTierError` |
 | No new dependency | Compliant | std + `serde_json` + existing `fs_probe` |
@@ -243,7 +244,7 @@ Checked against [[constitution]] (active, principles 1 to 8) and `CLAUDE.md`. Pr
 | `classify_restored(entry, page1: Option<&Restored>, now)` | `entry` decoded | For `ListingPage` with page above 1: no fresh page-1 anchor, or `validated_at < t1`, gives `Revalidate` or worse, never `Fresh`; `Standalone` and page 1 use `classify` | none |
 | `PersistKey::new(url, tier, auth, accept, page_role) -> Option<PersistKey>` | none; accepts arbitrary strings | `Some` only for `Baseline` + `Anonymous(None)` + https + closed host and query rule (+ declared role when `page` present); never panics | none |
 | `PersistKey::sibling_page(n)` | none | Same URL with only the `page` value replaced, query order and other pairs byte-identical; `None` when the key has no `page` and `n > 1` | none |
-| `PersistedEntry::decode(bytes, expected_url, expected_accept, now)` | none | `Ok` only if magic, version, header length at most 64 KiB, every field, `body_len` not above the body bytes present, checksum, URL and `Accept` all match and size cap holds; trailing bytes after the body are ignored (body integrity is covered by the checksum); never panics | none |
+| `PersistedEntry::decode(bytes, &PersistKey)` | none | `Ok` only if magic, version, header length at most 64 KiB, every field, `body_len` not above the body bytes present, checksum, URL and `Accept` all match the key (`UrlMismatch` iff header url differs from `key.url()`, `AcceptMismatch` iff accept differs from `key.accept()`) and size cap holds; trailing bytes after the body are ignored (body integrity is covered by the checksum); never panics | none |
 | `CacheDir::user_default(env)` | none | Reads only `env`, no filesystem access; `Ok` only for an absolute path built by the platform rules | relative `XDG_CACHE_HOME` and missing `HOME` yield `Err` |
 | `CacheDir` open (Unix) | probe file creatable in `temp_dir()` | Never creates the root unless parent is an owned `$HOME`; never creates or uses a component it does not own; components 0700 | none |
 | `PersistenceTarget::from_config(cfg, env)` | none | `Memory` gives `Memory`; `Disk` gives `Disk(dir)` or `Memory` plus one warn; never fails | none |

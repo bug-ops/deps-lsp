@@ -148,6 +148,8 @@ pub mod fallback_completion;
 pub mod freshness;
 pub mod fs_probe;
 pub mod github;
+/// Non-cryptographic hashing ([`hash::fnv1a64`]).
+pub mod hash;
 /// Protocol-agnostic [`hover::Hover`] type (issue #1277).
 ///
 /// The domain-level replacement for `tower_lsp_server::ls_types::Hover` returned by

@@ -2349,7 +2349,7 @@ impl ServerState {
             .ecosystem_registry
             .get(doc.ecosystem)
             .zip(doc.parse_result())
-            .map(|(ecosystem, parse_result)| {
+            .map_or_default(|(ecosystem, parse_result)| {
                 let formatter = ecosystem.formatter();
                 parse_result
                     .dependencies()
@@ -2361,8 +2361,7 @@ impl ServerState {
                             && !doc.signals.resolved_versions.contains_key(name)
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         if !not_attempted.is_empty() {
             let mut outcomes = doc.signals.outcomes.clone();
