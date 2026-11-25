@@ -13,6 +13,7 @@
 use super::*;
 use crate::test_utils::test_helpers::create_test_client_and_config;
 use deps_core::{DepsError, EcosystemId};
+use std::assert_matches;
 
 const SETTINGS: &str =
     "versionCatalogs { create(\"deps\") { from(files(\"gradle/deps.toml\")) } }\n";
@@ -190,7 +191,10 @@ async fn reserve_and_resolve_rejects_an_undeclared_toml_and_releases_the_reserva
 
     let result = reserve_and_resolve(&state, &fx.undeclared, None).await;
 
-    assert!(matches!(result, Err(DepsError::UnsupportedEcosystem(_))));
+    assert_matches!(
+        result.as_ref().err(),
+        Some(DepsError::UnsupportedEcosystem(_))
+    );
     assert_eq!(state.capture_open_epoch(&fx.undeclared), None);
 }
 
@@ -245,6 +249,6 @@ async fn change_for_an_untracked_unopened_catalog_is_dropped_quietly() {
     )
     .await;
 
-    assert!(matches!(result, Ok(None)), "not an error");
+    assert_matches!(result, Ok(None), "not an error");
     assert!(state.get_document(&fx.declared).is_none());
 }

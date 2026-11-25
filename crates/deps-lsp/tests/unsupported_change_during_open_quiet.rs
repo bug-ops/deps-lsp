@@ -1,6 +1,7 @@
 //! A didChange on an unsupported file that arrives while its didOpen is still resolving is
 //! dropped quietly: the client gets no "Change rejected" error message.
 
+use std::assert_matches;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -46,8 +47,9 @@ async fn change_during_unsupported_open_is_not_reported_to_the_client() {
         },
     });
     let mut open = std::pin::pin!(open);
-    assert!(
-        matches!(futures::poll!(open.as_mut()), Poll::Pending),
+    assert_matches!(
+        futures::poll!(open.as_mut()),
+        Poll::Pending,
         "open must still be probing"
     );
 

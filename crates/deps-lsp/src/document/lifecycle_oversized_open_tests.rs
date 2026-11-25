@@ -12,6 +12,7 @@
 use super::*;
 use crate::test_utils::test_helpers::create_test_client_and_config;
 use deps_core::{DepsError, EcosystemId};
+use std::assert_matches;
 
 fn catalog_uri(name: &str) -> Uri {
     let url = deps_core::test_util::test_uri(&format!("/project/gradle/{name}"));
@@ -45,10 +46,10 @@ async fn oversized_open_leaves_the_reservation_of_an_open_in_flight_alone() {
 
     let result = oversized_open(&state, &uri).await;
 
-    assert!(matches!(
+    assert_matches!(
         result,
         Err(DepsError::Io(ref error)) if error.kind() == std::io::ErrorKind::FileTooLarge
-    ));
+    );
     assert_eq!(state.capture_open_epoch(&uri), Some(epoch));
     assert!(state.insert_opened(in_flight, document()));
     assert!(state.get_document(&uri).is_some());
@@ -61,6 +62,6 @@ async fn oversized_open_of_an_unsupported_file_is_reported_as_unsupported() {
 
     let result = oversized_open(&state, &uri).await;
 
-    assert!(matches!(result, Err(DepsError::UnsupportedEcosystem(_))));
+    assert_matches!(result, Err(DepsError::UnsupportedEcosystem(_)));
     assert!(state.capture_open_epoch(&uri).is_none());
 }

@@ -3,6 +3,7 @@
 #![cfg(feature = "gradle")]
 #![expect(clippy::unwrap_used, reason = "test code")]
 
+use std::assert_matches;
 use std::sync::Arc;
 
 use deps_core::{DepsError, EcosystemId};
@@ -101,6 +102,6 @@ async fn open_of_an_undeclared_toml_is_rejected_as_unsupported() {
     )
     .await;
 
-    assert!(matches!(result, Err(DepsError::UnsupportedEcosystem(_))));
+    assert_matches!(result, Err(DepsError::UnsupportedEcosystem(_)));
     assert!(h.state.get_document(&h.undeclared).is_none());
 }

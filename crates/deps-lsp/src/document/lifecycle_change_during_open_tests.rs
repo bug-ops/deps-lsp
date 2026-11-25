@@ -11,6 +11,7 @@
 use super::*;
 use crate::test_utils::test_helpers::create_test_client_and_config;
 use deps_core::EcosystemId;
+use std::assert_matches;
 use std::task::Poll;
 
 const SETTINGS: &str =
@@ -61,8 +62,9 @@ async fn change_during_open_is_applied_after_the_open_lands(uri: &Uri) {
         tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(1)))
             .await
             .unwrap();
-        assert!(
-            matches!(futures::poll!(change.as_mut()), Poll::Pending),
+        assert_matches!(
+            futures::poll!(change.as_mut()),
+            Poll::Pending,
             "a change must wait for the open it captured instead of committing before it lands"
         );
     }
@@ -106,7 +108,7 @@ async fn change_outcome_when_the_open_is_abandoned(uri: &Uri) -> Result<Option<C
         config,
     );
     let mut change = std::pin::pin!(change);
-    assert!(matches!(futures::poll!(change.as_mut()), Poll::Pending));
+    assert_matches!(futures::poll!(change.as_mut()), Poll::Pending);
     drop(reservation);
 
     let outcome = change.await;
@@ -120,10 +122,7 @@ async fn change_waiting_for_an_abandoned_claimed_open_is_unsupported() {
 
     let outcome = change_outcome_when_the_open_is_abandoned(&fx.claimed).await;
 
-    assert!(matches!(
-        outcome,
-        Err(deps_core::DepsError::UnsupportedEcosystem(_))
-    ));
+    assert_matches!(outcome, Err(deps_core::DepsError::UnsupportedEcosystem(_)));
 }
 
 #[tokio::test]
@@ -132,5 +131,5 @@ async fn change_waiting_for_an_abandoned_static_open_is_dropped() {
 
     let outcome = change_outcome_when_the_open_is_abandoned(&fx.static_catalog).await;
 
-    assert!(matches!(outcome, Ok(None)));
+    assert_matches!(outcome, Ok(None));
 }

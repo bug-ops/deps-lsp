@@ -1175,6 +1175,7 @@ pub async fn handle_document_change(
 
 /// A committed change or open: the background task it spawned and the open it was committed
 /// against.
+#[derive(Debug)]
 pub(crate) struct CommittedChange {
     /// The debounced fetch/diagnostics task, not yet registered.
     pub(crate) task: JoinHandle<()>,
