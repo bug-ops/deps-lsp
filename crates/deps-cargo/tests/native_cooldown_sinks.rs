@@ -17,7 +17,7 @@ use std::sync::Arc;
 use deps_cargo::CargoEcosystem;
 use deps_cargo::config::ConfigFileCache;
 use deps_cargo::parser::CargoParseContext;
-use deps_core::edit::{UnplannableReason, UpdateCandidate};
+use deps_core::edit::{CooldownHold, UpdateCandidate};
 use deps_core::lsp_helpers::{DiagnosticSeverities, LockCandidates};
 use deps_core::native_cooldown::{NativeGate, NativeHold};
 use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
@@ -175,7 +175,7 @@ fn held_notes(messages: &[String]) -> Vec<&String> {
 
 fn planned_count(fx: &Fx, versions: VersionData<'_>) -> usize {
     fx.manifest
-        .collect_update_candidates(MANIFEST, versions)
+        .collect_update_candidates(MANIFEST, versions, deps_core::FreshnessSettings::Disabled)
         .iter()
         .filter(|c| matches!(c, UpdateCandidate::Planned(_)))
         .count()
@@ -263,20 +263,26 @@ async fn held_latest_is_never_planned_and_is_reported_as_within_native_cooldown(
     let fx = fixture(Some(WINDOW_CONFIG)).await;
     let cached = registry_data(&fx, Some(T0 - 3 * DAY));
     let l = locks(&fx, "3.8.0", &["3.8.0"]);
-    let candidates = fx
-        .manifest
-        .collect_update_candidates(MANIFEST, data(&cached, &l, T0));
+    let candidates = fx.manifest.collect_update_candidates(
+        MANIFEST,
+        data(&cached, &l, T0),
+        deps_core::FreshnessSettings::Disabled,
+    );
     assert_eq!(candidates.len(), 1);
     assert_matches!(
         &candidates[0],
-        UpdateCandidate::Unplannable {
-            reason: UnplannableReason::WithinNativeCooldown,
+        UpdateCandidate::Held {
+            hold: CooldownHold::Native,
             ..
         }
     );
     assert!(
         fx.manifest
-            .collect_update_all_edits(MANIFEST, data(&cached, &l, T0))
+            .collect_update_all_edits(
+                MANIFEST,
+                data(&cached, &l, T0),
+                deps_core::FreshnessSettings::Disabled
+            )
             .is_empty()
     );
 }
@@ -302,7 +308,11 @@ async fn single_instant_flips_diagnostic_hover_candidates_and_lens_together() {
     assert_eq!(planned_count(&fx, data(&cached, &l, before)), 0);
     assert!(
         fx.manifest
-            .collect_update_all_edits(MANIFEST, data(&cached, &l, before))
+            .collect_update_all_edits(
+                MANIFEST,
+                data(&cached, &l, before),
+                deps_core::FreshnessSettings::Disabled
+            )
             .is_empty()
     );
 
@@ -315,7 +325,11 @@ async fn single_instant_flips_diagnostic_hover_candidates_and_lens_together() {
     assert_eq!(planned_count(&fx, data(&cached, &l, after)), 1);
     assert_eq!(
         fx.manifest
-            .collect_update_all_edits(MANIFEST, data(&cached, &l, after))
+            .collect_update_all_edits(
+                MANIFEST,
+                data(&cached, &l, after),
+                deps_core::FreshnessSettings::Disabled
+            )
             .len(),
         1
     );

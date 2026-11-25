@@ -9,8 +9,13 @@
 //! tests instead of duplicating both.
 //!
 //! This is a different concern from [`crate::json_ast`], which recovers a dependency's
-//! *position* in the source text from a separate jsonc-AST parse of the same content — this
-//! module never touches that AST, only the `serde_json::Value` tree callers already hold.
+//! *position* in the source text from a separate jsonc-AST parse of the same content. This
+//! module reads the `serde_json::Value` tree callers already hold and borrows positions from
+//! that AST only to anchor [`non_string_entry_declarations`].
+
+use crate::ecosystem::{InvalidDeclarationOccurrence, InvalidDeclarationReason};
+use crate::json_ast::JsonSection;
+use crate::lsp_helpers::LineOffsetTable;
 
 /// Iterates a JSON object's entries, yielding only those whose value is a plain string.
 ///
@@ -42,6 +47,61 @@ pub fn string_valued_entries(
     entries
         .iter()
         .filter_map(|(name, value)| Some((name.as_str(), value.as_str()?)))
+}
+
+/// The entries [`string_valued_entries`] skips, as invalid declarations at their keys.
+///
+/// A dependency whose value is not a string is dropped from the dependency list; without this
+/// the user gets no sign that it is not checked (#2181). Occurrences are in source order. An
+/// entry whose position is unknown (`positions` is `None`) is reported at the start of the
+/// file.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::json_ast::JsonAst;
+/// use deps_core::json_helpers::non_string_entry_declarations;
+/// use deps_core::lsp_helpers::LineOffsetTable;
+///
+/// let content = r#"{"require": {"vendor/pkg": {"version": "1.0"}}}"#;
+/// let root: serde_json::Value = serde_json::from_str(content)?;
+/// let ast = JsonAst::parse(content).ok_or("not JSON")?;
+/// let skipped = non_string_entry_declarations(
+///     root["require"].as_object().ok_or("not an object")?,
+///     ast.section("require").as_ref(),
+///     content,
+///     &LineOffsetTable::new(content),
+/// );
+///
+/// assert_eq!(skipped.len(), 1);
+/// assert_eq!(skipped[0].key, "vendor/pkg");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use]
+pub fn non_string_entry_declarations(
+    entries: &serde_json::Map<String, serde_json::Value>,
+    positions: Option<&JsonSection<'_>>,
+    content: &str,
+    line_table: &LineOffsetTable,
+) -> Vec<InvalidDeclarationOccurrence> {
+    let mut skipped: Vec<_> = entries
+        .iter()
+        .filter(|(_, value)| !value.is_string())
+        .map(|(name, _)| InvalidDeclarationOccurrence {
+            range: positions
+                .and_then(|section| section.position(name, content, line_table))
+                .map_or_default(|(name_range, _)| name_range),
+            key: name.clone(),
+            reason: InvalidDeclarationReason::UnsupportedValue,
+        })
+        .collect();
+    skipped.sort_by_key(|occurrence| {
+        (
+            occurrence.range.start.line,
+            occurrence.range.start.character,
+        )
+    });
+    skipped
 }
 
 /// Accepts a JSON value that is either a single string or an array of strings, and

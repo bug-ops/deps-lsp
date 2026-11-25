@@ -329,7 +329,16 @@ fn within_native(plan: &UpdatePlan) -> Vec<&deps_cli::update::PlannedUpdateItem>
 
 #[tokio::test]
 async fn check_outdated_finding_names_the_native_source_and_remaining_time() {
-    let fx = fixture(Setup::latest_age(Some(WINDOW_7D), 3 * DAY)).await;
+    // 3.8.5 is eligible, so the held 3.9.0 still has a finding to explain.
+    let fx = fixture(Setup::new(
+        Some(WINDOW_7D),
+        &[
+            ("3.9.0", 3 * DAY),
+            ("3.8.5", 30 * DAY),
+            ("3.8.0", 100 * DAY),
+        ],
+    ))
+    .await;
     let messages = fx.check_messages().await;
     let held: Vec<_> = messages.iter().filter(|m| m.contains(NOTE)).collect();
     assert_eq!(held.len(), 1, "{messages:?}");
@@ -372,8 +381,10 @@ async fn update_skips_held_latest_as_within_native_cooldown_with_the_same_note_a
 
     let check = fx.check_messages().await;
     assert!(
-        check.iter().any(|m| m.contains(NOTE)),
-        "FR-016: both interfaces explain with the same source label"
+        check
+            .iter()
+            .all(|m| !m.contains(NOTE) && !m.contains("Newer version available")),
+        "nothing newer than the lock is eligible, so check reports no outdated finding: {check:?}"
     );
 }
 
@@ -518,6 +529,25 @@ async fn flagged_and_held_latest_still_applies_the_valid_fallback_exactly_as_bef
     );
     assert_eq!(applied(&h), applied(&n));
     assert!(within_native(&h).is_empty(), "{:#?}", h.items);
+}
+
+#[tokio::test]
+async fn fallback_under_a_native_hold_names_the_window_not_the_freshness_cooldown() {
+    let mut fx = fixture(Setup::new(
+        Some(WINDOW_7D),
+        &[("4.0.0", DAY), ("3.8.5", 30 * DAY), ("3.8.0", 100 * DAY)],
+    ))
+    .await;
+    fx.ctx.policy.freshness.enabled = false;
+
+    let plan = fx.update_plan().await;
+
+    assert_eq!(applied(&plan), ["3.8.5"], "{:#?}", plan.items);
+    let reason = plan.items[0].reason();
+    assert!(
+        reason.contains(NOTE) && !reason.contains("freshness"),
+        "{reason}"
+    );
 }
 
 #[tokio::test]

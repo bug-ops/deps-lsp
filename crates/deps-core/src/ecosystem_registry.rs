@@ -349,6 +349,8 @@ impl EcosystemRegistry {
     /// ecosystem (ascending [`EcosystemId`] order) whether it claims the file through
     /// [`EcosystemBase::claims_unrouted_manifest`].
     ///
+    /// `bound` is passed to every claim (see [`ClaimBound`](crate::ecosystem::ClaimBound)).
+    ///
     /// Only local absolute `file:` URIs are probed. The claims may read the filesystem, so call
     /// this only from a blocking context; [`for_uri`](Self::for_uri) stays pure.
     ///
@@ -367,9 +369,13 @@ impl EcosystemRegistry {
     /// let uri = Url::parse("file:///project/gradle/deps.toml").unwrap();
     ///
     /// // No ecosystem is registered, so nothing routes or claims the file.
-    /// assert!(registry.for_uri_blocking(&uri).is_none());
+    /// assert!(registry.for_uri_blocking(&uri, None).is_none());
     /// ```
-    pub fn for_uri_blocking(&self, uri: &url::Url) -> Option<Arc<dyn Ecosystem>> {
+    pub fn for_uri_blocking(
+        &self,
+        uri: &url::Url,
+        bound: Option<&crate::ecosystem::ClaimBound>,
+    ) -> Option<Arc<dyn Ecosystem>> {
         if let Some(routed) = self.for_uri(uri) {
             return Some(routed);
         }
@@ -378,7 +384,7 @@ impl EcosystemRegistry {
         ids.sort_unstable();
         ids.into_iter()
             .filter_map(|id| self.get(id))
-            .find(|ecosystem| ecosystem.claims_unrouted_manifest(&path))
+            .find(|ecosystem| ecosystem.claims_unrouted_manifest(&path, bound))
     }
 
     /// Matches a file whose containing directory path (tail) and file suffix are

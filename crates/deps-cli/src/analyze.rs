@@ -9,14 +9,13 @@
 
 use deps_core::licenses::LicensePolicy;
 use deps_core::lsp_helpers::{
-    CachedVersionsMap, CooldownDisposition, DependencyOutcomes, FormattedDependency, LatestVerdict,
-    ResolvedCandidatesMap, ResolvedVersionsMap, cooldown_disposition,
+    CachedVersionsMap, DependencyOutcomes, FormattedDependency, LatestVerdict,
+    ResolvedCandidatesMap, ResolvedVersionsMap,
 };
-use deps_core::native_cooldown::{NativeCooldown, NativeGate, native_cooldowns_by_name};
+use deps_core::native_cooldown::native_cooldowns_by_name;
 use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{
-    Ecosystem, EcosystemId, FreshnessSettings, GossipFindings, LicenseSource, NormalizedName,
-    PublishTime, VersionData,
+    Ecosystem, EcosystemId, GossipFindings, LicenseSource, NormalizedName, PublishTime, VersionData,
 };
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_lookup_misses_after_fetch,
@@ -95,12 +94,9 @@ pub struct AnalysisScope {
     /// registry pick (FR-014), so the prefetch's result would never be read — an avoidable
     /// network call.
     pub gossip: bool,
-    /// Whether to run spec 075 FR-010's extra, uncapped OSV round verifying every occurrence's
-    /// cooldown-fallback candidate. Only `true` for `update`'s default mode: `check` never
-    /// writes a fallback candidate (spec 075 §1 Out of Scope) and `--security-only`'s fix
-    /// target always comes from the advisory, never a freshness/GOSSIP-filtered pick — so
-    /// neither reads [`ManifestAnalysis::fallback_status`], and running this round for them
-    /// would be a wasted network call (NFR-004).
+    /// Whether to run the extra, uncapped OSV round verifying every held dependency's newest
+    /// eligible version. `check` names it and `update`'s default mode writes it;
+    /// `--security-only`'s fix target always comes from the advisory, so it skips the round.
     pub cooldown_fallback: bool,
 }
 
@@ -113,7 +109,7 @@ impl AnalysisScope {
             licenses: true,
             vulnerabilities: true,
             gossip: true,
-            cooldown_fallback: false,
+            cooldown_fallback: true,
         }
     }
 
@@ -205,7 +201,7 @@ pub struct ManifestAnalysis {
     /// against, retained here so `deps-cli update`'s planner (`plan_updates`) can reuse it
     /// instead of recomputing an identical `cooldown_fallback_view` from scratch (issue
     /// #1551 finding 3). Same gate as [`Self::fallback_status`]: `None` when
-    /// [`AnalysisScope::cooldown_fallback`] is `false`, or no dependency's [`cooldown_disposition`]
+    /// [`AnalysisScope::cooldown_fallback`] is `false`, or no dependency's `cooldown_disposition`
     /// actually differs from [`Self::cached_versions`] (NFR-004: nothing to substitute).
     pub cooldown_fallback_view: Option<CachedVersionsMap>,
     /// Already-computed GOSSIP findings (spec 074/075 FR-006), retained here instead of being
@@ -257,6 +253,9 @@ impl ManifestAnalysis {
         }
         if let Some(latest_status) = self.latest_status.as_ref() {
             version_data = version_data.with_latest_status(latest_status);
+        }
+        if let Some(fallback_status) = self.fallback_status.as_ref() {
+            version_data = version_data.with_fallback_status(fallback_status);
         }
         version_data
     }
@@ -349,59 +348,6 @@ impl ManifestAnalysis {
             LatestVerdict::Unverified
         )
     }
-}
-
-/// Builds a fallback view of `cached_versions`: every package whose [`cooldown_disposition`]
-/// is `Blocked { fallback: Some(_), .. }` has its `latest` swapped for the stored
-/// [`deps_core::lsp_helpers::CooldownFallback`] candidate, everything else left unchanged.
-///
-/// Feeds both spec 075 FR-010's OSV verification round (this module) and FR-007's unified
-/// planner pipeline (`crate::update`) the exact same substituted view, via
-/// [`deps_core::edit::collect_update_candidates`]/[`build_latest_check_targets`] reading
-/// `PackageVersions::latest` as they always do — so a fallback candidate is verified and
-/// planned against identically, with no separate code path to drift out of sync.
-///
-/// A package held back by its native publish-age window (`native_cooldowns`, judged against the
-/// lock maps at `now`) is substituted too when its stored fallback survives both windows.
-pub(crate) fn cooldown_fallback_view(
-    cached_versions: &CachedVersionsMap,
-    resolved_versions: &ResolvedVersionsMap,
-    resolved_version_candidates: &ResolvedCandidatesMap,
-    native_cooldowns: &HashMap<NormalizedName, NativeCooldown>,
-    gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
-    freshness: FreshnessSettings,
-    now: PublishTime,
-) -> CachedVersionsMap {
-    let version_data = VersionData::new(cached_versions, resolved_versions)
-        .with_resolved_version_candidates(resolved_version_candidates)
-        .with_now(now);
-    cached_versions
-        .iter()
-        .map(|(name, versions)| {
-            let mut substituted = versions.clone();
-            let gate = native_cooldowns
-                .get(name)
-                .map(|cooldown| NativeGate::for_name(cooldown, name, &version_data));
-            if let CooldownDisposition::Blocked {
-                fallback: Some(fallback),
-                ..
-            }
-            | CooldownDisposition::NativeHeld {
-                fallback: Some(fallback),
-                ..
-            } = cooldown_disposition(
-                versions,
-                name,
-                freshness,
-                gossip_prefetch,
-                gate.as_ref(),
-                now,
-            ) {
-                substituted.latest = fallback.version.clone();
-            }
-            (name.clone(), substituted)
-        })
-        .collect()
 }
 
 /// Parses `content`, resolves in-use/lock-file versions, and fetches latest registry versions.
@@ -610,12 +556,12 @@ pub async fn analyze_manifest(
 
     // Spec 075 FR-010: the fallback-candidate OSV round only fires when
     // `scope.cooldown_fallback` is set AND at least one dependency's `cooldown_disposition`
-    // actually found `Blocked { fallback: Some(_) }` — NFR-004: zero extra network calls
+    // found an eligible version — NFR-004: zero extra network calls
     // otherwise (a view identical to `cached_versions` has nothing new to verify).
     let cooldown_fallback_view_map = scope
         .cooldown_fallback
         .then(|| {
-            cooldown_fallback_view(
+            deps_core::lsp_helpers::cooldown_fallback_view(
                 &cached_versions,
                 &resolved_versions,
                 &resolved_version_candidates,

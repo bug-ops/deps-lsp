@@ -55,14 +55,15 @@ version-requirement edits to one manifest.
   independently OSV-verified before `update` writes it, and a flagged or unverified one is
   refused rather than silently substituted
 - **Freshness cooldown** — `update` skips a version published within `freshness.cooldown_secs`
-  (default 3 days) and targets the newest already-cooled-down, verified candidate instead
+  (default 3 days) and targets the newest already-cooled-down, verified candidate instead; `check`
+  judges `outdated` against that candidate
 - **Package-manager release-age window** — a `latest` held back by Cargo's `min-publish-age`
   (`.cargo/config.toml`), npm's `min-release-age`/`before` (root `.npmrc`), pnpm's
-  `minimumReleaseAge` (`pnpm-workspace.yaml`) or Bun's `minimumReleaseAge` (`bunfig.toml`) is
-  explained by `check` and skipped (exit 0) by `update`, never written;
+  `minimumReleaseAge` (`pnpm-workspace.yaml`), Bun's `minimumReleaseAge` (`bunfig.toml`), Yarn's
+  `npmMinimalAgeGate` (`.yarnrc.yml`) or uv's `exclude-newer` (`uv.toml`, `[tool.uv]`) is never
+  written by a default update: `check` and `update` move to the newest eligible version, and
+  `update` skips (`within-native-cooldown`, exit 0) when there is none;
   `[freshness] honor_native_cooldown = false` ignores it
-- **uv release-age window** — a `latest` held back by `exclude-newer` / `exclude-newer-package` in the
-  repository's `uv.toml` or `[tool.uv]` is skipped (`within-native-cooldown`, exit 0), never written
 - **Safe rewrites** — an unresolved version placeholder (`${VAR}`, `$(VAR)`, `%VAR%`,
   `self.version`, string interpolation) is never overwritten by a rewrite
 - **Advisory exemptions** — `check --advisory-exemptions <PATH>` loads an operator-owned file of
@@ -385,7 +386,8 @@ offline = false
 allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
 ```
 
-`deps-cli` looks for `./deps.toml` (relative to the walked root) when `--config` is not given.
+`deps-cli` looks for `./deps.toml` (relative to the walked root) when `--config` is not given. A
+`deps.toml` that a Gradle settings file declares as a version catalog is skipped with a warning.
 
 > [!WARNING]
 > An auto-discovered `deps.toml` — one found by this default lookup, not passed explicitly via

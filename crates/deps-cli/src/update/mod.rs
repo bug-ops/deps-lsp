@@ -18,12 +18,13 @@ use deps_core::ConcreteVersion;
 use deps_core::NormalizeName;
 use deps_core::VersionReq;
 use deps_core::edit::{
-    EditSpan, ManifestEdit, ManifestReparse, PlannedCurrent, PlannedUpdate, UnplannableReason,
-    UpdateCandidate, UpdateKind, apply_edits, classify_update, dedup_overlapping_edits,
+    CooldownHold, EditSpan, ManifestEdit, ManifestReparse, PlannedCurrent, PlannedUpdate,
+    UnplannableReason, UpdateCandidate, UpdateKind, apply_edits, classify_update,
+    dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
     CachedVersionsMap, CooldownDisposition, EcosystemFormatter, FallbackEditRejection,
-    FallbackEditVerdict, FormattedDependency, LatestVerdict, cooldown_disposition,
+    FallbackEditVerdict, FormattedDependency, LatestVerdict, NewestEligible, cooldown_disposition,
     fallback_edit_excludes_newer,
 };
 use deps_core::{NormalizedName, PackageKey, PackageName};
@@ -74,7 +75,12 @@ impl CurrentVersion {
     /// `actions/checkout@4.2.2` must render as written, not as an empty column), else
     /// [`Self::Unknown`].
     pub(crate) fn from_planned(planned: &PlannedUpdate) -> Self {
-        match &planned.current {
+        Self::from_planned_current(&planned.current)
+    }
+
+    /// Same as [`Self::from_planned`] for a bare [`PlannedCurrent`].
+    fn from_planned_current(current: &PlannedCurrent) -> Self {
+        match current {
             PlannedCurrent::Resolved(version) => Self::Resolved(version.clone()),
             PlannedCurrent::Declared(req) => Self::Declared(req.clone()),
             PlannedCurrent::Unresolved => Self::Unknown,
@@ -367,15 +373,24 @@ pub struct NativeHoldNote {
 /// [`PlannedUpdateItem::gossip_excluded_version`]'s existing attribution-field shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CooldownFallbackNote {
-    /// The fallback candidate was written; names the fresher, cooldown-blocked `latest` this
-    /// occurrence targeted instead.
-    AppliedInsteadOf(deps_core::ConcreteVersion),
+    /// The fallback candidate was written; names the held `latest` this occurrence targeted
+    /// instead, and what holds it.
+    AppliedInsteadOf(deps_core::ConcreteVersion, FallbackHold),
     /// A fallback candidate existed but was itself OSV-`Flagged`/`Unverified` (FR-011) and was
     /// never written; names the blocked fallback version.
     Blocked {
         /// The blocked fallback candidate's version.
         version: deps_core::ConcreteVersion,
     },
+}
+
+/// What holds the `latest` a fallback candidate stood in for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackHold {
+    /// The freshness cooldown.
+    Freshness,
+    /// The package manager's own publish-age window.
+    Native(deps_core::native_cooldown::NativeCooldown),
 }
 
 /// A dependency's disposition within an [`UpdatePlan`].
@@ -756,7 +771,7 @@ impl PlannedUpdateItem {
                     self.cooldown_fallback,
                     Some(CooldownFallbackNote::Blocked { .. })
                 ) {
-                    "the freshness-cooldown fallback candidate is flagged by OSV.dev — refusing to write it"
+                    "the cooldown fallback candidate is flagged by OSV.dev — refusing to write it"
                 } else {
                     "the registry's latest version is flagged by OSV.dev — refusing to write it"
                 }
@@ -770,7 +785,7 @@ impl PlannedUpdateItem {
                     self.cooldown_fallback,
                     Some(CooldownFallbackNote::Blocked { .. })
                 ) {
-                    "the freshness-cooldown fallback candidate could not be verified against OSV.dev — refusing to write it"
+                    "the cooldown fallback candidate could not be verified against OSV.dev — refusing to write it"
                 } else {
                     "the registry's latest version could not be verified against OSV.dev — refusing to write it"
                 }
@@ -784,11 +799,7 @@ impl PlannedUpdateItem {
                 ..
             } => "the selected update target was published within the freshness cooldown window",
             Outcome::Skipped {
-                reason:
-                    SkipReason::WithinNativeCooldown
-                    | SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::WithinNativeCooldown,
-                    ),
+                reason: SkipReason::WithinNativeCooldown,
                 ..
             } => "the latest version is held back by the package manager's own publish-age window",
             Outcome::Skipped {
@@ -834,10 +845,15 @@ impl PlannedUpdateItem {
         // specific candidate the base text above already describes as blocked (see the
         // `NotSafelyEditable` match arms' own fallback-aware wording).
         match &self.cooldown_fallback {
-            Some(CooldownFallbackNote::AppliedInsteadOf(latest)) => {
+            Some(CooldownFallbackNote::AppliedInsteadOf(latest, hold)) => {
+                let held = match hold {
+                    FallbackHold::Freshness => {
+                        "is still within its freshness cooldown window".to_string()
+                    }
+                    FallbackHold::Native(cooldown) => format!("is excluded by {cooldown}"),
+                };
                 reason.push_str(&format!(
-                    " (targeted a cooldown-cleared fallback instead of {latest}, which is still \
-                     within its freshness cooldown window)"
+                    " (targeted a cooldown-cleared fallback instead of {latest}, which {held})"
                 ));
             }
             Some(CooldownFallbackNote::Blocked { version }) => {
@@ -905,7 +921,7 @@ fn gossip_excluded_version(
 /// applied here instead of computing the view unconditionally — `None` either way means
 /// `plan_updates` skips [`deps_core::ParsedManifest::collect_update_candidates`]'s full-manifest pass over the fallback
 /// view entirely, since [`resolve_occurrence`] only ever consults it when a dependency's own
-/// [`cooldown_disposition`] is `Blocked { fallback: Some(_), .. }`.
+/// [`cooldown_disposition`] names an eligible version.
 ///
 /// The reuse path (impl-critic m3) does *not* re-apply `freshness`/`now` to the already-built
 /// view — it relies on the caller passing the same values `analyze_manifest` used to build it,
@@ -920,7 +936,7 @@ fn resolve_cooldown_fallback_view(
     if let Some(view) = analysis.cooldown_fallback_view.as_ref() {
         return Some(view.clone());
     }
-    let view = crate::analyze::cooldown_fallback_view(
+    let view = deps_core::lsp_helpers::cooldown_fallback_view(
         &analysis.cached_versions,
         &analysis.resolved_versions,
         &analysis.resolved_version_candidates,
@@ -1052,6 +1068,10 @@ fn resolve_cooldown_fallback_view(
 /// assert_eq!(plan.items[0].target(), Some(&ConcreteVersion::from("1.2.0")));
 /// ```
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass joining the latest and fallback views per occurrence"
+)]
 pub fn plan_updates(
     analysis: &ManifestAnalysis,
     content: &str,
@@ -1062,9 +1082,11 @@ pub fn plan_updates(
     now: deps_core::PublishTime,
 ) -> UpdatePlan {
     let formatter = analysis.parse_result.formatter();
-    let latest_candidates = analysis
-        .parse_result
-        .collect_update_candidates(content, analysis.version_data());
+    let latest_candidates = analysis.parse_result.collect_update_candidates(
+        content,
+        analysis.version_data(),
+        freshness,
+    );
 
     // Spec 075 FR-007/FR-008: a fallback view of the registry data (only `latest` swapped for
     // each dependency's stored cooldown-fallback candidate, when one exists) fed through the
@@ -1089,6 +1111,7 @@ pub fn plan_updates(
                 deps_core::VersionData::new(view, &analysis.resolved_versions)
                     .with_resolved_version_candidates(&analysis.resolved_version_candidates)
                     .with_ecosystem(analysis.ecosystem_id)
+                    .with_gossip_prefetch(&analysis.gossip_findings)
                     .with_now(analysis.now);
             fallback_version_data = match analysis.fallback_status.as_ref() {
                 Some(fallback_status) => fallback_version_data.with_latest_status(fallback_status),
@@ -1097,9 +1120,11 @@ pub fn plan_updates(
                 }
                 None => fallback_version_data,
             };
-            analysis
-                .parse_result
-                .collect_update_candidates(content, fallback_version_data)
+            analysis.parse_result.collect_update_candidates(
+                content,
+                fallback_version_data,
+                freshness,
+            )
         }
         None => Vec::new(),
     };
@@ -1296,19 +1321,36 @@ type OccurrenceKey = (
 fn candidate_identity(candidate: &UpdateCandidate) -> (NormalizedName, deps_core::position::Range) {
     match candidate {
         UpdateCandidate::Planned(p) => (p.key.normalized().clone(), p.name_range),
-        UpdateCandidate::Unplannable {
+        UpdateCandidate::Held {
+            key, name_range, ..
+        }
+        | UpdateCandidate::Unplannable {
             key, name_range, ..
         } => (key.normalized().clone(), *name_range),
     }
 }
 
-/// `(current, target)` for a `WithinFreshnessCooldown`/`NotRequested` item built directly from
-/// the latest view — a `Planned` candidate carries both; an `Unplannable` one carries neither
-/// (matches this planner's pre-#1543 convention for an item with no concrete write target).
+/// `(current, target)` for a cooldown-skipped or `NotRequested` item built directly from the
+/// latest view — a `Planned` or `Held` candidate carries both; an `Unplannable` one carries
+/// neither (an item with no concrete write target).
 fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, Option<ConcreteVersion>) {
     match candidate {
         UpdateCandidate::Planned(p) => (CurrentVersion::from_planned(p), Some(p.target.clone())),
+        UpdateCandidate::Held {
+            current, target, ..
+        } => (
+            CurrentVersion::from_planned_current(current),
+            Some(target.clone()),
+        ),
         UpdateCandidate::Unplannable { .. } => (CurrentVersion::Unknown, None),
+    }
+}
+
+/// The skip reason of a [`CooldownHold`].
+const fn held_skip_reason(hold: CooldownHold) -> SkipReason {
+    match hold {
+        CooldownHold::Freshness => SkipReason::WithinFreshnessCooldown,
+        CooldownHold::Native => SkipReason::WithinNativeCooldown,
     }
 }
 
@@ -1346,6 +1388,27 @@ fn resolve_from_latest(
                     Vec::new(),
                 )
             }
+        }
+        UpdateCandidate::Held {
+            key,
+            current,
+            target,
+            hold,
+            ..
+        } => {
+            let current = CurrentVersion::from_planned_current(&current);
+            let kind = current.update_kind_to(&target);
+            let reason = ignore_rules
+                .skip_reason(key.normalized(), kind)
+                .unwrap_or_else(|| held_skip_reason(hold));
+            (
+                current,
+                Outcome::Skipped {
+                    reason,
+                    target: Some(target),
+                },
+                Vec::new(),
+            )
         }
         UpdateCandidate::Unplannable { key, reason, .. } => {
             let outcome = if let Some(rule_reason) =
@@ -1516,7 +1579,7 @@ fn resolve_occurrence(
 ) -> PlannedUpdateItem {
     let package_key = match &latest_candidate {
         UpdateCandidate::Planned(p) => p.key.clone(),
-        UpdateCandidate::Unplannable { key, .. } => key.clone(),
+        UpdateCandidate::Held { key, .. } | UpdateCandidate::Unplannable { key, .. } => key.clone(),
     };
     let gossip_excluded = gossip_excluded_version(analysis, &package_key);
     let fallback_candidate = fallback_by_key.remove(&key);
@@ -1619,6 +1682,14 @@ fn resolve_occurrence(
             .flatten();
         build(current, outcome, advisory_ids, None).with_osv_sibling_match(sibling_match)
     };
+    let fallback_hold = match &disposition {
+        CooldownDisposition::NativeHeld { cooldown, .. } => {
+            FallbackHold::Native((*cooldown).clone())
+        }
+        CooldownDisposition::NotEvaluated
+        | CooldownDisposition::Cleared
+        | CooldownDisposition::Blocked { .. } => FallbackHold::Freshness,
+    };
     // DRY (code review finding): the routine "cooldown pause, targeting whatever `latest`
     // itself carries" shape recurs across rows 4/6/(fb.target-mismatch)/(requirement rejected)/11
     // — one closure instead of five hand-rolled copies.
@@ -1640,8 +1711,14 @@ fn resolve_occurrence(
         CooldownDisposition::NotEvaluated | CooldownDisposition::Cleared => {
             resolve_latest_only(latest_candidate)
         }
-        CooldownDisposition::Blocked { fallback: None, .. }
-        | CooldownDisposition::NativeHeld { fallback: None, .. } => {
+        CooldownDisposition::Blocked {
+            newest: NewestEligible::NoneEligible | NewestEligible::Undetermined,
+            ..
+        }
+        | CooldownDisposition::NativeHeld {
+            newest: NewestEligible::NoneEligible | NewestEligible::Undetermined,
+            ..
+        } => {
             if latest_is_osv_unplannable {
                 // Row 5: never demoted by a routine cooldown pause.
                 resolve_latest_only(latest_candidate)
@@ -1655,11 +1732,11 @@ fn resolve_occurrence(
         // planner's — it only ever decides fallback-vs-latest, never which blocker to name.
         CooldownDisposition::Blocked {
             by: _,
-            fallback: Some(fallback),
+            newest: NewestEligible::Eligible(fallback),
         }
         | CooldownDisposition::NativeHeld {
             cooldown: _,
-            fallback: Some(fallback),
+            newest: NewestEligible::Eligible(fallback),
         } => {
             let latest_version = package_versions.map(|v| v.latest.clone());
             let available: &[deps_core::ConcreteVersion] =
@@ -1749,7 +1826,9 @@ fn resolve_occurrence(
                                     target: fb.target,
                                 },
                                 advisory_ids,
-                                latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
+                                latest_version.map(|latest| {
+                                    CooldownFallbackNote::AppliedInsteadOf(latest, fallback_hold)
+                                }),
                             )
                             .with_osv_sibling_match(sibling_match)
                         } else {
@@ -1761,7 +1840,9 @@ fn resolve_occurrence(
                                     target: fb.target,
                                 },
                                 Vec::new(),
-                                latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
+                                latest_version.map(|latest| {
+                                    CooldownFallbackNote::AppliedInsteadOf(latest, fallback_hold)
+                                }),
                             )
                         }
                     } else {
@@ -1773,6 +1854,14 @@ fn resolve_occurrence(
                         } else {
                             cooldown_skip_from_latest(&latest_candidate)
                         }
+                    }
+                }
+                // A fallback that is itself held cannot be written.
+                Some(UpdateCandidate::Held { .. }) => {
+                    if latest_is_osv_unplannable {
+                        resolve_latest_only(latest_candidate)
+                    } else {
+                        cooldown_skip_from_latest(&latest_candidate)
                     }
                 }
                 // FR-011: an OSV-flagged/unverified fallback must surface here even when
@@ -4100,7 +4189,10 @@ mod tests {
         );
         assert_eq!(
             plan.items[0].cooldown_fallback,
-            Some(CooldownFallbackNote::AppliedInsteadOf("2.0.0".into()))
+            Some(CooldownFallbackNote::AppliedInsteadOf(
+                "2.0.0".into(),
+                FallbackHold::Freshness
+            ))
         );
         assert_eq!(
             plan.items[0]

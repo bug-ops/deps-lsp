@@ -9,8 +9,9 @@ use crate::{
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail, in_use_version_is};
 use super::exemption::ExemptionCheck;
 use super::{
-    DependencyFormatter, DependencyGate, EcosystemFormatter, LatestVerdict, LookupMiss,
-    PackageSuppression, RequirementStatus, SiblingMatchNote, VersionData, in_use_version,
+    CooldownBlocker, CooldownDisposition, DependencyFormatter, DependencyGate, EcosystemFormatter,
+    HeldOutcome, LatestVerdict, LookupMiss, PackageSuppression, RequirementStatus,
+    SiblingMatchNote, VersionData, cooldown_disposition, in_use_version, judge_held_latest,
     latest_verdict, resolve_scan_outcome, sanitize_and_truncate_for_diagnostic,
 };
 
@@ -137,6 +138,7 @@ fn lookup_miss_marker(
 pub fn generate_inlay_hints<P, F>(
     parse_result: &P,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     loading_state: crate::LoadingState,
     config: &EcosystemConfig,
     formatter: &F,
@@ -151,6 +153,7 @@ where
     // latest-check result apart from another's.
     let ctx = HintContext {
         versions,
+        freshness,
         loading_state,
         config,
         formatter,
@@ -170,6 +173,7 @@ where
 /// What every dependency's hint is rendered against.
 struct HintContext<'a, F> {
     versions: VersionData<'a>,
+    freshness: crate::freshness::FreshnessSettings,
     loading_state: crate::LoadingState,
     config: &'a EcosystemConfig,
     formatter: &'a F,
@@ -488,8 +492,35 @@ fn base_hint_for<F: DependencyFormatter>(
         | RequirementStatus::Unresolved => status,
     };
 
-    let (label_text, flagged_tooltip) =
-        hint_label(status, dep, &key, latest, resolved_version.as_ref(), ctx)?;
+    let held = match status {
+        RequirementStatus::Outdated => held_hint(dep, &key, latest, ctx),
+        RequirementStatus::UpToDate | RequirementStatus::Unresolved => None,
+    };
+    let (label_text, flagged_tooltip) = match held {
+        Some(HeldHint::Name { version, tooltip }) => (
+            config
+                .needs_update_text
+                .replace("{}", &sanitize_hint_version(version.as_str())),
+            Some(tooltip),
+        ),
+        Some(HeldHint::UpToDate { tooltip }) => {
+            if !config.show_up_to_date_hints {
+                return None;
+            }
+            let label = resolved_version.as_ref().map_or_else(
+                || config.up_to_date_text.clone(),
+                |resolved| {
+                    format!(
+                        "{} {}",
+                        config.up_to_date_text,
+                        sanitize_hint_version(resolved.as_str())
+                    )
+                },
+            );
+            (label, Some(tooltip))
+        }
+        None => hint_label(status, dep, &key, latest, resolved_version.as_ref(), ctx)?,
+    };
 
     // Issue #483 I5/SEC-2: `latest` here may be a warm-cache value fetched before an
     // online -> offline flip — without this, the badge is indistinguishable from live
@@ -501,6 +532,82 @@ fn base_hint_for<F: DependencyFormatter>(
     };
 
     Some(type_hint(position, label_text, flagged_tooltip))
+}
+
+/// How the hint of an outdated dependency reads when a release-age window holds its `latest`.
+enum HeldHint {
+    /// Offer the newest eligible version instead.
+    Name {
+        version: ConcreteVersion,
+        tooltip: String,
+    },
+    /// Nothing newer is eligible.
+    UpToDate { tooltip: String },
+}
+
+/// The verdict diagnostics reach for a held `latest`; `None` leaves the ordinary hint.
+fn held_hint<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    latest: &ConcreteVersion,
+    ctx: &HintContext<'_, F>,
+) -> Option<HeldHint> {
+    // A flagged or unverified `latest` keeps its own warning.
+    if !matches!(
+        ctx.latest_verdict_for(dep, key, latest.as_str()),
+        LatestVerdict::Verified | LatestVerdict::NotApplicable
+    ) {
+        return None;
+    }
+    let versions = &ctx.versions;
+    let cached = versions.cached_for(key)?;
+    let gate = crate::native_cooldown::NativeGate::for_dependency(dep, key, versions);
+    let (window, newest) = match cooldown_disposition(
+        cached,
+        key.normalized(),
+        ctx.freshness,
+        versions.gossip_prefetch,
+        gate.as_ref(),
+        versions.now,
+    ) {
+        CooldownDisposition::NativeHeld { cooldown, newest } => (cooldown.to_string(), newest),
+        CooldownDisposition::Blocked {
+            by: CooldownBlocker::Gossip,
+            newest,
+        } => ("deps.dev/GOSSIP cooldown".to_string(), newest),
+        CooldownDisposition::Blocked {
+            by: CooldownBlocker::Local { .. },
+            newest,
+        } => ("release cooldown".to_string(), newest),
+        CooldownDisposition::NotEvaluated | CooldownDisposition::Cleared => return None,
+    };
+    let held = format!(
+        "{} is held: {window}",
+        sanitize_hint_version(latest.as_str())
+    );
+    match judge_held_latest(
+        dep,
+        key,
+        versions,
+        ctx.formatter,
+        ctx.vuln_keys.as_ref(),
+        cached,
+        newest,
+    ) {
+        HeldOutcome::Name {
+            version,
+            unverified,
+        } => Some(HeldHint::Name {
+            version: version.clone(),
+            tooltip: if unverified {
+                format!("{held}; not yet verified against OSV")
+            } else {
+                held
+            },
+        }),
+        HeldOutcome::Silent => Some(HeldHint::UpToDate { tooltip: held }),
+        HeldOutcome::ReportLatest => None,
+    }
 }
 
 /// The hint for a dependency with no cached latest version: an offline or failed-lookup marker
@@ -724,6 +831,7 @@ mod tests {
         let hints_while_loading = generate_inlay_hints(
             &parse_result,
             VersionData::new(&HashMap::new(), &HashMap::new()),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loading,
             &config,
             &formatter.for_dependency(),
@@ -736,6 +844,7 @@ mod tests {
         let hints_loaded = generate_inlay_hints(
             &parse_result,
             VersionData::new(&HashMap::new(), &HashMap::new()),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter.for_dependency(),
@@ -779,6 +888,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&HashMap::new(), &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter.for_dependency(),
@@ -829,6 +939,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&HashMap::new(), &HashMap::new()),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loading,
             &config,
             &formatter.for_dependency(),
@@ -882,6 +993,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -932,6 +1044,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             formatter,
@@ -1011,6 +1124,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_latest_status(&latest_status),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1081,6 +1195,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_latest_status(&latest_status),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &MOCK_FORMATTER,
@@ -1170,6 +1285,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_latest_status(&latest_status),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1240,6 +1356,7 @@ mod tests {
             generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+                crate::FreshnessSettings::Disabled,
                 crate::LoadingState::Loaded,
                 &config,
                 &formatter,
@@ -1275,6 +1392,7 @@ mod tests {
         let clean = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1344,6 +1462,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1402,6 +1521,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1459,6 +1579,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1512,6 +1633,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &MOCK_FORMATTER,
@@ -1562,6 +1684,7 @@ mod tests {
             let hints = generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
+                crate::FreshnessSettings::Disabled,
                 crate::LoadingState::Loaded,
                 &config,
                 &MOCK_FORMATTER,
@@ -1610,6 +1733,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loading,
             &config,
             &formatter,
@@ -1661,6 +1785,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loading,
             &config,
             &formatter,
@@ -1847,6 +1972,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loading,
             &config,
             &formatter,
@@ -1902,6 +2028,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1957,6 +2084,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2014,6 +2142,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &MockUnresolvedFormatter,
@@ -2061,6 +2190,7 @@ mod tests {
         generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &MOCK_FORMATTER,
@@ -2146,6 +2276,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_outcomes(&outcomes)
                 .with_network(network),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &MOCK_FORMATTER.for_dependency(),
@@ -2297,6 +2428,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2344,6 +2476,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2397,6 +2530,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2447,6 +2581,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2504,6 +2639,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2561,6 +2697,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2619,6 +2756,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2676,6 +2814,7 @@ mod tests {
         let hints = generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -2753,6 +2892,7 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_vulnerabilities(&vulns)
                     .with_advisory_exemptions(&exemptions),
+                crate::FreshnessSettings::Disabled,
                 crate::LoadingState::Loaded,
                 &config,
                 &MOCK_FORMATTER,
@@ -2848,6 +2988,7 @@ mod tests {
                 .with_vulnerabilities(&vulns)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_advisory_exemptions(exemptions),
+            crate::FreshnessSettings::Disabled,
             crate::LoadingState::Loaded,
             &config,
             &MOCK_FORMATTER,

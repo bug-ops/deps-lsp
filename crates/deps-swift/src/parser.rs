@@ -39,6 +39,9 @@ pub struct SwiftParseResult {
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
     /// `id:` dependencies whose registry entry was rejected for another reason.
     pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
+    /// `id:` dependencies whose identity is not `scope.name` (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 deps_core::impl_parse_result!(
@@ -49,6 +52,7 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
         rejected_registries: rejected_registries,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -585,6 +589,9 @@ struct ScanState<'a> {
     budget: deps_core::DependencyBudget,
     resolver: IdResolver<'a>,
     dependencies: Vec<SwiftDependency>,
+    invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
+    /// Separate from `budget`, so a notice never displaces a dependency.
+    invalid_budget: deps_core::DependencyBudget,
 }
 
 impl ScanState<'_> {
@@ -601,6 +608,24 @@ impl ScanState<'_> {
             self.matched.insert(full.clone());
         }
         allowed
+    }
+
+    fn report_invalid_id(&mut self, cap: &regex::Captures<'_>) {
+        let Some(id) = cap.name("id") else {
+            return;
+        };
+        // An interpolated id is only known at build time.
+        if let Some(key) = self.content.get(id.range())
+            && !key.contains(r"\(")
+            && self.invalid_budget.allow()
+        {
+            self.invalid_declarations
+                .push(deps_core::InvalidDeclarationOccurrence {
+                    range: self.range(&id.range()),
+                    key: key.to_owned(),
+                    reason: deps_core::InvalidDeclarationReason::MalformedCoordinate,
+                });
+        }
     }
 
     fn push(&mut self, full: std::ops::Range<usize>, dependency: SwiftDependency) {
@@ -621,6 +646,7 @@ impl ScanState<'_> {
                 continue;
             }
             let Some((url_span, location)) = locate(&cap, content) else {
+                self.report_invalid_id(&cap);
                 self.matched.insert(full);
                 continue;
             };
@@ -732,6 +758,8 @@ fn parse_with_resolver(
         budget: deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT),
         resolver,
         dependencies: Vec::new(),
+        invalid_declarations: Vec::new(),
+        invalid_budget: deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT),
     };
 
     // 1. .package(url:|id: "...", .upToNextMajor(from: "..."))
@@ -784,6 +812,7 @@ fn parse_with_resolver(
         resolved_registries: state.resolver.used,
         blocked_registries: state.resolver.blocked,
         rejected_registries: state.resolver.rejected,
+        invalid_declarations: state.invalid_declarations,
     })
 }
 
@@ -2222,5 +2251,30 @@ let package = Package(
                 .character,
             expected
         );
+    }
+
+    #[test]
+    fn test_invalid_registry_id_is_reported() {
+        let result = parse_package_swift(
+            r#".package(id: "noscope", from: "1.0.0")"#,
+            &deps_core::test_util::test_uri("/p/Package.swift"),
+        )
+        .unwrap();
+
+        assert!(result.dependencies.is_empty());
+        let invalid = deps_core::ParseResult::invalid_declarations(&result);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].key, "noscope");
+    }
+
+    #[test]
+    fn test_interpolated_registry_id_is_not_invalid() {
+        let result = parse_package_swift(
+            r#".package(id: "\(scope).net", from: "1.0.0")"#,
+            &deps_core::test_util::test_uri("/p/Package.swift"),
+        )
+        .unwrap();
+
+        assert!(deps_core::ParseResult::invalid_declarations(&result).is_empty());
     }
 }

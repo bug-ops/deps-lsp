@@ -1267,6 +1267,7 @@ mod tests {
                 resolved_registries: Vec::new(),
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
+                invalid_declarations: Vec::new(),
             };
             let cache = Arc::new(deps_core::HttpCache::new());
             let eco = SwiftEcosystem::new(cache);
@@ -1376,6 +1377,7 @@ mod tests {
                 resolved_registries: Vec::new(),
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
+                invalid_declarations: Vec::new(),
             };
             let cache = Arc::new(deps_core::HttpCache::new());
             let eco = SwiftEcosystem::new(cache);
@@ -1433,6 +1435,7 @@ mod tests {
                 resolved_registries: Vec::new(),
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
+                invalid_declarations: Vec::new(),
             };
             let content = "let x = \"https://github.com/apple/swift-nio\"\n2.0.0";
             let cache = Arc::new(deps_core::HttpCache::new());

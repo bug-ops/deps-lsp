@@ -29,12 +29,14 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    let (network, osv_checks, vulnerability_visibility) = {
+    let (network, osv_checks, vulnerability_visibility, freshness, gossip_visibility) = {
         let config = config.read().await;
         (
             config.policy.network.mode(),
             config.policy.osv_checks(),
             PrefetchVisibility::from_enabled(config.policy.diagnostics.vulnerabilities_enabled),
+            config.policy.freshness.to_freshness(),
+            PrefetchVisibility::from_enabled(config.policy.gossip_checks().is_active()),
         )
     };
 
@@ -52,6 +54,7 @@ pub async fn handle_code_actions(
                 .with_latest_status(osv_checks)
                 .with_candidate_status(osv_checks)
                 .with_outcomes()
+                .with_gossip_prefetch(gossip_visibility)
                 .finish();
             Some((doc.ecosystem, manifest, doc.content.clone(), snapshot))
         })
@@ -76,7 +79,7 @@ pub async fn handle_code_actions(
         .with_interactive_fetch_gate(&state.interactive_fetch)
         .with_advisory_exemptions(&advisory_exemptions);
     let mut actions = manifest
-        .generate_code_actions(position, &domain_uri, version_data, &content)
+        .generate_code_actions(position, &domain_uri, version_data, freshness, &content)
         .await;
 
     bind_diagnostics(&mut actions, &params.context.diagnostics);

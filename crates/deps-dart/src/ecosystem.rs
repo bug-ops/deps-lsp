@@ -243,6 +243,7 @@ mod tests {
             .inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &EcosystemConfig::default(),
             )

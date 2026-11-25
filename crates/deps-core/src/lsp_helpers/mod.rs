@@ -229,6 +229,97 @@ impl CooldownFallback {
     }
 }
 
+/// Upper bound on [`CooldownCandidates`] entries; a longer list is cut and marked truncated.
+pub const MAX_COOLDOWN_CANDIDATES: usize = 128;
+
+/// Why a [`CooldownCandidates`] list stops where it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CandidatesEnd {
+    /// The in-use floor or the end of the version list was reached: nothing else exists.
+    Exhausted,
+    /// The search stopped early, so a later eligible version may exist.
+    #[default]
+    Truncated,
+}
+
+/// The versions older than `latest` that may stand in for it while it is held.
+///
+/// Computed at fetch time and judged at read time by [`cooldown_disposition`]. Entries are
+/// newest-first, distinct, strictly older than `latest`, above the in-use floor and dated. The
+/// default value is empty and [`CandidatesEnd::Truncated`], which proves nothing.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PublishTime;
+/// use deps_core::lsp_helpers::{CandidatesEnd, CooldownCandidates, CooldownFallback};
+///
+/// let list = CooldownCandidates::new(
+///     vec![CooldownFallback::new("1.1.0".into(), PublishTime::from_unix_secs(1_000))],
+///     CandidatesEnd::Exhausted,
+/// );
+/// assert_eq!(list.entries().len(), 1);
+/// assert_eq!(CooldownCandidates::default().end(), CandidatesEnd::Truncated);
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CooldownCandidates {
+    entries: Arc<[CooldownFallback]>,
+    end: CandidatesEnd,
+}
+
+impl CooldownCandidates {
+    /// Wraps `entries`, cutting them to [`MAX_COOLDOWN_CANDIDATES`] and marking a cut list
+    /// [`CandidatesEnd::Truncated`].
+    #[must_use]
+    pub fn new(mut entries: Vec<CooldownFallback>, end: CandidatesEnd) -> Self {
+        let end = if entries.len() > MAX_COOLDOWN_CANDIDATES {
+            entries.truncate(MAX_COOLDOWN_CANDIDATES);
+            CandidatesEnd::Truncated
+        } else {
+            end
+        };
+        Self {
+            entries: entries.into(),
+            end,
+        }
+    }
+
+    /// The candidates, newest first.
+    #[must_use]
+    pub fn entries(&self) -> &[CooldownFallback] {
+        &self.entries
+    }
+
+    /// Whether anything may exist beyond the last entry.
+    #[must_use]
+    pub const fn end(&self) -> CandidatesEnd {
+        self.end
+    }
+}
+
+/// The newest version a held `latest` leaves eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewestEligible<'a> {
+    /// The first candidate cleared by every window in effect.
+    Eligible(&'a CooldownFallback),
+    /// The whole range down to the in-use floor was searched and nothing is eligible.
+    NoneEligible,
+    /// The candidate list is incomplete, so nothing can be concluded.
+    Undetermined,
+}
+
+impl<'a> NewestEligible<'a> {
+    /// The eligible candidate, if one was found.
+    #[must_use]
+    pub const fn candidate(self) -> Option<&'a CooldownFallback> {
+        match self {
+            Self::Eligible(candidate) => Some(candidate),
+            Self::NoneEligible | Self::Undetermined => None,
+        }
+    }
+}
+
 /// What blocked [`PackageVersions::latest`] from being usable as-is — drives
 /// check/hover/diagnostics wording. Carried by [`CooldownDisposition::Blocked`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,25 +345,21 @@ pub enum CooldownDisposition<'a> {
     /// `latest` is not blocked by cooldown (no GOSSIP verdict, or a past one; no active local
     /// heuristic result).
     Cleared,
-    /// `latest` is currently blocked. `fallback`, when present, is the newest
-    /// cooldown-cleared, ecosystem-safe, floor-protected alternative a caller may offer
-    /// instead (spec 075) — `None` when no such candidate was found at fetch time.
+    /// `latest` is currently blocked by the freshness cooldown.
     Blocked {
         /// What blocked `latest`.
         by: CooldownBlocker,
-        /// The fallback candidate, if one was computed and stored for this dependency.
-        fallback: Option<&'a CooldownFallback>,
+        /// The newest version that is not held.
+        newest: NewestEligible<'a>,
     },
     /// `latest` is held back by the package manager's own publish-age window (spec 099).
-    /// Independent of the freshness feature: it is reported even when freshness is disabled.
-    /// `fallback` is the stored cooldown-fallback candidate, kept only when the freshness
-    /// cooldown would also have blocked `latest` and the candidate itself clears the native
-    /// window; surfaces that only explain the hold ignore it.
+    /// Independent of the freshness feature: it is reported even when freshness is disabled,
+    /// and takes precedence over [`Self::Blocked`].
     NativeHeld {
         /// The configured window that holds `latest` back.
         cooldown: &'a NativeCooldown,
-        /// The fallback candidate that survives both windows, if any.
-        fallback: Option<&'a CooldownFallback>,
+        /// The newest version that is not held.
+        newest: NewestEligible<'a>,
     },
 }
 
@@ -347,8 +434,7 @@ pub fn cooldown_precedence(
 /// The local freshness heuristic alone (`published_at` age against `cooldown`), without GOSSIP.
 ///
 /// Extracted from [`cooldown_precedence`]'s `Unavailable` arm so every site that evaluates the
-/// local rule by itself — that arm, and [`cooldown_disposition`]'s read-time fallback
-/// re-evaluation — shares one implementation rather than reimplementing the age comparison.
+/// local rule by itself shares one implementation rather than reimplementing the age comparison.
 ///
 /// # Examples
 ///
@@ -393,14 +479,15 @@ pub fn local_cooldown_precedence(
     }
 }
 
-/// Evaluates, at read time, whether [`PackageVersions::latest`] is blocked by the freshness
-/// cooldown and whether a stored [`PackageVersions::cooldown_fallback`] candidate is available.
+/// Evaluates, at read time, whether [`PackageVersions::latest`] is held and which older
+/// version is eligible instead.
 ///
-/// Spec 075 FR-004's single precedence function, shared by `apply_outdated_rule`
-/// (check/diagnostics wording) and `deps-cli update`'s planner so the two commands can no
-/// longer disagree (spec 075 NFR-001 steps 0-4; OSV verification is deliberately NOT this
-/// function's job — see spec 075 FR-010/FR-011). The GOSSIP-vs-local precedence itself is
-/// [`cooldown_precedence`]; this function adds the read-time fallback re-evaluation on top.
+/// The single precedence function shared by diagnostics, the update planner, the code actions
+/// and `deps-cli update`, so they cannot disagree. A native window excluding `latest` gives
+/// [`CooldownDisposition::NativeHeld`]; otherwise the freshness cooldown (GOSSIP first, local
+/// heuristic otherwise, see [`cooldown_precedence`]) decides. The eligible version is the first
+/// [`PackageVersions::cooldown_candidates`] entry cleared by both. OSV verification is
+/// deliberately not this function's job.
 ///
 /// # Examples
 ///
@@ -448,68 +535,208 @@ pub fn cooldown_disposition<'a>(
     native: Option<&NativeGate<'a>>,
     now: PublishTime,
 ) -> CooldownDisposition<'a> {
-    let freshness_disposition =
-        freshness_disposition(versions, name, freshness, gossip_prefetch, now);
-    let Some(gate) = native else {
-        return freshness_disposition;
+    let blocked_by = |version: &str, published_at| {
+        let cooldown = freshness.cooldown()?;
+        match cooldown_precedence(gossip_prefetch, name, version, published_at, cooldown, now) {
+            CooldownPrecedence::Cleared => None,
+            CooldownPrecedence::Blocked(by) => Some(by),
+        }
     };
-    if !gate.excludes(
-        versions.published_at_of(&versions.latest),
-        &versions.latest,
-        gate.now(),
-    ) {
-        return freshness_disposition;
-    }
-    let fallback = match freshness_disposition {
-        CooldownDisposition::Blocked { fallback, .. } => fallback.filter(|fallback| {
-            !gate.excludes(Some(fallback.published_at), &fallback.version, gate.now())
-        }),
-        CooldownDisposition::NotEvaluated
-        | CooldownDisposition::Cleared
-        | CooldownDisposition::NativeHeld { .. } => None,
+    let natively_excluded = |published_at, version: &ConcreteVersion| {
+        native.is_some_and(|gate| gate.excludes(published_at, version, gate.now()))
     };
-    CooldownDisposition::NativeHeld {
-        cooldown: gate.cooldown(),
-        fallback,
+    let newest = || {
+        let candidates = &versions.cooldown_candidates;
+        let eligible = candidates.entries().iter().find(|candidate| {
+            let published_at = Some(candidate.published_at);
+            blocked_by(candidate.version.as_str(), published_at).is_none()
+                && !natively_excluded(published_at, &candidate.version)
+        });
+        match (eligible, candidates.end()) {
+            (Some(candidate), _) => NewestEligible::Eligible(candidate),
+            (None, CandidatesEnd::Exhausted) => NewestEligible::NoneEligible,
+            (None, CandidatesEnd::Truncated) => NewestEligible::Undetermined,
+        }
+    };
+
+    if let Some(gate) = native
+        && natively_excluded(versions.published_at_of(&versions.latest), &versions.latest)
+    {
+        return CooldownDisposition::NativeHeld {
+            cooldown: gate.cooldown(),
+            newest: newest(),
+        };
     }
+    if !freshness.is_enabled() {
+        return CooldownDisposition::NotEvaluated;
+    }
+    blocked_by(versions.latest.as_str(), versions.published_at).map_or(
+        CooldownDisposition::Cleared,
+        |by| CooldownDisposition::Blocked {
+            by,
+            newest: newest(),
+        },
+    )
 }
 
-/// The freshness-cooldown half of [`cooldown_disposition`]: GOSSIP-vs-local precedence plus the
-/// read-time fallback re-evaluation, with no native window involved.
-fn freshness_disposition<'a>(
-    versions: &'a PackageVersions,
-    name: &NormalizedName,
-    freshness: crate::freshness::FreshnessSettings,
+/// A view of `cached_versions` where every held package whose newest eligible version exists
+/// has that version as `latest` (with its publish time); other entries are unchanged.
+///
+/// Feeds the OSV round and the update planner the exact version that would be named or written,
+/// so it is verified and planned like any `latest`. `native_cooldowns` is
+/// [`crate::native_cooldown::native_cooldowns_by_name`] of the document.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CooldownFallback, PackageVersions, cooldown_fallback_view};
+/// use deps_core::{
+///     CooldownWindow, FreshnessSettings, NormalizedName, PublishTime, ResolvedCandidatesMap,
+/// };
+/// use std::collections::HashMap;
+/// use std::sync::Arc;
+///
+/// let name = NormalizedName::for_test("left-pad");
+/// let versions = PackageVersions::new("2.0.0".into(), Arc::from(vec!["2.0.0".into()]))
+///     .with_published_at(PublishTime::from_unix_secs(9_900))
+///     .with_cooldown_fallback(CooldownFallback::new(
+///         "1.9.0".into(),
+///         PublishTime::from_unix_secs(1_000),
+///     ));
+///
+/// let view = cooldown_fallback_view(
+///     &HashMap::from([(name.clone(), versions)]),
+///     &HashMap::new(),
+///     &ResolvedCandidatesMap::new(),
+///     &HashMap::<NormalizedName, deps_core::native_cooldown::NativeCooldown>::new(),
+///     None,
+///     FreshnessSettings::Enabled {
+///         cooldown: CooldownWindow::from_secs(500),
+///     },
+///     PublishTime::from_unix_secs(10_000),
+/// );
+///
+/// assert_eq!(view[&name].latest, "1.9.0");
+/// ```
+#[must_use]
+pub fn cooldown_fallback_view<S: std::hash::BuildHasher>(
+    cached_versions: &CachedVersionsMap,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
+    native_cooldowns: &HashMap<NormalizedName, NativeCooldown, S>,
     gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
+    freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
-) -> CooldownDisposition<'a> {
-    let crate::freshness::FreshnessSettings::Enabled { cooldown } = freshness else {
-        return CooldownDisposition::NotEvaluated;
-    };
+) -> CachedVersionsMap {
+    let version_data = VersionData::new(cached_versions, resolved_versions)
+        .with_resolved_version_candidates(resolved_version_candidates)
+        .with_now(now);
+    cached_versions
+        .iter()
+        .map(|(name, versions)| {
+            let mut substituted = versions.clone();
+            let gate = native_cooldowns
+                .get(name)
+                .map(|cooldown| NativeGate::for_name(cooldown, name, &version_data));
+            if let CooldownDisposition::Blocked { newest, .. }
+            | CooldownDisposition::NativeHeld { newest, .. } = cooldown_disposition(
+                versions,
+                name,
+                freshness,
+                gossip_prefetch,
+                gate.as_ref(),
+                now,
+            ) && let Some(candidate) = newest.candidate()
+            {
+                substituted.latest = candidate.version.clone();
+                substituted.published_at = Some(candidate.published_at);
+            }
+            (name.clone(), substituted)
+        })
+        .collect()
+}
 
-    // NFR-002 (M3): the stored fallback candidate is itself re-evaluated at read time — a
-    // cooldown window narrowed between fetch and read (or, for a long-lived LSP cache, simply
-    // enough wall-clock time passing that the fetch-time computation has gone stale in the
-    // *other* direction the caller didn't ask about) must never let a candidate that no
-    // longer clears the window keep reading as usable. This can only make the outcome
-    // stricter, never less safe — a `None` fallback stays `None`.
-    let fallback = versions.cooldown_fallback.as_ref().filter(|fallback| {
-        matches!(
-            local_cooldown_precedence(Some(fallback.published_at), cooldown, now),
-            CooldownPrecedence::Cleared
+/// What a surface that reports an outdated `latest` says when a release-age window holds it.
+///
+/// Shared by diagnostics and inlay hints, so the two cannot disagree.
+pub(crate) enum HeldOutcome<'a> {
+    /// Name the newest eligible version instead of `latest`.
+    Name {
+        version: &'a ConcreteVersion,
+        unverified: bool,
+    },
+    /// Nothing eligible is newer than what is in use, so there is nothing to report.
+    Silent,
+    /// Eligibility cannot be established: keep reporting the held `latest`.
+    ReportLatest,
+}
+
+/// Judges the newest eligible version of a held `latest` against what `dep` already uses.
+pub(crate) fn judge_held_latest<'a, F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    versions: &VersionData<'_>,
+    formatter: &F,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
+    package_versions: &PackageVersions,
+    newest: NewestEligible<'a>,
+) -> HeldOutcome<'a> {
+    let candidate = match newest {
+        NewestEligible::Eligible(candidate) => &candidate.version,
+        NewestEligible::NoneEligible => return HeldOutcome::Silent,
+        NewestEligible::Undetermined => return HeldOutcome::ReportLatest,
+    };
+    let in_use = versions.ecosystem.and_then(|ecosystem| {
+        resolve_in_use_version(
+            dep,
+            key,
+            versions.resolved_map(),
+            versions.candidates_map(),
+            formatter,
+            ecosystem,
         )
     });
-
-    match cooldown_precedence(
-        gossip_prefetch,
-        name,
-        versions.latest.as_str(),
-        versions.published_at,
-        cooldown,
-        now,
-    ) {
-        CooldownPrecedence::Cleared => CooldownDisposition::Cleared,
-        CooldownPrecedence::Blocked(by) => CooldownDisposition::Blocked { by, fallback },
+    // The list is newest-first, so a smaller position is a newer version.
+    let position = |version: &ConcreteVersion| {
+        package_versions
+            .available
+            .iter()
+            .position(|listed| listed == version)
+    };
+    let (Some(candidate_at), Some(in_use_at)) =
+        (position(candidate), in_use.as_ref().and_then(position))
+    else {
+        return HeldOutcome::ReportLatest;
+    };
+    let admitted = dep.version_requirement().is_some_and(|requirement| {
+        formatter.requirement_status_for(dep, requirement, candidate) == RequirementStatus::UpToDate
+    });
+    if candidate_at >= in_use_at || admitted {
+        return HeldOutcome::Silent;
+    }
+    // Checking is on but no fallback round ran: the candidate is unverified, never "no check needed".
+    let verdict = if versions.fallback_status.is_none() && versions.latest_status.is_some() {
+        LatestVerdict::Unverified
+    } else {
+        latest_verdict(
+            versions.fallback_status,
+            dep,
+            vuln_keys,
+            key,
+            candidate.as_str(),
+            formatter,
+        )
+    };
+    match verdict {
+        LatestVerdict::Flagged { .. } => HeldOutcome::ReportLatest,
+        LatestVerdict::Unverified => HeldOutcome::Name {
+            version: candidate,
+            unverified: true,
+        },
+        LatestVerdict::Verified | LatestVerdict::NotApplicable => HeldOutcome::Name {
+            version: candidate,
+            unverified: false,
+        },
     }
 }
 
@@ -956,14 +1183,10 @@ pub struct PackageVersions {
     /// unfiltered pick is reused instead. Purely an in-process outcome-reporting field: no
     /// wire/schema format carries it.
     pub gossip_excluded_version: Option<ConcreteVersion>,
-    /// The newest cooldown-cleared, ecosystem-safe, floor-protected candidate found for this
-    /// dependency when `latest` may be cooldown-blocked (`deps-cli update`'s fallback, spec
-    /// 075 FR-001/FR-002). Computed unconditionally whenever freshness is enabled, regardless
-    /// of whether `latest` itself is currently blocked — see [`cooldown_disposition`] for the
-    /// read-time decision of whether it is actually needed (spec 075 NFR-002). `None` when
-    /// freshness is disabled, no lockfile-resolved in-use version exists to floor the search
-    /// (spec 075 OQ1), or no candidate passed every guard.
-    pub cooldown_fallback: Option<CooldownFallback>,
+    /// Older versions that may stand in for `latest` while it is held, collected at fetch time
+    /// when the freshness cooldown is enabled or a native window is in effect. See
+    /// [`cooldown_disposition`] for the read-time pick.
+    pub cooldown_candidates: CooldownCandidates,
     /// Publish time of each entry of [`Self::available`], same order and length; empty when
     /// unknown. Window-independent data read by the native publish-age gate.
     pub publish_times: Arc<[Option<crate::freshness::PublishTime>]>,
@@ -1000,7 +1223,7 @@ impl PackageVersions {
             yanked: Arc::from(Vec::new()),
             published_at: None,
             gossip_excluded_version: None,
-            cooldown_fallback: None,
+            cooldown_candidates: CooldownCandidates::default(),
             publish_times: Arc::from(Vec::new()),
         }
     }
@@ -1076,11 +1299,20 @@ impl PackageVersions {
             .flatten()
     }
 
-    /// Attaches the computed cooldown-fallback candidate. See [`Self::cooldown_fallback`].
+    /// Attaches the candidates that may stand in for a held `latest`.
     #[must_use]
-    pub fn with_cooldown_fallback(mut self, fallback: CooldownFallback) -> Self {
-        self.cooldown_fallback = Some(fallback);
+    pub fn with_cooldown_candidates(mut self, candidates: CooldownCandidates) -> Self {
+        self.cooldown_candidates = candidates;
         self
+    }
+
+    /// Attaches a single candidate in a list that may be incomplete; for fixtures.
+    #[must_use]
+    pub fn with_cooldown_fallback(self, fallback: CooldownFallback) -> Self {
+        self.with_cooldown_candidates(CooldownCandidates::new(
+            vec![fallback],
+            CandidatesEnd::Truncated,
+        ))
     }
 
     /// Builds a `PackageVersions` from only the "latest" version string, with `available`
@@ -1115,7 +1347,7 @@ impl PackageVersions {
             yanked: Arc::from(Vec::new()),
             published_at: None,
             gossip_excluded_version: None,
-            cooldown_fallback: None,
+            cooldown_candidates: CooldownCandidates::default(),
             publish_times: Arc::from(Vec::new()),
         }
     }
@@ -1142,7 +1374,7 @@ impl PackageVersions {
             yanked: Arc::from(Vec::new()),
             published_at: None,
             gossip_excluded_version: None,
-            cooldown_fallback: None,
+            cooldown_candidates: CooldownCandidates::default(),
             publish_times: Arc::from(Vec::new()),
         }
     }
@@ -4018,8 +4250,8 @@ mod tests {
 
     // --- cooldown_disposition (spec 075 FR-004/NFR-002) ---
 
-    /// Spec 099: a native publish-age hold is reported even with freshness disabled, and keeps a
-    /// stored fallback only when that fallback itself clears the native window.
+    /// Spec 099: a native publish-age hold is reported even with freshness disabled, and names
+    /// only a candidate that itself clears the native window.
     #[test]
     fn cooldown_disposition_native_hold_is_independent_of_freshness_and_vets_the_fallback() {
         use crate::native_cooldown::{
@@ -4065,8 +4297,11 @@ mod tests {
         );
         assert_matches!(
             disposition,
-            CooldownDisposition::NativeHeld { fallback: None, .. },
-            "freshness disabled never yields a fallback, but the native hold is still reported"
+            CooldownDisposition::NativeHeld {
+                newest: NewestEligible::Eligible(_),
+                ..
+            },
+            "the native hold names a candidate even with freshness disabled"
         );
 
         let enabled = crate::freshness::FreshnessSettings::Enabled {
@@ -4075,7 +4310,7 @@ mod tests {
         assert_matches!(
             cooldown_disposition(&old_fallback, &name, enabled, None, Some(&gate), now),
             CooldownDisposition::NativeHeld {
-                fallback: Some(_),
+                newest: NewestEligible::Eligible(_),
                 ..
             }
         );
@@ -4083,8 +4318,11 @@ mod tests {
         let young_fallback = held(99_500);
         assert_matches!(
             cooldown_disposition(&young_fallback, &name, enabled, None, Some(&gate), now),
-            CooldownDisposition::NativeHeld { fallback: None, .. },
-            "a fallback inside the native window is dropped"
+            CooldownDisposition::NativeHeld {
+                newest: NewestEligible::Undetermined,
+                ..
+            },
+            "a candidate inside the native window is skipped"
         );
 
         assert_matches!(
@@ -4094,10 +4332,8 @@ mod tests {
         );
     }
 
-    /// Fix-cycle item 8 (M3/NFR-002): a stored fallback candidate is re-evaluated against
-    /// read-time `now`/cooldown window, not trusted as a fetch-time snapshot. A
-    /// fallback whose own `published_at` no longer clears a (narrower, read-time)
-    /// cooldown window must read as absent, not as a stale "still usable" answer.
+    /// Candidates are judged against the read-time `now` and window, never trusted as a
+    /// fetch-time snapshot.
     #[test]
     fn cooldown_disposition_read_time_reevaluates_the_stored_fallback() {
         let now = PublishTime::from_unix_secs(10_000);
@@ -4124,7 +4360,7 @@ mod tests {
         assert_matches!(
             disposition,
             CooldownDisposition::Blocked {
-                fallback: Some(_),
+                newest: NewestEligible::Eligible(_),
                 ..
             },
             "got: {disposition:?}"
@@ -4145,8 +4381,11 @@ mod tests {
         );
         assert_matches!(
             disposition,
-            CooldownDisposition::Blocked { fallback: None, .. },
-            "a fallback that no longer clears cooldown at read time must not be surfaced: {disposition:?}"
+            CooldownDisposition::Blocked {
+                newest: NewestEligible::Undetermined,
+                ..
+            },
+            "a candidate inside the window must not be named: {disposition:?}"
         );
     }
 

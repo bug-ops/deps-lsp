@@ -257,6 +257,7 @@ pub trait TypedEcosystem: EcosystemBase + Sized + 'static {
         &'a self,
         parsed: ParsedView<'a, Self::Parsed>,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         loading_state: crate::LoadingState,
         config: &'a EcosystemConfig,
     ) -> BoxFuture<'a, Vec<InlayHint>> {
@@ -264,6 +265,7 @@ pub trait TypedEcosystem: EcosystemBase + Sized + 'static {
             crate::lsp_helpers::generate_inlay_hints(
                 &parsed,
                 versions,
+                freshness,
                 loading_state,
                 config,
                 self.own_formatter(),
@@ -367,6 +369,7 @@ pub trait TypedEcosystem: EcosystemBase + Sized + 'static {
         parsed: ParsedView<'a, Self::Parsed>,
         content: &'a str,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         uri: &'a url::Url,
         command_id: &'a str,
     ) -> BoxFuture<'a, Vec<CodeLens>> {
@@ -375,6 +378,7 @@ pub trait TypedEcosystem: EcosystemBase + Sized + 'static {
                 &parsed,
                 content,
                 versions,
+                freshness,
                 self.own_formatter(),
                 uri,
                 command_id,
@@ -719,7 +723,8 @@ pub async fn hover<'a, E: TypedEcosystem>(
 ///     versions: VersionData<'_>,
 ///     content: &str,
 /// ) {
-///     let _ = code_actions(eco, parsed, Position::new(0, 0), uri, versions, content).await;
+///     let freshness = deps_core::FreshnessSettings::Disabled;
+///     let _ = code_actions(eco, parsed, Position::new(0, 0), uri, versions, freshness, content).await;
 /// }
 /// ```
 #[cfg(feature = "lsp-responses")]
@@ -729,6 +734,7 @@ pub async fn code_actions<'a, E: TypedEcosystem>(
     position: Position,
     uri: &'a url::Url,
     versions: VersionData<'a>,
+    freshness: crate::freshness::FreshnessSettings,
     content: &'a str,
 ) -> Vec<CodeAction> {
     let registry = eco.registry();
@@ -737,6 +743,7 @@ pub async fn code_actions<'a, E: TypedEcosystem>(
         position,
         uri,
         versions,
+        freshness,
         content,
         registry.as_ref(),
         eco.own_formatter(),

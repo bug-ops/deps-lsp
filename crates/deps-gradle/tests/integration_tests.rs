@@ -249,6 +249,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
     let hints = generate_inlay_hints(
         &parse_result,
         VersionData::new(&cached_versions, &resolved_versions),
+        deps_core::FreshnessSettings::Disabled,
         LoadingState::Loaded,
         &config,
         &formatter,

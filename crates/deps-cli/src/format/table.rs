@@ -458,6 +458,7 @@ mod tests {
         applied_instead_of_item.cooldown_fallback =
             Some(crate::update::CooldownFallbackNote::AppliedInsteadOf(
                 deps_core::ConcreteVersion::from("1.3.0\x1B[31m"),
+                crate::update::FallbackHold::Freshness,
             ));
         let plan = crate::update::UpdatePlan {
             items: vec![item, applied_instead_of_item],

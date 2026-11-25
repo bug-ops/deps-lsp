@@ -44,10 +44,26 @@ struct Fixture {
 }
 
 async fn fixture(tool_uv: &str) -> Fixture {
+    fixture_listing(tool_uv, false).await
+}
+
+/// [`fixture`], optionally listing an eligible `2.31.5` between the locked version and `latest`.
+async fn fixture_listing(tool_uv: &str, with_eligible: bool) -> Fixture {
+    let (listed, file) = if with_eligible {
+        (
+            r#""2.31.5","#,
+            format!(
+                r#"{{"filename":"requests-2.31.5.tar.gz","yanked":false,"upload-time":"{}"}},"#,
+                rfc3339(now_secs() - 30 * DAY)
+            ),
+        )
+    } else {
+        ("", String::new())
+    };
     let mut index = mockito::Server::new_async().await;
     let body = format!(
-        r#"{{"meta":{{"api-version":"1.4"}},"name":"requests","versions":["2.31.0","2.32.0"],"files":[
-        {{"filename":"requests-2.31.0.tar.gz","yanked":false,"upload-time":"{}"}},
+        r#"{{"meta":{{"api-version":"1.4"}},"name":"requests","versions":["2.31.0",{listed}"2.32.0"],"files":[
+        {{"filename":"requests-2.31.0.tar.gz","yanked":false,"upload-time":"{}"}},{file}
         {{"filename":"requests-2.32.0.tar.gz","yanked":false,"upload-time":"{}"}}]}}"#,
         rfc3339(now_secs() - 100 * DAY),
         rfc3339(now_secs() - 3 * DAY),
@@ -173,7 +189,7 @@ fn applied(plan: &UpdatePlan) -> Vec<String> {
 
 #[tokio::test]
 async fn check_names_the_uv_source_and_remaining_time() {
-    let fx = fixture("exclude-newer = \"7 days\"").await;
+    let fx = fixture_listing("exclude-newer = \"7 days\"", true).await;
     let messages = fx.check_messages().await;
     let held: Vec<_> = messages.iter().filter(|m| m.contains(NOTE)).collect();
     assert_eq!(held.len(), 1, "{messages:?}");

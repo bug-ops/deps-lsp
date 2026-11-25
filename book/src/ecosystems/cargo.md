@@ -166,9 +166,9 @@ registry rather than requiring the document to be edited or reopened first
 ## Cargo's Publish-Age Window (`min-publish-age`)
 
 Cargo can refuse releases younger than a configured age. deps-lsp reads the same settings from
-the repository's `.cargo/config.toml` files and **explains** the hold; it never proposes the
-held version, and the window itself never causes an older version to be written (a freshness
-cooldown fallback in `deps-cli update` is a separate feature).
+the repository's `.cargo/config.toml` files and **explains** the hold. It never writes the held
+version (except as a security fix) and moves you to the newest eligible one instead, as described
+in [Release-Age Holds](../cross-ecosystem/version-diagnostics.md#release-age-holds).
 
 ```toml
 # .cargo/config.toml
@@ -187,15 +187,19 @@ Values use Cargo's grammar: `<integer> <unit>` with `second`, `minute`, `hour`, 
 A malformed value is ignored with one logged warning per config file. A window above ten years is
 clamped.
 
-**What changes while `latest` is inside the window:**
+**While `latest` is inside the window:**
 
-- The *outdated* diagnostic keeps its kind, range and severity, and reads
-  `... : 3.9.0 (excluded by cargo registry.global-min-publish-age = 7 days; eligible in 4 days)`.
+- The *outdated* diagnostic names the newest eligible version and why `latest` is held, for
+  example `(3.9.0 excluded by cargo registry.global-min-publish-age = 7 days; eligible in 4 days)`.
+  There is no diagnostic when there is nothing newer to move to.
 - Hover keeps the true `Latest` line and adds a "Held back" callout naming the setting.
-- The update-all code lens, the *Update to X* refactor actions and `deps-cli update` do not offer
-  the held version; `deps-cli update` reports it as skipped (`within-native-cooldown`, exit 0).
-- A vulnerability fix is **never** moved by the window: the fix keeps its target and the quick fix
-  title notes `inside <setting>` when the target is still younger than the window.
+- `deps-cli update` writes the eligible version, or reports `within-native-cooldown` (exit 0) when
+  there is none.
+- A vulnerability fix is **never** moved by the window: the quick fix title notes
+  `inside <setting>` when the target is still younger than the window.
+
+See [Release-Age Holds](../cross-ecosystem/version-diagnostics.md#release-age-holds) for inlay
+hints, the lens and code actions.
 
 **Which versions stay eligible:** a version with no known publish time, one published at least
 the window ago (the boundary is exclusive), and any version that appears in `Cargo.lock` for that
@@ -212,10 +216,8 @@ live version list the hover and code actions use.
   by files outside it and your own settings are not guessed at.
 - A `registry-index` URL dependency gets only the global key (it has no name to key on). Git and
   path dependencies have no window.
-- The window is explain-only. Inlay hints are display-only and still name the true latest
-  version, and the diagnostic and the code lens read the last fetched list while hover and code
-  actions read a fresh one, so right after a new release they can briefly name different
-  versions.
+- The diagnostic and the code lens read the last fetched version list while hover and code
+  actions read a fresh one, so right after a new release they can briefly name different versions.
 - A same-version git or path lock entry also keeps the registry release eligible (the lock maps
   do not record sources).
 - A malformed value is ignored (with one warning per config file naming the file, the count and

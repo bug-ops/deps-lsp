@@ -178,9 +178,9 @@ whether the file declares an explicit `--index-url` primary:
 ## uv's Release-Age Window (`exclude-newer`)
 
 uv can ignore releases newer than a configured age or instant. deps-lsp reads the same settings
-from the repository's `uv.toml` and `[tool.uv]` tables and **explains** the hold the same way it
-does for Cargo's `min-publish-age` (hover callout, `outdated` diagnostic note, no update offered
-for the held version, `deps-cli update` skips it); it never writes an older version because of it.
+from the repository's `uv.toml` and `[tool.uv]` tables and treats a `latest` inside it the same
+way as Cargo's `min-publish-age`: it explains the hold and moves to the newest eligible version,
+see [Release-Age Holds](../cross-ecosystem/version-diagnostics.md#release-age-holds).
 
 ```toml
 # pyproject.toml ([tool.uv]) or uv.toml (top level)

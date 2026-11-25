@@ -79,6 +79,80 @@ fn explicit_config_flag_still_loads_its_file_when_the_checked_file_is_named_deps
     );
 }
 
+#[test]
+fn skipping_a_walked_default_file_declared_as_a_catalog_is_announced() {
+    let (_dir, root) = project();
+    std::fs::write(root.join("settings.gradle.kts"), SETTINGS_DEPS).expect("settings");
+    std::fs::write(root.join("gradle/deps.toml"), CATALOG).expect("catalog");
+
+    let output = check(&root, &["gradle/"]);
+
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("was not loaded as configuration"),
+        "{stderr}"
+    );
+}
+
+/// A project whose root `deps.toml` is a declared version catalog.
+fn root_catalog_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (dir, root) = project();
+    std::fs::write(
+        root.join("settings.gradle.kts"),
+        "versionCatalogs { create(\"deps\") { from(files(\"deps.toml\")) } }\n",
+    )
+    .expect("settings");
+    std::fs::write(root.join("deps.toml"), CATALOG).expect("catalog");
+    (dir, root)
+}
+
+fn assert_catalog_skipped_as_config(output: &Output) {
+    let stderr = stderr(output);
+    assert!(!stderr.contains(CONFIG_ERROR), "{stderr}");
+    assert!(
+        stderr.contains("was not loaded as configuration"),
+        "{stderr}"
+    );
+    assert_ne!(output.status.code(), Some(2), "{stderr}");
+}
+
+#[test]
+fn several_walk_paths_do_not_load_a_root_catalog_as_config() {
+    let (_dir, root) = root_catalog_project();
+    for sub in ["a", "b"] {
+        std::fs::create_dir_all(root.join(sub)).expect("walk path");
+        std::fs::write(
+            root.join(sub).join("Cargo.toml"),
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+    }
+
+    assert_catalog_skipped_as_config(&check(&root, &["a", "b"]));
+}
+
+#[test]
+fn a_single_manifest_path_does_not_load_a_root_catalog_as_config() {
+    let (_dir, root) = root_catalog_project();
+
+    assert_catalog_skipped_as_config(&check(&root, &["settings.gradle.kts"]));
+}
+
+#[test]
+fn a_root_outside_the_working_directory_bounds_the_config_probe() {
+    let (_dir, root) = project();
+    std::fs::create_dir_all(root.join("proj/app")).expect("project");
+    std::fs::create_dir_all(root.join("elsewhere")).expect("cwd");
+    std::fs::write(
+        root.join("proj/app/settings.gradle.kts"),
+        "versionCatalogs { create(\"deps\") { from(files(\"../deps.toml\")) } }\n",
+    )
+    .expect("settings");
+    std::fs::write(root.join("proj/deps.toml"), CATALOG).expect("catalog");
+
+    assert_catalog_skipped_as_config(&check(&root.join("elsewhere"), &["../proj"]));
+}
+
 #[cfg(unix)]
 mod unix_file_identity {
     use super::*;

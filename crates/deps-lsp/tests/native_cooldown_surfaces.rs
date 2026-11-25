@@ -481,8 +481,14 @@ async fn hover_names_the_window_and_remaining_time_and_keeps_the_true_latest() {
 
 #[tokio::test]
 async fn outdated_diagnostic_names_the_native_source_and_keeps_its_kind_and_range() {
-    let held = fixture(Setup::new(Some(WINDOW_7D), 3 * DAY)).await;
-    let plain = fixture(Setup::new(None, 3 * DAY)).await;
+    // 3.8.5 gives the held 3.9.0 an eligible stand-in, so the diagnostic still has a subject.
+    let with_eligible = |config| {
+        let mut setup = Setup::new(config, 3 * DAY);
+        setup.versions.insert(1, ("3.8.5", 50 * DAY));
+        setup
+    };
+    let held = fixture(with_eligible(Some(WINDOW_7D))).await;
+    let plain = fixture(with_eligible(None)).await;
     let held_diags = held.diagnostics().await;
     let plain_diags = plain.diagnostics().await;
     assert_eq!(held_diags.len(), plain_diags.len());
@@ -492,7 +498,10 @@ async fn outdated_diagnostic_names_the_native_source_and_keeps_its_kind_and_rang
     assert_eq!(h["code"], p["code"]);
     let msg = h["message"].as_str().expect("message");
     assert!(
-        msg.contains("3.9.0") && msg.contains(HELD_NOTE) && msg.contains("eligible in"),
+        msg.contains("3.8.5")
+            && msg.contains("3.9.0")
+            && msg.contains(HELD_NOTE)
+            && msg.contains("eligible in"),
         "{msg}"
     );
 }

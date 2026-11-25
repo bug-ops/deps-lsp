@@ -116,6 +116,9 @@ pub struct DenoParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// `imports` entries that are not a usable value or a malformed `jsr:`/`npm:` specifier
+    /// (#2181), read by [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
     /// Every `.npmrc`-resolved alternate registry index an `npm:`-scheme import classified
     /// against (#1227) — the `deno.json` counterpart of
     /// `deps_npm::parser::NpmParseResult::resolved_registries`. Consumed by
@@ -133,6 +136,7 @@ deps_core::impl_parse_result!(
         dependencies: dependencies,
         uri: uri,
         dependency_truncation: dependency_truncation,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -207,6 +211,7 @@ pub fn parse_deno_json_with_context(
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
+    let mut invalid_declarations = Vec::new();
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     if let Some(Value::Object(root)) = root
@@ -218,6 +223,7 @@ pub fn parse_deno_json_with_context(
             content,
             &line_table,
             &mut dependencies,
+            &mut invalid_declarations,
             &mut budget,
         );
     }
@@ -228,6 +234,7 @@ pub fn parse_deno_json_with_context(
         dependencies,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
         resolved_registries,
     })
 }
@@ -301,10 +308,13 @@ fn collect_imports(
     content: &str,
     line_table: &LineOffsetTable,
     out: &mut Vec<DenoDependency>,
+    invalid: &mut Vec<deps_core::InvalidDeclarationOccurrence>,
     budget: &mut deps_core::DependencyBudget,
 ) {
     let mut seen_aliases = HashSet::new();
     let mut collected = Vec::new();
+    let mut invalid_budget =
+        deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     // Walk in reverse (last occurrence first) so the first alias we see for a given key
     // is the one that wins; earlier (source-order) duplicates are then skipped.
@@ -313,20 +323,44 @@ fn collect_imports(
         if !seen_aliases.insert(alias.to_string()) {
             continue;
         }
-        let Value::StringLit(value_lit) = &prop.value else {
-            continue;
+        let reason = match &prop.value {
+            // A `null` import deliberately blocks resolution, so it is not a declaration.
+            Value::NullKeyword(_) => continue,
+            Value::StringLit(value_lit) => {
+                if !budget.allow() {
+                    continue;
+                }
+                if let Some(dep) = build_dependency(value_lit, content, line_table) {
+                    collected.push(dep);
+                    continue;
+                }
+                // A URL, a path, a bare alias, or a directory mapping (`npm:/preact@10/`) is
+                // not a malformed registry dependency.
+                if crate::specifier::split_scheme(&value_lit.value)
+                    .is_none_or(|(_, rest)| rest.starts_with('/'))
+                {
+                    continue;
+                }
+                deps_core::InvalidDeclarationReason::MalformedCoordinate
+            }
+            _ => {
+                if !invalid_budget.allow() {
+                    continue;
+                }
+                deps_core::InvalidDeclarationReason::UnsupportedValue
+            }
         };
-        if !budget.allow() {
-            continue;
-        }
-        if let Some(dep) = build_dependency(value_lit, content, line_table) {
-            collected.push(dep);
-        }
+        invalid.push(deps_core::InvalidDeclarationOccurrence {
+            range: byte_span_to_range(content, line_table, prop.range.start, prop.range.end),
+            key: alias.to_string(),
+            reason,
+        });
     }
 
     // Restore source order for the surviving (deduplicated) entries.
     collected.reverse();
     out.extend(collected);
+    invalid.reverse();
 }
 
 /// Builds a [`DenoDependency`] from one `imports` value's string literal, or `None` if the
@@ -1061,5 +1095,48 @@ mod tests {
         for dep in &result.dependencies {
             assert_eq!(dep.source, deps_core::parser::DependencySource::Registry);
         }
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_unusable_imports_are_reported_but_non_registry_ones_are_not() {
+        let result = parse_deno_json(
+            r#"{"imports": {"a": 5, "b": "npm:@/x", "c": null, "d": "./local.ts", "e": "https://x.test/m.ts"}}"#,
+            &deps_core::test_util::test_uri("/p/deno.json"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reported(&result),
+            [
+                (
+                    "a".to_owned(),
+                    deps_core::InvalidDeclarationReason::UnsupportedValue
+                ),
+                (
+                    "b".to_owned(),
+                    deps_core::InvalidDeclarationReason::MalformedCoordinate
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_directory_mappings_of_a_registry_package_are_not_malformed() {
+        let result = parse_deno_json(
+            r#"{"imports": {"preact/": "npm:/preact@10/", "@std/": "jsr:/@std/fs@1/"}}"#,
+            &deps_core::test_util::test_uri("/p/deno.json"),
+        )
+        .unwrap();
+
+        assert_eq!(reported(&result), []);
     }
 }

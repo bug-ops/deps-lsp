@@ -3353,6 +3353,7 @@ mod tests {
                 Position::new(2, 11),
                 &uri,
                 deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;
@@ -3502,6 +3503,7 @@ mod tests {
                 &parse_result,
                 content,
                 deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 &eco.formatter,
             );
             let planned: Vec<(u32, &str)> = edits
@@ -3580,6 +3582,7 @@ mod tests {
                 &parse_result,
                 &content,
                 versions(),
+                deps_core::FreshnessSettings::Disabled,
                 &eco.formatter,
             );
             let mut edit_lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
@@ -3592,6 +3595,7 @@ mod tests {
                 .inlay_hints(
                     ParsedView::new(&parse_result),
                     versions(),
+                    deps_core::FreshnessSettings::Disabled,
                     deps_core::LoadingState::Loaded,
                     &deps_core::EcosystemConfig::default(),
                 )
@@ -3628,6 +3632,7 @@ mod tests {
                     Position::new(line, sha_column as u32 + 1),
                     &uri,
                     versions().with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::Disabled,
                     &content,
                 )
                 .await;
@@ -3695,6 +3700,7 @@ mod tests {
                     &self.parse_result,
                     &self.content,
                     deps_core::VersionData::new(&self.cached, &resolved),
+                    deps_core::FreshnessSettings::Disabled,
                     &self.eco.formatter,
                 )
             }

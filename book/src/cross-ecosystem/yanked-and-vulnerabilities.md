@@ -316,7 +316,8 @@ compatibility line (same major, or same major and minor for `0.x`) that carries 
 flag, is no newer than the registry's latest, and is not a release GOSSIP excluded. The registry's
 latest release is also skipped while it is still inside the default three-day release
 cooldown (publish times are known for the latest release only). If no such release exists the
-original target is kept. The steered release is verified against OSV like any other target; if
+original target is kept. A [release-age window](version-diagnostics.md#release-age-holds) never moves
+the fix target: if the target is still inside one, the title says so. The steered release is verified against OSV like any other target; if
 it fails verification, the action is omitted rather than falling back to the deprecated
 version. The code action steers from the registry data cached at request time while the OSV
 verification used the data from the last scan; if the two disagree, the action is omitted

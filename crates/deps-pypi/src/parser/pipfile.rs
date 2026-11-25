@@ -67,6 +67,7 @@ impl PypiParser {
             uv_named_by_dep: &no_uv_bindings,
             blocked_registries: RefCell::new(Vec::new()),
             rejected_registries: RefCell::new(Vec::new()),
+            invalid_declarations: RefCell::new(Vec::new()),
         };
 
         let mut dependencies = Vec::new();
@@ -100,6 +101,7 @@ impl PypiParser {
             blocked_registries: ctx.blocked_registries.into_inner(),
             rejected_registries: ctx.rejected_registries.into_inner(),
             dependency_truncation: budget.truncation(),
+            invalid_declarations: ctx.invalid_declarations.into_inner(),
         })
     }
 }

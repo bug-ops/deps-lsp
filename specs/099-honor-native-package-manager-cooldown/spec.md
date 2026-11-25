@@ -34,7 +34,7 @@ related:
 > **Type / priority**: research / parity (enhancement), P3, cross-ecosystem (`deps-core`, `deps-cargo`, `deps-npm`, `deps-pypi`, `deps-cli`)
 > **Issue**: #1982 (labels `enhancement`, `research`, `P3`, `cross-ecosystem`)
 > **Related issues**: #1569 (open, P4: installer-level cooldown for auto-following ecosystems), #1964 (untrusted-repository config must not hide advisories)
-> **Phase**: Phases 1 to 4 implemented (Cargo PR #2043; npm, pnpm, Bun and uv PR #2055; Yarn, uv index-level and advisory tests PR #2068). Open `[NEEDS CLARIFICATION]`: 1 (item 8, only for Maven, Gradle, NuGet, Composer, Bundler and Go; items 1 to 7 resolved below, Dart and Swift verified in spec 102).
+> **Phase**: Phases 1 to 4 implemented (Cargo PR #2043; npm, pnpm, Bun and uv PR #2055; Yarn, uv index-level and advisory tests PR #2068). Eligible version under a held latest (#2190, #2191): implemented, PR pending. Open `[NEEDS CLARIFICATION]`: 1 (item 8, only for Maven, Gradle, NuGet, Composer, Bundler and Go; items 1 to 7 resolved below, Dart and Swift verified in spec 102).
 
 > [!abstract]
 > deps-lsp's freshness signal (hover "recently published" callout, diagnostics, update code actions, `deps-cli update` fallback) is driven only by `freshness.cooldown_secs` (default 3 days). Since 2025-2026 every major package manager ships its own release-age gate (Cargo `min-publish-age`, npm `min-release-age`, pnpm `minimumReleaseAge`, Yarn `npmMinimalAgeGate`, Bun `minimumReleaseAge`, uv `exclude-newer`), but deps-lsp never reads them. The editor can therefore recommend a version the project's own resolver will refuse. This spec makes the native window an input to the effective freshness window, explains the reason in the UI, and keeps the untrusted-repository threat model intact: a native window may delay a recommended upgrade, but never hides a vulnerability diagnostic.
@@ -91,7 +91,7 @@ GIVEN .cargo/config.toml with [registry] global-min-publish-age = "7 days"
 WHEN the user hovers the dependency or requests code actions
 THEN the hover callout says the version is excluded by "cargo registry.global-min-publish-age = 7 days"
   AND no plain "Update to <that version>" action is offered
-  AND the newest eligible version is the one proposed (Phase 2; see Phase 1 resolution)
+  AND the newest eligible version is the one proposed (FR-021, FR-023)
 ```
 
 ### US-002: npm and pnpm project with a release-age gate
@@ -144,12 +144,12 @@ SO THAT I can fall back to `freshness.cooldown_secs` only.
 
 ## 3. Functional Requirements
 
-Terminology: **native window** is the duration derived from the project's own package-manager config; **effective window** is the duration deps-lsp applies to a given dependency; **source** is the human-readable name of the setting that produced it.
+Terminology: **native window** is the duration derived from the project's own package-manager config; **effective window** is the duration deps-lsp applies to a given dependency; **source** is the human-readable name of the setting that produced it. `latest` is **held** when a native window (**native hold**) or the freshness cooldown, local or GOSSIP (**freshness hold**), excludes it; the native hold takes precedence in the explanation. The **newest eligible version** (`e`) is the first version, in the registry's newest-first order, that is older than `latest`, newer than the in-use floor, has a known publish time and is cleared by both the freshness cooldown (when enabled) and the native window.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN an ecosystem's manifest scope declares a native release-age window THE SYSTEM SHALL compute the effective window for each dependency in that scope from the native window and `freshness.cooldown_secs`, using the rule fixed by `[NEEDS CLARIFICATION]` item 3. | must |
-| FR-002 | WHEN a version's publish time is younger than the effective window and the window comes from a native source THE SYSTEM SHALL treat that version as ineligible for "latest" in hover, update code actions, the "Update N outdated" lens and `deps-cli update`, and SHALL propose the newest eligible version instead. **Phase 1 narrows this to explain-only: the held version is named and never proposed, and no older version is proposed in its place.** | must |
+| FR-002 | WHEN a version is held THE SYSTEM SHALL NOT write it, except a security-fix target (FR-019); `check`, LSP diagnostics and inlay hints SHALL be judged against the newest eligible version (FR-021, FR-024) and `deps-cli update` SHALL propose it (FR-023). Hover stays advisory. The bulk lens follows the lens exception below. | must |
 | FR-003 | WHEN a version is excluded by a native window THE SYSTEM SHALL state the source in the hover callout and the diagnostic message, in the form `excluded by <tool> <setting> = <value>`. | must |
 | FR-004 | WHEN the native window comes from Cargo THE SYSTEM SHALL read `[registry] global-min-publish-age`, the matching `[registries.<name>] min-publish-age`, and `[resolver] incompatible-publish-age` from the `.cargo/config.toml` hierarchy already used for registry configuration, and SHALL apply the window only when `incompatible-publish-age` resolves to `deny`. | must |
 | FR-005 | WHEN a Cargo dependency resolves to a registry without publish-time data, or is a git or path dependency THE SYSTEM SHALL NOT apply a native window to it. | must |
@@ -163,8 +163,47 @@ Terminology: **native window** is the duration derived from the project's own pa
 | FR-013 | WHERE the user sets the opt-out configuration THE SYSTEM SHALL ignore all native windows and apply only `freshness.cooldown_secs`. | must |
 | FR-014 | WHEN a native setting is present but malformed, out of range, or in an unsupported unit THE SYSTEM SHALL ignore that setting, fall back to `freshness.cooldown_secs`, and log one `tracing` warning naming the file and key, without failing the document load. | must |
 | FR-015 | WHEN a native config file changes on disk (`.cargo/config.toml`, `.npmrc`, `pnpm-workspace.yaml`, `pyproject.toml`, `uv.toml`) THE SYSTEM SHALL recompute affected documents through the existing watched-file reparse path. | should |
-| FR-016 | WHEN `deps-cli update` computes its cooldown fallback THE SYSTEM SHALL apply the same effective window as the LSP for the same manifest, so both interfaces produce identical edits. | must |
+| FR-016 | WHEN `deps-cli update` computes its cooldown fallback THE SYSTEM SHALL apply the same effective window as the LSP for the same manifest, so both interfaces produce identical edits, except that the LSP bulk lens skips held dependencies (lens exception below). | must |
 | FR-017 | WHEN the native tool's per-package exemption matches a dependency THE SYSTEM SHALL use only `freshness.cooldown_secs` for that dependency. | should |
+| FR-018 | WHEN a version is held THE SYSTEM SHALL NOT write it through the "Update N outdated" lens or its command, and SHALL NOT offer a refactor action "Update to <that version>"; the lens count SHALL exclude held dependencies. A held dependency SHALL be a typed planner outcome that keeps current and target and is never written; an OSV `Flagged` or `Unverified` outcome takes precedence. For refactor actions an unknown publish time counts as eligible, and publish times stored at fetch time are used when the registry's version list lacks them. The lens command SHALL plan from the same inputs as the lens, so it never writes an OSV-flagged or not-yet-verified `latest`. With no window in effect, planned edits and actions are unchanged apart from that OSV rule. | must |
+| FR-019 | WHEN a vulnerability fix target is held THE SYSTEM SHALL keep the target unchanged and name the hold in the action title: `inside <source>` for a native hold (wins when both apply), else `published <age> ago, inside the release cooldown` whenever the target's publish time is known (GOSSIP holds included). Only for a GOSSIP hold without a known publish time is the suffix exactly `; inside the release cooldown (deps.dev/GOSSIP)`. | must |
+| FR-020 | WHEN `latest` is held THE SYSTEM SHALL NOT offer the unsatisfiable-requirement fix that would write it. | must |
+| FR-021 | WHEN `latest` is held and its OSV verdict is `Verified` or `NotApplicable` THE SYSTEM SHALL decide the outdated diagnostic per the FR-021 table below, identically in `deps-cli check` and the LSP for the same data. | must |
+| FR-022 | WHEN a diagnostic or an update would name or write `e` THE SYSTEM SHALL verify `e` against OSV on both surfaces, in a verdict map separate from the one for `latest`. With OSV checking on and no verdict round for `e`, `e` counts as unverified. In the LSP the round shares the phase-B deadline and is committed under the same content and generation guard as the `latest` verdicts; a cut round, or an `e` re-picked after the last scan, shows the unverified suffix until the next scan. | must |
+| FR-023 | WHEN `latest` is held and `e` exists THE SYSTEM SHALL let `deps-cli update` propose it through the existing fallback pipeline ([[075-cli-update-cooldown-fallback/spec\|075]] and [[076-cli-update-cooldown-fallback-no-lockfile/spec\|076]] guards unchanged, including exit 1 for a flagged or unverified fallback), under a native hold as well as a freshness hold, and under a native hold whether or not the freshness cooldown is enabled. The update reason SHALL name the native window when it caused the hold. Held items that are not written SHALL report current and target in table, JSON and PR body. | must |
+| FR-024 | WHEN `latest` is held THE SYSTEM SHALL derive the inlay hint from the FR-021 decision per the FR-024 table below. | must |
+
+### FR-021 decision table
+
+| Case | Result |
+|------|--------|
+| `e` exists, is newer than the in-use version (lock file or concrete pin), is not admitted by the requirement, and is not OSV `Flagged` | Diagnostic names `e` and says why `latest` is held; suffix `(not yet verified against OSV)` when `e` is `Unverified` |
+| `e` is not newer than the in-use version, or is admitted by the requirement, or no eligible version exists | No outdated diagnostic (no `check` finding) |
+| Eligibility cannot be determined, the in-use version is unknown, or `e` is `Flagged` | The previous message for the held `latest` |
+
+A `Flagged` or `Unverified` `latest` is unchanged. Vulnerability diagnostics are unaffected (FR-011).
+
+Eligibility cannot be determined when: a range requirement has no lock-file version; an undated entry precedes the answer; the candidate list was cut (128 entries) or ended on an ecosystem-unsafe pick; the in-use floor cannot be located; or `latest` is not in the version list (for example a Go pseudo-version).
+
+> [!note] Ordering limit
+> "Newest" is the registry's newest-first list order, not a separate version comparison.
+
+### FR-024 inlay hints
+
+| FR-021 outcome | Inlay hint |
+|----------------|------------|
+| Diagnostic names `e` | Needs-update hint with `e`; tooltip `<latest> is held: <window>`, plus `not yet verified against OSV` when `e` is `Unverified` |
+| No outdated diagnostic | Up to date |
+| Previous message (undetermined, unknown in-use version, `e` flagged) | As before |
+
+A `Flagged` or `Unverified` `latest` is unchanged. Hover stays advisory.
+
+The up-to-date hint is shown only when up-to-date hints are enabled. A held `latest` whose `e` is admitted by the requirement but newer than the lock file reads up to date (the FR-021 verdict), while an unheld `latest` in the same lock-behind position reads as needing an update.
+
+### Lens exception
+
+> [!warning] Exception to FR-002 and FR-016
+> The LSP bulk lens skips a held dependency, while `deps-cli update` may write its newest eligible version, so the two edit sets can differ for held dependencies only. Code actions still offer eligible versions among their listed targets. Follow-up: #2192 (P3).
 
 ## 4. Non-Functional Requirements
 
@@ -173,11 +212,11 @@ Terminology: **native window** is the duration derived from the project's own pa
 | NFR-001 | Security (untrusted repository) | Native config is repository-controlled input. A hostile config may only lengthen or shorten the delay of a non-security recommendation; it SHALL NOT suppress any diagnostic, alter any edit target to an unlisted version, or cause network access. See #1964 and the `vulnerability` suppression rule of [[094-lsp-per-package-diagnostic-suppression/spec|094]]. |
 | NFR-002 | Security (bounded reads) | Every native config read SHALL go through `deps-core::fs_probe::read_to_string_capped` and the existing ancestor search bound `MAX_CONFIG_ANCESTOR_DEPTH`; unbounded or TOCTOU-prone reads are not permitted. Ancestor files SHALL be cached through `mtime_cache`. |
 | NFR-003 | Security (resource) | A window value SHALL be clamped to a documented maximum so an absurd value (for example a 10^12 day count) cannot overflow duration arithmetic; overflow SHALL fall back per FR-014. |
-| NFR-004 | Network | The feature SHALL add no deps.dev or OSV request. For Cargo and PyPI it consumes publish times already returned with the version list. For npm, pnpm and Bun, WHEN a native window applies THE SYSTEM SHALL fetch the full package document (the one the freshness signal already fetches; same cache, timeout and size limits), including for `.npmrc`-declared registries through the workspace-gated transport, even with freshness disabled (user-approved exception, #2041). With no native config the request count is unchanged. Where a registry response lacks a publish time, the window does not apply (FR-005). |
+| NFR-004 | Network | The feature SHALL add no deps.dev request, and one additional OSV round only when an eligible version would be named or written (FR-022). GOSSIP is not consulted when candidates are collected at fetch time. For Cargo and PyPI it consumes publish times already returned with the version list. For npm, pnpm and Bun, WHEN a native window applies THE SYSTEM SHALL fetch the full package document (the one the freshness signal already fetches; same cache, timeout and size limits), including for `.npmrc`-declared registries through the workspace-gated transport, even with freshness disabled (user-approved exception, #2041). With no native config the request count is unchanged. Where a registry response lacks a publish time, the window does not apply (FR-005). |
 | NFR-005 | Performance | Hover and completion SHALL remain non-blocking; native windows are resolved at document load or reparse and cached, not on the request path. |
 | NFR-006 | Type safety | The native window, its source and the opt-out SHALL be dedicated types (a duration newtype, an enum of sources that is exhaustive and without a catch-all `_` arm), not raw `u64` seconds or `String` labels. |
 | NFR-007 | Consistency | The same scenario SHALL give the same hover, diagnostic and action behavior across Cargo, npm/pnpm and uv, differing only in the source label. |
-| NFR-008 | Compatibility | With no native config present, output SHALL be byte-identical to current behavior; existing snapshots SHALL not change. |
+| NFR-008 | Compatibility | With no native config, the native-window feature itself SHALL leave output unchanged. Freshness holds change outdated diagnostics (FR-021), inlay hints (FR-024), lens edits and counts, and refactor and fix actions (FR-018 to FR-020), with or without native config. |
 | NFR-009 | Documentation | The mdBook ecosystem pages for the covered ecosystems and the configuration reference SHALL document the behavior and the opt-out. |
 
 ## 5. Data Model
@@ -216,7 +255,7 @@ Terminology: **native window** is the duration derived from the project's own pa
 |----|--------|--------|
 | SC-001 | The 2026-11-09 repro (`rmcp = "=3.8.0"`, `global-min-publish-age = "7 days"`) no longer yields a plain `Update to 3.9.0` for a non-security case, and names the native source | 100% |
 | SC-002 | Per-ecosystem live checks (Cargo, npm, pnpm, uv) where the proposed version matches what the real tool resolves | 100% of verified fixtures |
-| SC-003 | Projects with no native config produce unchanged output | 0 snapshot diffs |
+| SC-003 | Projects with no native config and no held version produce unchanged output | 0 snapshot diffs for those cases |
 | SC-004 | Vulnerability diagnostics emitted with a hostile native window set | identical to the no-config run |
 | SC-005 | Added network requests per document load | 0 with no native config; with an npm-family window, one full-document request per package, bounded by the freshness cache |
 | SC-006 | Duplicate window-parsing or duration-normalization code across ecosystem crates | 0 (single `deps-core` implementation) |
@@ -269,11 +308,11 @@ Each phase ships behind the same opt-out and updates `.local/testing/coverage.md
 
 Resolved open questions and the shape that shipped:
 
-- **Item 3 (effective window):** the native window decides eligibility and the explanation; `freshness.cooldown_secs` keeps its advisory role unchanged. The native hold is independent of `freshness.enabled`.
+- **Item 3 (effective window):** the native window decides eligibility and the explanation; `freshness.cooldown_secs` also decides the outdated diagnostic, inlay hints and what the lens and code actions may write (FR-018 to FR-024); hover stays advisory. The native hold is independent of `freshness.enabled`.
 - **Item 4 (security fixes):** a fix inside the window is listed with its target unchanged, and annotated `inside <source>` (quick fix title, `deps-cli update --security-only` reason). The window never moves a fix target.
 - **Item 5 (Cargo version):** the window applies whenever configured; the installed Cargo version is not detected.
 - **Item 7 (surface and environment):** boolean opt-out `freshness.honor_native_cooldown` (default `true`). Only repository-level `.cargo/config.toml` files from the manifest directory up to the workspace root are read (the manifest directory alone without a workspace root); `~/.cargo/config.toml`, `$CARGO_HOME/config.toml` and `CARGO_*` environment variables are never read.
-- **Narrowed FR-002 / US-001:** explain-only. A held `latest` is never proposed and nothing older is proposed in its place; a version in `Cargo.lock` stays eligible.
+- **FR-002 / US-001:** the Phase 1 explain-only narrowing is superseded by FR-018 to FR-024 (#2190, #2191); a version in `Cargo.lock` stays eligible.
 - **Read-time gate:** per-version publish times (`PackageVersions::publish_times`) are stored window-independently; the gate runs at read time against the lock maps and one instant (`VersionData::now`), so a `Cargo.lock` change or a release published after the fetch is judged correctly without a refetch.
 
 ### Phase 2 resolution (npm, pnpm, Bun, #2041)
@@ -307,6 +346,13 @@ Resolved open questions and the shape that shipped:
 - **Test seam (#2053):** `EcosystemRuntime::with_{npm,pypi}_public_base_for_test` (feature `test-util`) registers the npm/PyPI registry with a mock public base, so CLI tests reach OSV; the base is passed without a trailing slash.
 
 **F1 (Phase 2 follow-up):** steering a recommended fix past a held version (`steer_past_deprecated`) is not implemented, because Cargo never reports `AdvisoryDeprecated`. When another ecosystem needs it, the native steer filter must be applied identically in deps-engine `resolve_fix_target` and every `FixTargetContext` site, or the fix-target verifier and the action desync and a hostile window could hide a fix.
+
+### Eligible version under a held latest (#2190, #2191)
+
+- Fetch time stores a bounded, newest-first candidate list (at most 128 entries, collected within a bounded number of selection turns); `e` is picked at read time. A native window collects candidates even with freshness disabled.
+- An ecosystem-unsafe pick ends the list with no retry past it ([[075-cli-update-cooldown-fallback/spec|075]] FR-001); `deps-cli check` now runs the fallback OSV round.
+- The Phase 1 "within native cooldown" unplannable outcome is replaced by the held planner outcome (FR-018).
+- Change record: [[099-honor-native-package-manager-cooldown/changes/archive/2026-11-25-eligible-version-under-hold|delta, 2026-11-25]].
 
 ## 11. See Also
 

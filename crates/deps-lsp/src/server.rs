@@ -12,9 +12,11 @@ use crate::document::{
     trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
+use crate::handlers::code_lens::{UpdateAllPolicy, update_all_edits};
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
+use deps_core::gradle_layout::GradleSettingsFile;
 use deps_core::lsp_helpers::exemption::{
     ExemptionFile, OperatorExemptions, UserConfigLookup, WorkspaceRoots,
 };
@@ -87,6 +89,16 @@ mod commands {
 ///
 /// Folders added after `initialize` are not tracked (spec 101 residual risk).
 fn initialize_workspace_roots(params: &InitializeParams) -> Vec<std::path::PathBuf> {
+    initialize_workspace_folders(params)
+        .into_iter()
+        .chain(std::env::current_dir().ok())
+        .collect()
+}
+
+/// The directories the client declared: `workspaceFolders` and the deprecated `rootUri` /
+/// `rootPath`. Unlike [`initialize_workspace_roots`] it leaves out the server's own working
+/// directory, which is not a project the user opened.
+fn initialize_workspace_folders(params: &InitializeParams) -> Vec<std::path::PathBuf> {
     #[expect(deprecated, reason = "older clients only send rootUri / rootPath")]
     let (root_uri, root_path) = (params.root_uri.as_ref(), params.root_path.as_ref());
     let uri_path = |uri: &Uri| {
@@ -99,7 +111,6 @@ fn initialize_workspace_roots(params: &InitializeParams) -> Vec<std::path::PathB
         .filter_map(|folder| uri_path(&folder.uri))
         .chain(root_uri.and_then(uri_path))
         .chain(root_path.map(std::path::PathBuf::from))
-        .chain(std::env::current_dir().ok())
         .collect()
 }
 
@@ -430,6 +441,7 @@ struct ConfigSideEffects {
     license_policy: deps_core::LicensePolicy,
     typosquat_checks: TyposquatChecks,
     gossip_checks: GossipChecks,
+    freshness: deps_core::FreshnessSettings,
     /// Issue #1517 critique S5: `vulnerabilities_enabled && !offline`, the same effective
     /// condition `document::lifecycle`'s phase-A spawn gate and every renderer's
     /// `with_latest_status` attach already check (critique S3).
@@ -461,6 +473,7 @@ impl ConfigSideEffects {
             license_policy: config.policy.license_policy.to_policy(),
             typosquat_checks: config.policy.typosquat_checks(),
             gossip_checks: config.policy.gossip_checks(),
+            freshness: config.policy.freshness.to_freshness(),
             osv_checks: config.policy.osv_checks(),
             #[cfg(feature = "swift")]
             fetch_timeout: config.policy.cache.fetch_timeout,
@@ -646,6 +659,8 @@ impl Backend {
         self.state.set_typosquat_checks(effects.typosquat_checks);
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
         self.state.set_gossip_checks(effects.gossip_checks);
+        // Read by phase B, which has no config handle of its own.
+        self.state.set_freshness(effects.freshness);
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
         self.state.set_osv_checks(effects.osv_checks);
         notices
@@ -815,11 +830,11 @@ impl Backend {
         .await
         {
             Ok(ChangeOutcome::Committed(change)) => {
-                // Registered only if the document is still the open the change committed
-                // against: a close or reopen that raced it must neither keep nor cancel this
-                // task's replacement (#2022).
+                // Registered only if this commit is still the document's current one: a close,
+                // reopen or newer edit that raced it must neither keep this task nor cancel
+                // theirs (#2022, #2184).
                 self.state
-                    .register_change_task(uri, change.task, change.epoch)
+                    .register_change_task(uri, change.task, change.stamp)
                     .await;
             }
             Ok(ChangeOutcome::Dropped(CommitRefusal::Untracked)) => {
@@ -1108,6 +1123,8 @@ impl Backend {
                 requires_dedicated_fetch: ecosystem_impl
                     .license_source()
                     .requires_dedicated_fetch(),
+                // A lock-file change has no manifest edit of its own to owe a fetch for.
+                license_refresh: crate::document::LicenseRefresh::Settled,
             },
         );
 
@@ -1438,6 +1455,8 @@ impl LanguageServer for Backend {
             );
         }
 
+        self.state
+            .set_workspace_folders(initialize_workspace_folders(&params));
         let roots = initialize_workspace_roots(&params);
         let exemption_config_dir = self.exemption_config_dir.clone();
         let (exemptions, exemption_warning) = tokio::task::spawn_blocking(move || {
@@ -1532,6 +1551,19 @@ impl LanguageServer for Backend {
         // would permanently burn one of only 4 concurrent message slots.
         let mut patterns = self.state.ecosystem_registry.all_lockfile_patterns();
         patterns.extend(self.state.ecosystem_registry.all_watched_config_patterns());
+        // A settings file can declare, or stop declaring, an open document (#2180).
+        if self
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Gradle)
+            .is_some()
+        {
+            patterns.extend(
+                GradleSettingsFile::ALL
+                    .iter()
+                    .map(|settings| format!("**/{}", settings.file_name())),
+            );
+        }
         match tokio::time::timeout(
             CLIENT_REFRESH_TIMEOUT,
             file_watcher::register_lock_file_watchers(&self.client, &patterns),
@@ -1842,6 +1874,11 @@ impl LanguageServer for Backend {
                 tracing::debug!("unsupported file type: {:?}", uri);
                 return;
             };
+            // A document nothing handles keeps the editor's latest text, in case a declaring file
+            // claims it later. Updated before the checks below, so an open landing in between
+            // either reads the new text or is seen here.
+            self.state
+                .update_unrouted_open(&uri, &content, Some(version));
             // No probe here: the commit path resolves a claimed catalog once, after waiting for
             // an in-flight open to land (queued edits are ordered by the version-monotonic guard).
             let handled = tracked_ecosystem(&self.state, &uri, &domain_uri).is_some()
@@ -1860,11 +1897,10 @@ impl LanguageServer for Backend {
         let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("document closed: {:?}", uri);
 
-        diagnostics::clear_diagnostics_on_close(&self.state, &uri, |uri, cleared| {
+        crate::document::close_document(&self.state, &uri, |uri, cleared| {
             self.client.publish_diagnostics(uri, cleared, None)
         })
         .await;
-        self.state.cancel_background_task(&uri).await;
     }
 
     /// Not routed through `canonicalize_uri` (#1086): `change.uri` here is a watched
@@ -1877,6 +1913,7 @@ impl LanguageServer for Backend {
     #[tracing::instrument(skip(self, params), fields(count = params.changes.len()))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!("Received {} file change events", params.changes.len());
+        let mut declarations_changed = false;
 
         for change in params.changes {
             // #1090: guards against a non-`file:` scheme, a remote-host `file:` URI, or a
@@ -1892,6 +1929,14 @@ impl LanguageServer for Backend {
             let Some(filename) = file_watcher::extract_lockfile_name(&path) else {
                 continue;
             };
+
+            if GradleSettingsFile::ALL
+                .iter()
+                .any(|settings| settings.file_name() == filename)
+            {
+                declarations_changed = true;
+                continue;
+            }
 
             if let Some(ecosystem) = self.state.ecosystem_registry.for_lockfile(filename) {
                 tracing::info!(
@@ -1942,6 +1987,12 @@ impl LanguageServer for Backend {
             }
 
             tracing::debug!("Skipping unrecognized watched-file change: {}", filename);
+        }
+
+        // Once per batch: every settings event re-checks the same documents.
+        if declarations_changed {
+            crate::document::reroute_claimed_documents(&self.state, &self.client, &self.config)
+                .await;
         }
     }
 
@@ -2163,13 +2214,7 @@ impl Backend {
     // it anyway. Verified false positive.
     #[allow(clippy::await_holding_invalid_type)]
     async fn execute_update_all_outdated(&self, uri: Uri) {
-        let suppression = self
-            .config
-            .read()
-            .await
-            .policy
-            .diagnostics
-            .effective_suppression();
+        let policy = UpdateAllPolicy::from_config(&*self.config.read().await);
         let Some(doc) = self.state.get_document(&uri) else {
             self.warn_update_all_outdated_not_ready().await;
             return;
@@ -2188,14 +2233,7 @@ impl Backend {
             return;
         };
 
-        let edits = manifest.collect_update_all_edits(
-            &doc.content,
-            deps_core::VersionData::new(
-                &doc.signals.cached_versions,
-                &doc.signals.resolved_versions,
-            )
-            .with_suppression(&suppression),
-        );
+        let edits = update_all_edits(&doc, manifest, &policy);
         let version = doc.version;
         drop(doc);
 
@@ -6022,6 +6060,19 @@ let package = Package(
             }
         }
 
+        /// Records `version` as OSV-verified, without which the command writes nothing.
+        fn verify_latest(doc: &mut DocumentState, name: &str, version: &str) {
+            doc.update_latest_status(
+                std::iter::once((
+                    deps_core::test_util::vuln_key(name),
+                    deps_core::osv::UpgradeStatus::CandidateClean {
+                        version: version.into(),
+                    },
+                ))
+                .collect(),
+            );
+        }
+
         #[tokio::test]
         async fn test_execute_command_update_all_outdated_closed_document_no_op() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -6233,6 +6284,7 @@ let package = Package(
                     .collect_update_all_edits(
                         &content,
                         deps_core::VersionData::new(&cached, &empty_resolved),
+                        deps_core::FreshnessSettings::Disabled,
                     )
                     .len(),
                 1,
@@ -6245,6 +6297,7 @@ let package = Package(
             doc_state.set_version(Some(1));
             doc_state.set_loaded();
             doc_state.update_cached_versions(cached);
+            verify_latest(&mut doc_state, "serde", "1.2.0");
             assert!(doc_state.is_ready_for_batch_update());
             backend.state.update_document(canonical_uri, doc_state);
 
@@ -6388,6 +6441,7 @@ let package = Package(
                 deps_core::PackageVersions::latest_only("1.2.0"),
             );
             doc_state.update_cached_versions(cached);
+            verify_latest(&mut doc_state, "serde", "1.2.0");
             assert!(doc_state.is_ready_for_batch_update());
             backend.state.update_document(uri.clone(), doc_state);
 

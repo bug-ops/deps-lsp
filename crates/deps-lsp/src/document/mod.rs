@@ -18,6 +18,7 @@ pub(crate) mod keychain_refresh;
 mod lifecycle;
 pub(crate) mod listener_lifecycle;
 mod loader;
+mod osv_fallback;
 mod osv_scan;
 mod prefetch_support;
 pub(crate) mod probes;
@@ -52,17 +53,18 @@ pub(crate) mod tag_refresh;
 pub(crate) use diff::reload_resolved_versions;
 pub(crate) use lifecycle::{
     ChangeOutcome, ChangeTaskTriggerGates, CommitRefusal, DocumentUnavailable, ResolvedVersionMove,
-    change_task_triggers, handle_document_change_for_open, load_document, tracked_ecosystem,
-    trigger_gossip_prefetch_for_open_documents, trigger_license_prefetch_for_open_documents,
-    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
+    change_task_triggers, close_document, handle_document_change_for_open, load_document,
+    reroute_claimed_documents, tracked_ecosystem, trigger_gossip_prefetch_for_open_documents,
+    trigger_license_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;
 pub(crate) use osv_scan::{rescan_after_resolved_version_change, run_license_prefetch};
 pub(crate) use resolved::RefetchPolicy;
 pub(crate) use state::{
-    CLIENT_REFRESH_TIMEOUT, DocStamp, PrefetchVisibility, PublishGate, PublishTicket, RefreshKind,
-    refresh_with_timeout, spawn_supervised,
+    CLIENT_REFRESH_TIMEOUT, DocStamp, LicenseRefresh, PrefetchVisibility, PublishGate,
+    PublishTicket, RefreshKind, refresh_with_timeout, spawn_supervised,
 };
 pub use state::{
     ColdStartLimiter, DocumentState, LSP_DISPATCH_CONCURRENCY, LoadingState, PackageSignals,

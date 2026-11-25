@@ -27,7 +27,7 @@
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Shared upper bound on how many ancestor directories a config-file discovery walk
 /// climbs, independent of whether the filesystem root has been reached.
@@ -86,6 +86,45 @@ pub const PRUNED_WALK_DIRECTORIES: &[&str] = &[
     "dist",
     "build",
 ];
+
+/// Folds `.` and `..` components of an absolute `path` without touching the filesystem (no
+/// `canonicalize`, no symlink resolution).
+///
+/// A `..` right after the root is dropped, as a real filesystem resolves `/..`. Returns `None`
+/// for a relative path: its leading `..` has nothing to fold against, and silently dropping it
+/// would name another file. The folding is lexical, so after a symlinked directory `..` may
+/// name a different location than the filesystem would.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::fs_probe::lexically_normalize;
+/// use std::path::Path;
+///
+/// let absolute = std::env::temp_dir();
+/// assert_eq!(
+///     lexically_normalize(&absolute.join("a/./b/../c")),
+///     lexically_normalize(&absolute.join("a/c"))
+/// );
+/// assert!(lexically_normalize(Path::new("../a")).is_none());
+/// ```
+#[must_use]
+pub fn lexically_normalize(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    Some(normalized)
+}
 
 /// Ancestor directories of `start_dir`, inclusive, capped at [`MAX_CONFIG_ANCESTOR_DEPTH`].
 ///
@@ -484,6 +523,12 @@ impl ReadCompleteness {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
         let metadata = file.metadata()?;
+        // A real reparse point that is not a symlink needs a filter driver, so a test forces the
+        // classification to pin which `ReadContent` each public reader passes.
+        #[cfg(test)]
+        if FORCE_EXACT_COMPLETENESS.with(std::cell::Cell::get) {
+            return Ok(Self::Exact(metadata.len()));
+        }
         Ok(
             if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
                 Self::Unchecked
@@ -553,6 +598,14 @@ enum ReadContent {
 mod read_completeness_tests;
 #[cfg(test)]
 mod read_content_tests;
+#[cfg(all(test, windows))]
+mod reader_content_wiring_tests;
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// Makes [`ReadCompleteness::of_no_follow_handle`] verify every handle on this thread.
+    static FORCE_EXACT_COMPLETENESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 fn open_regular_no_follow(
     path: &Path,

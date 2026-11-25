@@ -67,14 +67,14 @@ async fn register_change_task_with_current_epoch_registers_and_aborts_the_previo
     let state = Arc::new(ServerState::new());
     let uri = uri();
     open(&state, &uri);
-    let epoch = state.with_document(&uri, |d| d.open_epoch()).unwrap();
+    let stamp = state.with_document(&uri, |d| d.commit_stamp()).unwrap();
 
     let (first, first_abort) = pending_task();
     let (second, second_abort) = pending_task();
     let second_id = second.id();
 
-    assert!(state.register_change_task(uri.clone(), first, epoch).await);
-    assert!(state.register_change_task(uri.clone(), second, epoch).await);
+    assert!(state.register_change_task(uri.clone(), first, stamp).await);
+    assert!(state.register_change_task(uri.clone(), second, stamp).await);
 
     assert!(
         eventually_finished(&first_abort).await,
@@ -90,12 +90,12 @@ async fn register_change_task_after_close_aborts_the_new_task_and_registers_noth
     let state = Arc::new(ServerState::new());
     let uri = uri();
     open(&state, &uri);
-    let stale_epoch = state.with_document(&uri, |d| d.open_epoch()).unwrap();
+    let stale_stamp = state.with_document(&uri, |d| d.commit_stamp()).unwrap();
     close(&state, &uri);
 
     let (stale, stale_abort) = pending_task();
     let registered = state
-        .register_change_task(uri.clone(), stale, stale_epoch)
+        .register_change_task(uri.clone(), stale, stale_stamp)
         .await;
 
     assert!(!registered);
@@ -109,18 +109,18 @@ async fn register_change_task_after_reopen_aborts_only_the_stale_task() {
     let uri = uri();
 
     open(&state, &uri);
-    let stale_epoch = state.with_document(&uri, |d| d.open_epoch()).unwrap();
+    let stale_stamp = state.with_document(&uri, |d| d.commit_stamp()).unwrap();
     close(&state, &uri);
 
     open(&state, &uri);
-    let reopen_epoch = state.with_document(&uri, |d| d.open_epoch()).unwrap();
-    assert_ne!(stale_epoch, reopen_epoch);
+    let reopen_stamp = state.with_document(&uri, |d| d.commit_stamp()).unwrap();
+    assert_ne!(stale_stamp, reopen_stamp);
 
     let (reopen_fetch, reopen_abort) = pending_task();
     let reopen_id = reopen_fetch.id();
     assert!(
         state
-            .register_change_task(uri.clone(), reopen_fetch, reopen_epoch)
+            .register_change_task(uri.clone(), reopen_fetch, reopen_stamp)
             .await
     );
 
@@ -134,7 +134,7 @@ async fn register_change_task_after_reopen_aborts_only_the_stale_task() {
 
     let (stale, stale_abort) = pending_task();
     let registered = state
-        .register_change_task(uri.clone(), stale, stale_epoch)
+        .register_change_task(uri.clone(), stale, stale_stamp)
         .await;
 
     assert!(!registered);
@@ -165,10 +165,50 @@ async fn register_change_task_for_a_never_opened_uri_registers_nothing() {
         .unwrap();
     let donor: Uri = "file:///tmp/open-epoch-donor/Cargo.toml".parse().unwrap();
     open(&state, &donor);
-    let epoch = state.with_document(&donor, |d| d.open_epoch()).unwrap();
+    let stamp = state.with_document(&donor, |d| d.commit_stamp()).unwrap();
 
     let (task, abort) = pending_task();
-    assert!(!state.register_change_task(other.clone(), task, epoch).await);
+    assert!(!state.register_change_task(other.clone(), task, stamp).await);
     assert!(eventually_finished(&abort).await);
     assert_eq!(registered_id(&state, &other).await, None);
+}
+
+/// #2184: a task whose commit a newer commit of the same open superseded is aborted, in every
+/// registration order.
+#[tokio::test]
+async fn register_change_task_of_a_superseded_commit_is_aborted() {
+    let state = Arc::new(ServerState::new());
+    let uri = uri();
+    open(&state, &uri);
+    let older = state.with_document(&uri, |d| d.commit_stamp()).unwrap();
+    let advance = |state: &ServerState| {
+        let mut doc = state.documents.get_mut(&uri).unwrap();
+        let previous = doc.clone();
+        doc.inherit_commit_lineage(&previous, true);
+    };
+    advance(&state);
+    let newer = state.with_document(&uri, |d| d.commit_stamp()).unwrap();
+    assert_ne!(older, newer);
+
+    let (new_task, new_abort) = pending_task();
+    let new_id = new_task.id();
+    assert!(
+        state
+            .register_change_task(uri.clone(), new_task, newer)
+            .await
+    );
+    let (old_task, old_abort) = pending_task();
+    assert!(
+        !state
+            .register_change_task(uri.clone(), old_task, older)
+            .await
+    );
+
+    assert!(eventually_finished(&old_abort).await);
+    assert!(
+        !new_abort.is_finished(),
+        "the newer commit's task must survive"
+    );
+    assert_eq!(registered_id(&state, &uri).await, Some(new_id));
+    new_abort.abort();
 }

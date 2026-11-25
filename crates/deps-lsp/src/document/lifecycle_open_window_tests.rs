@@ -241,7 +241,7 @@ async fn close_between_insert_and_registration_refuses_the_task() {
 
     assert!(
         !state
-            .register_change_task(uri.clone(), change.task, change.epoch)
+            .register_change_task(uri.clone(), change.task, change.stamp)
             .await
     );
     assert!(state.get_document(&uri).is_none());

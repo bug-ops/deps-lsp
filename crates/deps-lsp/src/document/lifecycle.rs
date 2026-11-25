@@ -16,8 +16,8 @@ use super::osv_scan::{
 use super::probes::spawn_background_probes;
 use super::resolved::RefetchPolicy;
 use super::state::{
-    DocumentState, OpenEpoch, OpenReservation, ParseFailure, RefetchEscalation, ServerState,
-    spawn_supervised,
+    CommitStamp, DocumentState, LicenseRefresh, OpenEpoch, OpenReservation, ParseFailure,
+    RefetchEscalation, ServerState, spawn_supervised,
 };
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
@@ -86,9 +86,9 @@ fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
 /// that task for the document.
 ///
 /// Returns `Ok(true)` when the document is tracked and its fetch task registered. Returns
-/// `Ok(false)` when a `didClose` or a newer `didOpen` for `uri` won the race against this
-/// open (during the parse, or between the insert and the task registration); the document is
-/// then left to whichever won, and no task from this open remains.
+/// `Ok(false)` when a `didClose`, a newer `didOpen` or a newer edit of `uri` won the race
+/// against this open (during the parse, or between the insert and the task registration); the
+/// document is then left to whichever won, and no task from this open remains.
 ///
 /// # Errors
 ///
@@ -116,7 +116,7 @@ pub async fn handle_document_open(
         return Ok(false);
     };
     Ok(state
-        .register_change_task(uri, change.task, change.epoch)
+        .register_change_task(uri, change.task, change.stamp)
         .await)
 }
 
@@ -145,7 +145,13 @@ pub(crate) async fn open_document(
             unsupported_ecosystem(&uri)
         });
     }
+    // Remembered before the first await: a `didClose` racing the claim probe then forgets it,
+    // and a `didChange` during the probe updates the remembered text.
+    if is_claim_candidate(&state, &uri) {
+        state.remember_unrouted_open(&uri, &content, version);
+    }
     let resolved = reserve_and_resolve(&state, &uri, None).await?;
+    state.forget_unrouted_open(&uri);
     open_with_reservation(
         resolved,
         uri,
@@ -211,7 +217,21 @@ async fn open_with_reservation(
     };
     doc_state.set_version(version);
 
+    // An open is a commit of every dependency it holds, so it owes their license fetch too.
+    if ecosystem.license_source().requires_dedicated_fetch()
+        && !state.license_policy().is_empty()
+        && doc_state
+            .manifest()
+            .is_some_and(|manifest| !manifest.dependencies().is_empty())
+    {
+        doc_state.set_license_refresh(LicenseRefresh::Pending);
+    }
+
     let epoch = reservation.epoch();
+    let stamp = CommitStamp {
+        epoch,
+        ..doc_state.commit_stamp()
+    };
     if !state.insert_opened(reservation, doc_state) {
         tracing::debug!("open of {:?} superseded by a close or a newer open", uri);
         return Ok(None);
@@ -240,7 +260,7 @@ async fn open_with_reservation(
         .instrument(span),
     );
 
-    Ok(Some(CommittedChange { task, epoch }))
+    Ok(Some(CommittedChange { task, stamp }))
 }
 
 /// [`open_document`] for tests that drive the spawned task themselves: the task is returned
@@ -823,9 +843,9 @@ async fn apply_pre_fetch_reparse(
         return None;
     }
     let content = state.get_document(uri)?.content.clone();
-    let (reparsed, diff, _) = parse_and_diff_manifest(uri, &content, state, ecosystem).await;
-    let needs_osv_rescan = diff.needs_osv_rescan();
-    commit_parsed_document(
+    let (reparsed, _) = parse_manifest_for_change(uri, &content, state, ecosystem).await;
+    // The re-parse belongs to the commit whose task runs it, so it keeps that commit's position.
+    let report = commit_parsed_document(
         uri,
         ecosystem.as_ref(),
         content,
@@ -833,11 +853,14 @@ async fn apply_pre_fetch_reparse(
         version,
         state,
         CommitOptions {
-            diff: &diff,
             guard: CommitGuard::SameOpenAndVersion { epoch, version },
+            position: CommitPosition::Keep,
         },
     )
-    .then_some(PreFetchReparse { needs_osv_rescan })
+    .ok()?;
+    Some(PreFetchReparse {
+        needs_osv_rescan: report.diff.needs_osv_rescan(),
+    })
 }
 
 /// What a pre-fetch re-parse introduced, see [`apply_pre_fetch_reparse`]. The names it makes
@@ -846,60 +869,24 @@ struct PreFetchReparse {
     needs_osv_rescan: bool,
 }
 
-/// Parses the freshly-edited manifest content and diffs its dependencies against the
-/// document's previously stored parse result, so the caller can react to what actually
-/// changed (added/removed/version-changed) instead of unconditionally re-fetching and
-/// re-scanning everything on every keystroke.
+/// Parses the freshly-edited manifest content and reports whether its
+/// [`deps_core::SelectionContext`] (e.g. Composer's `minimum-stability`, #1433) differs from the
+/// document's previously stored parse result.
 ///
-/// The returned `bool` is whether the manifest's own [`deps_core::SelectionContext`] (e.g.
-/// Composer's `minimum-stability`, #1433) changed between the old and new parse — `diff`
-/// alone cannot see this: editing only `minimum-stability` changes neither the dependency
-/// name set nor any single dependency's version requirement, so it would otherwise report an
-/// empty diff even though every dependency's "latest" pick may have just changed. The caller
-/// must escalate to [`RefetchPolicy::AllDependencies`] when this is `true`, or hover/
-/// completion/code-actions (which read the freshly committed parse result's context
-/// immediately) would disagree with diagnostics/inlay-hints (which stay on `cached_versions`
-/// from before the edit) until the next unrelated refetch.
-///
-/// The same flag is raised when the document's publish-time demand rises from
-/// [`deps_core::PublishTimeDemand::NotRequired`] to `NativeWindow` (a native release-age window
-/// appeared through a watched file, an edited `pnpm-workspace.yaml` buffer or the
-/// `freshness.honor_native_cooldown` toggle): the cached versions carry no publish times, so
-/// every dependency must be fetched again for the window to judge them.
-async fn parse_and_diff_manifest(
+/// The commit computes the dependency diff itself (#2183); the context change is reported here
+/// because it must be recorded as a sticky full refetch even when the commit is later refused.
+/// The diff alone cannot see it: editing only `minimum-stability` changes neither the dependency
+/// name set nor any single requirement, so every "latest" pick could change under an empty diff.
+async fn parse_manifest_for_change(
     uri: &Uri,
     content: &str,
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
-) -> (ParseOutcome, DependencyDiff, bool) {
-    let (old_deps, old_selection_context, old_demand): (
-        HashMap<NormalizedName, Vec<Option<VersionReq>>>,
-        deps_core::SelectionContext,
-        deps_core::PublishTimeDemand,
-    ) = state.get_document(uri).map_or_else(
-        || {
-            (
-                HashMap::new(),
-                deps_core::SelectionContext::none(),
-                deps_core::PublishTimeDemand::NotRequired,
-            )
-        },
-        |doc| match doc.parse_result() {
-            Some(pr) => (
-                dependency_version_map(pr, ecosystem.formatter()),
-                pr.selection_context(),
-                doc.manifest()
-                    .map_or(deps_core::PublishTimeDemand::NotRequired, |manifest| {
-                        deps_core::PublishTimeDemand::for_document(manifest)
-                    }),
-            ),
-            None => (
-                HashMap::new(),
-                deps_core::SelectionContext::none(),
-                deps_core::PublishTimeDemand::NotRequired,
-            ),
-        },
-    );
+) -> (ParseOutcome, bool) {
+    let old_selection_context = state.get_document(uri).and_then(|doc| {
+        doc.parse_result()
+            .map(deps_core::ParseResult::selection_context)
+    });
 
     // Try to parse manifest (may fail for incomplete syntax, or for a URI shape
     // `url::Url` rejects — both are treated the same as "no parse result").
@@ -924,37 +911,38 @@ async fn parse_and_diff_manifest(
         }
     };
 
-    let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = parse_result
-        .as_ref()
-        .ok()
-        .map_or_default(|pr| dependency_version_map(pr.as_ref(), ecosystem.formatter()));
     let new_selection_context = parse_result
         .as_deref()
         .ok()
         .map_or_else(deps_core::SelectionContext::none, |pr| {
             pr.selection_context()
         });
-    let new_demand = parse_result
-        .as_deref()
-        .ok()
-        .map_or(deps_core::PublishTimeDemand::NotRequired, |pr| {
-            deps_core::PublishTimeDemand::for_document(pr)
-        });
-    let demand_rose = old_demand == deps_core::PublishTimeDemand::NotRequired
-        && new_demand == deps_core::PublishTimeDemand::NativeWindow
-        && ecosystem.registry().honors_publish_time_demand();
-    let selection_context_changed = old_selection_context != new_selection_context || demand_rose;
+    let selection_context_changed = old_selection_context
+        .unwrap_or_else(deps_core::SelectionContext::none)
+        != new_selection_context;
 
-    let diff = DependencyDiff::compute(&old_deps, &new_deps);
-    tracing::debug!(
-        added = diff.added.len(),
-        removed = diff.removed.len(),
-        version_changed = diff.version_changed.len(),
-        selection_context_changed,
-        "dependency diff"
-    );
+    (parse_result, selection_context_changed)
+}
 
-    (parse_result, diff, selection_context_changed)
+/// What a commit replaced: the dependencies as the previous entry held them, and its
+/// publish-time demand.
+struct ReplacedEntry {
+    deps: HashMap<NormalizedName, Vec<Option<VersionReq>>>,
+    demand: deps_core::PublishTimeDemand,
+}
+
+impl ReplacedEntry {
+    fn of(doc: &DocumentState, formatter: &dyn deps_core::EcosystemFormatter) -> Self {
+        Self {
+            deps: doc
+                .parse_result()
+                .map_or_default(|pr| dependency_version_map(pr, formatter)),
+            demand: doc.manifest().map_or(
+                deps_core::PublishTimeDemand::NotRequired,
+                deps_core::PublishTimeDemand::for_document,
+            ),
+        }
+    }
 }
 
 /// A manifest parse: the result, or why the parser rejected the content.
@@ -1017,19 +1005,66 @@ impl CommitGuard {
     }
 }
 
+/// Whether a commit is a new position of its open (a change or reparse) or a refinement of the
+/// current one (the pre-fetch re-parse the commit's own task runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitPosition {
+    Advance,
+    Keep,
+}
+
 /// Bundles [`commit_parsed_document`]'s two commit-behavior parameters — kept as one struct
 /// (rather than two more positional parameters) to stay under `clippy::too_many_arguments`.
-struct CommitOptions<'a> {
-    diff: &'a DependencyDiff,
+struct CommitOptions {
     guard: CommitGuard,
+    position: CommitPosition,
+}
+
+/// What a landed commit produced.
+struct CommitReport {
+    /// Identity of the committed state.
+    stamp: CommitStamp,
+    /// The dependency diff against the entry the commit replaced (#2183).
+    diff: DependencyDiff,
+    /// The full refetch owed to the document as of this commit, read under the same
+    /// `documents` entry, so a concurrent commit's request is never missed.
+    escalation: Option<RefetchEscalation>,
+}
+
+/// Parses `content` and commits it to the tracked document, as a change does, returning the
+/// diff against the replaced entry and whether the selection context changed.
+#[cfg(test)]
+async fn parse_and_commit(
+    state: &ServerState,
+    uri: &Uri,
+    ecosystem: &Arc<dyn Ecosystem>,
+    content: &str,
+) -> (DependencyDiff, bool) {
+    let (parsed, selection_context_changed) =
+        parse_manifest_for_change(uri, content, state, ecosystem).await;
+    let report = commit_parsed_document(
+        uri,
+        ecosystem.as_ref(),
+        content.to_string(),
+        parsed,
+        None,
+        state,
+        CommitOptions {
+            guard: CommitGuard::IfTracked,
+            position: CommitPosition::Advance,
+        },
+    )
+    .expect("the document is tracked");
+    (report.diff, selection_context_changed)
 }
 
 /// Builds the new `DocumentState` from the parsed manifest (or a parse-result-less
-/// placeholder when parsing failed), carries over cache entries the previous state already
-/// held, prunes/invalidates entries `options.diff` says are now stale, and commits the result
-/// into `state` — unless the document is no longer tracked, or `options.guard` is
+/// placeholder when parsing failed), diffs it against the entry it replaces, carries over cache
+/// entries the previous state already held, prunes/invalidates the entries the diff says are
+/// stale, and commits the result into `state` — unless the document is no longer tracked, or
+/// `options.guard` is
 /// [`CommitGuard::SameOpenAndVersion`] and the document's *current* version in `state` no longer
-/// matches, in which case the commit is skipped entirely and `false` is returned. Both checks
+/// matches, in which case the commit is skipped entirely. Both checks
 /// run inside the one `documents` entry the commit then writes through, so a `did_close` cannot
 /// slip in between the check and the write (#2009).
 ///
@@ -1041,6 +1076,17 @@ struct CommitOptions<'a> {
 /// overwriting the newer edit with the older, watched-config-triggered content (impl-critic
 /// S1). [`handle_document_change`] passes [`CommitGuard::SameOpen`] — a real edit's own
 /// version is authoritative, so only a closed or reopened document skips the commit.
+///
+/// Returns what landed, so the caller can register follow-up work against exactly that commit
+/// (#2022, #2184) and react to the diff against the replaced entry (#2183). A publish-time demand
+/// rising from `NotRequired` to `NativeWindow` (a native release-age window appeared, so cached
+/// versions carry no publish times to judge them by) records a full refetch. All of it happens
+/// inside the same `documents` entry the commit writes through.
+///
+/// # Errors
+///
+/// [`CommitRefusal::Untracked`] when no document is tracked for `uri`,
+/// [`CommitRefusal::Superseded`] when the guard refuses; nothing is written in either case.
 fn commit_parsed_document(
     uri: &Uri,
     ecosystem: &dyn Ecosystem,
@@ -1048,39 +1094,8 @@ fn commit_parsed_document(
     parse_result: ParseOutcome,
     version: Option<i32>,
     state: &ServerState,
-    options: CommitOptions<'_>,
-) -> bool {
-    commit_parsed_document_in_open(
-        uri,
-        ecosystem,
-        content,
-        parse_result,
-        version,
-        state,
-        options,
-    )
-    .is_ok()
-}
-
-/// [`commit_parsed_document`], returning the [`OpenEpoch`] of the entry it replaced so the
-/// caller can register follow-up work against exactly that open (#2022). Read inside the same
-/// `documents` entry the commit writes through, so no reopen can slip in between.
-///
-/// # Errors
-///
-/// [`CommitRefusal::Untracked`] when no document is tracked for `uri`,
-/// [`CommitRefusal::Superseded`] when the guard refuses; nothing is written in either case.
-fn commit_parsed_document_in_open(
-    uri: &Uri,
-    ecosystem: &dyn Ecosystem,
-    content: String,
-    parse_result: ParseOutcome,
-    version: Option<i32>,
-    state: &ServerState,
-    options: CommitOptions<'_>,
-) -> std::result::Result<OpenEpoch, CommitRefusal> {
-    let diff = options.diff;
-
+    options: CommitOptions,
+) -> std::result::Result<CommitReport, CommitRefusal> {
     let mut doc_state = match parse_result {
         Ok(pr) => DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr),
         Err(failure) => DocumentState::new_parse_failed(ecosystem.ecosystem_id(), content, failure),
@@ -1114,8 +1129,35 @@ fn commit_parsed_document_in_open(
         );
         return Err(CommitRefusal::Superseded);
     }
-    doc_state.inherit_open_epoch(old_doc.get());
+    let formatter = ecosystem.formatter();
+    let replaced = ReplacedEntry::of(old_doc.get(), formatter);
+    let new_deps = doc_state
+        .parse_result()
+        .map_or_default(|pr| dependency_version_map(pr, formatter));
+    let new_demand = doc_state.manifest().map_or(
+        deps_core::PublishTimeDemand::NotRequired,
+        deps_core::PublishTimeDemand::for_document,
+    );
+    let demand_rose = replaced.demand == deps_core::PublishTimeDemand::NotRequired
+        && new_demand == deps_core::PublishTimeDemand::NativeWindow
+        && ecosystem.registry().honors_publish_time_demand();
+    let diff = DependencyDiff::compute(&replaced.deps, &new_deps);
+    tracing::debug!(
+        added = diff.added.len(),
+        removed = diff.removed.len(),
+        version_changed = diff.version_changed.len(),
+        demand_rose,
+        "dependency diff"
+    );
+
+    doc_state.inherit_commit_lineage(old_doc.get(), options.position == CommitPosition::Advance);
     preserve_cache(&mut doc_state, old_doc.get());
+    if ecosystem.license_source().requires_dedicated_fetch()
+        && !state.license_policy().is_empty()
+        && !(diff.added.is_empty() && diff.version_changed.is_empty())
+    {
+        doc_state.set_license_refresh(LicenseRefresh::Pending);
+    }
 
     // Prune stale cache entries for packages no longer declared under any spelling.
     doc_state.signals.prune_removed(&diff.removed);
@@ -1157,9 +1199,18 @@ fn commit_parsed_document_in_open(
 
     // Writes through the same entry acquired above — see its comment for why this must not be
     // a fresh `state.update_document` lookup.
-    let epoch = doc_state.open_epoch();
+    let stamp = doc_state.commit_stamp();
     old_doc.insert(doc_state);
-    Ok(epoch)
+    // Recorded and read while `old_doc` is still held: the next commit of this URI sees it.
+    if demand_rose {
+        state.escalate_refetch(uri);
+    }
+    let escalation = state.pending_refetch_escalation(uri);
+    Ok(CommitReport {
+        stamp,
+        diff,
+        escalation,
+    })
 }
 
 /// Generic document change handler using ecosystem registry.
@@ -1194,15 +1245,14 @@ pub async fn handle_document_change(
     )
 }
 
-/// A committed change or open: the background task it spawned and the open it was committed
-/// against.
+/// A committed change or open: the background task it spawned and the commit it belongs to.
 #[derive(Debug)]
 pub(crate) struct CommittedChange {
     /// The debounced fetch/diagnostics task, not yet registered.
     pub(crate) task: JoinHandle<()>,
-    /// The open the commit (or the open itself) belongs to; register `task` with
-    /// [`ServerState::register_change_task`] using it (#2022).
-    pub(crate) epoch: OpenEpoch,
+    /// The commit (or open) that spawned the task; register `task` with
+    /// [`ServerState::register_change_task`] using it (#2022, #2184).
+    pub(crate) stamp: CommitStamp,
 }
 
 /// What became of a change or reparse: committed, or dropped for a typed reason.
@@ -1366,43 +1416,48 @@ pub(crate) async fn commit_document_change(
     let ecosystem = resolve_change_ecosystem(&uri, &content, &state).await?;
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
-    let (parse_result, diff, selection_context_changed) =
-        parse_and_diff_manifest(&uri, &content, &state, &ecosystem).await;
+    let (parse_result, selection_context_changed) =
+        parse_manifest_for_change(&uri, &content, &state, &ecosystem).await;
 
     // #1433: a `minimum-stability`-only edit changes no dependency name/version, so `diff`
     // alone would see nothing to fetch — escalate so every dependency's "latest" pick is
     // refetched under the new context, matching what hover/completion/code-actions already
-    // compute live against the freshly committed parse result (see `parse_and_diff_manifest`'s
+    // compute live against the freshly committed parse result (see `parse_manifest_for_change`'s
     // doc).
     // #1994: an escalation is sticky until a committed fetch serves it, so a newer edit that
     // aborts the debounced task before its fetch cannot drop the full refetch. Recorded before
     // the commit guard so a skipped (superseded) reparse does not lose it either.
-    let escalation = if selection_context_changed || refetch == RefetchPolicy::AllDependencies {
-        Some(state.escalate_refetch(&uri))
-    } else {
-        state.pending_refetch_escalation(&uri)
-    };
-    let refetch = if escalation.is_some() {
-        RefetchPolicy::AllDependencies
-    } else {
-        refetch
-    };
+    if selection_context_changed || refetch == RefetchPolicy::AllDependencies {
+        state.escalate_refetch(&uri);
+    }
 
-    let committed = commit_parsed_document_in_open(
+    let committed = commit_parsed_document(
         &uri,
         ecosystem.as_ref(),
         content,
         parse_result,
         version,
         &state,
-        CommitOptions { diff: &diff, guard },
+        CommitOptions {
+            guard,
+            position: CommitPosition::Advance,
+        },
     );
     // A close that raced the recording above already removed the document and cleared the
     // entry before it existed; without this the entry would outlive the document.
     state.drop_refetch_escalation_if_untracked(&uri);
-    let epoch = match committed {
-        Ok(epoch) => epoch,
+    let CommitReport {
+        stamp,
+        diff,
+        escalation,
+    } = match committed {
+        Ok(report) => report,
         Err(refusal) => return Ok(ChangeOutcome::Dropped(refusal)),
+    };
+    let refetch = if escalation.is_some() {
+        RefetchPolicy::AllDependencies
+    } else {
+        refetch
     };
 
     // Read before any OSV request is built (FR-011; issue #1517 critique S3 — see the
@@ -1447,7 +1502,7 @@ pub(crate) async fn commit_document_change(
         .instrument(span),
     );
 
-    Ok(ChangeOutcome::Committed(CommittedChange { task, epoch }))
+    Ok(ChangeOutcome::Committed(CommittedChange { task, stamp }))
 }
 
 /// The ecosystem that handles a change to `uri`, after rejecting a URI no ecosystem handles and
@@ -1551,6 +1606,8 @@ pub(crate) struct ResolvedVersionMove {
 pub(crate) struct ChangeTaskTriggerGates {
     pub(crate) osv_checks: OsvChecks,
     pub(crate) requires_dedicated_fetch: bool,
+    /// The document's carried license obligation, which survives aborted edits.
+    pub(crate) license_refresh: LicenseRefresh,
 }
 
 /// Computes [`run_document_change_task`]'s OSV-rescan and license-refresh triggers
@@ -1566,6 +1623,8 @@ pub(crate) struct ChangeTaskTriggerGates {
 /// alone must be able to trigger a rescan/refresh, since `resolved_changed` is only
 /// ever computed when a lock file resolved something, while `diff_needs_rescan` is the
 /// *only* signal available for the ecosystems that have no lock file to reload at all.
+/// The license refresh follows the carried obligation ([`LicenseRefresh`]) instead of the
+/// diff, so a newer edit that aborts a task cannot drop it.
 ///
 /// Returns `(needs_osv_rescan, needs_license_refresh)`.
 pub(crate) fn change_task_triggers(
@@ -1574,7 +1633,9 @@ pub(crate) fn change_task_triggers(
 ) -> (bool, bool) {
     let any_resolved_move = mv.diff_needs_rescan || mv.resolved_changed;
     let needs_osv_rescan = gates.osv_checks.is_active() && any_resolved_move;
-    let needs_license_refresh = any_resolved_move && gates.requires_dedicated_fetch;
+    let needs_license_refresh = (gates.license_refresh == LicenseRefresh::Pending
+        || mv.resolved_changed)
+        && gates.requires_dedicated_fetch;
     (needs_osv_rescan, needs_license_refresh)
 }
 
@@ -1794,6 +1855,9 @@ async fn run_document_change_task(
         ChangeTaskTriggerGates {
             osv_checks: config.diagnostics.osv_checks(),
             requires_dedicated_fetch: ecosystem.license_source().requires_dedicated_fetch(),
+            license_refresh: state
+                .with_document(&uri, DocumentState::license_refresh)
+                .unwrap_or_default(),
         },
     );
 
@@ -2378,6 +2442,10 @@ pub(crate) async fn trigger_license_prefetch_for_open_documents(
     fetch_timeout: FetchTimeout,
 ) {
     for (uri, ecosystem) in open_tier3_license_documents(state) {
+        // Owed until a fetch round completes, even if this prefetch's result is dropped as stale.
+        if let Some(mut doc) = state.documents.get_mut(&uri) {
+            doc.set_license_refresh(LicenseRefresh::Pending);
+        }
         let state = Arc::clone(state);
         let client = client.clone();
         let config = Arc::clone(&config);
@@ -2455,6 +2523,16 @@ pub async fn ensure_document_loaded(
     config: Arc<RwLock<DepsConfig>>,
 ) -> bool {
     load_document(uri, state, client, config).await.is_ok()
+}
+
+/// Whether a declaring file could make an ecosystem claim `uri`: only a local TOML file no static
+/// route handles can be a settings-declared version catalog.
+// ASSUMPTION: Gradle is the only ecosystem with a content claim, so only TOML opens are remembered.
+fn is_claim_candidate(state: &ServerState, uri: &Uri) -> bool {
+    crate::lsp_types_interop::from_lsp_uri(uri)
+        .filter(|url| state.ecosystem_registry.for_uri(url).is_none())
+        .and_then(|url| deps_core::lockfile::resolve_manifest_file_path(&url))
+        .is_some_and(|path| deps_core::gradle_layout::is_version_catalog_file(&path))
 }
 
 /// Loads `uri` from disk into `state` unless it is already tracked.
@@ -2559,7 +2637,7 @@ pub(crate) async fn load_document(
         Ok(opened) => {
             if let Some(change) = opened {
                 state
-                    .register_change_task(uri.clone(), change.task, change.epoch)
+                    .register_change_task(uri.clone(), change.task, change.stamp)
                     .await;
             }
             tracing::info!("Document loaded successfully from disk: {:?}", uri);
@@ -2573,6 +2651,176 @@ pub(crate) async fn load_document(
             tracing::warn!("Failed to process loaded document {:?}: {}", uri, e);
             Err(DocumentUnavailable::NotLoaded)
         }
+    }
+}
+
+/// `didClose` of `uri`: forgets it, removes its document publishing empty diagnostics through
+/// `send`, and cancels its background task.
+pub(crate) async fn close_document<S, SFut>(state: &ServerState, uri: &Uri, send: S)
+where
+    S: FnOnce(Uri, Vec<tower_lsp_server::ls_types::Diagnostic>) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    // Forgotten on both sides of the removal: before it, so a re-route that has reserved the
+    // URI finds nothing to open; after it, so a re-route that was untracking the document leaves
+    // no entry behind.
+    state.forget_unrouted_open(uri);
+    diagnostics::clear_diagnostics_on_close(state, uri, send).await;
+    state.cancel_background_task(uri).await;
+    state.forget_unrouted_open(uri);
+}
+
+/// Re-checks the content-aware claims after a declaring file changed (#2180): drops the claimed
+/// documents nobody claims any more, publishing empty diagnostics for them, and opens the
+/// remembered unhandled documents that are now claimed, with the editor's latest text.
+pub(crate) async fn reroute_claimed_documents(
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: &Arc<RwLock<DepsConfig>>,
+) {
+    if let Some(plan) = plan_reroute(state).await {
+        apply_reroute(plan, state, client, config).await;
+    }
+}
+
+/// Which documents the re-checked claims drop and gain, decided from a snapshot.
+struct ReroutePlan {
+    /// With the open each decision was made about, so a reopened URI is left alone.
+    dropped: Vec<(Uri, url::Url, OpenEpoch)>,
+    gained: Vec<(Uri, url::Url)>,
+}
+
+async fn plan_reroute(state: &Arc<ServerState>) -> Option<ReroutePlan> {
+    for id in state.ecosystem_registry.ecosystem_ids() {
+        if let Some(ecosystem) = state.ecosystem_registry.get(id) {
+            ecosystem.invalidate_claims();
+        }
+    }
+
+    // Open documents no static rule routes are tracked only because they were claimed.
+    let claimed: Vec<(Uri, url::Url, OpenEpoch)> = state
+        .documents
+        .iter()
+        .filter_map(|entry| {
+            let domain_uri = crate::lsp_types_interop::from_lsp_uri(entry.key())?;
+            state
+                .ecosystem_registry
+                .for_uri(&domain_uri)
+                .is_none()
+                .then(|| (entry.key().clone(), domain_uri, entry.value().open_epoch()))
+        })
+        .collect();
+    let unhandled: Vec<(Uri, url::Url)> = state
+        .remembered_unrouted_opens()
+        .into_iter()
+        .filter_map(|uri| {
+            let domain_uri = crate::lsp_types_interop::from_lsp_uri(&uri)?;
+            Some((uri, domain_uri))
+        })
+        .collect();
+
+    let probe_state = Arc::clone(state);
+    let probed = tokio::task::spawn_blocking(move || {
+        let is_claimed = |url: &url::Url| claim_for(&probe_state, url).is_some();
+        let dropped: Vec<_> = claimed
+            .into_iter()
+            .filter(|(_, url, _)| !is_claimed(url))
+            .collect();
+        let gained: Vec<_> = unhandled
+            .into_iter()
+            .filter(|(_, url)| is_claimed(url))
+            .collect();
+        (dropped, gained)
+    })
+    .await;
+    match probed {
+        Ok((dropped, gained)) => Some(ReroutePlan { dropped, gained }),
+        Err(error) => {
+            tracing::error!(%error, "re-routing the declared manifests failed");
+            None
+        }
+    }
+}
+
+/// Opens the remembered unhandled `uri` with the editor's latest text, unless it was closed or
+/// opened again meanwhile.
+async fn open_remembered(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: &Arc<RwLock<DepsConfig>>,
+) {
+    // Reserved before the entry is read: a close that forgets it first leaves nothing to open,
+    // and one that follows removes the reservation, so the open cannot land.
+    let Some(reservation) = state.try_reserve_cold_start(uri) else {
+        return;
+    };
+    let Some((content, version)) = state.unrouted_open(uri) else {
+        return;
+    };
+    let resolved = match reserve_and_resolve(state, uri, Some(reservation)).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::debug!(?uri, %error, "the claimed document was not opened");
+            return;
+        }
+    };
+    match open_with_reservation(
+        resolved,
+        uri.clone(),
+        content,
+        version,
+        Arc::clone(state),
+        client.clone(),
+        Arc::clone(config),
+    )
+    .await
+    {
+        Ok(Some(change)) => {
+            state.forget_unrouted_open(uri);
+            state
+                .register_change_task(uri.clone(), change.task, change.stamp)
+                .await;
+        }
+        Ok(None) => tracing::debug!(?uri, "claimed open superseded"),
+        Err(error) => tracing::warn!(?uri, %error, "could not open the claimed document"),
+    }
+}
+
+async fn apply_reroute(
+    plan: ReroutePlan,
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: &Arc<RwLock<DepsConfig>>,
+) {
+    let ReroutePlan { dropped, gained } = plan;
+    for (uri, _, epoch) in &dropped {
+        // Remembered under the document guard, so a close cannot have removed it in between;
+        // a close that comes later forgets it again.
+        let untracked = state
+            .documents
+            .get(uri)
+            .filter(|doc| doc.open_epoch() == *epoch)
+            .map(|doc| {
+                if doc.version.is_some() {
+                    state.remember_unrouted_open(uri, &doc.content, doc.version);
+                }
+            });
+        if untracked.is_none() {
+            continue;
+        }
+        tracing::info!(?uri, "no longer declared; untracking");
+        diagnostics::clear_diagnostics_on_close(state, uri, |uri, cleared| {
+            client.publish_diagnostics(uri, cleared, None)
+        })
+        .await;
+        state.cancel_background_task(uri).await;
+    }
+    for (uri, _) in &gained {
+        open_remembered(uri, state, client, config).await;
+    }
+    if !(dropped.is_empty() && gained.is_empty()) {
+        state.spawn_refresh_requests(client);
     }
 }
 
@@ -2599,12 +2847,21 @@ async fn resolve_open_ecosystem(
     if let Some(ecosystem) = state.ecosystem_registry.for_uri(uri) {
         return Some(ecosystem);
     }
-    let registry = Arc::clone(&state.ecosystem_registry);
+    let state = Arc::clone(state);
     let uri = uri.clone();
-    tokio::task::spawn_blocking(move || registry.for_uri_blocking(&uri))
+    tokio::task::spawn_blocking(move || claim_for(&state, &uri))
         .await
         .ok()
         .flatten()
+}
+
+/// The content-aware route of `uri`, bounded by its workspace folder. Blocking.
+fn claim_for(state: &ServerState, uri: &url::Url) -> Option<Arc<dyn Ecosystem>> {
+    let bound = deps_core::lockfile::resolve_manifest_file_path(uri)
+        .and_then(|path| state.claim_bound(&path));
+    state
+        .ecosystem_registry
+        .for_uri_blocking(uri, bound.as_ref())
 }
 
 /// Reserves the open (reusing `reservation` when given), then resolves its ecosystem.
@@ -2684,6 +2941,14 @@ mod rekey_signals_tests;
 #[path = "lifecycle_open_epoch_tests.rs"]
 mod open_epoch_tests;
 
+#[cfg(test)]
+#[path = "lifecycle_commit_lineage_tests.rs"]
+mod commit_lineage_tests;
+
+#[cfg(all(test, feature = "gradle"))]
+#[path = "lifecycle_reroute_tests.rs"]
+mod reroute_tests;
+
 #[cfg(all(test, feature = "npm"))]
 #[path = "lifecycle_open_window_tests.rs"]
 mod open_window_tests;
@@ -2762,8 +3027,7 @@ mod tests {
         ]
     }
 
-    /// Issue #1407 R1: exhaustive truth table over `change_task_triggers`'s four
-    /// boolean inputs, so a future edit can't silently reintroduce the regression
+    /// Issue #1407 R1: exhaustive truth table over `change_task_triggers`'s inputs, so a future edit can't silently reintroduce the regression
     /// this fix closed (a trigger nested inside the "lock file resolved something"
     /// guard, which is always false for Gradle/Deno and for Dart/Swift before their
     /// first resolve). No feature gate needed — pure function, no ecosystem I/O.
@@ -2776,7 +3040,12 @@ mod tests {
         for diff_needs_rescan in [false, true] {
             for resolved_changed in [false, true] {
                 for osv_checks in both_osv_checks() {
-                    for requires_dedicated_fetch in [false, true] {
+                    for (requires_dedicated_fetch, license_refresh) in [
+                        (false, LicenseRefresh::Settled),
+                        (false, LicenseRefresh::Pending),
+                        (true, LicenseRefresh::Settled),
+                        (true, LicenseRefresh::Pending),
+                    ] {
                         let (osv, license) = change_task_triggers(
                             ResolvedVersionMove {
                                 diff_needs_rescan,
@@ -2785,6 +3054,7 @@ mod tests {
                             ChangeTaskTriggerGates {
                                 osv_checks,
                                 requires_dedicated_fetch,
+                                license_refresh,
                             },
                         );
                         let any_resolved_move = diff_needs_rescan || resolved_changed;
@@ -2796,7 +3066,8 @@ mod tests {
                         );
                         assert_eq!(
                             license,
-                            any_resolved_move && requires_dedicated_fetch,
+                            (license_refresh == LicenseRefresh::Pending || resolved_changed)
+                                && requires_dedicated_fetch,
                             "license mismatch for diff={diff_needs_rescan} resolved={resolved_changed} \
                              osv_checks={osv_checks:?} tier3={requires_dedicated_fetch}"
                         );
@@ -2850,12 +3121,12 @@ mod tests {
 
     /// impl-critic S1 (#1433): a `minimum-stability`-only edit changes no dependency
     /// name/version, so `DependencyDiff` alone reports nothing to fetch — proves
-    /// `parse_and_diff_manifest`'s own `selection_context_changed` signal catches this case
+    /// `parse_manifest_for_change`'s own `selection_context_changed` signal catches this case
     /// regardless, which `commit_document_change` escalates to
     /// `RefetchPolicy::AllDependencies` on (see that function's own comment at the call site).
     #[cfg(feature = "composer")]
     #[tokio::test]
-    async fn test_parse_and_diff_manifest_detects_minimum_stability_only_change() {
+    async fn test_parse_and_commit_detects_minimum_stability_only_change() {
         let state = Arc::new(ServerState::new());
         let url = deps_core::test_util::test_uri("/test/composer.json");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
@@ -2878,8 +3149,8 @@ mod tests {
 
         // Same single dependency, same requirement — only `minimum-stability` is new.
         let content2 = r#"{"minimum-stability": "alpha", "require": {"symfony/console": "^6.0"}}"#;
-        let (_, diff, selection_context_changed) =
-            parse_and_diff_manifest(&uri, content2, &state, &ecosystem).await;
+        let (diff, selection_context_changed) =
+            parse_and_commit(&state, &uri, &ecosystem, content2).await;
 
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
@@ -2896,7 +3167,7 @@ mod tests {
     /// force an unnecessary `RefetchPolicy::AllDependencies` on every keystroke).
     #[cfg(feature = "composer")]
     #[tokio::test]
-    async fn test_parse_and_diff_manifest_no_selection_context_change_for_unrelated_edit() {
+    async fn test_parse_and_commit_no_selection_context_change_for_unrelated_edit() {
         let state = Arc::new(ServerState::new());
         let url = deps_core::test_util::test_uri("/test/composer.json");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
@@ -2919,8 +3190,8 @@ mod tests {
 
         // `name` changes, `minimum-stability` stays absent, the dependency is untouched.
         let content2 = r#"{"name": "acme/renamed", "require": {"symfony/console": "^6.0"}}"#;
-        let (_, diff, selection_context_changed) =
-            parse_and_diff_manifest(&uri, content2, &state, &ecosystem).await;
+        let (diff, selection_context_changed) =
+            parse_and_commit(&state, &uri, &ecosystem, content2).await;
 
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
@@ -2947,6 +3218,7 @@ mod tests {
             ChangeTaskTriggerGates {
                 osv_checks: OsvChecks::resolve(false, deps_core::NetworkMode::Online),
                 requires_dedicated_fetch: true, // a tier-3 ecosystem
+                license_refresh: LicenseRefresh::Pending, // set by the commit of the edit
             },
         );
         assert!(
@@ -3890,6 +4162,7 @@ mod tests {
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, FakeParseResult>,
                 _versions: VersionData<'a>,
+                _freshness: deps_core::FreshnessSettings,
                 _loading_state: deps_core::LoadingState,
                 _config: &'a EcosystemConfig,
             ) -> BoxFuture<'a, Vec<InlayHint>> {
@@ -3900,6 +4173,7 @@ mod tests {
                 _parsed: deps_core::ParsedView<'a, FakeParseResult>,
                 _content: &'a str,
                 _versions: VersionData<'a>,
+                _freshness: deps_core::FreshnessSettings,
                 _uri: &'a url::Url,
                 _command_id: &'a str,
             ) -> BoxFuture<'a, Vec<CodeLens>> {
@@ -4209,18 +4483,6 @@ anyhow = "1.0"
         // `anyhow` removed from the manifest — its license entry must be pruned
         // along with it, not left behind as an orphaned entry.
         let content2 = "[dependencies]\nserde = \"1.0\"\n";
-        let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = ["serde", "anyhow"]
-            .iter()
-            .map(|s| (NormalizedName::for_test(*s), vec![None]))
-            .collect();
-        let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
-            std::iter::once((NormalizedName::for_test("serde"), vec![None])).collect();
-        let diff = DependencyDiff::compute(&old_deps, &new_deps);
-        assert_eq!(
-            diff.removed.as_slice(),
-            [NormalizedName::for_test("anyhow")]
-        );
-
         let parse_result2 = Arc::clone(&ecosystem)
             .parse_manifest(content2, &url)
             .await
@@ -4233,11 +4495,11 @@ anyhow = "1.0"
             None,
             &state,
             CommitOptions {
-                diff: &diff,
                 guard: CommitGuard::IfTracked,
+                position: CommitPosition::Advance,
             },
         );
-        assert!(committed);
+        assert!(committed.is_ok());
 
         let doc = state.get_document(&uri).unwrap();
         assert!(
@@ -5538,20 +5800,7 @@ tokio = "1.0"
             ecosystem: &Arc<dyn Ecosystem>,
             content: &str,
         ) -> DependencyDiff {
-            let (parse, diff, _) = parse_and_diff_manifest(uri, content, state, ecosystem).await;
-            assert!(commit_parsed_document(
-                uri,
-                ecosystem.as_ref(),
-                content.to_string(),
-                parse,
-                None,
-                state,
-                CommitOptions {
-                    diff: &diff,
-                    guard: CommitGuard::IfTracked,
-                },
-            ));
-            diff
+            parse_and_commit(state, uri, ecosystem, content).await.0
         }
 
         #[tokio::test]

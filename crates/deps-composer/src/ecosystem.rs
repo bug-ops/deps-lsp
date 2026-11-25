@@ -713,6 +713,7 @@ mod tests {
                 .inlay_hints(
                     ParsedView::new(&parse_result),
                     VersionData::new(&HashMap::new(), &HashMap::new()),
+                    deps_core::FreshnessSettings::Disabled,
                     deps_core::LoadingState::Loaded,
                     &EcosystemConfig::default(),
                 )
@@ -927,6 +928,7 @@ mod tests {
                     position,
                     &uri,
                     VersionData::new(&HashMap::new(), &HashMap::new()),
+                    deps_core::FreshnessSettings::Disabled,
                     MANIFEST,
                 )
                 .await;

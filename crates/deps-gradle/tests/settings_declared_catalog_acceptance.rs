@@ -60,7 +60,7 @@ fn claims(settings_name: &str, settings: &str, candidate_rel: &str) -> bool {
     let project = Project::new();
     project.write(settings_name, settings);
     let candidate = project.write(candidate_rel, "[libraries]\n");
-    ecosystem().claims_unrouted_manifest(&candidate)
+    ecosystem().claims_unrouted_manifest(&candidate, None)
 }
 
 #[test]
@@ -74,7 +74,10 @@ fn registry_for_uri_blocking_routes_a_declared_kotlin_catalog_to_gradle() {
 
     assert!(registry.for_uri(&uri).is_none(), "for_uri stays pure");
     assert_eq!(
-        registry.for_uri_blocking(&uri).unwrap().ecosystem_id(),
+        registry
+            .for_uri_blocking(&uri, None)
+            .unwrap()
+            .ecosystem_id(),
         EcosystemId::Gradle
     );
 }
@@ -88,7 +91,7 @@ fn registry_routes_nothing_without_a_declaring_settings_file() {
     let registry = registry();
 
     assert!(registry.for_uri(&uri).is_none());
-    assert!(registry.for_uri_blocking(&uri).is_none());
+    assert!(registry.for_uri_blocking(&uri, None).is_none());
 }
 
 #[test]
@@ -197,7 +200,7 @@ fn claim_on_a_non_toml_path_makes_no_filesystem_probe() {
     let ecosystem = ecosystem();
 
     let before = deps_core::fs_probe::snapshot();
-    let claimed = ecosystem.claims_unrouted_manifest(&candidate);
+    let claimed = ecosystem.claims_unrouted_manifest(&candidate, None);
     let after = deps_core::fs_probe::snapshot();
 
     assert!(!claimed);
@@ -226,6 +229,29 @@ fn locate_lockfile_for_a_declared_catalog_finds_the_root_lockfile() {
 fn claim_never_panics_on_a_relative_or_missing_path() {
     let _guard = deps_core::fs_probe::snapshot_guard();
     let ecosystem = ecosystem();
-    assert!(!ecosystem.claims_unrouted_manifest(Path::new("deps.toml")));
-    assert!(!ecosystem.claims_unrouted_manifest(Path::new("/nonexistent-dir/gradle/deps.toml")));
+    assert!(!ecosystem.claims_unrouted_manifest(Path::new("deps.toml"), None));
+    assert!(
+        !ecosystem.claims_unrouted_manifest(Path::new("/nonexistent-dir/gradle/deps.toml"), None)
+    );
+}
+
+/// #2180 (D6): the listing of an ancestor is memoized, so a settings file created in an existing
+/// child directory is seen once `invalidate_claims` drops the memo.
+#[test]
+fn invalidate_claims_lets_a_new_sibling_settings_file_claim_the_catalog() {
+    let _guard = deps_core::fs_probe::snapshot_guard();
+    let project = Project::new();
+    let catalog = project.write("shared/deps.toml", "[libraries]\n");
+    std::fs::create_dir(project.root().join("project")).unwrap();
+    let bound = deps_core::ecosystem::ClaimBound::new(&project.root()).unwrap();
+    let ecosystem = ecosystem();
+    assert!(!ecosystem.claims_unrouted_manifest(&catalog, Some(&bound)));
+
+    project.write(
+        "project/settings.gradle.kts",
+        &KTS_DECLARING.replace("gradle/deps.toml", "../shared/deps.toml"),
+    );
+    ecosystem.invalidate_claims();
+
+    assert!(ecosystem.claims_unrouted_manifest(&catalog, Some(&bound)));
 }

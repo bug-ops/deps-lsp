@@ -47,26 +47,43 @@ pub mod private {
 
 /// The caller's upper limit for forward catalog lookups.
 ///
-/// An ecosystem that asks whether a manifest is declared by a file elsewhere in the tree never
-/// lists a directory above this bound, so the search cannot reach an unbounded part of the
-/// filesystem.
+/// An ecosystem that asks whether a manifest is declared by a file elsewhere in the tree limits
+/// how far up it lists directories, so the search cannot reach an unbounded part of the
+/// filesystem. The bound is not the only limit: Gradle takes the outer of the nearest git root
+/// and this bound (among those containing the manifest), so a git root above the bound widens
+/// the reach up to that root.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ecosystem::ClaimBound;
+/// use std::path::Path;
+///
+/// assert!(ClaimBound::new(Path::new("relative/dir")).is_none());
+/// let project = std::env::temp_dir().join("project");
+/// assert_eq!(ClaimBound::new(&project).unwrap().dir(), project);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimBound {
     dir: PathBuf,
 }
 
 impl ClaimBound {
-    /// Builds a bound from an absolute directory.
+    /// Builds a bound from an absolute directory, folding `.` and `..` lexically.
     ///
     /// Returns `None` for a relative path, a filesystem root (including Windows drive and UNC
     /// roots) or the user's home directory.
     #[must_use]
-    #[expect(
-        unused_variables,
-        reason = "signature stub, body follows in the same PR"
-    )]
     pub fn new(dir: &Path) -> Option<Self> {
-        todo!()
+        let dir = crate::fs_probe::lexically_normalize(dir)?;
+        let is_home = UserHome::current().is_some_and(|home| home.is(&dir));
+        (dir.parent().is_some() && !is_home).then_some(Self { dir })
+    }
+
+    /// The bounding directory, in absolute lexical form.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
@@ -1445,10 +1462,31 @@ pub trait EcosystemBase: Send + Sync + private::Sealed {
     /// Whether this ecosystem parses `path` as its manifest although static routing does not
     /// match it (e.g. a `*.toml` that `settings.gradle` declares as a version catalog).
     ///
+    /// `bound` caps how far up the tree the ecosystem may look; `None` leaves only the lookups
+    /// that need no bound.
+    ///
     /// May block on filesystem I/O: call it only from a blocking context. Defaults to `false`.
-    fn claims_unrouted_manifest(&self, _path: &Path) -> bool {
+    fn claims_unrouted_manifest(&self, _path: &Path, _bound: Option<&ClaimBound>) -> bool {
         false
     }
+
+    /// The manifests the file at `manifest` declares by path (e.g. the version catalogs of a
+    /// `settings.gradle`), as absolute lexical paths. A directory walk uses it to find declared
+    /// files it would not visit by itself.
+    ///
+    /// Existence is not checked, and the list is bounded by the implementor. May block on
+    /// filesystem I/O. Defaults to empty.
+    fn declared_manifests(&self, _manifest: &Path) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    /// Drops every cached claim answer, so the next [`Self::claims_unrouted_manifest`] looks
+    /// again.
+    ///
+    /// The LSP calls it when a file that can change claim answers changed on disk. Implementors
+    /// must drop every cached claim answer and must not block for long (no I/O). Defaults to a
+    /// no-op, for ecosystems that cache no answers.
+    fn invalidate_claims(&self) {}
 
     /// File extensions this ecosystem handles when the manifest basename is
     /// not fixed (e.g. `[".csproj", ".fsproj"]` for NuGet project files).

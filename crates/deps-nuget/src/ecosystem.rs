@@ -1019,6 +1019,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             let results = eco
@@ -1076,6 +1077,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             let results = eco
@@ -1103,6 +1105,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             let results = eco
@@ -1150,6 +1153,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             let results = eco
@@ -1201,6 +1205,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             let results = eco
@@ -1295,6 +1300,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             let results = eco
@@ -1348,6 +1354,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
 
             // The alternate occurrence resolves deterministically without network: its index was
@@ -1399,6 +1406,7 @@ mod tests {
                 .inlay_hints(
                     ParsedView::new(&parse_result),
                     VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings::Disabled,
                     LoadingState::Idle,
                     &EcosystemConfig::default(),
                 )
@@ -2537,6 +2545,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
             let position = Position::new(0, 1);
             let freshness = deps_core::FreshnessSettings::default();
@@ -2588,6 +2597,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             };
             // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
             // slice of `content` to actually match `dep_with_source`'s declared

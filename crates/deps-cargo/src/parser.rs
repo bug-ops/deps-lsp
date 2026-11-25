@@ -97,6 +97,9 @@ pub struct CargoParseResult {
     /// (unlike [`Self::blocked_registries`]'s `INFORMATION` — a rejection, not merely a
     /// block), so it never degrades silently to only a `tracing::warn!`.
     pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
+    /// Dependency entries whose value is neither a version string nor a table (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -280,6 +283,7 @@ pub fn parse_cargo_toml_with_context(
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
+    let mut invalid_declarations = Vec::new();
     // Shared across every section/target/workspace-deps table below (#796) — per-document,
     // not per-section.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -293,6 +297,7 @@ pub fn parse_cargo_toml_with_context(
         content,
         &line_table,
         &mut dependencies,
+        &mut invalid_declarations,
         &mut budget,
     );
 
@@ -308,6 +313,7 @@ pub fn parse_cargo_toml_with_context(
                     content,
                     &line_table,
                     &mut dependencies,
+                    &mut invalid_declarations,
                     &mut budget,
                 );
             }
@@ -325,6 +331,7 @@ pub fn parse_cargo_toml_with_context(
             content,
             &line_table,
             CargoDependencySection::WorkspaceDependencies,
+            &mut invalid_declarations,
             &mut budget,
         ));
     }
@@ -348,6 +355,7 @@ pub fn parse_cargo_toml_with_context(
         rejected_registries,
         resolved_registries,
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
     })
 }
 
@@ -611,6 +619,7 @@ fn parse_dependency_kind_tables(
     content: &str,
     line_table: &LineOffsetTable,
     dependencies: &mut Vec<CargoDependency>,
+    invalid: &mut Vec<deps_core::InvalidDeclarationOccurrence>,
     budget: &mut deps_core::DependencyBudget,
 ) {
     if let Some(deps_val) = get_val(table, "dependencies")
@@ -621,6 +630,7 @@ fn parse_dependency_kind_tables(
             content,
             line_table,
             CargoDependencySection::Dependencies,
+            invalid,
             budget,
         ));
     }
@@ -633,6 +643,7 @@ fn parse_dependency_kind_tables(
             content,
             line_table,
             CargoDependencySection::DevDependencies,
+            invalid,
             budget,
         ));
     }
@@ -645,6 +656,7 @@ fn parse_dependency_kind_tables(
             content,
             line_table,
             CargoDependencySection::BuildDependencies,
+            invalid,
             budget,
         ));
     }
@@ -660,6 +672,7 @@ fn parse_dependencies_section(
     content: &str,
     line_table: &LineOffsetTable,
     section: CargoDependencySection,
+    invalid: &mut Vec<deps_core::InvalidDeclarationOccurrence>,
     budget: &mut deps_core::DependencyBudget,
 ) -> Vec<CargoDependency> {
     let mut deps = Vec::new();
@@ -692,6 +705,11 @@ fn parse_dependencies_section(
         } else if let Some(t) = value.as_table() {
             parse_table_dependency(&mut dep, t, content, line_table);
         } else {
+            invalid.push(deps_core::InvalidDeclarationOccurrence {
+                range: dep.name_range,
+                key: key.name.to_string(),
+                reason: deps_core::InvalidDeclarationReason::UnsupportedValue,
+            });
             continue;
         }
 
@@ -1026,6 +1044,7 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
         rejected_registries: rejected_registries,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -2564,5 +2583,40 @@ tokio = "1.0"
         assert!(!output.contains("ghp_SUPERSECRETTOKEN123"));
         assert!(!output.contains("svcacct"));
         assert!(output.contains("pkg.internal.corp"));
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_non_string_non_table_entries_are_reported() {
+        let result = parse_cargo_toml(
+            "[dependencies]\nserde = 5\ntokio = true\nlog = \"0.4\"\n",
+            &deps_core::test_util::test_uri("/p/Cargo.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        let mut keys: Vec<_> = reported(&result);
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            keys,
+            [
+                (
+                    "serde".to_owned(),
+                    deps_core::InvalidDeclarationReason::UnsupportedValue
+                ),
+                (
+                    "tokio".to_owned(),
+                    deps_core::InvalidDeclarationReason::UnsupportedValue
+                ),
+            ]
+        );
     }
 }

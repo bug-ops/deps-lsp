@@ -48,10 +48,10 @@ cooldown baseline is unaffected by this flag — it never reads GOSSIP data and 
 ## `deps-cli` Parity (issue #1474)
 
 `deps-cli check`/`update` also honor `[gossip].enabled` (spec 074). Unlike `deps-lsp`'s
-hover/diagnostics-only integration above (which only ever rewords a message — the local
-`freshness.cooldown_secs` heuristic never excludes a version from being "latest" either),
-GOSSIP is the *only* mechanism in `deps-cli` that can change which version counts as
-"latest" at all, for both `check`'s `Outdated` classification (indirect only — no new
+integration above (where a finding counts as a
+[release-age hold](version-diagnostics.md#release-age-holds)), in `deps-cli`
+GOSSIP is also the only mechanism that changes which version counts as
+"latest" itself, for both `check`'s `Outdated` classification (indirect only — no new
 `Category`/`--fail-on` token) and `update`'s fix-target selection, since both share one
 classification pipeline.
 

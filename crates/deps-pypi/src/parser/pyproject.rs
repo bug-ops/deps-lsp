@@ -7,7 +7,10 @@ use crate::error::Result;
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::net_policy::RegistryAccessPolicy;
-use deps_core::{BlockedRegistryOccurrence, RejectedRegistryOccurrence};
+use deps_core::{
+    BlockedRegistryOccurrence, InvalidDeclarationOccurrence, InvalidDeclarationReason,
+    RejectedRegistryOccurrence,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
@@ -34,6 +37,9 @@ pub(super) struct IndexContext<'a> {
     /// [`Self::blocked_registries`]'s counterpart for every rejection reason *other* than a
     /// policy-blocked host (#1438).
     pub(super) rejected_registries: RefCell<Vec<RejectedRegistryOccurrence>>,
+    /// Declarations no helper could turn into a dependency (#2181), behind a `RefCell` for the
+    /// same reason as [`Self::blocked_registries`].
+    pub(super) invalid_declarations: RefCell<Vec<InvalidDeclarationOccurrence>>,
 }
 
 /// The key spellings that differ between Poetry's and pipenv's dependency tables, which
@@ -80,6 +86,21 @@ impl TableDialect {
 }
 
 impl IndexContext<'_> {
+    fn record_invalid(
+        &self,
+        range: deps_core::position::Range,
+        key: &str,
+        reason: InvalidDeclarationReason,
+    ) {
+        self.invalid_declarations
+            .borrow_mut()
+            .push(InvalidDeclarationOccurrence {
+                range,
+                key: key.to_owned(),
+                reason,
+            });
+    }
+
     /// Resolves `dep`'s source through `self.config`, **only** when `dep.source` is still the
     /// PEP 508-string-parser default `Registry` — a dependency already routed to Git/Path/Url
     /// (a direct reference) has no PyPI index concept and is left untouched.
@@ -170,6 +191,7 @@ impl PypiParser {
                     blocked_registries: Vec::new(),
                     rejected_registries: Vec::new(),
                     dependency_truncation: budget.truncation(),
+                    invalid_declarations: Vec::new(),
                 });
             }
         };
@@ -196,6 +218,7 @@ impl PypiParser {
             uv_named_by_dep: &uv_named_by_dep,
             blocked_registries: RefCell::new(Vec::new()),
             rejected_registries: RefCell::new(Vec::new()),
+            invalid_declarations: RefCell::new(Vec::new()),
         };
 
         // PEP 517/518
@@ -265,13 +288,14 @@ impl PypiParser {
             blocked_registries: ctx.blocked_registries.into_inner(),
             rejected_registries: ctx.rejected_registries.into_inner(),
             dependency_truncation: budget.truncation(),
+            invalid_declarations: ctx.invalid_declarations.into_inner(),
         })
     }
 
     /// Parse PEP 517/518 `[build-system]` requires array.
     ///
-    /// Always succeeds: a malformed individual requirement is logged and skipped rather
-    /// than propagated.
+    /// Always succeeds: a malformed individual requirement is recorded as an invalid
+    /// declaration rather than propagated.
     fn parse_build_system_requires(
         &self,
         build_system: &Table<'_>,
@@ -280,50 +304,22 @@ impl PypiParser {
         ctx: &IndexContext<'_>,
         budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
-        let Some(requires_val) = build_system.get("requires") else {
+        let Some(requires) = build_system.get("requires").and_then(Value::as_array) else {
             return Vec::new();
         };
 
-        let Some(requires_array) = requires_val.as_array() else {
-            return Vec::new();
+        let array = RequirementArray {
+            values: requires,
+            key: "requires",
+            section: PypiDependencySection::BuildSystem,
         };
-
-        let mut dependencies = Vec::new();
-
-        for value in requires_array {
-            if !budget.allow() {
-                continue;
-            }
-            if let Some(dep_str) = value.as_str() {
-                match self.parse_pep508_requirement(
-                    dep_str,
-                    Some(value.span.start..value.span.end),
-                    content,
-                    line_table,
-                ) {
-                    Ok(mut dep) => {
-                        dep.section = PypiDependencySection::BuildSystem;
-                        ctx.resolve(&mut dep);
-                        dependencies.push(dep);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse build-system require '{}': {}",
-                            super::truncate_for_log(dep_str),
-                            e.reason_for_log()
-                        );
-                    }
-                }
-            }
-        }
-
-        dependencies
+        self.parse_requirement_array(&array, content, line_table, ctx, budget)
     }
 
     /// Parse PEP 621 `[project.dependencies]` array.
     ///
-    /// Always succeeds: a malformed individual requirement is logged and skipped rather
-    /// than propagated.
+    /// Always succeeds: a malformed individual requirement is recorded as an invalid
+    /// declaration rather than propagated.
     fn parse_pep621_dependencies(
         &self,
         project: &Table<'_>,
@@ -332,50 +328,22 @@ impl PypiParser {
         ctx: &IndexContext<'_>,
         budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
-        let Some(deps_val) = project.get("dependencies") else {
+        let Some(requirements) = project.get("dependencies").and_then(Value::as_array) else {
             return Vec::new();
         };
 
-        let Some(deps_array) = deps_val.as_array() else {
-            return Vec::new();
+        let array = RequirementArray {
+            values: requirements,
+            key: "dependencies",
+            section: PypiDependencySection::Dependencies,
         };
-
-        let mut dependencies = Vec::new();
-
-        for value in deps_array {
-            if !budget.allow() {
-                continue;
-            }
-            if let Some(dep_str) = value.as_str() {
-                match self.parse_pep508_requirement(
-                    dep_str,
-                    Some(value.span.start..value.span.end),
-                    content,
-                    line_table,
-                ) {
-                    Ok(mut dep) => {
-                        dep.section = PypiDependencySection::Dependencies;
-                        ctx.resolve(&mut dep);
-                        dependencies.push(dep);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse dependency '{}': {}",
-                            super::truncate_for_log(dep_str),
-                            e.reason_for_log()
-                        );
-                    }
-                }
-            }
-        }
-
-        dependencies
+        self.parse_requirement_array(&array, content, line_table, ctx, budget)
     }
 
     /// Parse PEP 621 `[project.optional-dependencies]` tables.
     ///
-    /// Always succeeds: a malformed individual requirement is logged and skipped rather
-    /// than propagated.
+    /// Always succeeds: a malformed individual requirement is recorded as an invalid
+    /// declaration rather than propagated.
     fn parse_pep621_optional_dependencies(
         &self,
         project: &Table<'_>,
@@ -384,46 +352,25 @@ impl PypiParser {
         ctx: &IndexContext<'_>,
         budget: &mut deps_core::DependencyBudget,
     ) -> Vec<PypiDependency> {
-        let Some(opt_deps_val) = project.get("optional-dependencies") else {
-            return Vec::new();
-        };
-
-        let Some(opt_deps_table) = opt_deps_val.as_table() else {
+        let Some(groups) = project
+            .get("optional-dependencies")
+            .and_then(Value::as_table)
+        else {
             return Vec::new();
         };
 
         let mut dependencies = Vec::new();
-
-        for (group_key, group_val) in opt_deps_table {
-            if let Some(group_array) = group_val.as_array() {
-                for value in group_array {
-                    if !budget.allow() {
-                        continue;
-                    }
-                    if let Some(dep_str) = value.as_str() {
-                        match self.parse_pep508_requirement(
-                            dep_str,
-                            Some(value.span.start..value.span.end),
-                            content,
-                            line_table,
-                        ) {
-                            Ok(mut dep) => {
-                                dep.section = PypiDependencySection::OptionalDependencies {
-                                    group: group_key.name.to_string(),
-                                };
-                                ctx.resolve(&mut dep);
-                                dependencies.push(dep);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to parse dependency '{}': {}",
-                                    super::truncate_for_log(dep_str),
-                                    e.reason_for_log()
-                                );
-                            }
-                        }
-                    }
-                }
+        for (group_key, group_val) in groups {
+            if let Some(values) = group_val.as_array() {
+                let array = RequirementArray {
+                    values,
+                    key: &group_key.name,
+                    section: PypiDependencySection::OptionalDependencies {
+                        group: group_key.name.to_string(),
+                    },
+                };
+                dependencies
+                    .extend(self.parse_requirement_array(&array, content, line_table, ctx, budget));
             }
         }
 
@@ -440,8 +387,8 @@ impl PypiParser {
     /// test = ["pytest>=8.0", "pytest-cov>=4.0"]
     /// ```
     ///
-    /// Always succeeds: a malformed individual requirement is logged and skipped rather
-    /// than propagated.
+    /// Always succeeds: a malformed individual requirement is recorded as an invalid
+    /// declaration rather than propagated.
     fn parse_dependency_groups(
         &self,
         dep_groups: &Table<'_>,
@@ -453,34 +400,70 @@ impl PypiParser {
         let mut dependencies = Vec::new();
 
         for (group_key, group_val) in dep_groups {
-            if let Some(group_array) = group_val.as_array() {
-                for value in group_array {
-                    if !budget.allow() {
-                        continue;
-                    }
-                    if let Some(dep_str) = value.as_str() {
-                        match self.parse_pep508_requirement(
-                            dep_str,
-                            Some(value.span.start..value.span.end),
-                            content,
-                            line_table,
-                        ) {
-                            Ok(mut dep) => {
-                                dep.section = PypiDependencySection::DependencyGroup {
-                                    group: group_key.name.to_string(),
-                                };
-                                ctx.resolve(&mut dep);
-                                dependencies.push(dep);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to parse dependency group '{}' item '{}': {}",
-                                    super::truncate_for_log(&group_key.name),
-                                    super::truncate_for_log(dep_str),
-                                    e.reason_for_log()
-                                );
-                            }
-                        }
+            if let Some(values) = group_val.as_array() {
+                let array = RequirementArray {
+                    values,
+                    key: &group_key.name,
+                    section: PypiDependencySection::DependencyGroup {
+                        group: group_key.name.to_string(),
+                    },
+                };
+                dependencies
+                    .extend(self.parse_requirement_array(&array, content, line_table, ctx, budget));
+            }
+        }
+
+        dependencies
+    }
+
+    /// Parses one array of PEP 508 requirement strings.
+    fn parse_requirement_array(
+        &self,
+        array: &RequirementArray<'_>,
+        content: &str,
+        line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
+        budget: &mut deps_core::DependencyBudget,
+    ) -> Vec<PypiDependency> {
+        let mut dependencies = Vec::new();
+
+        for value in array.values {
+            if !budget.allow() {
+                continue;
+            }
+            let Some(dep_str) = value.as_str() else {
+                if !is_include_group(&array.section, value) {
+                    ctx.record_invalid(
+                        span_to_range(content, line_table, value.span),
+                        array.key,
+                        InvalidDeclarationReason::UnsupportedValue,
+                    );
+                }
+                continue;
+            };
+            match self.parse_pep508_requirement(
+                dep_str,
+                Some(value.span.start..value.span.end),
+                content,
+                line_table,
+            ) {
+                Ok(mut dep) => {
+                    dep.section = array.section.clone();
+                    ctx.resolve(&mut dep);
+                    dependencies.push(dep);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse dependency '{}': {}",
+                        super::truncate_for_log(dep_str),
+                        e.reason_for_log()
+                    );
+                    if !has_context_placeholder(dep_str) {
+                        ctx.record_invalid(
+                            span_to_range(content, line_table, value.span),
+                            super::invalid_requirement_key(dep_str),
+                            super::invalid_requirement_reason(&e),
+                        );
                     }
                 }
             }
@@ -589,6 +572,13 @@ impl PypiParser {
                         super::truncate_for_log(name),
                         e.reason_for_log()
                     );
+                    if !is_multiple_constraints(ctx.dialect, value) {
+                        ctx.record_invalid(
+                            span_to_range(content, line_table, name_key.span),
+                            name,
+                            super::invalid_requirement_reason(&e),
+                        );
+                    }
                 }
             }
         }
@@ -774,6 +764,40 @@ impl PypiParser {
             super::truncate_for_log(name)
         )))
     }
+}
+
+/// One array of requirement strings and the section its dependencies belong to.
+struct RequirementArray<'a> {
+    values: &'a [Value<'a>],
+    /// Names the array in a notice about an element that is not a string.
+    key: &'a str,
+    section: PypiDependencySection,
+}
+
+/// Whether `requirement` carries a placeholder a build backend expands before reading it
+/// (Hatch's `{root:uri}`, PDM's `${PROJECT_ROOT}`).
+fn has_context_placeholder(requirement: &str) -> bool {
+    requirement
+        .split_once('{')
+        .is_some_and(|(_, rest)| rest.contains('}'))
+}
+
+/// Whether `value` is a PEP 735 `{ include-group = "..." }` reference, which names another
+/// group rather than a requirement.
+fn is_include_group(section: &PypiDependencySection, value: &Value<'_>) -> bool {
+    matches!(section, PypiDependencySection::DependencyGroup { .. })
+        && value
+            .as_table()
+            .is_some_and(|table| table.contains_key("include-group"))
+}
+
+/// Whether `value` is Poetry's multiple-constraints form (an array of tables), which is valid
+/// even though this parser does not read it.
+fn is_multiple_constraints(dialect: TableDialect, value: &Value<'_>) -> bool {
+    matches!(dialect, TableDialect::Poetry)
+        && value.as_array().is_some_and(|items| {
+            !items.is_empty() && items.iter().all(|item| item.as_table().is_some())
+        })
 }
 
 /// Parses `content` as TOML under the shared nesting-depth guard.
@@ -3219,5 +3243,43 @@ dependencies = ["otherpkg >=< 2.0"]
             !log.contains("***"),
             "there is nothing here to redact — a bare '***' means real diagnostic text was lost: {log:?}"
         );
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_unreadable_requirements_are_reported_but_include_group_is_not() {
+        let result = PypiParser::new()
+            .parse_content(
+                "[project]\ndependencies = [\"bad name!\", 3, \"ok>=1\"]\n[dependency-groups]\ndev = [{ include-group = \"x\" }]\n[tool.poetry.dependencies]\nmulti = [{ version = \"1\" }]\nwrong = 4\n",
+                &deps_core::test_util::test_uri("/p/pyproject.toml"),
+            )
+            .unwrap();
+
+        let keys: Vec<_> = reported(&result).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["bad", "dependencies", "wrong"]);
+    }
+
+    #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "the braces are Hatch's own placeholder syntax"
+    )]
+    fn test_hatch_context_formatted_requirement_is_not_invalid() {
+        let result = PypiParser::new()
+            .parse_content(
+                "[project]\ndependencies = [\"pkg @ {root:uri}/packages/pkg\"]\n",
+                &deps_core::test_util::test_uri("/p/pyproject.toml"),
+            )
+            .unwrap();
+
+        assert_eq!(reported(&result), []);
     }
 }

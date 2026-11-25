@@ -196,7 +196,8 @@ pub(crate) async fn regen_child_main() {
         regenerate_lockfile_unlistened,
     };
     use deps_cli::update::{
-        CooldownFallbackNote, CurrentVersion, Outcome, PlannedUpdateItem, UpdatePlan, apply_plan,
+        CooldownFallbackNote, CurrentVersion, FallbackHold, Outcome, PlannedUpdateItem, UpdatePlan,
+        apply_plan,
     };
     use deps_core::edit::ManifestEdit;
     use deps_core::net_policy::{MapEnv, RegistryEnvironment};
@@ -258,7 +259,10 @@ pub(crate) async fn regen_child_main() {
                 false,
                 None,
                 fallback.then(|| {
-                    CooldownFallbackNote::AppliedInsteadOf(ConcreteVersion::from("99.0.0"))
+                    CooldownFallbackNote::AppliedInsteadOf(
+                        ConcreteVersion::from("99.0.0"),
+                        FallbackHold::Freshness,
+                    )
                 }),
             )
         })

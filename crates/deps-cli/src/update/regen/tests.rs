@@ -43,8 +43,8 @@ use super::{
 use crate::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, update_exit_code};
 use crate::format::DryRun;
 use crate::update::{
-    CooldownFallbackNote, CurrentVersion, Outcome, PlannedUpdateItem, SkipReason, UpdatePlan,
-    UpdateRun, apply_plan,
+    CooldownFallbackNote, CurrentVersion, FallbackHold, Outcome, PlannedUpdateItem, SkipReason,
+    UpdatePlan, UpdateRun, apply_plan,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -155,7 +155,10 @@ fn plan_of(content: &str, bumps: &[Bump]) -> UpdatePlan {
                 false,
                 None,
                 bump.cooldown_fallback.then(|| {
-                    CooldownFallbackNote::AppliedInsteadOf(ConcreteVersion::from("99.0.0"))
+                    CooldownFallbackNote::AppliedInsteadOf(
+                        ConcreteVersion::from("99.0.0"),
+                        FallbackHold::Freshness,
+                    )
                 }),
             )
         })

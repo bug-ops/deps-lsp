@@ -36,6 +36,9 @@ pub struct MavenParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// `<dependency>` and `<plugin>` elements without a usable coordinate (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 /// Context stack element for SAX parsing.
@@ -55,6 +58,8 @@ enum ParseContext {
 /// Accumulator for a single dependency being parsed.
 #[derive(Default)]
 struct DepAccum {
+    /// Byte span of the element's tag name, anchoring a notice about a missing coordinate.
+    element_span: (usize, usize),
     group_id: Option<String>,
     artifact_id: Option<String>,
     artifact_id_start: u64,
@@ -145,6 +150,9 @@ struct AccumulatedDep {
 pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies: Vec<AccumulatedDep> = Vec::new();
+    let mut invalid_declarations = Vec::new();
+    let mut invalid_budget =
+        deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     let mut properties = HashMap::new();
 
     let mut reader = Reader::from_str(content);
@@ -191,12 +199,12 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     }
                     (ParseContext::Dependencies, "dependency") => {
                         context_stack.push(ParseContext::Dependency);
-                        current_dep = Some(DepAccum::default());
+                        current_dep = Some(DepAccum::at(content, e.local_name().as_ref()));
                         current_tag = None;
                     }
                     (ParseContext::Plugins, "plugin") => {
                         context_stack.push(ParseContext::Plugin);
-                        current_dep = Some(DepAccum::default());
+                        current_dep = Some(DepAccum::at(content, e.local_name().as_ref()));
                         current_tag = None;
                     }
                     (ParseContext::Root, "properties") => {
@@ -321,15 +329,22 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     (ParseContext::Dependency, "dependency") | (ParseContext::Plugin, "plugin") => {
                         let this_is_plugin = tag == "plugin";
                         context_stack.pop();
-                        if let Some(dep) = current_dep.take()
-                            && let Some(maven_dep) =
+                        if let Some(dep) = current_dep.take() {
+                            if let Some(occurrence) =
+                                missing_coordinate(&dep, this_is_plugin, content, &line_table)
+                            {
+                                if invalid_budget.allow() {
+                                    invalid_declarations.push(occurrence);
+                                }
+                            } else if let Some(maven_dep) =
                                 finalize_dep(dep, content, &line_table, &properties)
-                            && budget.allow()
-                        {
-                            dependencies.push(AccumulatedDep {
-                                dep: maven_dep,
-                                is_plugin: this_is_plugin,
-                            });
+                                && budget.allow()
+                            {
+                                dependencies.push(AccumulatedDep {
+                                    dep: maven_dep,
+                                    is_plugin: this_is_plugin,
+                                });
+                            }
                         }
                         current_tag = None;
                     }
@@ -495,6 +510,42 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
         properties,
         uri: doc_uri.clone(),
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
+    })
+}
+
+impl DepAccum {
+    fn at(content: &str, tag_name: &str) -> Self {
+        Self {
+            element_span: content
+                .substr_range(tag_name)
+                .map_or_default(|range| (range.start, range.end)),
+            ..Self::default()
+        }
+    }
+}
+
+/// A notice for an element that cannot name a package. A plugin may omit `groupId`, which
+/// Maven then defaults, so it is not reported for that.
+fn missing_coordinate(
+    dep: &DepAccum,
+    is_plugin: bool,
+    content: &str,
+    line_table: &LineOffsetTable,
+) -> Option<deps_core::InvalidDeclarationOccurrence> {
+    let key = match (&dep.group_id, &dep.artifact_id) {
+        (Some(_), Some(_)) => return None,
+        (None, Some(_)) if is_plugin => return None,
+        (group, artifact) => artifact
+            .as_deref()
+            .or(group.as_deref())
+            .unwrap_or(if is_plugin { "plugin" } else { "dependency" }),
+    };
+    let (start, end) = dep.element_span;
+    Some(deps_core::InvalidDeclarationOccurrence {
+        range: byte_span_to_range(content, line_table, start, end),
+        key: key.to_owned(),
+        reason: deps_core::InvalidDeclarationReason::MissingCoordinate,
     })
 }
 
@@ -660,6 +711,7 @@ deps_core::impl_parse_result!(
         dependencies: dependencies,
         uri: uri,
         dependency_truncation: dependency_truncation,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -2125,6 +2177,32 @@ mod tests {
             result,
             format!("{value2}{filler1}"),
             "a predicted length landing exactly at the cap on round 2 must still resolve"
+        );
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_elements_without_a_coordinate_are_reported() {
+        let result = parse_pom_xml(
+            "<project><dependencies><dependency><artifactId>a</artifactId></dependency></dependencies><build><plugins><plugin><artifactId>p</artifactId></plugin></plugins></build></project>",
+            &deps_core::test_util::test_uri("/p/pom.xml"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reported(&result),
+            [(
+                "a".to_owned(),
+                deps_core::InvalidDeclarationReason::MissingCoordinate
+            )]
         );
     }
 }

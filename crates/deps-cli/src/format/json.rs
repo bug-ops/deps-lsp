@@ -953,7 +953,7 @@ pub fn update_to_document(run: &crate::update::UpdateRun, dry_run: DryRun) -> Up
                         .collect()
                 }),
             cooldown_fallback: item.cooldown_fallback.as_ref().map(|note| match note {
-                crate::update::CooldownFallbackNote::AppliedInsteadOf(latest) => {
+                crate::update::CooldownFallbackNote::AppliedInsteadOf(latest, _) => {
                     CooldownFallbackDocument::AppliedInsteadOf {
                         latest: crate::sanitize::sanitize_message_for_display(latest.as_str()),
                     }
@@ -1343,6 +1343,7 @@ mod tests {
         applied_instead_of_item.cooldown_fallback =
             Some(crate::update::CooldownFallbackNote::AppliedInsteadOf(
                 deps_core::ConcreteVersion::from("1.3.0\x1B[31m"),
+                crate::update::FallbackHold::Freshness,
             ));
         let plan = crate::update::UpdatePlan {
             items: vec![item, applied_instead_of_item],

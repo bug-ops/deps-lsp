@@ -88,7 +88,7 @@ fn for_uri_blocking_routes_a_settings_declared_catalog_to_gradle() {
     assert!(registry.for_uri(&uri).is_none(), "for_uri stays pure");
     assert_eq!(
         registry
-            .for_uri_blocking(&uri)
+            .for_uri_blocking(&uri, None)
             .map(|ecosystem| ecosystem.ecosystem_id()),
         Some(EcosystemId::Gradle)
     );
@@ -100,7 +100,7 @@ fn for_uri_blocking_leaves_an_undeclared_toml_unrouted() {
     let registry = registry();
     let (_dir, uri) = declared_catalog(None);
 
-    assert!(registry.for_uri_blocking(&uri).is_none());
+    assert!(registry.for_uri_blocking(&uri, None).is_none());
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn for_uri_blocking_keeps_static_routing_for_cargo_and_pypi() {
         let uri = url::Url::from_file_path(root.path().join(name)).expect("file url");
         assert_eq!(
             registry
-                .for_uri_blocking(&uri)
+                .for_uri_blocking(&uri, None)
                 .map(|ecosystem| ecosystem.ecosystem_id()),
             Some(id),
             "{name}"

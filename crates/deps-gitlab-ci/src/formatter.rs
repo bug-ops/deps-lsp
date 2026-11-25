@@ -2017,6 +2017,7 @@ mod tests {
             Position::new(2, 11).into(),
             &uri,
             VersionData::new(&cached, &resolved),
+            deps_core::FreshnessSettings::Disabled,
             content,
             &registry,
             &fmt,
@@ -2345,7 +2346,13 @@ mod tests {
         let resolved = HashMap::new();
         let versions = VersionData::new(&cached, &resolved);
 
-        let candidates = collect_update_candidates(&result, content, versions, &fmt);
+        let candidates = collect_update_candidates(
+            &result,
+            content,
+            versions,
+            deps_core::FreshnessSettings::Disabled,
+            &fmt,
+        );
 
         assert!(
             candidates.is_empty(),

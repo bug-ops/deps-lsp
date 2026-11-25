@@ -273,6 +273,7 @@ where
         dep,
         versions,
         fetched.as_ref(),
+        freshness,
         registry,
         formatter,
     );
@@ -295,6 +296,7 @@ fn code_actions_state<R, P, F>(
     dep: &P::Dep,
     versions: VersionData<'_>,
     fetched: Option<&FetchedVersions>,
+    freshness: crate::freshness::FreshnessSettings,
     registry: &R,
     formatter: &F,
 ) -> CodeActions
@@ -310,6 +312,7 @@ where
                     parse_result,
                     dep,
                     versions,
+                    freshness,
                     fetched,
                     registry,
                     formatter,
@@ -4640,7 +4643,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -4692,7 +4695,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -4738,7 +4741,7 @@ mod tests {
                 // 1 hour ago — well within the default 3-day cooldown.
                 published_at: Some(PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60)),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -4795,7 +4798,7 @@ mod tests {
                 // 1 hour ago — well within the default 3-day cooldown.
                 published_at: Some(PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60)),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -4838,7 +4841,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60)),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -4926,7 +4929,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -4973,7 +4976,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -5021,7 +5024,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -5093,7 +5096,7 @@ mod tests {
                     now.as_unix_secs() - 90 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8205,6 +8208,7 @@ mod tests {
                 VersionData::new(&cached, &resolved)
                     .with_outcomes(&outcomes)
                     .with_vulnerabilities(&vulnerabilities),
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &MOCK_FORMATTER,
@@ -8259,6 +8263,7 @@ mod tests {
         }
 
         #[tokio::test]
+        #[expect(clippy::too_many_lines, reason = "one table of footer cases")]
         async fn footer_is_present_exactly_when_code_actions_are() {
             let scenarios = [
                 Scenario {
@@ -8400,6 +8405,7 @@ mod tests {
                     version_range.start,
                     parse_result.uri(),
                     versions,
+                    crate::FreshnessSettings::Disabled,
                     &content,
                     scenario.registry.as_ref(),
                     scenario.formatter,
@@ -8443,6 +8449,7 @@ mod tests {
                     &parse_result,
                     &parse_result.deps[0],
                     versions,
+                    crate::FreshnessSettings::Disabled,
                     &FetchedVersions::from_interactive(InteractiveFetch::Degraded(no_live_list)),
                     &ErrorRegistry,
                     &MOCK_FORMATTER,
