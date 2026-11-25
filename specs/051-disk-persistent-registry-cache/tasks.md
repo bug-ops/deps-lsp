@@ -224,6 +224,8 @@ graph TD
 - [ ] The read path's file name lookup (`PersistKey::file_name()`) and `decode(bytes, &PersistKey)` use the key, so the normalized URL is type-enforced (PR-A hardening, #2153); remaining PR-B work: call sites and logging, follow-up #2142
 - [ ] Tests (#2142): a corrupt header with a secret-shaped marker in its content fails decode and the captured tracing output names the `DecodeError` variant without the marker; the degrade warning (open failure and first-read timeout) contains the cache path and the reason; a mixed-case host or `:443` URL written earlier is found on disk through `PersistKey::url()` with `decode` accepting it as `expected_url`
 - [ ] Entry trust checks use the metadata of the same handle that read the bytes (owner, mode, mtime), never a separate `stat`
+- [ ] `FileStore` (concrete module `persist/file_store.rs`, no trait) is introduced as the single storage boundary with `get(&PersistKey) -> Option<(PersistedEntry, ValidatedAt)>`, `put_if_newer(key, entry, validated_at)`, `restamp_if_matches(key, &EntryFingerprint, validated_at)`, `remove(key)` and `prune(now)`; the read path calls only `FileStore::get`, which owns the same-handle metadata, owner check and mtime
+- [ ] `DiskTier` and the writer do not import `fs_probe` or `std::fs` directly; all disk access goes through `FileStore` (grep check over `persist/mod.rs`)
 - [ ] Tests: open in progress then the read waits and hits (does not miss), including N concurrent first-wave reads that all hit disk (SC-002); open slower than 250 ms yields a miss without degrading; semaphore-wait timeout does not degrade; a blocking read slower than 250 ms (test seam delay) degrades the tier with exactly one warn and later reads are misses ([[spec#FR-015]]); the `info!` appears exactly once across several successful uses (captured tracing subscriber); NFR-001: `set_persistence(Disk(tmp))` leaves the directory absent until the first eligible op; NFR-002: the disk-access counter stays 0 across repeated in-memory hits even after the directory is made unreadable
 **Dependencies**: T007
 **Files**: `crates/deps-core/src/cache/persist/mod.rs`, `crates/deps-core/src/cache/fetch.rs`, `crates/deps-core/src/cache/store.rs`, `crates/deps-core/src/cache/tests/`
@@ -236,6 +238,7 @@ graph TD
 **Context**: Write-behind with newest-validation-wins and safe restamping.
 **Spec reference**: [[spec#FR-006]], [[spec#FR-007]], [[spec#FR-012]], [[spec#FR-015]], [[spec#FR-016]]
 **Acceptance criteria**:
+- [ ] The writer applies ops only through `FileStore::put_if_newer`, `restamp_if_matches`, `remove` and `prune`; the FR-012 rules (drop an op older than the file's mtime, restamp only when the header fingerprint matches, otherwise a full write with mtime equal to `validated_at`) live inside those methods, not in the writer; `DiskTier`/writer do not import `fs_probe` or `std::fs` directly
 - [ ] Bounded mpsc queue (256 ops, 16 MiB queued body bytes, atomic counter), `try_send` drops when full, never blocks; one writer spawned lazily on the first enqueue; ops applied via `spawn_blocking`
 - [ ] `DiskOp::{Put, Validated, Remove}` carry `validated_at`; writer per key: stat the existing file and drop the op if its mtime is later than `validated_at`; `Validated` reads only the header through one `open_for_restamp` handle and restamps only if the fingerprint matches, otherwise writes the full entry; a full write sets mtime to `validated_at` (never the write time)
 - [ ] An oversize 200 enqueues `Remove` (and marks `stale_on_disk`, T010); 304 on an eligible key enqueues `Validated`
@@ -260,6 +263,7 @@ graph TD
 **Context**: Never serve a known-older disk copy, and never mix a fresh page 1 with an old later page.
 **Spec reference**: [[spec#FR-012]], [[spec#FR-013]]
 **Acceptance criteria**:
+- [ ] `stale_on_disk` handling uses only `FileStore` methods (a keyed `Put` via `put_if_newer`, never `restamp_if_matches`); no direct `fs_probe`/`std::fs` use in `DiskTier`
 - [ ] `stale_on_disk` session set (cap 4096; overflow suspends read-through for the session); read-through skips keys in it; the writer clears a key once its `Put` is applied; keys in it always enqueue `Put`, never `Validated`
 - [ ] Page-1 rule in the read path: for `ListingPage` with `PersistKey::page() > 1`, `Fresh` only when the `sibling_page(1)` entry is in memory as `Restored` and `Fresh` and own `validated_at >= t1`; page 1 absent or `Network` gives `Revalidate`; `Standalone` classified by own age
 - [ ] Tests: new page 1 at T1 with old page 2 at T0, restart revalidates page 2 and the merged list contains the old tag; page 1 `Network` makes page 2 revalidate; `Standalone` compare probe is served `Fresh`; oversize 200 then memory eviction does not serve the old copy within the window
@@ -292,6 +296,7 @@ graph TD
 **Acceptance criteria**:
 - [ ] `#[cfg(test)] fn loopback_admitted` in `PersistKey::new` admits `http`/`https` loopback hosts (`127.0.0.1`, `::1`, `localhost`) on any port; no enum variant and no `feature = "test-util"` path
 - [ ] mockito + tempdir tests: restart inside the window sends 0 hits; after the window one conditional request returns 304 and restamps the mtime; offline restart serves with no request; `Accept` mismatch is a miss; credentialed, `Pinned` and `WorkspaceDeclared` entries never appear on disk; `CacheMode::Disabled` neither reads nor writes
+- [ ] The two-process test exercises the `FileStore` CAS methods (`put_if_newer`, `restamp_if_matches`, `get`, `remove`) directly, not only `HttpCache`
 - [ ] Two-process test in `crates/deps-core/src/cache/tests/`: re-spawn `current_exe()` with `--exact <test>` and a role env var (so `cfg(test)` holds in children); two children do N reads and writes on the same keys; zero decode failures (also with torn-read assertions)
 - [ ] Windows test: rename over a file another handle holds open succeeds (runs in the Windows nextest shards)
 - [ ] FIFO planted at an entry name does not block and is discarded

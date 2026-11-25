@@ -346,7 +346,8 @@ None. All clarification items from the research draft are resolved below.
 
 | # | Original item | Decision |
 |---|---------------|----------|
-| D-1 | Backend crate | std + `serde_json` + `fs_probe`, no new dependency; rejected `redb` and `fjall` (exclusive process lock breaks US-003), `sled` (unmaintained), `rusqlite` (C build, cross targets), `cacache` (heavy tree) |
+| D-1 | Backend crate | std + `serde_json` + `fs_probe`, no new dependency (flat files, not a database). Rejected: `rusqlite`/SQLite (SQLite file locks via `fcntl` are unreliable on NFS/SMB and WAL does not work there at all, while atomic rename is safe on both, the same reason `File::lock` is rejected; a corrupt entry file is one miss but a corrupt database file means recreating the whole store; NFR-005/NFR-006 and Ask First forbid a new dependency; the store is small and bounded per FR-016/FR-004 (2048 entries, 64 MiB, 8 MiB per entry, closed `PersistableHost` enum of 16 hosts), read-mostly and accessed by key only, so queries and transactions buy nothing), `redb` and `fjall` (exclusive process lock breaks US-003), `sled` (unmaintained), `cacache` (heavy tree). A C build and cross targets are not a reason: `aws-lc-sys` (C + cmake) already builds via `reqwest`/`rustls` on every release target (musl, win-arm64, i686), `wasm32-wasip1` concerns only `deps-zed`, which `deps-core` does not link, and `unsafe_code = "forbid"` covers workspace crates only, not a dependency with FFI |
+| D-1a | Backend measurement | APFS, 2048 entries x 16 KiB: scan+stat+sort 5.5 ms (files) vs 1.0 ms (SQLite), read 15 vs 6 µs, write 0.15 vs 0.09 ms; at 16384 entries 42 vs 7 ms. At the current limits the difference is invisible next to a network request, so it does not change D-1 |
 | D-2 | Directory | OS cache directory via env-resolved `CacheDir::user_default(env)` + `deps-lsp/http/v1`; rejected workspace `.deps-lsp/` and a configurable path |
 | D-3 | `Instant` vs wall clock | File mtime is the wall-clock last-validation stamp (R2); `Instant` untouched |
 | D-4 | Eviction budget | Independent disk budget 64 MiB / 2048 files, 7-day cap, least recently validated first |
@@ -355,6 +356,19 @@ None. All clarification items from the research draft are resolved below.
 | D-7 | Tiers | `Baseline` + anonymous only; `Pinned` and `WorkspaceDeclared` excluded |
 | D-8 | `test-util` surface | `#[cfg(test)]` loopback admission in deps-core, no new `test-util` surface |
 | D-9 | Competitor evaluation | Not required once the user chose to implement |
+
+### Backend revisit triggers
+
+D-1 is revisited, and a move to `rusqlite` (bundled; WAL, `synchronous=NORMAL`, `busy_timeout`, `SQLITE_OPEN_NOFOLLOW`; on a remote filesystem either an in-memory database or `journal_mode=DELETE`) is considered, only when any one of these holds:
+
+- [ ] (a) Persistence starts to cover OSV or deps.dev data, or any other data that is not an HTTP response.
+- [ ] (b) The limit must rise above about 16k entries, or a measured prune or cold start exceeds 50 ms.
+- [ ] (c) A query other than get-by-key is needed (invalidation by host or prefix, statistics).
+- [ ] (d) The two-process tests (T012) find FR-012 races that need atomicity across several keys.
+- [ ] (e) After #2173, two or more further filesystem or Windows defects are found in `fs_probe`.
+
+> [!note] Migration cost
+> The migration is cheap because this is a cache: the `v1` directory can be discarded ([[spec#NFR-003]]) and there is no data to carry over. `redb` and `fjall` stay unsuitable (exclusive process lock, US-003). `turso` stays unsuitable until proven otherwise: its multi-process access readiness has not been verified (unverified, not rejected on evidence).
 
 ## 10. See Also
 
