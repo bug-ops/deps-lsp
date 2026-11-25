@@ -8,19 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-core**: `generate_inlay_hints`, `ParsedManifest::generate_inlay_hints` and `TypedEcosystem::inlay_hints` take `freshness` (#2190)
-- **deps-cli**: `ConfigLookup` gains the `DiscoveredDefaultIsManifest` variant and `for_walk_paths` takes a manifest probe (#2182)
-- **deps-cli**: `CooldownFallbackNote::AppliedInsteadOf` also carries the `FallbackHold` that caused it (#2190)
-- **deps-core**: planner, code-lens and code-action APIs take a `freshness` argument, `cooldown_candidates` replaces `cooldown_fallback`, and `UnplannableReason::WithinNativeCooldown` gives way to `UpdateCandidate::Held` (#2190, #2191)
-- **deps-core**: `claims_unrouted_manifest` and `EcosystemRegistry::for_uri_blocking` take `Option<&ClaimBound>`, and ecosystem parse results gain `invalid_declarations` (#2178, #2181)
+- **deps-core**: `generate_inlay_hints`, `ParsedManifest::generate_inlay_hints` and `TypedEcosystem::inlay_hints` take `freshness` (#2190, #2205)
+- **deps-cli**: `ConfigLookup` gains the `DiscoveredDefaultIsManifest` variant and `for_walk_paths` takes a manifest probe (#2182, #2205)
+- **deps-cli**: `CooldownFallbackNote::AppliedInsteadOf` also carries the `FallbackHold` that caused it (#2190, #2205)
+- **deps-core**: planner, code-lens and code-action APIs take a `freshness` argument, `cooldown_candidates` replaces `cooldown_fallback`, and `UnplannableReason::WithinNativeCooldown` gives way to `UpdateCandidate::Held` (#2190, #2191, #2205)
+- **deps-core**: `claims_unrouted_manifest` and `EcosystemRegistry::for_uri_blocking` take `Option<&ClaimBound>`, and ecosystem parse results gain `invalid_declarations` (#2178, #2181, #2205)
 - **deps-gradle**: `GradleParseResult` gains the public field `invalid_declarations`, breaking struct-literal construction outside the crate (#2170, #2188)
 - **deps-cli**: `Outcome::RequiresLockfileUpdate` carries the ecosystem, `LockfileFix::ecosystem` is removed and `LockfileDocument::Failed` gains an additive `held` array (#2116, #2120, #2128)
 - **deps-cli**: lock-only regeneration and Gradle legacy-layout migration add `Companion::{Created, Removed}`, `Removal`, `IoOperation::RemoveLegacyLockfile`, `RekeyRefusal::OriginalRequestMissing`, `RegenerationError::{LockfilePinNotKept, LockStateDrift}`, a `LegacyLayoutConflict` payload on `UnsupportedReason::LegacyLockLayout`, an additive `migration` key in the JSON lockfile document, and drop `LockfileOnlyMove` (#2113, #2102, #2134)
 - **deps-cli**: JSON lockfile `failed` entries for `lockfile-pin-not-kept`, `fallback-pin-not-kept` and `lock-state-drift` fill `package`/`expected` and add optional `configuration`/`change` (#2132, #2136)
 
 ### Added
-- **deps-gradle**, **deps-cli**, **deps-lsp**: version catalogs declared outside the settings subtree or with hidden names are recognized, and open documents are re-routed after a settings change (#2178, #2179, #2180)
-- **ecosystems**: skipped invalid dependency declarations are reported as warnings in npm, Composer, Cargo, Deno, PyPI, NuGet, Maven, Go and Swift (#2181)
+- **deps-gradle**, **deps-cli**, **deps-lsp**: version catalogs declared outside the settings subtree or with hidden names are recognized, and open documents are re-routed after a settings change (#2178, #2179, #2180, #2205)
+- **ecosystems**: skipped invalid dependency declarations are reported as warnings in npm, Composer, Cargo, Deno, PyPI, NuGet, Maven, Go and Swift (#2181, #2205)
 - **deps-core**: shared `gradle_layout` module and `ParseResult::invalid_declarations` with a warning diagnostic per skipped declaration (#2174, #2170, #2188)
 - **deps-gradle**, **deps-cli**: unreadable version-catalog `[libraries]` entries are reported as warnings and `check` findings instead of being dropped silently (#2170, #2188)
 - **deps-core**: `EcosystemBase::claims_unrouted_manifest` and `EcosystemRegistry::for_uri_blocking` route a file an ecosystem claims by content when static routing misses it (#2161, #2175)
@@ -32,14 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: std-only Windows `CacheDir::open` for the disk cache, relying on the per-user `%LOCALAPPDATA%` ACL, not yet wired into `HttpCache` (#2145, #2149)
 
 ### Fixed
-- **deps-lsp**: inlay hints no longer offer a `latest` held by a release-age window and follow the outdated diagnostic (#2190)
-- **deps-lsp**: update lenses and actions no longer write versions inside the freshness cooldown; security fixes still offer them with a label (#2191)
-- **deps-cli**, **deps-lsp**: a version held by a cooldown window is no longer reported as outdated; the newest eligible version is named instead, and `update` can write it (#2190)
-- **deps-lsp**: `updateAllOutdated` no longer writes versions that are OSV-flagged or not yet verified
-- **deps-cli**: a checked Gradle catalog named `deps.toml` is no longer loaded as CLI configuration (#2182)
-- **deps-lsp**: overlapping edits no longer register a stale change task, diff against a replaced document or drop a license refresh (#2183, #2184)
-- **deps-gradle**, **deps-core**: settings lookups are memoized and the mtime cache evicts least-recently-used entries instead of refusing new ones (#2185)
-- **tests**: coverage for catalog notices, `didChange` ordering, cold-start handlers and reparse reads, and a profile-wide nextest `leak-timeout` (#2186, #2187)
+- **deps-lsp**: inlay hints no longer offer a `latest` held by a release-age window and follow the outdated diagnostic (#2190, #2205)
+- **deps-lsp**: update lenses and actions no longer write versions inside the freshness cooldown; security fixes still offer them with a label (#2191, #2205)
+- **deps-cli**, **deps-lsp**: a version held by a cooldown window is no longer reported as outdated; the newest eligible version is named instead, and `update` can write it (#2190, #2205)
+- **deps-lsp**: `updateAllOutdated` no longer writes versions that are OSV-flagged or not yet verified (#2205)
+- **deps-cli**: a checked Gradle catalog named `deps.toml` is no longer loaded as CLI configuration (#2182, #2205)
+- **deps-lsp**: overlapping edits no longer register a stale change task, diff against a replaced document or drop a license refresh (#2183, #2184, #2205)
+- **deps-gradle**, **deps-core**: settings lookups are memoized and the mtime cache evicts least-recently-used entries instead of refusing new ones (#2185, #2205)
+- **tests**: coverage for catalog notices, `didChange` ordering, cold-start handlers and reparse reads, and a profile-wide nextest `leak-timeout` (#2186, #2187, #2205)
 - **deps-lsp**: `didChange` parses finishing out of order no longer overwrite a newer document version; a superseded edit is logged at debug, not WARN (#2166, #2188)
 - **deps-lsp**: cold-start requests for files no ecosystem handles, or with `cold_start.enabled = false`, log at debug instead of WARN when skipped by the cold-start gates (#2172, #2188)
 - **deps-lsp**: flaky `did_change_reopen_race` and `notification_ordering` tests made deterministic, with a scoped nextest `leak-timeout` for two tests (#2169, #2188)
@@ -66,9 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workspace**: scheduled `semver` job excludes crates new since the baseline and allows the just-published baseline version (#2126, #2128)
 
 ### Changed
-- **deps-cli**: a discovered `deps.toml` that is a declared Gradle catalog is skipped with a warning (#2182)
-- **deps-cli**: `update` can exit 1 under a long native release-age window when the only eligible version is OSV-flagged (#2190)
-- **deps-cli**: `update` items held by a native release-age window now report current and target versions (#2190)
+- **deps-cli**: a discovered `deps.toml` that is a declared Gradle catalog is skipped with a warning (#2182, #2205)
+- **deps-cli**: `update` can exit 1 under a long native release-age window when the only eligible version is OSV-flagged (#2190, #2205)
+- **deps-cli**: `update` items held by a native release-age window now report current and target versions (#2190, #2205)
 - **deps-gradle**: `parse_gradle` treats any `*.toml` URI as a version catalog (#2161, #2175)
 - **deps-core**: disk-cache entry format and file naming accept only `PersistKey` (#2153, #2165)
 - **deps-core**: disk-cache primitives share `closed_str_enum!`, `EntryTrust`, `OpenBlocking` and one `deps_core::hash::fnv1a64` (#2156, #2165)
