@@ -438,6 +438,10 @@ pub struct VersionData<'a> {
     /// items) must consult [`candidate_verdict`] with this field for every version it is about
     /// to offer, not only the one [`Self::latest_status`] already covers.
     pub candidate_status: Option<&'a CandidateStatusMap>,
+    /// OSV verdicts for the newest eligible version named under a held `latest`, kept apart
+    /// from [`Self::latest_status`] and keyed like it. Read with [`latest_verdict`]: `None`
+    /// means checking is off, a missing entry means unverified.
+    pub fallback_status: Option<&'a LatestStatusMap>,
     /// Failure memo and concurrency cap for hover's and code actions' interactive registry
     /// await (#1830). `None` by default — and for every surface but `handlers/hover.rs` and
     /// `handlers/code_actions.rs` (deps-lsp) — which keeps the plain
@@ -491,6 +495,7 @@ impl<'a> VersionData<'a> {
             gossip_client: None,
             latest_status: None,
             candidate_status: None,
+            fallback_status: None,
             interactive_fetch: None,
             suppression: None,
             advisory_exemptions: None,
@@ -730,6 +735,27 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn with_candidate_status(mut self, candidate_status: &'a CandidateStatusMap) -> Self {
         self.candidate_status = Some(candidate_status);
+        self
+    }
+
+    /// Attaches the OSV verdicts of the newest eligible versions. See [`Self::fallback_status`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use deps_core::osv::LatestStatusMap;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let fallback_status = LatestStatusMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_fallback_status(&fallback_status);
+    /// assert!(versions.fallback_status.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_fallback_status(mut self, fallback_status: &'a LatestStatusMap) -> Self {
+        self.fallback_status = Some(fallback_status);
         self
     }
 

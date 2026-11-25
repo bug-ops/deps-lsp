@@ -116,6 +116,71 @@ async fn did_change_with_older_version_finishing_last_does_not_overwrite_newer_c
     assert_eq!(h.version(), Some(3));
 }
 
+/// Whatever order the parses of a burst finish in, the stored document is the highest version,
+/// and a change commits only if no higher version committed before it.
+///
+/// One blocking thread, held by the test, keeps every parse queued while the changes start, so
+/// none can commit before the chosen order awaits it.
+#[test]
+fn did_change_burst_keeps_the_highest_version_in_every_commit_order() {
+    tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(burst_in_every_commit_order());
+}
+
+async fn burst_in_every_commit_order() {
+    const ORDERS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    for order in ORDERS {
+        let h = opened_at_v1().await;
+        let mut changes: Vec<_> = (2..=4_u32)
+            .map(|version| {
+                Some(Box::pin(handle_document_change(
+                    h.uri.clone(),
+                    manifest(version),
+                    Some(i32::try_from(version).unwrap()),
+                    Arc::clone(&h.state),
+                    h.client.clone(),
+                    Arc::clone(&h.config),
+                )))
+            })
+            .collect();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || held.recv());
+        // Every change has captured the open and queued its parse before any commits.
+        for change in &mut changes {
+            let change = change.as_mut().unwrap();
+            assert_matches!(futures::poll!(change.as_mut()), Poll::Pending);
+        }
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        // The pool is FIFO with one thread: once this runs, every queued parse has finished.
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+
+        let mut highest = 0;
+        for index in order {
+            let change = changes.get_mut(index).and_then(Option::take).unwrap();
+            let task = change.await.unwrap();
+            let version = index + 2;
+            assert_eq!(task.is_some(), version > highest, "{order:?}: v{version}");
+            task.inspect(tokio::task::JoinHandle::abort);
+            highest = highest.max(version);
+        }
+
+        assert_eq!(h.content(), manifest(4), "{order:?}");
+        assert_eq!(h.version(), Some(4), "{order:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn did_change_version_guard_refuses_lower_and_admits_equal_or_unversioned() {
     let h = opened_at_v1().await;

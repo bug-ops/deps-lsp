@@ -81,6 +81,7 @@ pub trait ParsedManifest: ParseResult + crate::sealed::ParsedManifest {
     fn generate_inlay_hints<'a>(
         &'a self,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         loading_state: crate::LoadingState,
         config: &'a EcosystemConfig,
     ) -> BoxFuture<'a, Vec<InlayHint>>;
@@ -101,6 +102,7 @@ pub trait ParsedManifest: ParseResult + crate::sealed::ParsedManifest {
         position: Position,
         uri: &'a url::Url,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>>;
 
@@ -123,6 +125,7 @@ pub trait ParsedManifest: ParseResult + crate::sealed::ParsedManifest {
         &'a self,
         content: &'a str,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         uri: &'a url::Url,
         command_id: &'a str,
     ) -> BoxFuture<'a, Vec<CodeLens>>;
@@ -143,13 +146,19 @@ pub trait ParsedManifest: ParseResult + crate::sealed::ParsedManifest {
     /// Edits of the "update all outdated dependencies" lens, see
     /// [`crate::lsp_helpers::collect_update_all_edits`].
     #[cfg(feature = "lsp-responses")]
-    fn collect_update_all_edits(&self, content: &str, versions: VersionData<'_>) -> Vec<TextEdit>;
+    fn collect_update_all_edits(
+        &self,
+        content: &str,
+        versions: VersionData<'_>,
+        freshness: crate::freshness::FreshnessSettings,
+    ) -> Vec<TextEdit>;
 
     /// The update candidates of the document, see [`crate::edit::collect_update_candidates`].
     fn collect_update_candidates(
         &self,
         content: &str,
         versions: VersionData<'_>,
+        freshness: crate::freshness::FreshnessSettings,
     ) -> Vec<UpdateCandidate>;
 
     /// The vulnerability lookup keys of the document, see [`crate::osv::vulnerability_keys`].
@@ -275,11 +284,12 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
     fn generate_inlay_hints<'a>(
         &'a self,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         loading_state: crate::LoadingState,
         config: &'a EcosystemConfig,
     ) -> BoxFuture<'a, Vec<InlayHint>> {
         self.ecosystem
-            .inlay_hints(self.view(), versions, loading_state, config)
+            .inlay_hints(self.view(), versions, freshness, loading_state, config)
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -304,6 +314,7 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
         position: Position,
         uri: &'a url::Url,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
         Box::pin(super::code_actions(
@@ -312,6 +323,7 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
             position,
             uri,
             versions,
+            freshness,
             content,
         ))
     }
@@ -343,11 +355,12 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
         &'a self,
         content: &'a str,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
         uri: &'a url::Url,
         command_id: &'a str,
     ) -> BoxFuture<'a, Vec<CodeLens>> {
         self.ecosystem
-            .code_lenses(self.view(), content, versions, uri, command_id)
+            .code_lenses(self.view(), content, versions, freshness, uri, command_id)
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -367,11 +380,17 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn collect_update_all_edits(&self, content: &str, versions: VersionData<'_>) -> Vec<TextEdit> {
+    fn collect_update_all_edits(
+        &self,
+        content: &str,
+        versions: VersionData<'_>,
+        freshness: crate::freshness::FreshnessSettings,
+    ) -> Vec<TextEdit> {
         crate::lsp_helpers::collect_update_all_edits(
             &self.view(),
             content,
             versions,
+            freshness,
             self.ecosystem.own_formatter(),
         )
     }
@@ -380,11 +399,13 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
         &self,
         content: &str,
         versions: VersionData<'_>,
+        freshness: crate::freshness::FreshnessSettings,
     ) -> Vec<UpdateCandidate> {
         crate::edit::collect_update_candidates(
             &self.view(),
             content,
             versions,
+            freshness,
             self.ecosystem.own_formatter(),
         )
     }
@@ -735,6 +756,7 @@ mod tests {
             &'a self,
             parsed: ParsedView<'a, Self::Parsed>,
             _versions: VersionData<'a>,
+            _freshness: crate::freshness::FreshnessSettings,
             _loading_state: crate::LoadingState,
             _config: &'a EcosystemConfig,
         ) -> BoxFuture<'a, Vec<InlayHint>> {
@@ -784,6 +806,7 @@ mod tests {
             parsed: ParsedView<'a, Self::Parsed>,
             _content: &'a str,
             _versions: VersionData<'a>,
+            _freshness: crate::freshness::FreshnessSettings,
             _uri: &'a url::Url,
             _command_id: &'a str,
         ) -> BoxFuture<'a, Vec<CodeLens>> {
@@ -930,6 +953,7 @@ mod tests {
             manifest
                 .generate_inlay_hints(
                     versions(),
+                    freshness,
                     crate::LoadingState::default(),
                     &EcosystemConfig::new(),
                 )
@@ -938,11 +962,23 @@ mod tests {
                 .generate_hover(position, versions(), freshness)
                 .await;
             manifest
-                .generate_code_actions(position, &uri, versions(), "")
+                .generate_code_actions(
+                    position,
+                    &uri,
+                    versions(),
+                    crate::FreshnessSettings::Disabled,
+                    "",
+                )
                 .await;
             manifest.generate_document_links(&uri);
             manifest
-                .generate_code_lenses("", versions(), &uri, "cmd")
+                .generate_code_lenses(
+                    "",
+                    versions(),
+                    crate::FreshnessSettings::Disabled,
+                    &uri,
+                    "cmd",
+                )
                 .await;
             manifest.generate_completions(position, "", freshness).await;
             manifest.collect_pin_all_to_sha_edits(versions());
@@ -985,14 +1021,14 @@ mod tests {
             public_content_calls(&ecosystem),
             MAX_DEPENDENCIES_PER_DOCUMENT
         );
-        manifest.collect_update_candidates("", versions());
+        manifest.collect_update_candidates("", versions(), crate::FreshnessSettings::Disabled);
         assert_eq!(
             public_content_calls(&ecosystem),
             MAX_DEPENDENCIES_PER_DOCUMENT
         );
         #[cfg(feature = "lsp-responses")]
         {
-            manifest.collect_update_all_edits("", versions());
+            manifest.collect_update_all_edits("", versions(), crate::FreshnessSettings::Disabled);
             assert_eq!(
                 public_content_calls(&ecosystem),
                 MAX_DEPENDENCIES_PER_DOCUMENT

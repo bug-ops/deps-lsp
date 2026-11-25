@@ -157,6 +157,7 @@ impl PypiParser {
         let mut document_links = Vec::new();
         let mut blocked_registries = Vec::new();
         let mut rejected_registries = Vec::new();
+        let mut invalid_declarations = Vec::new();
         let mut strong_signal = false;
         let mut failed_lines: usize = 0;
         let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -331,6 +332,13 @@ impl PypiParser {
                         e.reason_for_log()
                     );
                     failed_lines += 1;
+                    if looks_like_requirement(req_text) {
+                        invalid_declarations.push(deps_core::InvalidDeclarationOccurrence {
+                            range: byte_span_to_range(content, &line_table, abs_start, abs_end),
+                            key: super::invalid_requirement_key(req_text).to_owned(),
+                            reason: super::invalid_requirement_reason(&e),
+                        });
+                    }
                 }
             }
         }
@@ -361,6 +369,11 @@ impl PypiParser {
                 Vec::new()
             },
             dependency_truncation: if keep { budget.truncation() } else { None },
+            invalid_declarations: if keep {
+                invalid_declarations
+            } else {
+                Vec::new()
+            },
         })
     }
 }
@@ -503,10 +516,26 @@ fn is_nameless_requirement(text: &str) -> bool {
     if NAMELESS_URL_PREFIXES.iter().any(|p| text.starts_with(p)) {
         return true;
     }
-    if text == "." || text.starts_with("./") || text.starts_with("../") || text.starts_with('/') {
+    // `.[extra] ; marker` names the current or parent directory, not a package.
+    let path = text.split(';').next().unwrap_or(text).trim_end();
+    let path = path
+        .strip_suffix(']')
+        .and_then(|path| path.split_once('['))
+        .map_or(path, |(path, _extras)| path);
+    if matches!(path, "." | "..")
+        || text.starts_with("./")
+        || text.starts_with("../")
+        || text.starts_with('/')
+    {
         return true;
     }
     !text.contains('@') && NAMELESS_ARCHIVE_SUFFIXES.iter().any(|s| text.ends_with(s))
+}
+
+/// Whether an unparsable line was meant as a requirement. A local path without `./` and an
+/// environment-variable reference are things pip accepts that this parser does not read.
+fn looks_like_requirement(text: &str) -> bool {
+    !text.contains('$') && (text.contains('@') || !text.contains(['/', '\\']))
 }
 
 #[cfg(test)]
@@ -1619,4 +1648,24 @@ mod tests {
             target: deps_core::conformance::CREDENTIAL_PROBE_URL.to_string(),
         },
     );
+
+    #[test]
+    fn test_unparsable_requirement_line_is_reported() {
+        let result = parse("requests==1.0\nflask>=\nvendor/dir\n${PKG}\n");
+
+        let keys: Vec<_> = deps_core::ParseResult::invalid_declarations(&result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.range.start.line))
+            .collect();
+        assert_eq!(keys, [("flask".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn test_current_and_parent_directory_forms_are_nameless_not_invalid() {
+        let result = parse(
+            "requests==1.0\n..\n.[dev]\n..[a,b]\n.[dev] ; python_version >= \"3.9\"\n. ; sys_platform == \"linux\"\n",
+        );
+
+        assert!(deps_core::ParseResult::invalid_declarations(&result).is_empty());
+    }
 }

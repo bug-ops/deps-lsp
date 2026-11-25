@@ -6,14 +6,70 @@
 //! not here — it needs the raw `Vec<TextEdit>`, not the wrapped `CodeLens`.
 
 use crate::config::DepsConfig;
-use crate::document::{PrefetchVisibility, ServerState, load_document};
+use crate::document::{DocumentState, PrefetchVisibility, ServerState, load_document};
+use deps_core::lsp_helpers::SuppressionSet;
+use deps_core::policy_config::OsvChecks;
+use deps_core::{EcosystemId, FreshnessSettings, NetworkMode, ParsedManifest, VersionData};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
-use tower_lsp_server::ls_types::{CodeLens, CodeLensParams};
+use tower_lsp_server::ls_types::{CodeLens, CodeLensParams, TextEdit};
 
 /// The `workspace/executeCommand` id bound to the lens produced here.
 pub const COMMAND_ID: &str = "deps-lsp.updateAllOutdated";
+
+/// The configuration both the "Update N outdated" lens and its command plan with, so the
+/// command applies exactly the edits the lens counted.
+pub(crate) struct UpdateAllPolicy {
+    freshness: FreshnessSettings,
+    suppression: SuppressionSet,
+    network: NetworkMode,
+    osv_checks: OsvChecks,
+    vulnerabilities: PrefetchVisibility,
+    gossip: PrefetchVisibility,
+}
+
+impl UpdateAllPolicy {
+    pub(crate) fn from_config(config: &DepsConfig) -> Self {
+        let network = config.policy.network.mode();
+        Self {
+            freshness: config.policy.freshness.to_freshness(),
+            suppression: config.policy.diagnostics.effective_suppression(),
+            network,
+            osv_checks: config.policy.osv_checks(),
+            vulnerabilities: PrefetchVisibility::from_enabled(
+                config.policy.diagnostics.vulnerabilities_enabled,
+            ),
+            gossip: PrefetchVisibility::from_enabled(config.policy.gossip_checks().is_active()),
+        }
+    }
+
+    /// Completes the planner's inputs; `ecosystem` lets the OSV latest-verdict gate tell
+    /// duplicate dependency names apart (issue #1517).
+    fn versions<'a>(&'a self, base: VersionData<'a>, ecosystem: EcosystemId) -> VersionData<'a> {
+        base.with_network(self.network)
+            .with_ecosystem(ecosystem)
+            .with_suppression(&self.suppression)
+    }
+}
+
+/// The edits the "Update N outdated" command applies to `doc`.
+pub(crate) fn update_all_edits(
+    doc: &DocumentState,
+    manifest: &dyn ParsedManifest,
+    policy: &UpdateAllPolicy,
+) -> Vec<TextEdit> {
+    let snapshot = doc
+        .signals
+        .snapshot()
+        .with_update_inputs(policy.vulnerabilities, policy.osv_checks, policy.gossip)
+        .finish();
+    manifest.collect_update_all_edits(
+        &doc.content,
+        policy.versions(snapshot.version_data(), doc.ecosystem),
+        policy.freshness,
+    )
+}
 
 /// Handles `textDocument/codeLens` requests using trait-based delegation.
 ///
@@ -47,17 +103,13 @@ pub async fn handle_code_lens(
         return vec![];
     }
 
-    let (network, severities, osv_checks, suppression) = {
+    let (severities, policy) = {
         let config = config.read().await;
         (
-            config.policy.network.mode(),
             config.policy.diagnostics.to_severities(),
-            config.policy.osv_checks(),
-            config.policy.diagnostics.effective_suppression(),
+            UpdateAllPolicy::from_config(&config),
         )
     };
-    let vulnerability_visibility =
-        PrefetchVisibility::from_enabled(severities.vulnerabilities_enabled);
 
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
@@ -76,8 +128,7 @@ pub async fn handle_code_lens(
             let snapshot = doc
                 .signals
                 .snapshot()
-                .with_vulnerabilities(vulnerability_visibility)
-                .with_latest_status(osv_checks)
+                .with_update_inputs(policy.vulnerabilities, policy.osv_checks, policy.gossip)
                 .finish();
             Some((
                 ecosystem,
@@ -100,15 +151,15 @@ pub async fn handle_code_lens(
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
     };
-    // Issue #1517: `with_ecosystem` lets `collect_update_candidates`'s own OSV latest-verdict
-    // gate disambiguate duplicate dependency names, mirroring every other renderer.
-    let versions = snapshot
-        .version_data()
-        .with_network(network)
-        .with_ecosystem(ecosystem_id)
-        .with_suppression(&suppression);
+    let versions = policy.versions(snapshot.version_data(), ecosystem_id);
     let mut lenses = manifest
-        .generate_code_lenses(&content, versions, &domain_uri, COMMAND_ID)
+        .generate_code_lenses(
+            &content,
+            versions,
+            policy.freshness,
+            &domain_uri,
+            COMMAND_ID,
+        )
         .await;
 
     // M4 (#640): the bulk pin-to-SHA lens lives here, not in an ecosystem override, so no
@@ -131,9 +182,8 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    #[cfg(feature = "github-actions")]
+    #[cfg(any(feature = "cargo", feature = "github-actions"))]
     use deps_core::ConcreteVersion;
-    use deps_core::EcosystemId;
     // Only `cargo_tests` and `cross_ecosystem_tests`' per-ecosystem cases consume this.
     #[cfg(any(
         feature = "cargo",
@@ -309,6 +359,60 @@ mod tests {
             doc_state.set_loaded();
             doc_state.set_version(Some(1));
             state.update_document(uri.clone(), doc_state);
+        }
+
+        /// The command once wrote an OSV-flagged `latest` the lens had excluded from its count.
+        #[tokio::test]
+        async fn update_all_command_edits_match_the_lens_count_when_one_latest_is_flagged() {
+            let state = Arc::new(ServerState::new());
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
+            let content = "[dependencies]\nserde = \"1.0.0\"\ntokio = \"1.0.0\"\n";
+            let cached = ["serde", "tokio"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        NormalizedName::for_test(name),
+                        PackageVersions::latest_only("2.0.0"),
+                    )
+                })
+                .collect();
+            seed(&state, &uri, content, cached).await;
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                let mut latest_status = doc.signals.latest_status.clone();
+                latest_status.insert(
+                    deps_core::test_util::vuln_key("tokio"),
+                    deps_core::osv::UpgradeStatus::CandidateVulnerable {
+                        version: ConcreteVersion::from("2.0.0"),
+                        advisory_ids: deps_core::osv::Capped::new(
+                            vec![deps_core::test_util::osv_id("MAL-2026-00001")],
+                            1,
+                        ),
+                        worst_severity: Some(deps_core::osv::VulnSeverity::Malicious),
+                        via_sibling_tags: None,
+                    },
+                );
+                doc.update_latest_status(latest_status);
+            }
+
+            let (client, config) = create_test_client_and_config();
+            let policy = UpdateAllPolicy::from_config(&*config.read().await);
+            let edits = {
+                let doc = state.get_document(&uri).unwrap();
+                update_all_edits(&doc, doc.manifest().unwrap(), &policy)
+            };
+            let lenses = handle_code_lens(state, params(uri), true, client, config).await;
+
+            let titles: Vec<_> = lenses
+                .iter()
+                .filter_map(|lens| lens.command.as_ref())
+                .map(|command| command.title.as_str())
+                .collect();
+            assert_eq!(titles, ["Update 1 outdated dependency"]);
+            assert_eq!(edits.len(), 1, "only the unflagged dependency: {edits:?}");
+            assert_eq!(edits[0].range.start.line, 1, "serde, not the flagged tokio");
         }
 
         #[tokio::test]
@@ -575,8 +679,11 @@ mod tests {
                 .await
                 .expect("fixture must parse");
             let resolved = HashMap::new();
-            let edits = parse_result
-                .collect_update_all_edits(content, deps_core::VersionData::new(&cached, &resolved));
+            let edits = parse_result.collect_update_all_edits(
+                content,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
+            );
             assert_eq!(edits.len(), 1, "expected exactly one edit for this fixture");
 
             let new_content = apply_single_edit(content, &edits[0]);
@@ -611,8 +718,11 @@ mod tests {
                 .await
                 .expect("fixture must parse");
             let resolved = HashMap::new();
-            let edits = parse_result
-                .collect_update_all_edits(content, deps_core::VersionData::new(&cached, &resolved));
+            let edits = parse_result.collect_update_all_edits(
+                content,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
+            );
             assert!(
                 edits.is_empty(),
                 "expected the literal-span guard to skip this dependency"

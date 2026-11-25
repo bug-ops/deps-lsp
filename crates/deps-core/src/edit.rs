@@ -700,6 +700,7 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 ///     &parse_result,
 ///     content,
 ///     VersionData::new(&cached, &resolved),
+///     deps_core::FreshnessSettings::Disabled,
 ///     &MockFormatter,
 /// );
 ///
@@ -712,6 +713,7 @@ pub fn collect_update_edits<P, F>(
     parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     formatter: &F,
 ) -> Vec<PlannedUpdate>
 where
@@ -719,11 +721,11 @@ where
     F: DependencyFormatter<Dep = P::Dep>,
 {
     let planned: Vec<PlannedUpdate> =
-        collect_update_candidates(parse_result, content, versions, formatter)
+        collect_update_candidates(parse_result, content, versions, freshness, formatter)
             .into_iter()
             .filter_map(|candidate| match candidate {
                 UpdateCandidate::Planned(planned) => Some(planned),
-                UpdateCandidate::Unplannable { .. } => None,
+                UpdateCandidate::Held { .. } | UpdateCandidate::Unplannable { .. } => None,
             })
             .collect();
 
@@ -756,9 +758,15 @@ pub enum UnplannableReason {
     /// version is never distinguishable from a flagged one at write time, so neither is ever
     /// planned.
     LatestUnverified,
-    /// The cached `latest` is still inside the native package-manager publish-age window
-    /// (spec 099 Phase 1): explained, never proposed.
-    WithinNativeCooldown,
+}
+
+/// Which release-age window keeps a `latest` from being written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownHold {
+    /// The freshness cooldown (GOSSIP or the local heuristic).
+    Freshness,
+    /// The package manager's own publish-age window.
+    Native,
 }
 
 /// One [`crate::lsp_helpers::RequirementStatus::Outdated`] dependency's planning outcome.
@@ -766,6 +774,20 @@ pub enum UnplannableReason {
 pub enum UpdateCandidate {
     /// A safe edit was planned.
     Planned(PlannedUpdate),
+    /// `latest` is inside a release-age window: reported with its current and target, never
+    /// written.
+    Held {
+        /// The dependency's declared and normalized names.
+        key: PackageKey,
+        /// The dependency name's span in the manifest source.
+        name_range: crate::position::Range,
+        /// The in-use version, as for [`PlannedUpdate::current`].
+        current: PlannedCurrent,
+        /// The held `latest`.
+        target: ConcreteVersion,
+        /// Which window holds it.
+        hold: CooldownHold,
+    },
     /// The dependency is `Outdated` but no edit could be safely produced — callers that
     /// report per-dependency outcomes (`deps-cli update`) must surface this rather than
     /// silently dropping the dependency; [`collect_update_edits`] (the LSP-facing planner,
@@ -802,6 +824,7 @@ pub fn collect_update_candidates<P, F>(
     parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     formatter: &F,
 ) -> Vec<UpdateCandidate>
 where
@@ -908,20 +931,14 @@ where
             }
         }
 
-        // Spec 099: a `latest` inside the native publish-age window is explained, never proposed.
-        if let Some(gate) = crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions)
-            && gate.excludes(
-                versions
-                    .cached_for(&key)
-                    .and_then(|v| v.published_at_of(latest)),
-                latest,
-                gate.now(),
-            )
-        {
-            candidates.push(UpdateCandidate::Unplannable {
-                key,
+        // A held `latest` is reported, never written.
+        if let Some(hold) = latest_hold(dep, &key, &versions, freshness) {
+            candidates.push(UpdateCandidate::Held {
+                current: planned_current(dep, &key, &versions, version_req, formatter),
+                target: latest.clone(),
                 name_range,
-                reason: UnplannableReason::WithinNativeCooldown,
+                hold,
+                key,
             });
             continue;
         }
@@ -955,32 +972,7 @@ where
             continue;
         }
 
-        // FR-003: per occurrence, never the collapsed per-name map — a renamed/aliased
-        // dependency (spec 050) must classify against its own resolved pin. `None` here means
-        // genuinely unresolvable (not, as for `plan_verified_fix`, simply never attempted) — a
-        // caller that classifies this field via `classify_update` gets `UpdateKind::Unknown`
-        // for it, since there is no version string to pass in.
-        let current = versions.ecosystem.and_then(|ecosystem| {
-            resolve_in_use_version(
-                dep,
-                &key,
-                versions.resolved_map(),
-                versions.candidates_map(),
-                formatter,
-                ecosystem,
-            )
-        });
-
-        let current = match current {
-            Some(version) => PlannedCurrent::Resolved(version),
-            None if versions.ecosystem.is_some_and(|ecosystem| {
-                crate::lsp_helpers::concrete_pin_version(version_req.as_str(), ecosystem).is_some()
-            }) =>
-            {
-                PlannedCurrent::Declared(version_req.clone())
-            }
-            None => PlannedCurrent::Unresolved,
-        };
+        let current = planned_current(dep, &key, &versions, version_req, formatter);
 
         candidates.push(UpdateCandidate::Planned(PlannedUpdate {
             key,
@@ -995,6 +987,62 @@ where
     }
 
     candidates
+}
+
+/// Which release-age window holds `dep`'s registry `latest`, if any.
+fn latest_hold(
+    dep: &dyn Dependency,
+    key: &PackageKey,
+    versions: &VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
+) -> Option<CooldownHold> {
+    use crate::lsp_helpers::{CooldownDisposition, cooldown_disposition};
+
+    let cached = versions.cached_for(key)?;
+    let gate = crate::native_cooldown::NativeGate::for_dependency(dep, key, versions);
+    match cooldown_disposition(
+        cached,
+        key.normalized(),
+        freshness,
+        versions.gossip_prefetch,
+        gate.as_ref(),
+        versions.now,
+    ) {
+        CooldownDisposition::Blocked { .. } => Some(CooldownHold::Freshness),
+        CooldownDisposition::NativeHeld { .. } => Some(CooldownHold::Native),
+        CooldownDisposition::NotEvaluated | CooldownDisposition::Cleared => None,
+    }
+}
+
+/// The in-use version an update of `dep` starts from, per occurrence and never the collapsed
+/// per-name map (spec 050): a renamed or aliased dependency classifies against its own pin.
+fn planned_current<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    versions: &VersionData<'_>,
+    version_req: &VersionReq,
+    formatter: &F,
+) -> PlannedCurrent {
+    let resolved = versions.ecosystem.and_then(|ecosystem| {
+        resolve_in_use_version(
+            dep,
+            key,
+            versions.resolved_map(),
+            versions.candidates_map(),
+            formatter,
+            ecosystem,
+        )
+    });
+    match resolved {
+        Some(version) => PlannedCurrent::Resolved(version),
+        None if versions.ecosystem.is_some_and(|ecosystem| {
+            crate::lsp_helpers::concrete_pin_version(version_req.as_str(), ecosystem).is_some()
+        }) =>
+        {
+            PlannedCurrent::Declared(version_req.clone())
+        }
+        None => PlannedCurrent::Unresolved,
+    }
 }
 
 /// Why [`plan_vulnerability_fix`] could not produce a [`PlannedUpdate`] for a dependency
@@ -1937,7 +1985,13 @@ mod tests {
                 .with_resolved_version_candidates(&candidates)
                 .with_ecosystem(EcosystemId::Cargo);
 
-            let mut planned = collect_update_edits(&pr, content, versions, &MOCK_FORMATTER);
+            let mut planned = collect_update_edits(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER,
+            );
             planned.sort_by_key(|p| p.edit.range.start.line);
 
             assert_eq!(planned.len(), 2);
@@ -1965,7 +2019,13 @@ mod tests {
             let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            let candidates = collect_update_candidates(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER,
+            );
             assert_eq!(candidates.len(), 1);
             assert_matches!(
                 candidates[0],
@@ -1975,7 +2035,14 @@ mod tests {
                 }
             );
             assert!(
-                collect_update_edits(&pr, content, versions, &MOCK_FORMATTER).is_empty(),
+                collect_update_edits(
+                    &pr,
+                    content,
+                    versions,
+                    crate::FreshnessSettings::Disabled,
+                    &MOCK_FORMATTER
+                )
+                .is_empty(),
                 "an unplannable candidate must never reach collect_update_edits's writable subset"
             );
         }
@@ -2012,7 +2079,13 @@ mod tests {
             );
             let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            let candidates = collect_update_candidates(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER,
+            );
             assert_eq!(candidates.len(), 1, "{candidates:?}");
             assert_matches!(
                 candidates[0],
@@ -2022,7 +2095,14 @@ mod tests {
                 }
             );
             assert!(
-                collect_update_edits(&pr, content, versions, &MOCK_FORMATTER).is_empty(),
+                collect_update_edits(
+                    &pr,
+                    content,
+                    versions,
+                    crate::FreshnessSettings::Disabled,
+                    &MOCK_FORMATTER
+                )
+                .is_empty(),
                 "a flagged latest must never reach collect_update_edits's writable subset"
             );
         }
@@ -2044,7 +2124,13 @@ mod tests {
             let latest_status = crate::osv::LatestStatusMap::new();
             let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            let candidates = collect_update_candidates(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER,
+            );
             assert_eq!(candidates.len(), 1, "{candidates:?}");
             assert_matches!(
                 candidates[0],
@@ -2101,7 +2187,13 @@ mod tests {
             let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &NoOpFormatter);
+            let candidates = collect_update_candidates(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &NoOpFormatter,
+            );
             assert_eq!(candidates.len(), 1);
             assert_matches!(
                 candidates[0],
@@ -2124,7 +2216,13 @@ mod tests {
             let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            let candidates = collect_update_candidates(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER,
+            );
             assert_eq!(candidates.len(), 1);
             assert_matches!(
                 candidates[0],
@@ -2149,7 +2247,13 @@ mod tests {
             let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            let candidates = collect_update_candidates(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER,
+            );
             assert!(candidates.is_empty());
         }
 
@@ -2222,8 +2326,13 @@ mod tests {
             let versions =
                 VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::GithubActions);
 
-            let candidates =
-                collect_update_candidates(&pr, &content, versions, &ShaPinResolvedFormatter);
+            let candidates = collect_update_candidates(
+                &pr,
+                &content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &ShaPinResolvedFormatter,
+            );
 
             assert_eq!(candidates.len(), 1, "{candidates:?}");
             let UpdateCandidate::Planned(planned) = &candidates[0] else {
@@ -2311,8 +2420,13 @@ mod tests {
                 let versions =
                     VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::GithubActions);
 
-                let candidates =
-                    collect_update_candidates(&pr, &content, versions, &UnpublishedFormatter);
+                let candidates = collect_update_candidates(
+                    &pr,
+                    &content,
+                    versions,
+                    crate::FreshnessSettings::Disabled,
+                    &UnpublishedFormatter,
+                );
 
                 let [UpdateCandidate::Planned(planned)] = candidates.as_slice() else {
                     panic!("expected one planned update for {requirement}, got {candidates:?}");

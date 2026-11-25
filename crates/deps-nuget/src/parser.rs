@@ -72,6 +72,9 @@ pub struct NuGetParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// Package elements that name no package (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 deps_core::impl_parse_result!(
@@ -82,6 +85,7 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
         rejected_registries: rejected_registries,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -125,6 +129,9 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
     reader.config_mut().trim_text(true);
 
     let mut dependencies = Vec::new();
+    let mut invalid_declarations = Vec::new();
+    let mut invalid_budget =
+        deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     loop {
@@ -134,10 +141,18 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
 
         match event {
             Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == "package" => {
-                if let Some(dep) = parse_package_element(content, &line_table, e)
-                    && budget.allow()
-                {
-                    dependencies.push(dep);
+                if let Some(dep) = parse_package_element(content, &line_table, e) {
+                    if budget.allow() {
+                        dependencies.push(dep);
+                    }
+                } else if invalid_budget.allow() {
+                    let tag = e.local_name();
+                    invalid_declarations.push(nameless_element(
+                        content,
+                        &line_table,
+                        attribute_byte_range(content, tag.as_ref()),
+                        tag.as_ref(),
+                    ));
                 }
             }
             Event::Eof => break,
@@ -152,6 +167,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
         blocked_registries: Vec::new(),
         rejected_registries: Vec::new(),
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
     })
 }
 
@@ -227,6 +243,45 @@ struct DepAccum {
     name_span: (usize, usize),
     version: Option<String>,
     version_span: (usize, usize),
+    /// The element amends, removes or defines metadata for items declared elsewhere
+    /// (`Update`/`Remove`, `ItemDefinitionGroup`, `Target`), so it legitimately carries no
+    /// `Include`.
+    amends_item: bool,
+    /// Byte span of the element's tag name, anchoring a notice about a nameless element.
+    element_span: (usize, usize),
+}
+
+/// Collects what the elements of one MSBuild file declare, under the shared budget.
+struct Collected<'a> {
+    content: &'a str,
+    line_table: &'a LineOffsetTable,
+    tag_name: &'a str,
+    dependencies: Vec<NuGetDependency>,
+    invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
+    budget: deps_core::DependencyBudget,
+    /// Separate from `budget`, so a notice never displaces a dependency.
+    invalid_budget: deps_core::DependencyBudget,
+}
+
+impl Collected<'_> {
+    fn push(&mut self, accum: DepAccum) {
+        if accum.name.is_none() {
+            if !accum.amends_item && self.invalid_budget.allow() {
+                self.invalid_declarations.push(nameless_element(
+                    self.content,
+                    self.line_table,
+                    accum.element_span,
+                    self.tag_name,
+                ));
+            }
+            return;
+        }
+        if let Some(dep) = finalize_dep(self.content, self.line_table, accum)
+            && self.budget.allow()
+        {
+            self.dependencies.push(dep);
+        }
+    }
 }
 
 fn parse_reference_elements(
@@ -238,10 +293,18 @@ fn parse_reference_elements(
     let mut reader = Reader::from_str(content);
     reader.config_mut().trim_text(true);
 
-    let mut dependencies = Vec::new();
     let mut current: Option<DepAccum> = None;
     let mut in_version_child = false;
-    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
+    let mut metadata_depth = 0usize;
+    let mut collected = Collected {
+        content,
+        line_table: &line_table,
+        tag_name,
+        dependencies: Vec::new(),
+        invalid_declarations: Vec::new(),
+        budget: deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT),
+        invalid_budget: deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT),
+    };
 
     loop {
         let text_pos = reader.buffer_position();
@@ -251,17 +314,20 @@ fn parse_reference_elements(
 
         match event {
             Event::Empty(ref e) => {
-                if e.local_name().as_ref() == tag_name
-                    && let Some(dep) =
-                        finalize_dep(content, &line_table, accum_from_attrs(content, e))
-                    && budget.allow()
-                {
-                    dependencies.push(dep);
+                if e.local_name().as_ref() == tag_name {
+                    let mut accum = accum_from_attrs(content, e);
+                    accum.amends_item |= metadata_depth > 0;
+                    collected.push(accum);
                 }
             }
             Event::Start(ref e) => {
+                if is_metadata_scope(e.local_name().as_ref()) {
+                    metadata_depth += 1;
+                }
                 if e.local_name().as_ref() == tag_name {
-                    current = Some(accum_from_attrs(content, e));
+                    let mut accum = accum_from_attrs(content, e);
+                    accum.amends_item |= metadata_depth > 0;
+                    current = Some(accum);
                 } else if current.is_some() && e.local_name().as_ref() == "Version" {
                     in_version_child = true;
                 }
@@ -275,14 +341,15 @@ fn parse_reference_elements(
             }
             Event::End(ref e) => {
                 let local = e.local_name();
+                if is_metadata_scope(local.as_ref()) {
+                    metadata_depth = metadata_depth.saturating_sub(1);
+                }
                 if local.as_ref() == "Version" && in_version_child {
                     in_version_child = false;
                 } else if local.as_ref() == tag_name
                     && let Some(accum) = current.take()
-                    && let Some(dep) = finalize_dep(content, &line_table, accum)
-                    && budget.allow()
                 {
-                    dependencies.push(dep);
+                    collected.push(accum);
                 }
             }
             Event::Eof => break,
@@ -291,17 +358,21 @@ fn parse_reference_elements(
     }
 
     Ok(NuGetParseResult {
-        dependencies,
+        dependencies: collected.dependencies,
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
         blocked_registries: Vec::new(),
         rejected_registries: Vec::new(),
-        dependency_truncation: budget.truncation(),
+        dependency_truncation: collected.budget.truncation(),
+        invalid_declarations: collected.invalid_declarations,
     })
 }
 
 fn accum_from_attrs(content: &str, e: &BytesStart<'_>) -> DepAccum {
-    let mut accum = DepAccum::default();
+    let mut accum = DepAccum {
+        element_span: attribute_byte_range(content, e.local_name().as_ref()),
+        ..DepAccum::default()
+    };
     for attr in e.attributes().flatten() {
         match attr.key.local_name().as_ref() {
             "Include" => {
@@ -312,10 +383,31 @@ fn accum_from_attrs(content: &str, e: &BytesStart<'_>) -> DepAccum {
                 accum.version_span = attribute_byte_range(content, &attr.value);
                 accum.version = Some(decode_attr_value(&attr.value));
             }
+            "Update" | "Remove" => accum.amends_item = true,
             _ => {}
         }
     }
     accum
+}
+
+/// Containers whose item elements need no `Include`: they set metadata on items declared
+/// elsewhere.
+fn is_metadata_scope(tag: &str) -> bool {
+    matches!(tag, "ItemDefinitionGroup" | "Target")
+}
+
+/// A notice for a package element that names no package.
+fn nameless_element(
+    content: &str,
+    line_table: &LineOffsetTable,
+    element_span: (usize, usize),
+    tag_name: &str,
+) -> deps_core::InvalidDeclarationOccurrence {
+    deps_core::InvalidDeclarationOccurrence {
+        range: span_to_range(content, line_table, element_span),
+        key: tag_name.to_owned(),
+        reason: deps_core::InvalidDeclarationReason::MissingCoordinate,
+    }
 }
 
 fn finalize_dep(
@@ -915,5 +1007,56 @@ mod tests {
         let result = parse_project_file(xml, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
         assert_eq!(dep.name_range.start.line, 2);
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_package_elements_without_a_name_are_reported_but_amending_ones_are_not() {
+        let result = parse_project_file(
+            "<Project><ItemGroup><PackageReference Version=\"1\" /><PackageReference Update=\"A\" Version=\"1\" /></ItemGroup></Project>",
+            &deps_core::test_util::test_uri("/p/a.csproj"),
+        )
+        .unwrap();
+
+        assert!(result.dependencies.is_empty());
+        assert_eq!(
+            reported(&result),
+            [(
+                "PackageReference".to_owned(),
+                deps_core::InvalidDeclarationReason::MissingCoordinate
+            )]
+        );
+
+        let result = parse_packages_config(
+            "<packages><package version=\"1\" /></packages>",
+            &deps_core::test_util::test_uri("/p/packages.config"),
+        )
+        .unwrap();
+        assert_eq!(reported(&result).len(), 1);
+    }
+
+    #[test]
+    fn test_nameless_items_that_define_metadata_are_not_invalid() {
+        let result = parse_project_file(
+            "<Project><ItemDefinitionGroup><PackageReference><PrivateAssets>all</PrivateAssets></PackageReference></ItemDefinitionGroup><Target Name=\"t\"><ItemGroup><PackageReference Version=\"1\" /></ItemGroup></Target></Project>",
+            &deps_core::test_util::test_uri("/p/Directory.Build.props"),
+        )
+        .unwrap();
+        assert_eq!(reported(&result), []);
+
+        let result = parse_directory_packages_props(
+            "<Project><ItemDefinitionGroup><PackageVersion><X>1</X></PackageVersion></ItemDefinitionGroup></Project>",
+            &deps_core::test_util::test_uri("/p/Directory.Packages.props"),
+        )
+        .unwrap();
+        assert_eq!(reported(&result), []);
     }
 }

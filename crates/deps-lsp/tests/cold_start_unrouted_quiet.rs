@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use tower::Service as _;
 use tower_lsp_server::LanguageServer as _;
 use tower_lsp_server::ls_types::{
-    CodeLensParams, DocumentLinkParams, HoverParams, InitializeParams, InlayHintParams,
+    CodeActionParams, CodeLensParams, CompletionParams, DocumentDiagnosticParams,
+    DocumentLinkParams, HoverParams, InitializeParams, InlayHintParams,
 };
 
 fn params<T: DeserializeOwned>(value: Value) -> T {
@@ -44,7 +45,8 @@ async fn server(
     (service, socket)
 }
 
-/// Sends hover, inlay hint, code lens and document link for `uri`, `rounds` times.
+/// Sends hover, completion, diagnostics, code action, inlay hint, code lens and document link
+/// for `uri`, `rounds` times.
 async fn burst(backend: &deps_lsp::Backend, uri: &str, rounds: usize) {
     for _ in 0..rounds {
         let text_document = json!({ "uri": uri });
@@ -52,6 +54,27 @@ async fn burst(backend: &deps_lsp::Backend, uri: &str, rounds: usize) {
             .hover(params::<HoverParams>(json!({
                 "textDocument": text_document,
                 "position": { "line": 0, "character": 0 },
+            })))
+            .await;
+        let _ = backend
+            .completion(params::<CompletionParams>(json!({
+                "textDocument": text_document,
+                "position": { "line": 0, "character": 0 },
+            })))
+            .await;
+        let _ = backend
+            .diagnostic(params::<DocumentDiagnosticParams>(
+                json!({ "textDocument": text_document }),
+            ))
+            .await;
+        let _ = backend
+            .code_action(params::<CodeActionParams>(json!({
+                "textDocument": text_document,
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 },
+                },
+                "context": { "diagnostics": [] },
             })))
             .await;
         let _ = backend
@@ -138,4 +161,22 @@ async fn cold_start_disabled_logs_no_warning_for_unrouted_or_routed_files() {
         "the skipped routed load must be visible at debug and name the cold start (span fields \
          alone carry the uri)"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_rate_limited_routed_file_warns_that_the_document_could_not_be_loaded() {
+    let (logs, _guard) = log_capture::LogCapture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let missing_routed = file_uri(&dir, "package.json", None);
+    let (service, _socket) = server(json!({ "cold_start": { "rate_limit_ms": 60_000 } })).await;
+    let backend = service.inner();
+
+    burst(backend, &missing_routed, 2).await;
+
+    for needle in ["Cold start rate limited", "Could not load document"] {
+        assert!(
+            !logs.warnings_containing(needle).is_empty(),
+            "a rate-limited routed file must warn {needle:?}"
+        );
+    }
 }

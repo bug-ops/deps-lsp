@@ -338,7 +338,17 @@ allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
 `check` was given exactly one path, that path's own directory (or its parent, if the path is a
 file); if it was given several paths, or none (the implicit `.`), the lookup falls back to the
 current working directory instead, since there is no single "the walked root" to prefer among
-several. `deps.toml` itself is capped at 1 MB and must be valid TOML matching this schema
+several.
+
+A file named `deps.toml` can also be a Gradle version catalog. A file you check by name is never
+loaded as configuration. A `deps.toml` found by this lookup that a `settings.gradle(.kts)`
+declares as a catalog is not loaded either: the run uses the default configuration and prints
+
+```text
+deps-cli: warning: <path> was not loaded as configuration: a Gradle settings file declares it as a version catalog; pass a configuration file with --config
+```
+
+`deps.toml` itself is capped at 1 MB and must be valid TOML matching this schema
 exactly (`deny_unknown_fields` at the top level — an unrecognized top-level key rejects the
 whole file; an unrecognized key nested inside a known section like `[cache]` is tolerated for
 forward compatibility). `--offline` and `--cooldown` override the loaded config for that run
@@ -430,9 +440,14 @@ explicit choice.
   `update` refuses to write it and exits non-zero naming that version, the same way an unsafe
   `latest` is refused — it never silently falls back to the plain cooldown skip. Disable this
   filter entirely with a `--config` file setting `[freshness] enabled = false`, or narrow the
-  window with `--cooldown` (see below). This filter is `deps-cli update`-specific — `check`'s
-  own `Outdated` diagnostic and `deps-lsp`'s "update to latest" code action still only
-  *annotate* a fresh version's age, never exclude it or substitute a fallback.
+  window with `--cooldown` (see below).
+
+  The package manager's own release-age window is honored the same way, even with
+  `[freshness] enabled = false`: `update` writes the newest eligible version, and reports the
+  dependency as `within-native-cooldown` only when there is none. `honor_native_cooldown = false`
+  turns that off. A skipped item reports its current and target version. `check` judges
+  `outdated` against the same eligible version, see
+  [Release-Age Holds](cross-ecosystem/version-diagnostics.md#release-age-holds).
 
   For npm and Deno, the fallback edit keeps the requirement operator (`^`, `~`, `=`). When a
   `^` range would still admit the newer version that was withheld (because it is cooling down or
@@ -1009,7 +1024,7 @@ writing.
 | Exit code | Meaning |
 |---|---|
 | `0` | Every selected update was applied, or nothing was eligible, or every non-applied item was a deliberate exclusion — an `[update].ignore` match, a `--package` exclusion, or a version held back by the default-mode freshness cooldown (reported as a `skipped` outcome, see above) |
-| `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span, `requires-lockfile-update`, `unfixable`, or a cooldown-fallback candidate that was itself OSV-flagged/unverified |
+| `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span, `requires-lockfile-update`, `unfixable`, or a cooldown-fallback candidate that was itself OSV-flagged/unverified (also under a package manager's release-age window) |
 | `2` | Execution error — a failed `--lockfile regenerate` step (report still printed), not a single recognized manifest, a registry required to classify the manifest was unreachable, a write/read failure, a symlinked manifest path (refused before any read, not just before the write), stale content detected before write, or `--security-only` combined with `network.offline`/vulnerability scanning disabled |
 
 An ignore rule, a `--package` exclusion, or a freshness-cooldown pause is something the run

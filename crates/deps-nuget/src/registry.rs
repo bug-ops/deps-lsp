@@ -1507,12 +1507,13 @@ impl deps_core::Registry for NuGetRegistry {
         let req_str = if req_str.is_empty() { "*" } else { req_str };
 
         let matched = if req_str.contains('*') {
-            let strings: Vec<String> = versions
+            // Borrowed: candidate collection calls this once per remaining suffix.
+            let strings: Vec<&str> = versions
                 .iter()
-                .map(|v| v.version_string().to_string())
+                .map(|v| v.version_string().as_str())
                 .collect();
             crate::version::resolve_float(&strings, req_str)
-                .and_then(|matched| strings.iter().position(|s| s == matched))
+                .and_then(|matched| strings.iter().position(|s| *s == matched))
         } else {
             let req_is_prerelease_bearing = req_str.contains('-');
             versions.iter().position(|v| {

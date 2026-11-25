@@ -936,6 +936,7 @@ mod tests {
                 blocked_registries: Vec::new(),
                 rejected_registries: Vec::new(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
                 duplicate_default_catalog: None,
                 workspace_members: None,
             }
@@ -1284,6 +1285,7 @@ mod tests {
                 .inlay_hints(
                     ParsedView::new(&parse_result),
                     VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::FreshnessSettings::Disabled,
                     deps_core::LoadingState::Loaded,
                     &config,
                 )
@@ -1426,6 +1428,7 @@ mod tests {
                 position,
                 &uri,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;
@@ -1473,6 +1476,7 @@ mod tests {
                 position,
                 &uri,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;
@@ -2120,6 +2124,7 @@ mod pnpm_workspace_tests {
                 Position::new(1, 12),
                 &uri,
                 VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;
@@ -2160,6 +2165,7 @@ mod pnpm_workspace_tests {
                 Position::new(1, 12),
                 &uri,
                 VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 expected,
             )
             .await;
@@ -2219,6 +2225,7 @@ mod pnpm_workspace_tests {
             Position::new(1, 10),
             &uri,
             VersionData::new(&cached, &resolved),
+            deps_core::FreshnessSettings::Disabled,
             content,
         )
         .await;
@@ -2253,6 +2260,7 @@ mod pnpm_workspace_tests {
             Position::new(1, 11),
             &uri,
             VersionData::new(&cached, &resolved),
+            deps_core::FreshnessSettings::Disabled,
             content,
         )
         .await;
@@ -2281,6 +2289,7 @@ mod pnpm_workspace_tests {
             Position::new(2, 11),
             &uri,
             VersionData::new(&cached, &resolved),
+            deps_core::FreshnessSettings::Disabled,
             content,
         )
         .await;

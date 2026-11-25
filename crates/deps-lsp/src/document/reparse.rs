@@ -128,8 +128,8 @@ pub(crate) async fn reparse_open_documents(
         )
         .await
         {
-            Ok(ChangeOutcome::Committed(CommittedChange { task, epoch })) => {
-                state.register_change_task(uri, task, epoch).await;
+            Ok(ChangeOutcome::Committed(CommittedChange { task, stamp })) => {
+                state.register_change_task(uri, task, stamp).await;
             }
             // A skip (superseded by a concurrent `did_change`) must never touch the task
             // registry for this URI — `spawn_background_task` unconditionally aborts

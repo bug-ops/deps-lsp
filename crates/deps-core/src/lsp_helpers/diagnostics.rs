@@ -25,9 +25,9 @@ use crate::{
 
 use super::{
     CooldownBlocker, CooldownDisposition, DependencyFormatter, DependencyGate, DiagnosticMessages,
-    EcosystemFormatter, LatestVerdict, LookupMiss, PackageVersions, RequirementMatcher,
-    RequirementStatus, SuppressedKinds, VersionData, cooldown_disposition, resolve_scan_outcome,
-    version_range_is_synthetic_empty,
+    EcosystemFormatter, HeldOutcome, LatestVerdict, LookupMiss, NewestEligible, PackageVersions,
+    RequirementMatcher, RequirementStatus, SuppressedKinds, VersionData, cooldown_disposition,
+    judge_held_latest, resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -2920,6 +2920,51 @@ fn push_unverified_latest_check_failed(
     );
 }
 
+/// The message about a held `latest`, naming the newest eligible version when there is one.
+/// `None` when there is nothing to report.
+fn held_message<F: DependencyFormatter>(
+    ctx: &RuleContext<'_, F>,
+    package_versions: &PackageVersions,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
+    newest: NewestEligible<'_>,
+    latest: &str,
+    latest_clause: &str,
+    latest_clause_after_version: &str,
+) -> Option<String> {
+    let notice = ctx
+        .formatter
+        .newer_version_notice(ctx.dep.version_requirement());
+    match judge_held_latest(
+        ctx.dep,
+        ctx.key,
+        &ctx.versions,
+        ctx.formatter,
+        vuln_keys,
+        package_versions,
+        newest,
+    ) {
+        HeldOutcome::Silent => None,
+        HeldOutcome::ReportLatest => Some(format!("{notice}: {latest} ({latest_clause})")),
+        HeldOutcome::Name {
+            version,
+            unverified,
+        } => {
+            let version = sanitize_and_truncate_for_diagnostic(
+                version.as_str(),
+                MAX_VERSION_DIAGNOSTIC_CHARS,
+            );
+            let suffix = if unverified {
+                " (not yet verified against OSV)"
+            } else {
+                ""
+            };
+            Some(format!(
+                "{notice}: {version} ({latest} {latest_clause_after_version}){suffix}"
+            ))
+        }
+    }
+}
+
 fn apply_outdated_rule<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_, F>,
@@ -3011,7 +3056,7 @@ fn apply_outdated_rule<F: DependencyFormatter>(
                 ctx.now,
             );
             let message = match disposition {
-                CooldownDisposition::NativeHeld { cooldown, .. } => {
+                CooldownDisposition::NativeHeld { cooldown, newest } => {
                     let remaining = native.as_ref().and_then(|gate| {
                         gate.hold(
                             package_versions.published_at_of(&package_versions.latest),
@@ -3022,25 +3067,53 @@ fn apply_outdated_rule<F: DependencyFormatter>(
                     let eligible = remaining.map_or_else(String::new, |hold| {
                         format!("; {}", hold.eligibility_clause())
                     });
-                    format!("{notice}: {latest} (excluded by {cooldown}{eligible})")
+                    let clause = format!("excluded by {cooldown}{eligible}");
+                    held_message(
+                        ctx,
+                        package_versions,
+                        vuln_keys,
+                        newest,
+                        &latest,
+                        &clause,
+                        &clause,
+                    )
                 }
                 CooldownDisposition::Blocked {
                     by: CooldownBlocker::Gossip,
-                    ..
-                } => format!(
-                    "{notice}: {latest} (deps.dev/GOSSIP reports this release is \
-                     still within its cooldown window)"
+                    newest,
+                } => held_message(
+                    ctx,
+                    package_versions,
+                    vuln_keys,
+                    newest,
+                    &latest,
+                    "deps.dev/GOSSIP reports this release is still within its cooldown window",
+                    "is held back by a deps.dev/GOSSIP cooldown",
                 ),
                 CooldownDisposition::Blocked {
                     by: CooldownBlocker::Local { published_at },
-                    ..
-                } => format!(
-                    "{notice}: {latest} (published {} — still within the release cooldown window)",
-                    format_relative_age(published_at.age_secs_from(ctx.now))
-                ),
-                CooldownDisposition::Cleared | CooldownDisposition::NotEvaluated => {
-                    format!("{notice}: {latest}")
+                    newest,
+                } => {
+                    let clause = format!(
+                        "published {} — still within the release cooldown window",
+                        format_relative_age(published_at.age_secs_from(ctx.now))
+                    );
+                    held_message(
+                        ctx,
+                        package_versions,
+                        vuln_keys,
+                        newest,
+                        &latest,
+                        &clause,
+                        &clause,
+                    )
                 }
+                CooldownDisposition::Cleared | CooldownDisposition::NotEvaluated => {
+                    Some(format!("{notice}: {latest}"))
+                }
+            };
+            let Some(message) = message else {
+                return;
             };
             (DiagnosticKind::Outdated, message, ctx.severities.outdated)
         }
@@ -5525,7 +5598,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7204,7 +7277,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7264,7 +7337,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 30 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7332,7 +7405,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7404,7 +7477,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7558,7 +7631,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7621,7 +7694,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7753,7 +7826,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7851,7 +7924,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -7951,7 +8024,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8336,7 +8409,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8368,6 +8441,90 @@ mod tests {
             "got: {}",
             diagnostics[0].message()
         );
+    }
+
+    /// The outdated message for a held `3.0.0` whose eligible stand-in `2.0.0` carries
+    /// `fallback_status`, with the lock file at `1.0.0` and `latest` verified clean.
+    fn held_message_for(fallback_status: Option<crate::osv::UpgradeStatus>) -> String {
+        use crate::lsp_helpers::CooldownFallback;
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let now = PublishTime::now();
+        let name = NormalizedName::for_test("serde");
+        let versions = PackageVersions::new(
+            "3.0.0".into(),
+            Arc::from(vec!["3.0.0".into(), "2.0.0".into(), "1.0.0".into()]),
+        )
+        .with_published_at(now)
+        .with_cooldown_fallback(CooldownFallback::new(
+            "2.0.0".into(),
+            PublishTime::from_unix_secs(1_000),
+        ));
+        let cached = HashMap::from([(name.clone(), versions)]);
+        let resolved = HashMap::from([(name, "1.0.0".into())]);
+        let latest_status = HashMap::from([(
+            crate::test_util::vuln_key("serde"),
+            crate::osv::UpgradeStatus::CandidateClean {
+                version: "3.0.0".into(),
+            },
+        )]);
+        let fallback_status: crate::osv::LatestStatusMap = fallback_status
+            .into_iter()
+            .map(|status| (crate::test_util::vuln_key("serde"), status))
+            .collect();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached, &resolved)
+                .with_ecosystem(crate::EcosystemId::Cargo)
+                .with_latest_status(&latest_status)
+                .with_fallback_status(&fallback_status),
+            &MOCK_FORMATTER,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            now,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        diagnostics[0].message().to_string()
+    }
+
+    #[test]
+    fn a_held_latest_names_the_eligible_version_only_as_osv_allows() {
+        let clean = held_message_for(Some(crate::osv::UpgradeStatus::CandidateClean {
+            version: "2.0.0".into(),
+        }));
+        assert!(clean.contains(": 2.0.0 (3.0.0 "), "{clean}");
+        assert!(!clean.contains("not yet verified"), "{clean}");
+
+        let unchecked = held_message_for(None);
+        assert!(unchecked.contains(": 2.0.0 (3.0.0 "), "{unchecked}");
+        assert!(
+            unchecked.ends_with("(not yet verified against OSV)"),
+            "{unchecked}"
+        );
+
+        let flagged = held_message_for(Some(crate::osv::UpgradeStatus::CandidateVulnerable {
+            version: "2.0.0".into(),
+            advisory_ids: crate::osv::Capped::new(
+                vec![crate::test_util::osv_id("MAL-2026-00001")],
+                1,
+            ),
+            worst_severity: Some(crate::osv::VulnSeverity::Malicious),
+            via_sibling_tags: None,
+        }));
+        assert!(flagged.contains(": 3.0.0 ("), "{flagged}");
+        assert!(!flagged.contains("2.0.0"), "{flagged}");
     }
 
     /// Spec 075 FR-005 (R-S3), inverting the earlier `..._suppresses_local_fallback`
@@ -8405,7 +8562,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8472,7 +8629,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8522,7 +8679,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8576,7 +8733,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -8633,7 +8790,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -9498,7 +9655,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -9555,7 +9712,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -9605,7 +9762,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -9661,7 +9818,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -9745,7 +9902,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -10589,7 +10746,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
-                cooldown_fallback: None,
+                cooldown_candidates: Default::default(),
                 publish_times: std::sync::Arc::from(Vec::new()),
             },
         );
@@ -11921,7 +12078,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -11978,7 +12135,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12053,7 +12210,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::AdvisoryDeprecated)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12127,7 +12284,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12211,7 +12368,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12281,7 +12438,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12332,7 +12489,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.0.0".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12432,7 +12589,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -12498,7 +12655,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );

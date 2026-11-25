@@ -145,20 +145,7 @@ async fn edit(
     ecosystem: &Arc<dyn Ecosystem>,
     content: &str,
 ) -> DependencyDiff {
-    let (parse, diff, _) = parse_and_diff_manifest(uri, content, state, ecosystem).await;
-    assert!(commit_parsed_document(
-        uri,
-        ecosystem.as_ref(),
-        content.to_string(),
-        parse,
-        None,
-        state,
-        CommitOptions {
-            diff: &diff,
-            guard: CommitGuard::IfTracked,
-        },
-    ));
-    diff
+    parse_and_commit(state, uri, ecosystem, content).await.0
 }
 
 fn assert_every_channel_holds_django(state: &ServerState, uri: &Uri) {

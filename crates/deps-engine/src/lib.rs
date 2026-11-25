@@ -18,7 +18,7 @@
 //! reimplementing ecosystem registration itself — see `specs/062-cli-check-mode/
 //! architecture-decision.md` for the full design rationale (issue #1058).
 //!
-//! Four modules:
+//! Five modules:
 //!
 //! - [`setup`] — the composition root itself: `EcosystemRuntime`, `register_ecosystems`, and
 //!   the ~110 concrete ecosystem types re-exported for convenience, moved verbatim from
@@ -28,11 +28,13 @@
 //!   fan-out, and outcome-merging helpers), moved from `deps-lsp`'s `document/` module
 //!   (issue #1059) so a future `deps-cli` reaches identical verdicts without reimplementing
 //!   any of it.
+//! - [`manifest_probe`] — manifest recognition that needs no registry or policy (#2182).
 //! - [`probe`] — the PreFetch/PostFetch background-probe sequence the CLI and the server share.
 //! - [`progress`] — a driving-adapter-agnostic progress-reporting port fetch tasks report
 //!   through, also moved from `deps-lsp` as part of #1059.
 
 pub mod classify;
+pub mod manifest_probe;
 pub mod probe;
 pub mod progress;
 pub mod setup;

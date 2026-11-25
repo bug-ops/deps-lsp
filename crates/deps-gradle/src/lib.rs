@@ -37,6 +37,29 @@ pub(crate) fn is_catalog_file_name(name: &str) -> bool {
     deps_core::gradle_layout::is_version_catalog_file(std::path::Path::new(name))
 }
 
+/// Whether a `settings.gradle(.kts)` declares `path` as a version catalog, without building an
+/// ecosystem: no policy, no registry, no network. Reads the filesystem, so call it only from a
+/// blocking context.
+///
+/// `bound` caps how far the lookup may reach (see [`deps_core::ecosystem::ClaimBound`]). For a
+/// long-lived or repeated probe use the ecosystem's claim instead: this creates a fresh cache on
+/// every call.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// assert!(!deps_gradle::settings_declare_catalog(Path::new("relative/deps.toml"), None));
+/// ```
+#[must_use]
+pub fn settings_declare_catalog(
+    path: &std::path::Path,
+    bound: Option<&deps_core::ecosystem::ClaimBound>,
+) -> bool {
+    settings_catalogs::SettingsCatalogCache::new().declares(path, bound)
+}
+
 pub use ecosystem::GradleEcosystem;
 pub use formatter::GradleFormatter;
 pub use lockfile::GradleLockParser;

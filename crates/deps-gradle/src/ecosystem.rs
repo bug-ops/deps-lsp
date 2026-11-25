@@ -196,8 +196,20 @@ impl EcosystemBase for GradleEcosystem {
         &[crate::CATALOG_PATTERN]
     }
 
-    fn claims_unrouted_manifest(&self, path: &std::path::Path) -> bool {
-        self.settings_catalogs.declares(path)
+    fn claims_unrouted_manifest(
+        &self,
+        path: &std::path::Path,
+        bound: Option<&deps_core::ecosystem::ClaimBound>,
+    ) -> bool {
+        self.settings_catalogs.declares(path, bound)
+    }
+
+    fn declared_manifests(&self, manifest: &std::path::Path) -> Vec<std::path::PathBuf> {
+        self.settings_catalogs.declared_by(manifest)
+    }
+
+    fn invalidate_claims(&self) {
+        self.settings_catalogs.reset_forward();
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {

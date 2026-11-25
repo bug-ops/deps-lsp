@@ -417,11 +417,11 @@ pub(crate) fn float_matches(version: &str, parsed: &ParsedVersion, pattern: &Flo
 /// Prerelease versions are excluded unless the pattern is itself prerelease-bearing
 /// (`*-*`, `*.-*`) or the prerelease-label-prefix form is used. Returns `None` if the
 /// pattern cannot be parsed or no version matches.
-pub fn resolve_float<'a>(versions: &'a [String], pattern: &str) -> Option<&'a str> {
+pub fn resolve_float<'a, S: AsRef<str>>(versions: &'a [S], pattern: &str) -> Option<&'a str> {
     let float = parse_float(pattern)?;
     let mut best: Option<(&'a str, ParsedVersion)> = None;
 
-    for v in versions {
+    for v in versions.iter().map(AsRef::as_ref) {
         let parsed = ParsedVersion::parse(v);
         if !float_matches(v, &parsed, &float) {
             continue;
@@ -431,7 +431,7 @@ pub fn resolve_float<'a>(versions: &'a [String], pattern: &str) -> Option<&'a st
             compare_parsed(&parsed, best_parsed) == Ordering::Greater
         });
         if is_better {
-            best = Some((v.as_str(), parsed));
+            best = Some((v, parsed));
         }
     }
 

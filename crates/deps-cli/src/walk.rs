@@ -6,10 +6,11 @@
 //! denylist still keeps common dependency/build/VCS trees (`node_modules`, `target`, `vendor`,
 //! ...) out of the scan either way — see [`walk`]'s doc.
 
+use deps_core::ecosystem::ClaimBound;
 use deps_core::fs_probe::PRUNED_WALK_DIRECTORIES as PRUNED_DIRECTORIES;
 use deps_core::{Ecosystem, EcosystemRegistry};
 use ignore::WalkBuilder;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -372,7 +373,12 @@ fn walk_with_limit(
         limit,
         entries_walked: 0,
         outcome: WalkOutcome::default(),
+        bound: None,
+        selection: None,
     };
+    let current_dir = std::env::current_dir()
+        .ok()
+        .and_then(|dir| ClaimBound::new(&dir));
     let hidden_ecosystem_dirs = hidden_ecosystem_directories(registry);
     let options = WalkOptions {
         respect_gitignore: matches!(gitignore_policy, GitignorePolicy::Respect),
@@ -394,6 +400,7 @@ fn walk_with_limit(
                 .push_walk_error(format!("could not resolve path: {}", root.display()));
             continue;
         };
+        let absolute_root = fold_parent_components(absolute_root);
 
         if root.is_file() {
             if ctx.entries_walked >= ctx.limit {
@@ -406,18 +413,16 @@ fn walk_with_limit(
             }
             ctx.entries_walked += 1;
             let matched_before = ctx.outcome.manifests().len();
-            route_file(
-                &absolute_root,
-                &absolute_root,
-                root,
-                registry,
-                &mut ctx.outcome,
-            );
+            ctx.bound.clone_from(&current_dir);
+            route_file(&absolute_root, &absolute_root, root, &mut ctx);
             if ctx.outcome.manifests().len() == matched_before {
                 ctx.outcome.push_unrecognized_explicit_path(root.clone());
             }
             continue;
         }
+
+        // A walked root caps the catalog lookups of everything found under it.
+        ctx.bound = ClaimBound::new(&absolute_root);
 
         // Short-circuit a broken/non-file-target manifest-shaped symlink root via the same
         // `classify_symlink` the walk uses, so it can't both fall through as a directory walk
@@ -426,7 +431,7 @@ fn walk_with_limit(
             // A fn pointer, not a `&mut Vec<PathBuf>` reference into `ctx.outcome`, since the
             // fields it would point at are private (#1305).
             let sink: Option<fn(&mut WalkOutcome, PathBuf)> =
-                match classify_symlink(&absolute_root, registry) {
+                match classify_symlink(&absolute_root, registry, ctx.bound.as_ref()) {
                     SymlinkClassification::Broken => {
                         Some(WalkOutcome::push_broken_manifest_symlink)
                     }
@@ -461,6 +466,7 @@ fn walk_with_limit(
         // so every symlink target falls back to `ignored_manifests` (or the sub-root is simply
         // not walked) rather than being routed.
         let canonical_root = std::fs::canonicalize(&absolute_root).ok();
+        let matched_before = ctx.outcome.manifests().len();
 
         // `DotDirs::Skip` filters entries by their own basename as the walk descends, so
         // `walk_root` itself is never excluded even if its name starts with `.` (e.g. a
@@ -505,9 +511,135 @@ fn walk_with_limit(
                 break 'roots;
             }
         }
+
+        if !walk_declared_manifests(
+            &absolute_root,
+            matched_before,
+            options,
+            canonical_root.as_deref(),
+            &mut ctx,
+        ) {
+            break 'roots;
+        }
     }
 
     ctx.outcome
+}
+
+/// `root` with its `..` components folded, so it prefixes the absolute lexical paths that
+/// declaring files resolve to (POSIX `std::path::absolute` keeps `..`). Folding is only used when
+/// both spellings name the same directory: after a symlinked directory `..` means something
+/// else to the filesystem.
+///
+/// A root left unfolded may leave a declared hidden catalog unadmitted (it fails closed: the
+/// file is not walked).
+fn fold_parent_components(root: PathBuf) -> PathBuf {
+    match deps_core::fs_probe::lexically_normalize(&root) {
+        Some(folded)
+            if folded != root
+                && std::fs::canonicalize(&folded).ok() == std::fs::canonicalize(&root).ok() =>
+        {
+            folded
+        }
+        _ => root,
+    }
+}
+
+/// Declared files the plain walk never visits (hidden names), and the ecosystem declaring each.
+struct DeclaredSelection {
+    targets: BTreeMap<PathBuf, Arc<dyn Ecosystem>>,
+    /// Every directory between the walk root and a target.
+    ancestors: BTreeSet<PathBuf>,
+}
+
+impl DeclaredSelection {
+    /// The hidden, unpruned files inside `root` that the manifests found since `matched_before`
+    /// declare and that were not already discovered. `None` when there are none.
+    fn collect(root: &Path, matched_before: usize, outcome: &WalkOutcome) -> Option<Self> {
+        let found = outcome
+            .manifests()
+            .get(matched_before..)
+            .unwrap_or_default();
+        let mut discovered: Option<HashSet<PathBuf>> = None;
+        let mut targets = BTreeMap::new();
+        let mut ancestors = BTreeSet::new();
+        for manifest in found {
+            for declared in manifest.ecosystem.declared_manifests(&manifest.uri_path) {
+                let Ok(relative) = declared.strip_prefix(root) else {
+                    continue;
+                };
+                let mut hidden = false;
+                let mut pruned = false;
+                let mut components = relative.components().peekable();
+                while let Some(component) = components.next() {
+                    let name = component.as_os_str();
+                    hidden |= name.as_encoded_bytes().starts_with(b".");
+                    pruned |= components.peek().is_some()
+                        && name
+                            .to_str()
+                            .is_some_and(|name| PRUNED_DIRECTORIES.contains(&name));
+                }
+                if !hidden || pruned {
+                    continue;
+                }
+                // A declared file may alias one the walk already routed.
+                let discovered = discovered.get_or_insert_with(|| {
+                    outcome
+                        .manifests()
+                        .iter()
+                        .filter_map(|m| std::fs::canonicalize(&m.path).ok())
+                        .collect()
+                });
+                if std::fs::canonicalize(&declared)
+                    .is_ok_and(|canonical| !discovered.insert(canonical))
+                {
+                    continue;
+                }
+                ancestors.extend(
+                    declared
+                        .ancestors()
+                        .skip(1)
+                        .take_while(|dir| dir.starts_with(root))
+                        .map(Path::to_path_buf),
+                );
+                targets.insert(declared, Arc::clone(&manifest.ecosystem));
+            }
+        }
+        (!targets.is_empty()).then_some(Self { targets, ancestors })
+    }
+
+    fn admits(&self, entry: &ignore::DirEntry) -> bool {
+        entry.depth() == 0
+            || self.ancestors.contains(entry.path())
+            || self.targets.contains_key(entry.path())
+    }
+}
+
+/// Walks only the declared hidden files of this root, through the same per-entry admission
+/// (gitignore, symlink policy, containment, entry budget) as the plain walk, so an excluded
+/// file stays excluded. Returns `false` once the walk limit is reached.
+fn walk_declared_manifests(
+    absolute_root: &Path,
+    matched_before: usize,
+    options: WalkOptions,
+    canonical_root: Option<&Path>,
+    ctx: &mut WalkCtx<'_>,
+) -> bool {
+    let Some(selection) = DeclaredSelection::collect(absolute_root, matched_before, &ctx.outcome)
+    else {
+        return true;
+    };
+    ctx.selection = Some(Arc::new(selection));
+    let completed = walk_directory(
+        absolute_root,
+        absolute_root,
+        DotDirs::Descend,
+        options,
+        canonical_root,
+        ctx,
+    );
+    ctx.selection = None;
+    completed
 }
 
 /// Bundles the state threaded through every helper in a single walk run, so adding a new
@@ -519,6 +651,10 @@ struct WalkCtx<'a> {
     limit: usize,
     entries_walked: usize,
     outcome: WalkOutcome,
+    /// Upper limit of catalog lookups for the root being walked.
+    bound: Option<ClaimBound>,
+    /// Set while walking only the declared hidden files.
+    selection: Option<Arc<DeclaredSelection>>,
 }
 
 /// The `respect_gitignore`/`follow_symlinks` pair, bundled so the internal walk chain (issue
@@ -630,7 +766,11 @@ fn walk_directory(
         let canonical_root_owned = canonical_root.map(Path::to_path_buf);
         let follow_symlinks = options.follow_symlinks;
         let hidden_manifests = ctx.hidden_manifest_names.clone();
+        let selection = ctx.selection.clone();
         builder.filter_entry(move |entry| {
+            if selection.as_ref().is_some_and(|s| !s.admits(entry)) {
+                return false;
+            }
             if !dot_dirs.admits(entry, &hidden_manifests) {
                 return false;
             }
@@ -669,22 +809,17 @@ fn walk_directory(
                     // the same check. Resolved path doubles as the real read path (FR-007).
                     match canonicalize_within_root(path, canonical_root) {
                         Some(canonical_path) => {
-                            route_file(
-                                path,
-                                &canonical_path,
-                                &display,
-                                ctx.registry,
-                                &mut ctx.outcome,
-                            );
+                            route_file(path, &canonical_path, &display, ctx);
                         }
                         // S4: reachable only via a rare TOCTOU race (metadata failed here after
                         // `is_file()` succeeded above); routed like any other unresolvable path.
                         None => {
-                            classify_symlink(path, ctx.registry).record(&mut ctx.outcome, display);
+                            classify_symlink(path, ctx.registry, ctx.bound.as_ref())
+                                .record(&mut ctx.outcome, display);
                         }
                     }
                 } else {
-                    route_file(path, path, &display, ctx.registry, &mut ctx.outcome);
+                    route_file(path, path, &display, ctx);
                 }
             }
             // #1112/#1124: `file_type()` reports the symlink's own (unresolved) type under
@@ -694,7 +829,7 @@ fn walk_directory(
             Ok(entry) => {
                 if entry.path_is_symlink() {
                     let path = entry.path();
-                    let classification = classify_symlink(path, ctx.registry);
+                    let classification = classify_symlink(path, ctx.registry, ctx.bound.as_ref());
                     if !matches!(classification, SymlinkClassification::Irrelevant) {
                         let display = display_relative_path(path, display_root);
                         // Mirrors the `is_file()` arm's `visited` insert — otherwise
@@ -715,7 +850,7 @@ fn walk_directory(
                 let classified_as_broken = if let ignore::Error::WithPath { path, err } = &error
                     && err.is_io()
                     && is_symlink(path)
-                    && is_manifest_shaped_by_name(path, ctx.registry)
+                    && is_manifest_shaped_by_name(path, ctx.registry, ctx.bound.as_ref())
                 {
                     let display = display_relative_path(path, display_root);
                     if options.respect_gitignore {
@@ -746,7 +881,7 @@ fn walk_directory(
         warn_on_pruned_directory_manifest(pruned_dir, display_root, ctx);
     }
 
-    if options.respect_gitignore {
+    if options.respect_gitignore && ctx.selection.is_none() {
         detect_ignored_manifests(walk_root, display_root, dot_dirs, ctx, &visited);
     }
     true
@@ -777,7 +912,7 @@ fn warn_on_pruned_directory_manifest(
     for entry in read_dir.flatten() {
         let path = entry.path();
         let display = display_relative_path(&path, display_root);
-        classify_symlink(&path, ctx.registry).record(&mut ctx.outcome, display);
+        classify_symlink(&path, ctx.registry, ctx.bound.as_ref()).record(&mut ctx.outcome, display);
     }
 }
 
@@ -845,7 +980,8 @@ fn detect_ignored_manifests(
             if entry.path_is_symlink() {
                 let display = display_relative_path(path, display_root);
                 if !visited.contains(&display) {
-                    classify_symlink(path, ctx.registry).record(&mut ctx.outcome, display);
+                    classify_symlink(path, ctx.registry, ctx.bound.as_ref())
+                        .record(&mut ctx.outcome, display);
                 }
             }
             continue;
@@ -857,7 +993,11 @@ fn detect_ignored_manifests(
         }
         match url::Url::from_file_path(path) {
             Ok(uri) => {
-                if ctx.registry.for_uri_blocking(&uri).is_some() {
+                if ctx
+                    .registry
+                    .for_uri_blocking(&uri, ctx.bound.as_ref())
+                    .is_some()
+                {
                     ctx.outcome.push_ignored_manifest(display);
                 }
             }
@@ -952,8 +1092,12 @@ impl SymlinkClassification {
 /// Classifies `path` without reading its content — gates `Broken` on `path` actually being a
 /// symlink (lstat), not merely non-regular-file, so an ordinary permission-denied directory or
 /// file that happens to share a manifest's name is never misreported as tampering.
-fn classify_symlink(path: &Path, registry: &EcosystemRegistry) -> SymlinkClassification {
-    if !is_manifest_shaped_by_name(path, registry) {
+fn classify_symlink(
+    path: &Path,
+    registry: &EcosystemRegistry,
+    bound: Option<&ClaimBound>,
+) -> SymlinkClassification {
+    if !is_manifest_shaped_by_name(path, registry, bound) {
         return SymlinkClassification::Irrelevant;
     }
     match std::fs::metadata(path) {
@@ -981,15 +1125,20 @@ fn display_relative_path(path: &Path, display_root: &Path) -> PathBuf {
 }
 
 /// `EcosystemRegistry::for_uri_blocking` on `path`'s own name, never on a resolved target.
-fn is_manifest_shaped_by_name(path: &Path, registry: &EcosystemRegistry) -> bool {
+fn is_manifest_shaped_by_name(
+    path: &Path,
+    registry: &EcosystemRegistry,
+    bound: Option<&ClaimBound>,
+) -> bool {
     let Ok(uri) = url::Url::from_file_path(path) else {
         return false;
     };
-    registry.for_uri_blocking(&uri).is_some()
+    registry.for_uri_blocking(&uri, bound).is_some()
 }
 
-/// Routes one already-discovered file through `registry.for_uri`, pushing a
-/// [`DiscoveredManifest`] onto `outcome` when an ecosystem claims it.
+/// Routes one already-discovered file through `registry.for_uri_blocking`, pushing a
+/// [`DiscoveredManifest`] onto the outcome when an ecosystem claims it. While walking declared
+/// files, the declaring ecosystem takes the file.
 ///
 /// `route_path` and `read_path` are the same path for every caller except the
 /// `follow_symlinks: true` branch of `walk_directory` (FR-007): ecosystem routing is a
@@ -1006,26 +1155,26 @@ fn is_manifest_shaped_by_name(path: &Path, registry: &EcosystemRegistry) -> bool
 /// practice; if it somehow does (issue #1108), that is recorded as a warning rather than
 /// silently dropping the file, so a future regression in the absolutization degrades loudly
 /// instead of quietly reintroducing the "walk finds zero manifests" bug.
-fn route_file(
-    route_path: &Path,
-    read_path: &Path,
-    display_path: &Path,
-    registry: &EcosystemRegistry,
-    outcome: &mut WalkOutcome,
-) {
+fn route_file(route_path: &Path, read_path: &Path, display_path: &Path, ctx: &mut WalkCtx<'_>) {
     // #1299 round 2: sanitized once here, the single place `DiscoveredManifest` is built —
     // every caller's `display_path` (a walk root, a `display_relative_path` result, ...)
     // reaches display-safety through this one chokepoint rather than at each call site.
     let display_path = crate::sanitize::sanitize_path_for_display(display_path);
     let Ok(uri) = url::Url::from_file_path(route_path) else {
-        outcome.push_walk_error(format!(
+        ctx.outcome.push_walk_error(format!(
             "could not convert to a file URI, skipping: {}",
             display_path.display()
         ));
         return;
     };
-    if let Some(ecosystem) = registry.for_uri_blocking(&uri) {
-        outcome.push_manifest(DiscoveredManifest {
+    let declaring = ctx
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.targets.get(route_path))
+        .map(Arc::clone);
+    let routed = declaring.or_else(|| ctx.registry.for_uri_blocking(&uri, ctx.bound.as_ref()));
+    if let Some(ecosystem) = routed {
+        ctx.outcome.push_manifest(DiscoveredManifest {
             path: read_path.to_path_buf(),
             uri_path: route_path.to_path_buf(),
             display_path,
@@ -3064,6 +3213,85 @@ mod tests {
             outcome.manifests().is_empty(),
             "a symlinked .github escaping the walked root must never be scanned, even in the \
              default mode: {:?}",
+            outcome
+                .manifests()
+                .iter()
+                .map(|m| &m.display_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "gradle")]
+    #[test]
+    fn a_declared_hidden_catalog_stays_excluded_when_the_walk_excludes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("gradle")).unwrap();
+        fs::create_dir_all(root.join(".gradle")).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("settings.gradle.kts"),
+            "versionCatalogs { create(\"a\") { from(files(\"gradle/.a.toml\")) }\n\
+             create(\"b\") { from(files(\".gradle/b.toml\")) } }\n",
+        )
+        .unwrap();
+        fs::write(root.join("gradle/.a.toml"), "").unwrap();
+        fs::write(root.join(".gradle/b.toml"), "").unwrap();
+        let registry = test_registry();
+        let names = |policy| {
+            walk(
+                &[root.to_path_buf()],
+                &registry,
+                policy,
+                SymlinkPolicy::Skip,
+            )
+            .manifests()
+            .iter()
+            .map(|m| m.display_path.clone())
+            .collect::<Vec<_>>()
+        };
+        let hidden = PathBuf::from("gradle/.a.toml");
+
+        let found = names(GitignorePolicy::Ignore);
+        assert!(found.contains(&hidden), "{found:?}");
+        // `.gradle` is a pruned directory.
+        assert!(
+            !found.contains(&PathBuf::from(".gradle/b.toml")),
+            "{found:?}"
+        );
+
+        fs::write(root.join(".gitignore"), "gradle/.a.toml\n").unwrap();
+        let respected = names(GitignorePolicy::Respect);
+        assert!(!respected.contains(&hidden), "{respected:?}");
+    }
+
+    #[cfg(feature = "gradle")]
+    #[test]
+    fn a_root_spelled_with_parent_components_still_walks_declared_hidden_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("gradle")).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(
+            root.join("settings.gradle.kts"),
+            "versionCatalogs { create(\"a\") { from(files(\"gradle/.a.toml\")) } }\n",
+        )
+        .unwrap();
+        fs::write(root.join("gradle/.a.toml"), "").unwrap();
+
+        let outcome = walk(
+            &[root.join("sub/..")],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
+
+        assert!(
+            outcome
+                .manifests()
+                .iter()
+                .any(|m| m.display_path == Path::new("gradle/.a.toml")),
+            "{:?}",
             outcome
                 .manifests()
                 .iter()

@@ -47,7 +47,11 @@ impl crate::ecosystem::EcosystemBase for ClaimingEcosystem {
         self.filenames
     }
 
-    fn claims_unrouted_manifest(&self, _path: &Path) -> bool {
+    fn claims_unrouted_manifest(
+        &self,
+        _path: &Path,
+        _bound: Option<&crate::ecosystem::ClaimBound>,
+    ) -> bool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.claims
     }
@@ -83,7 +87,7 @@ fn for_uri_blocking_routes_an_unrouted_file_uri_to_a_claimant() {
     let (fake, calls) = ClaimingEcosystem::new(EcosystemId::Cargo, &[], true);
     registry.register(fake);
 
-    let routed = registry.for_uri_blocking(&unrouted_uri()).unwrap();
+    let routed = registry.for_uri_blocking(&unrouted_uri(), None).unwrap();
 
     assert_eq!(routed.ecosystem_id(), EcosystemId::Cargo);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -95,7 +99,7 @@ fn for_uri_blocking_returns_none_when_no_ecosystem_claims() {
     let (fake, calls) = ClaimingEcosystem::new(EcosystemId::Cargo, &[], false);
     registry.register(fake);
 
-    assert!(registry.for_uri_blocking(&unrouted_uri()).is_none());
+    assert!(registry.for_uri_blocking(&unrouted_uri(), None).is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -109,7 +113,7 @@ fn for_uri_blocking_does_not_call_a_claim_for_a_static_hit() {
     registry.register(claimant);
     let uri = crate::test_util::test_uri("/project/pinned.manifest");
 
-    let routed = registry.for_uri_blocking(&uri).unwrap();
+    let routed = registry.for_uri_blocking(&uri, None).unwrap();
 
     assert_eq!(routed.ecosystem_id(), EcosystemId::Go);
     assert_eq!(static_calls.load(Ordering::SeqCst), 0);
@@ -123,7 +127,7 @@ fn for_uri_blocking_does_not_call_a_claim_for_a_non_file_uri() {
     registry.register(fake);
     let uri = url::Url::parse("https://example.com/unrouted.bin").unwrap();
 
-    assert!(registry.for_uri_blocking(&uri).is_none());
+    assert!(registry.for_uri_blocking(&uri, None).is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
@@ -135,7 +139,7 @@ fn for_uri_blocking_prefers_the_lowest_ecosystem_id_among_claimants() {
     registry.register(npm);
     registry.register(cargo);
 
-    let routed = registry.for_uri_blocking(&unrouted_uri()).unwrap();
+    let routed = registry.for_uri_blocking(&unrouted_uri(), None).unwrap();
 
     assert_eq!(routed.ecosystem_id(), EcosystemId::Cargo);
 }
@@ -148,7 +152,7 @@ fn for_uri_blocking_skips_a_non_claiming_lower_id() {
     registry.register(cargo);
     registry.register(npm);
 
-    let routed = registry.for_uri_blocking(&unrouted_uri()).unwrap();
+    let routed = registry.for_uri_blocking(&unrouted_uri(), None).unwrap();
 
     assert_eq!(routed.ecosystem_id(), EcosystemId::Npm);
 }

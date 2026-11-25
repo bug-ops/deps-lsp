@@ -81,6 +81,9 @@ pub struct PackageSignals {
     /// `preserve_cache`. Every handler attaches this unconditionally, mirroring
     /// [`Self::latest_status`]'s own unconditional attach.
     pub candidate_status: CandidateStatusMap,
+    /// OSV verdicts of the newest eligible version under a held latest, written by phase B
+    /// and attached together with [`Self::latest_status`].
+    pub fallback_status: LatestStatusMap,
     /// Yanked, deprecation, and fetch-failure findings from the lifecycle's registry
     /// fetch, keyed by **normalized** package name like every other per-package map here.
     /// See
@@ -199,6 +202,7 @@ impl std::fmt::Debug for PackageSignals {
             osv_scan_plan,
             latest_status,
             candidate_status,
+            fallback_status,
             outcomes,
             licenses,
             typosquats,
@@ -218,6 +222,7 @@ impl std::fmt::Debug for PackageSignals {
             .field("osv_scan_plan_count", &osv_scan_plan.len())
             .field("latest_status_count", &latest_status.len())
             .field("candidate_status_count", &candidate_status.len())
+            .field("fallback_status_count", &fallback_status.len())
             .field("licenses_count", &licenses.len())
             .field("typosquats_count", &typosquats.len())
             .field(
@@ -251,6 +256,7 @@ impl Default for PackageSignals {
             osv_scan_plan: OsvScanPlan::default(),
             latest_status: LatestStatusMap::new(),
             candidate_status: CandidateStatusMap::new(),
+            fallback_status: LatestStatusMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
@@ -285,6 +291,7 @@ impl PackageSignals {
             osv_scan_plan,
             latest_status,
             candidate_status,
+            fallback_status,
             outcomes,
             licenses,
             typosquats,
@@ -304,6 +311,7 @@ impl PackageSignals {
             osv_scan_plan.retain_not_named(removed_dep);
             latest_status.retain(|key, _| !key.is_for_name(removed_dep));
             candidate_status.retain(|key, _| !key.is_for_name(removed_dep));
+            fallback_status.retain(|key, _| !key.is_for_name(removed_dep));
             outcomes.remove(removed_dep);
         }
     }
@@ -323,6 +331,7 @@ impl PackageSignals {
             vulnerabilities: None,
             latest_status: None,
             candidate_status: None,
+            fallback_status: None,
             outcomes: None,
             licenses: None,
             typosquats: None,
@@ -375,6 +384,7 @@ pub(crate) struct SignalsSnapshotBuilder<'a> {
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
     candidate_status: Option<CandidateStatusMap>,
+    fallback_status: Option<LatestStatusMap>,
     outcomes: Option<DependencyOutcomes>,
     licenses: Option<HashMap<NormalizedName, Vec<String>>>,
     typosquats: Option<HashMap<NormalizedName, TyposquatSignal>>,
@@ -406,7 +416,8 @@ impl SignalsSnapshotBuilder<'_> {
         self
     }
 
-    /// Attaches [`PackageSignals::latest_status`] (issue #1517) when `osv_checks` is
+    /// Attaches [`PackageSignals::latest_status`] (issue #1517) and
+    /// [`PackageSignals::fallback_status`] when `osv_checks` is
     /// [`CheckState::Active`], leaving it `None` otherwise (critique S3) — checking never actually
     /// runs while offline either (`document::lifecycle`'s phase-A spawn gate matches), so both
     /// conditions must degrade the same way here.
@@ -424,7 +435,10 @@ impl SignalsSnapshotBuilder<'_> {
     #[must_use]
     pub(crate) fn with_latest_status(mut self, osv_checks: OsvChecks) -> Self {
         match osv_checks.state() {
-            CheckState::Active => self.latest_status = Some(self.signals.latest_status.clone()),
+            CheckState::Active => {
+                self.latest_status = Some(self.signals.latest_status.clone());
+                self.fallback_status = Some(self.signals.fallback_status.clone());
+            }
             CheckState::Inactive => {}
         }
         self
@@ -484,6 +498,21 @@ impl SignalsSnapshotBuilder<'_> {
         self
     }
 
+    /// Attaches every dimension the update planner reads, so the "Update N outdated" lens and
+    /// its command cannot plan from different inputs.
+    #[must_use]
+    pub(crate) fn with_update_inputs(
+        self,
+        vulnerabilities: PrefetchVisibility,
+        osv_checks: OsvChecks,
+        gossip: PrefetchVisibility,
+    ) -> Self {
+        self.with_resolved_version_candidates()
+            .with_vulnerabilities(vulnerabilities)
+            .with_latest_status(osv_checks)
+            .with_gossip_prefetch(gossip)
+    }
+
     /// Finishes the snapshot, consuming the builder.
     #[must_use]
     pub(crate) fn finish(self) -> SignalsSnapshot {
@@ -494,6 +523,7 @@ impl SignalsSnapshotBuilder<'_> {
             vulnerabilities: self.vulnerabilities,
             latest_status: self.latest_status,
             candidate_status: self.candidate_status,
+            fallback_status: self.fallback_status,
             outcomes: self.outcomes,
             licenses: self.licenses,
             typosquats: self.typosquats,
@@ -516,6 +546,7 @@ pub(crate) struct SignalsSnapshot {
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
     candidate_status: Option<CandidateStatusMap>,
+    fallback_status: Option<LatestStatusMap>,
     outcomes: Option<DependencyOutcomes>,
     licenses: Option<HashMap<NormalizedName, Vec<String>>>,
     typosquats: Option<HashMap<NormalizedName, TyposquatSignal>>,
@@ -541,6 +572,9 @@ impl SignalsSnapshot {
         }
         if let Some(candidate_status) = &self.candidate_status {
             data = data.with_candidate_status(candidate_status);
+        }
+        if let Some(fallback_status) = &self.fallback_status {
+            data = data.with_fallback_status(fallback_status);
         }
         if let Some(outcomes) = &self.outcomes {
             data = data.with_outcomes(outcomes);

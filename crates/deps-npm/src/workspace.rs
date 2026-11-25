@@ -856,6 +856,7 @@ pub fn parse_pnpm_workspace_manifest(
         blocked_registries: registries.blocked,
         rejected_registries: registries.rejected,
         dependency_truncation: budget.truncation(),
+        invalid_declarations: Vec::new(),
         duplicate_default_catalog: document
             .defect
             .filter(|defect| *defect == ConfigDefect::DuplicateDefaultCatalog)

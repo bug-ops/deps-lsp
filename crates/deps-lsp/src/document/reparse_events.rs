@@ -190,9 +190,9 @@ async fn reparse_due(
         )
         .await
         {
-            Ok(ChangeOutcome::Committed(CommittedChange { task, epoch })) => {
+            Ok(ChangeOutcome::Committed(CommittedChange { task, stamp })) => {
                 reparsed = true;
-                state.register_change_task(uri, task, epoch).await;
+                state.register_change_task(uri, task, stamp).await;
             }
             Ok(ChangeOutcome::Dropped(refusal)) => tracing::debug!(
                 "skipped stale reparse for {:?}: dropped as {:?} (concurrent edit, close or reopen)",

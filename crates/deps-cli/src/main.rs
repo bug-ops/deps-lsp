@@ -20,10 +20,12 @@ use deps_cli::update::ignore::IgnoreRules;
 use deps_cli::update::pr;
 use deps_cli::update::regen::{LockfileMode, LockfileOutcome};
 use deps_cli::{format, walk};
+use deps_core::ecosystem::ClaimBound;
 use deps_core::net_policy::{EnvSource, ProcessEnv, RegistryEnvironment};
 use deps_core::osv::{OSV_BASE_URL_ENV, OsvClient, OsvEndpoint};
 use deps_core::policy_config::{PolicyConfig, WorkspaceRegistriesEffect};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
+use deps_engine::manifest_probe::manifest_claimed_without_policy;
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -211,7 +213,13 @@ fn run_check_command(
     osv_endpoint: &OsvEndpoint,
 ) -> ExitCode {
     let walk_paths = args.walk_paths();
-    let config_lookup = config::ConfigLookup::for_walk_paths(&walk_paths);
+    let config_lookup = config::ConfigLookup::for_walk_paths(&walk_paths, |default| {
+        // Bounded by the directory the lookup inspects, like the walk's own root.
+        let bound = std::path::absolute(default)
+            .ok()
+            .and_then(|path| path.parent().and_then(ClaimBound::new));
+        manifest_claimed_without_policy(default, bound.as_ref())
+    });
     let cli_config = match config::load_for_check(args.config.as_deref(), &config_lookup) {
         Ok(config) => config::apply_overrides(
             config,

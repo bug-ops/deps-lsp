@@ -40,7 +40,15 @@ pub async fn handle_inlay_hints(
     }
 
     // Snapshot config before the document lookup (Copy value, no lock held across the call)
-    let (loading_config, network, osv_checks, vulnerability_visibility, suppression) = {
+    let (
+        loading_config,
+        network,
+        osv_checks,
+        vulnerability_visibility,
+        suppression,
+        freshness,
+        gossip_visibility,
+    ) = {
         let full_config = full_config.read().await;
         (
             full_config.loading_indicator.clone(),
@@ -50,6 +58,8 @@ pub async fn handle_inlay_hints(
                 full_config.policy.diagnostics.vulnerabilities_enabled,
             ),
             full_config.policy.diagnostics.effective_suppression(),
+            full_config.policy.freshness.to_freshness(),
+            PrefetchVisibility::from_enabled(full_config.policy.gossip_checks().is_active()),
         )
     };
 
@@ -68,6 +78,7 @@ pub async fn handle_inlay_hints(
             .with_vulnerabilities(vulnerability_visibility)
             .with_latest_status(osv_checks)
             .with_outcomes()
+            .with_gossip_prefetch(gossip_visibility)
             .finish();
         Some((
             ecosystem,
@@ -106,6 +117,7 @@ pub async fn handle_inlay_hints(
                 .with_network(network)
                 .with_suppression(&suppression)
                 .with_advisory_exemptions(&advisory_exemptions),
+            freshness,
             loading_state,
             &ecosystem_config,
         )
@@ -395,6 +407,96 @@ serde = "1.0.0"
 
             let labels: Vec<&str> = hints.iter().map(hint_label).collect();
             assert_eq!(labels, ["ℹ 1.0.0", "⚠ 1.0.0", "⚠ 1.0.0"], "{labels:?}");
+        }
+
+        /// The hint of `serde = "1.0.0"` (locked at 1.0.0) whose `latest` 3.0.0 is inside the
+        /// freshness cooldown, with `older` standing in for the candidates collected below it.
+        async fn hint_for_held_latest(older: Option<&str>) -> Vec<String> {
+            use deps_core::lsp_helpers::{
+                CandidatesEnd, CooldownCandidates, CooldownFallback, PackageVersions,
+            };
+            use deps_core::osv::UpgradeStatus;
+            use deps_core::{ConcreteVersion, NormalizedName, PublishTime};
+
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = "[dependencies]\nserde = \"=1.0.0\"\n".to_string();
+            let parse_result = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap()
+                .parse_manifest(&content, &url)
+                .await
+                .expect("Failed to parse manifest");
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+            let name = NormalizedName::for_test("serde");
+            let available: Vec<ConcreteVersion> = std::iter::once("3.0.0")
+                .chain(older)
+                .chain(["1.0.0"])
+                .map(ConcreteVersion::from)
+                .collect();
+            let candidates = older
+                .map(|v| CooldownFallback::new(v.into(), PublishTime::from_unix_secs(1_000)))
+                .into_iter()
+                .collect();
+            let versions = PackageVersions::new("3.0.0".into(), available.into())
+                .with_published_at(PublishTime::now())
+                .with_cooldown_candidates(CooldownCandidates::new(
+                    candidates,
+                    CandidatesEnd::Exhausted,
+                ));
+            doc_state
+                .signals
+                .resolved_versions
+                .insert(name.clone(), "1.0.0".into());
+            doc_state.update_cached_versions(std::iter::once((name, versions)).collect());
+            let clean = |version: &str| {
+                std::iter::once((
+                    deps_core::test_util::vuln_key("serde"),
+                    UpgradeStatus::CandidateClean {
+                        version: version.into(),
+                    },
+                ))
+                .collect()
+            };
+            doc_state.update_latest_status(clean("3.0.0"));
+            doc_state.update_fallback_status(clean(older.unwrap_or("1.0.0")));
+            doc_state.set_loaded();
+            state.update_document(uri.clone(), doc_state);
+
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "UPTODATE".to_string(),
+                needs_update_text: "UPDATE: {}".to_string(),
+            };
+            let (client, full_config) = create_test_client_and_config();
+            handle_inlay_hints(state, params, &config, client, full_config)
+                .await
+                .iter()
+                .map(|hint| hint_label(hint).to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn inlay_hint_names_the_eligible_version_instead_of_the_held_latest() {
+            assert_eq!(hint_for_held_latest(Some("2.0.0")).await, ["UPDATE: 2.0.0"]);
+        }
+
+        #[tokio::test]
+        async fn inlay_hint_reads_up_to_date_when_nothing_newer_is_eligible() {
+            assert_eq!(hint_for_held_latest(None).await, ["UPTODATE 1.0.0"]);
         }
 
         #[tokio::test]

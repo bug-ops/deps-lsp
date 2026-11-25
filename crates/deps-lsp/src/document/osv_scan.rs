@@ -2,7 +2,8 @@
 //! phase A/B execution, license pre-fetch, and fix-target
 //! verification.
 
-use super::state::{ResolvedGeneration, ServerState};
+use super::osv_fallback::{FallbackViewInputs, run_fallback_check};
+use super::state::{LicenseRefresh, ResolvedGeneration, ServerState};
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
@@ -402,7 +403,7 @@ pub(crate) async fn run_license_prefetch(
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout: FetchTimeout,
 ) {
-    if !ecosystem.license_source().requires_dedicated_fetch() || state.license_policy().is_empty() {
+    if !ecosystem.license_source().requires_dedicated_fetch() {
         return;
     }
 
@@ -411,27 +412,34 @@ pub(crate) async fn run_license_prefetch(
         ResolvedGeneration,
         Vec<deps_engine::classify::license::Tier3Target>,
     ) = {
-        let Some(doc) = state.get_document(&uri) else {
+        let Some(mut doc) = state.documents.get_mut(&uri) else {
             return;
         };
-        let Some(manifest) = doc.manifest() else {
-            return;
+        // Checked under the document guard: a policy enabled afterwards marks the obligation
+        // again, so it cannot be settled behind its back.
+        let targets = if state.license_policy().is_empty() {
+            Vec::new()
+        } else {
+            doc.manifest().map_or_default(|manifest| {
+                deps_engine::classify::license::tier3_license_targets(
+                    manifest,
+                    &doc.signals.resolved_versions,
+                    &doc.signals.resolved_version_candidates,
+                )
+            })
         };
-        let targets = deps_engine::classify::license::tier3_license_targets(
-            manifest,
-            &doc.signals.resolved_versions,
-            &doc.signals.resolved_version_candidates,
-        );
+        // Nothing to fetch for the document as it is: the obligation is met (settled under the
+        // same guard the targets were read under).
+        if targets.is_empty() {
+            doc.set_license_refresh(LicenseRefresh::Settled);
+            return;
+        }
         (
             doc.content.clone(),
             doc.signals.resolved_versions_generation,
             targets,
         )
     };
-
-    if targets.is_empty() {
-        return;
-    }
 
     let result = deps_engine::classify::license::fetch_tier3_licenses(
         ecosystem.as_ref(),
@@ -456,6 +464,7 @@ pub(crate) async fn run_license_prefetch(
             );
         } else {
             doc.merge_licenses(result.licenses);
+            doc.set_license_refresh(LicenseRefresh::Settled);
         }
     }
 }
@@ -539,11 +548,13 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         mut candidate_status,
         candidate_tags,
         fix_target_registry,
+        vuln_keys,
+        fallback_inputs,
     ) = {
         let Some(doc) = state.get_document(uri) else {
             return;
         };
-        let Some(manifest) = doc.manifest() else {
+        let Some(manifest) = doc.manifest_arc() else {
             return;
         };
         let vuln_keys = manifest.vulnerability_keys(
@@ -551,16 +562,16 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             Some(&doc.signals.resolved_version_candidates),
         );
         let candidate_tags =
-            deps_engine::classify::osv::candidate_tag_sources(manifest, &vuln_keys);
+            deps_engine::classify::osv::candidate_tag_sources(manifest.as_ref(), &vuln_keys);
         let (targets, latest_status) = deps_engine::classify::osv::build_latest_check_targets(
-            manifest,
+            manifest.as_ref(),
             &doc.signals.cached_versions,
             &vuln_keys,
             &candidate_tags,
         );
         let (candidate_rounds, candidate_status) =
             deps_engine::classify::osv::build_candidate_check_targets(
-                manifest,
+                manifest.as_ref(),
                 &doc.signals.cached_versions,
                 &vuln_keys,
                 &candidate_tags,
@@ -568,7 +579,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         // Snapshotted in this same read: the guard is released before the awaits below, and a
         // later re-read could pair a fresher cache with this scan's keys (#1832).
         let fix_target_registry = deps_engine::classify::osv::fix_target_registry(
-            manifest,
+            manifest.as_ref(),
             &vuln_keys,
             &doc.signals.cached_versions,
         );
@@ -579,43 +590,59 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             candidate_status,
             candidate_tags,
             fix_target_registry,
+            vuln_keys,
+            FallbackViewInputs {
+                manifest: Arc::clone(&manifest),
+                cached_versions: doc.signals.cached_versions.clone(),
+                resolved_versions: doc.signals.resolved_versions.clone(),
+                resolved_version_candidates: Arc::clone(&doc.signals.resolved_version_candidates),
+                gossip_findings: doc.signals.gossip_findings.clone(),
+            },
         )
     };
 
-    if !targets.is_empty() {
-        let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
-        let checked = state
-            .osv
-            .check_candidates(ecosystem_id, &targets, timeout_duration)
+    // B.1 then B.2 (B.2 reads B.1's results), concurrently with the fallback round, which needs
+    // neither and would otherwise delay the first commit by a whole OSV round.
+    let verification = async {
+        if !targets.is_empty() {
+            let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
+            let checked = state
+                .osv
+                .check_candidates(ecosystem_id, &targets, timeout_duration)
+                .await;
+            latest_status.extend(checked);
+        }
+
+        // B.2 runs before the B.1b candidate rounds below (impl-critic S1): both draw from the
+        // same shared `phase_b_deadline`, and B.2 verifies the recommended-fix quickfix's target
+        // F — an existing, higher-value feature than #1524's new candidate rounds. Running the
+        // rounds first could starve B.2's budget on a cold cache/large manifest, making the
+        // Fix-Vulnerability quickfix silently disappear; ordering B.2 first means only the newer
+        // feature ever degrades under time pressure, never the older one.
+        if !vulnerable_keys.is_empty() {
+            run_osv_fix_target_verification(
+                &mut result.vulnerabilities,
+                &vulnerable_keys,
+                &result.osv_name_by_key,
+                &latest_status,
+                &candidate_tags,
+                &fix_target_registry,
+                ecosystem_id,
+                formatter,
+                &state.osv,
+                phase_b_deadline,
+            )
             .await;
-        latest_status.extend(checked);
-    }
+        }
+    };
+    let ((), fallback_status) = tokio::join!(
+        verification,
+        run_fallback_check(state, uri, phase_b_deadline, &vuln_keys, &fallback_inputs)
+    );
 
-    // B.2 runs before the B.1b candidate rounds below (impl-critic S1): both draw from the
-    // same shared `phase_b_deadline`, and B.2 verifies the recommended-fix quickfix's target F
-    // — an existing, higher-value feature than #1524's new candidate rounds. Running the
-    // rounds first could starve B.2's budget on a cold cache/large manifest, making the
-    // Fix-Vulnerability quickfix silently disappear; ordering B.2 first means only the newer
-    // feature ever degrades under time pressure, never the older one.
-    if !vulnerable_keys.is_empty() {
-        run_osv_fix_target_verification(
-            &mut result.vulnerabilities,
-            &vulnerable_keys,
-            &result.osv_name_by_key,
-            &latest_status,
-            &candidate_tags,
-            &fix_target_registry,
-            ecosystem_id,
-            formatter,
-            &state.osv,
-            phase_b_deadline,
-        )
-        .await;
-    }
-
-    // First commit (impl-critic S1): `vulnerabilities`/`latest_status` land as soon as B.1/B.2
-    // finish, independent of how long the B.1b candidate rounds below take — hover/diagnostics
-    // consume these two, not `candidate_status`, so gating their staleness on an unrelated,
+    // First commit (impl-critic S1): `vulnerabilities`/`latest_status`/`fallback_status` land as
+    // soon as B.1/B.2 and the concurrent fallback round finish, independent of how long the B.1b
+    // candidate rounds below take — hover/diagnostics consume these, not `candidate_status`, so gating their staleness on an unrelated,
     // newer (#1524) check would only make already-stale-feeling data stay stale longer.
     //
     // Impl-critic N1: also the early-exit gate for the candidate rounds below. A document that
@@ -638,6 +665,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             doc.update_vulnerabilities(result.vulnerabilities);
             doc.signals.osv_scan_plan = result.scan_plan;
             doc.update_latest_status(latest_status);
+            doc.update_fallback_status(fallback_status.unwrap_or_default());
             false
         }
     } else {
@@ -1403,6 +1431,11 @@ mod tests {
                 license: vec!["MIT".to_string()],
             });
             setup_document(&state, &uri, &ecosystem, &url).await;
+            state
+                .documents
+                .get_mut(&uri)
+                .unwrap()
+                .set_license_refresh(LicenseRefresh::Pending);
 
             let task = {
                 let uri = uri.clone();
@@ -1438,6 +1471,11 @@ mod tests {
                 .unwrap();
 
             let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.license_refresh(),
+                LicenseRefresh::Pending,
+                "a stale drop leaves the fetch owed"
+            );
             assert!(
                 doc.signals.licenses.is_empty(),
                 "an intervening generation bump between snapshot and commit must drop this \
@@ -1463,6 +1501,11 @@ mod tests {
                 license: vec!["MIT".to_string()],
             });
             setup_document(&state, &uri, &ecosystem, &url).await;
+            state
+                .documents
+                .get_mut(&uri)
+                .unwrap()
+                .set_license_refresh(LicenseRefresh::Pending);
 
             let task = {
                 let uri = uri.clone();
@@ -1489,6 +1532,7 @@ mod tests {
                 .unwrap();
 
             let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.license_refresh(), LicenseRefresh::Settled);
             assert_eq!(
                 doc.signals.licenses.get(&NormalizedName::for_test("dep-0")),
                 Some(&vec!["MIT".to_string()]),

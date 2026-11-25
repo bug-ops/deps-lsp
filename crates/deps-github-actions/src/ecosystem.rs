@@ -2397,6 +2397,7 @@ mod tests {
                 &ParsedView::new(&parse_result),
                 &content,
                 versions,
+                deps_core::FreshnessSettings::Disabled,
                 &eco.formatter,
             );
 
@@ -2474,6 +2475,7 @@ mod tests {
                 &ParsedView::new(&parse_result),
                 &content,
                 versions(),
+                deps_core::FreshnessSettings::Disabled,
                 &eco.formatter,
             );
             let mut edit_lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
@@ -2485,6 +2487,7 @@ mod tests {
                 .inlay_hints(
                     ParsedView::new(&parse_result),
                     versions(),
+                    deps_core::FreshnessSettings::Disabled,
                     deps_core::LoadingState::Loaded,
                     &deps_core::EcosystemConfig::default(),
                 )
@@ -2521,6 +2524,7 @@ mod tests {
                     Position::new(line, sha_column as u32 + 1),
                     &uri,
                     versions().with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::Disabled,
                     &content,
                 )
                 .await;
@@ -2656,6 +2660,7 @@ mod tests {
                     &ParsedView::new(&parse_result),
                     &content,
                     versions,
+                    deps_core::FreshnessSettings::Disabled,
                     &eco.formatter,
                 );
                 assert_eq!(newer_count(&diagnostics), 1, "{line}: {diagnostics:?}");
@@ -3178,6 +3183,7 @@ mod tests {
                 &ParsedView::new(&parse_result),
                 &content,
                 deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 &eco.formatter,
             );
             let edits: Vec<_> = planned.into_iter().map(|p| p.edit).collect();
@@ -3349,6 +3355,7 @@ mod tests {
                 &ParsedView::new(&parse_result),
                 &content,
                 deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::Disabled,
                 &eco.formatter,
             );
             assert!(edits.is_empty(), "{edits:?}");

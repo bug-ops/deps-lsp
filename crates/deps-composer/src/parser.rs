@@ -7,7 +7,7 @@
 use crate::types::{ComposerDependency, ComposerSection};
 use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
-use deps_core::json_helpers::string_valued_entries;
+use deps_core::json_helpers::{non_string_entry_declarations, string_valued_entries};
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::{InvalidStabilityOccurrence, StabilityFloor};
 use serde_json::Value;
@@ -78,6 +78,9 @@ pub struct ComposerParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// `require`/`require-dev` entries that are not version strings (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 // Hand-written rather than `deps_core::impl_parse_result!`: that macro's optional fields
@@ -103,6 +106,10 @@ impl deps_core::ParseResult for ComposerParseResult {
 
     fn dependency_truncation(&self) -> Option<deps_core::DependencyTruncation> {
         self.dependency_truncation
+    }
+
+    fn invalid_declarations(&self) -> Vec<deps_core::InvalidDeclarationOccurrence> {
+        self.invalid_declarations.clone()
     }
 
     /// Surfaces [`Self::minimum_stability`]'s effective floor so hover, completion, and code
@@ -298,6 +305,9 @@ fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseR
         );
     }
     let mut dependencies = Vec::new();
+    let mut invalid_declarations = Vec::new();
+    let mut invalid_budget =
+        deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     // Shared across every section below (#796) — the ceiling is per-document, not
     // per-section.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -323,6 +333,13 @@ fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseR
                 &line_table,
                 &mut budget,
             ));
+            invalid_declarations.extend(
+                non_string_entry_declarations(deps, positions.as_ref(), content, &line_table)
+                    .into_iter()
+                    .filter(|occurrence| {
+                        !is_platform_package(&occurrence.key) && invalid_budget.allow()
+                    }),
+            );
         }
     }
 
@@ -372,6 +389,7 @@ fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseR
             uri: uri.clone(),
             minimum_stability,
             dependency_truncation: budget.truncation(),
+            invalid_declarations,
         },
         has_bare_repo,
     ))
@@ -1945,5 +1963,32 @@ mod tests {
         assert_eq!(result[0].name, "vendor/pkg");
         assert_eq!(result[0].name_range, Range::default());
         assert!(result[0].version_range.is_none());
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_non_string_requirements_are_reported_but_platform_ones_are_not() {
+        let result = parse_composer_json(
+            r#"{"require": {"monolog/monolog": {"version": "3.0"}, "php": 8}}"#,
+            &deps_core::test_util::test_uri("/p/composer.json"),
+        )
+        .unwrap();
+
+        assert!(result.dependencies.is_empty());
+        assert_eq!(
+            reported(&result),
+            [(
+                "monolog/monolog".to_owned(),
+                deps_core::InvalidDeclarationReason::UnsupportedValue
+            )]
+        );
     }
 }

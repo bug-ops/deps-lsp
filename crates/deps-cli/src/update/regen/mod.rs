@@ -904,7 +904,7 @@ fn collect_pins(plan: &UpdatePlan, formatter: &dyn EcosystemFormatter) -> Vec<Lo
             target: target.clone(),
             cooldown_fallback: matches!(
                 item.cooldown_fallback,
-                Some(CooldownFallbackNote::AppliedInsteadOf(_))
+                Some(CooldownFallbackNote::AppliedInsteadOf(..))
             ),
             cooldown_held: item.lockfile_fix.cooldown_held.clone(),
             origin,

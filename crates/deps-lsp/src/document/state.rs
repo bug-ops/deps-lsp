@@ -3,6 +3,7 @@ use super::lifecycle::DocumentUnavailable;
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::NormalizeName;
+use deps_core::ecosystem::ClaimBound;
 use deps_core::lockfile::LockFileCache;
 use deps_core::lsp_helpers::InteractiveFetchGate;
 use deps_core::lsp_helpers::exemption::OperatorExemptions;
@@ -17,7 +18,7 @@ use deps_core::{
     GossipFindings, LicensePolicy, NormalizedName, ParseResult, ParsedManifest,
     ResolvedCandidatesMap, ResolvedVersionsMap, TyposquatSignal,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -254,9 +255,56 @@ impl std::fmt::Debug for ManifestParse {
     }
 }
 
+/// Most unhandled open documents remembered for re-routing after a declaring file changes.
+pub(crate) const MAX_UNROUTED_OPENS: usize = 256;
+
+/// Most text those remembered documents hold together; a larger document is not remembered.
+pub(crate) const MAX_UNROUTED_BYTES: usize = 16 * 1024 * 1024;
+
+/// An open document no ecosystem handles, with what the editor last sent for it.
+struct UnroutedOpen {
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+}
+
 /// Identity of one open of a document, distinguishing a reopened URI from its predecessor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenEpoch(u64);
+
+/// Position of a commit among the commits of one open, advanced by every change or reparse
+/// commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CommitSeq(u64);
+
+impl CommitSeq {
+    pub(super) const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
+/// Identity of one commit: the open it belongs to and its position in that open (#2184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitStamp {
+    /// The open the commit belongs to.
+    pub(crate) epoch: OpenEpoch,
+    /// The commit's position within that open.
+    pub(crate) seq: CommitSeq,
+}
+
+/// Whether a dedicated tier-3 license fetch is still owed for the document's dependencies.
+///
+/// Set by a commit that adds or changes a dependency and carried across commits, so a debounced
+/// task that a newer edit aborts cannot lose the fetch; settled only by a fetch round that
+/// ran to its end against unchanged content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LicenseRefresh {
+    /// A fetch is owed.
+    Pending,
+    /// Nothing is owed.
+    #[default]
+    Settled,
+}
 
 /// An epoch reserved for an open still parsing; dropping it without
 /// [`ServerState::insert_opened`] releases the reservation.
@@ -372,6 +420,10 @@ pub struct DocumentState {
     /// and carried across edits by the commit, so work started under a previous open can be told
     /// apart from the current one even when both sit at the same LSP version (#2022).
     open_epoch: OpenEpoch,
+    /// Position of the commit that produced this state; see [`CommitSeq`].
+    commit_seq: CommitSeq,
+    /// The tier-3 license fetch still owed; see [`LicenseRefresh`].
+    license_refresh: LicenseRefresh,
 }
 
 /// [`DocumentState`]'s load lifecycle, carrying [`LoadingState::Loading`]'s start [`Instant`]
@@ -513,6 +565,8 @@ impl std::fmt::Debug for DocumentState {
             .field("loading_started_at", &self.loading_started_at())
             .field("version", &self.version)
             .field("open_epoch", &self.open_epoch)
+            .field("commit_seq", &self.commit_seq)
+            .field("license_refresh", &self.license_refresh)
             .finish()
     }
 }
@@ -522,6 +576,34 @@ impl DocumentState {
     /// (an edit, not a reopen). The only way besides [`ServerState::update_document`] to set it.
     pub(super) const fn inherit_open_epoch(&mut self, previous: &Self) {
         self.open_epoch = previous.open_epoch;
+    }
+
+    /// Carries the open's commit position and license obligation over from the state this one
+    /// replaces, advancing the position when `advance` is set.
+    pub(super) const fn inherit_commit_lineage(&mut self, previous: &Self, advance: bool) {
+        self.inherit_open_epoch(previous);
+        self.commit_seq = if advance {
+            previous.commit_seq.next()
+        } else {
+            previous.commit_seq
+        };
+        self.license_refresh = previous.license_refresh;
+    }
+
+    /// The identity of the commit that produced this state.
+    pub(crate) const fn commit_stamp(&self) -> CommitStamp {
+        CommitStamp {
+            epoch: self.open_epoch,
+            seq: self.commit_seq,
+        }
+    }
+
+    pub(crate) const fn license_refresh(&self) -> LicenseRefresh {
+        self.license_refresh
+    }
+
+    pub(crate) const fn set_license_refresh(&mut self, license_refresh: LicenseRefresh) {
+        self.license_refresh = license_refresh;
     }
 
     /// Returns the epoch of the open this state belongs to; see [`OpenEpoch`].
@@ -542,6 +624,8 @@ impl DocumentState {
             load_phase: LoadPhase::Idle,
             version: None,
             open_epoch: OpenEpoch::UNSTAMPED,
+            commit_seq: CommitSeq::default(),
+            license_refresh: LicenseRefresh::Settled,
         }
     }
 
@@ -697,6 +781,15 @@ impl DocumentState {
     /// every run rather than incrementally patching a prior result.
     pub fn update_latest_status(&mut self, latest_status: deps_core::osv::LatestStatusMap) {
         self.signals.latest_status = latest_status;
+    }
+
+    /// Replaces the OSV verdicts of the newest eligible versions, written by phase B under the
+    /// same guard as [`Self::update_latest_status`].
+    pub(crate) fn update_fallback_status(
+        &mut self,
+        fallback_status: deps_core::osv::LatestStatusMap,
+    ) {
+        self.signals.fallback_status = fallback_status;
     }
 
     /// Updates phase B's per-(dependency, candidate-version) check result (#1524) — the same
@@ -1253,6 +1346,13 @@ pub struct ServerState {
     /// user config directory and never reloaded: a change needs a server restart. Unset (and
     /// read as no exemptions) until then.
     advisory_exemptions: OnceLock<Arc<OperatorExemptions>>,
+    /// The client's workspace folders, fixed by `initialize`; they bound the lookups of
+    /// content-aware manifest claims. Folders added later are not tracked.
+    workspace_folders: OnceLock<Vec<std::path::PathBuf>>,
+    /// Open documents no ecosystem handled although a declaring file could make one claim them,
+    /// oldest first (#2180), with the editor's latest text; at most [`MAX_UNROUTED_OPENS`]
+    /// entries and [`MAX_UNROUTED_BYTES`] of text.
+    unrouted_opens: std::sync::Mutex<VecDeque<UnroutedOpen>>,
     /// Live-updatable `policy.typosquat.enabled` setting (issue #1437), mirroring
     /// `license_policy`'s own rationale: read unconditionally by
     /// `handlers::diagnostics::generate_diagnostics_internal` on every diagnostics
@@ -1270,6 +1370,8 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.gossip`.
     gossip_checks: AtomicToggle<GossipChecks>,
+    /// Live copy of the freshness settings for background tasks that have no config handle.
+    freshness: RwLock<deps_core::FreshnessSettings>,
     /// Whether the OSV latest-check (issue #1517) is currently *effectively* enabled —
     /// `policy.diagnostics.vulnerabilities_enabled && !policy.network.offline`, mirroring
     /// `typosquat_checks`'s rationale but tracking a derived, two-flag condition rather than
@@ -1496,8 +1598,11 @@ impl ServerState {
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
             advisory_exemptions: OnceLock::new(),
+            workspace_folders: OnceLock::new(),
+            unrouted_opens: std::sync::Mutex::default(),
             typosquat_checks: AtomicToggle::new(default_policy.typosquat_checks()),
             gossip_checks: AtomicToggle::new(default_policy.gossip_checks()),
+            freshness: RwLock::new(default_policy.freshness.to_freshness()),
             osv_checks: AtomicToggle::new(default_policy.osv_checks()),
             workspace_registry_ecosystems,
             probe_slots: super::probes::ProbeSlots::default(),
@@ -1606,6 +1711,22 @@ impl ServerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
     }
 
+    /// The freshness settings last applied from the configuration.
+    pub(crate) fn freshness(&self) -> deps_core::FreshnessSettings {
+        *self
+            .freshness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Replaces the freshness settings read by background tasks.
+    pub(crate) fn set_freshness(&self, freshness: deps_core::FreshnessSettings) {
+        *self
+            .freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = freshness;
+    }
+
     /// The operator's advisory exemptions: none until [`Self::set_advisory_exemptions`] ran.
     pub fn advisory_exemptions(&self) -> Arc<OperatorExemptions> {
         self.advisory_exemptions
@@ -1617,6 +1738,87 @@ impl ServerState {
     /// takes effect (`initialize` runs once per process).
     pub fn set_advisory_exemptions(&self, exemptions: Arc<OperatorExemptions>) {
         let _ = self.advisory_exemptions.set(exemptions);
+    }
+
+    /// Fixes the client's workspace folders; only the first call takes effect.
+    pub(crate) fn set_workspace_folders(&self, folders: Vec<std::path::PathBuf>) {
+        let _ = self.workspace_folders.set(folders);
+    }
+
+    /// The bound for content-aware claims on `path`: the innermost workspace folder containing
+    /// it, unless that folder is too broad to bound anything (a root or the home directory).
+    ///
+    /// Resolves the home directory, so call it from a blocking context.
+    // ASSUMPTION: of nested workspace folders the innermost bounds the lookup (the narrower reach).
+    pub(crate) fn claim_bound(&self, path: &std::path::Path) -> Option<ClaimBound> {
+        self.workspace_folders
+            .get()?
+            .iter()
+            .filter(|folder| path.starts_with(folder))
+            .max_by_key(|folder| folder.components().count())
+            .and_then(|folder| ClaimBound::new(folder))
+    }
+
+    /// Remembers an open document no ecosystem handles, so a change of a declaring file can
+    /// re-check it. A document over [`MAX_UNROUTED_BYTES`] is not remembered; older entries make
+    /// room otherwise.
+    pub(crate) fn remember_unrouted_open(&self, uri: &Uri, content: &str, version: Option<i32>) {
+        let mut unrouted = self.unrouted_opens();
+        unrouted.retain(|known| known.uri != *uri);
+        if content.len() > MAX_UNROUTED_BYTES {
+            return;
+        }
+        let mut bytes: usize = unrouted.iter().map(|known| known.content.len()).sum();
+        while unrouted.len() >= MAX_UNROUTED_OPENS || bytes + content.len() > MAX_UNROUTED_BYTES {
+            let Some(oldest) = unrouted.pop_front() else {
+                break;
+            };
+            bytes -= oldest.content.len();
+        }
+        unrouted.push_back(UnroutedOpen {
+            uri: uri.clone(),
+            content: content.to_owned(),
+            version,
+        });
+    }
+
+    /// Replaces the text of a remembered document with a newer `didChange`; does nothing for a
+    /// document that is not remembered or for an older version.
+    pub(crate) fn update_unrouted_open(&self, uri: &Uri, content: &str, version: Option<i32>) {
+        let newer = self.unrouted_opens().iter().any(|known| {
+            known.uri == *uri
+                && !matches!((version, known.version), (Some(new), Some(old)) if new < old)
+        });
+        if newer {
+            self.remember_unrouted_open(uri, content, version);
+        }
+    }
+
+    /// The remembered text and version of `uri`.
+    pub(crate) fn unrouted_open(&self, uri: &Uri) -> Option<(String, Option<i32>)> {
+        self.unrouted_opens()
+            .iter()
+            .find(|known| known.uri == *uri)
+            .map(|known| (known.content.clone(), known.version))
+    }
+
+    /// Forgets a document that was closed or is now handled.
+    pub(crate) fn forget_unrouted_open(&self, uri: &Uri) {
+        self.unrouted_opens().retain(|known| known.uri != *uri);
+    }
+
+    /// The open documents currently remembered as unhandled.
+    pub(crate) fn remembered_unrouted_opens(&self) -> Vec<Uri> {
+        self.unrouted_opens()
+            .iter()
+            .map(|known| known.uri.clone())
+            .collect()
+    }
+
+    fn unrouted_opens(&self) -> std::sync::MutexGuard<'_, VecDeque<UnroutedOpen>> {
+        self.unrouted_opens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Returns the typosquat-similarity gate as of the last applied config (issue #1437).
@@ -2230,29 +2432,30 @@ impl ServerState {
         self.supervise_background_task(uri, task, task_id);
     }
 
-    /// Registers `task` as `uri`'s change task only if `epoch` is still the open that started
-    /// it, deciding under the `tasks` lock (#2022).
+    /// Registers `task` as `uri`'s change task only if `stamp` is still the document's current
+    /// commit, deciding under the `tasks` lock (#2022, #2184).
     ///
-    /// A task of the current open replaces (and aborts) the previously registered task, exactly
-    /// as [`Self::spawn_background_task`] does. A task of a closed or superseded open is aborted
-    /// itself and registered nowhere; the task a reopen installed, and its typosquat and gossip
-    /// tasks, are left alone. Returns whether `task` was registered.
+    /// The task of the current commit replaces (and aborts) the previously registered task,
+    /// exactly as [`Self::spawn_background_task`] does. A task of a superseded commit, or of a
+    /// closed or reopened document, is aborted itself and registered nowhere; the task a newer
+    /// commit or reopen installed, and its typosquat and gossip tasks, are left alone. Returns
+    /// whether `task` was registered.
     ///
-    /// Sound because an open inserts its document before registering any task and a close
-    /// removes the document before cancelling the task, so an epoch seen here under the lock
-    /// cannot be resurrected.
+    /// Sound because a commit (or an open) installs its document before registering any task and
+    /// a close removes the document before cancelling the task, so a stamp seen here under the
+    /// lock cannot be resurrected.
     #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub(crate) async fn register_change_task(
         self: &Arc<Self>,
         uri: Uri,
         task: JoinHandle<()>,
-        epoch: OpenEpoch,
+        stamp: CommitStamp,
     ) -> bool {
         let task_id = task.id();
         {
             let mut tasks = self.tasks.write().await;
-            let current = self.documents.get(&uri).map(|doc| doc.open_epoch());
-            if current != Some(epoch) {
+            let current = self.documents.get(&uri).map(|doc| doc.commit_stamp());
+            if current != Some(stamp) {
                 self.abort_registry.mark_aborted(task_id);
                 task.abort();
                 return false;
@@ -2583,6 +2786,7 @@ mod tests {
                         tower_lsp_server::ls_types::Position::new(0, 0),
                         &url,
                         VersionData::new(&cached, &resolved),
+                        deps_core::FreshnessSettings::Disabled,
                         "",
                     )
                     .await;

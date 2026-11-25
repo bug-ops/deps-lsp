@@ -30,6 +30,11 @@ related:
 > **Priority**: P2
 > **Type**: research / parity gap
 
+> [!info] Amended by [[099-honor-native-package-manager-cooldown/spec|spec 099: eligible version under a held latest]] (implemented, PR pending)
+> The freshness cooldown no longer changes only the wording: a held `latest` is not written by the
+> lens or refactor actions, and the outdated diagnostic is judged against the newest eligible version
+> (it may name that version or be absent); inlay hints follow it. Hover stays advisory.
+
 ## 1. Overview
 
 ### Problem Statement

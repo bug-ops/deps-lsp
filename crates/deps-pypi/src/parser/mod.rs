@@ -375,6 +375,25 @@ fn looks_like_valid_pep508_name(name: &str) -> bool {
         && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
 }
 
+/// The key a notice names an unparsable requirement string by: its package-name token, which
+/// cannot carry a URL credential, or the whole string when it has none.
+fn invalid_requirement_key(requirement: &str) -> &str {
+    match pep508_leading_name(requirement) {
+        "" => requirement,
+        name => name,
+    }
+}
+
+const fn invalid_requirement_reason(error: &PypiError) -> deps_core::InvalidDeclarationReason {
+    use deps_core::InvalidDeclarationReason::{MalformedCoordinate, UnsupportedValue};
+    match error {
+        PypiError::InvalidDependencySpec { .. } => MalformedCoordinate,
+        PypiError::UnsupportedFormat { .. }
+        | PypiError::RequirementTooLong { .. }
+        | PypiError::TomlParseError { .. } => UnsupportedValue,
+    }
+}
+
 /// A `-r`/`-c` reference to another requirements/constraints file.
 ///
 /// Surfaced as a `textDocument/documentLink` so it can be ctrl/cmd-clicked
@@ -438,6 +457,9 @@ pub struct ParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// Requirements the parser could not turn into a dependency (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 deps_core::impl_parse_result!(
@@ -449,6 +471,7 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
         rejected_registries: rejected_registries,
+        invalid_declarations: invalid_declarations,
     }
 );
 

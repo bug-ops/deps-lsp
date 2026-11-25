@@ -169,9 +169,11 @@ instead, and every other satisfying entry stays an `also locked at` alternative.
 ## Release-Age Windows
 
 When the project's package manager holds back young releases, a `latest` inside that window is
-explained, never written: hover and `check` name the setting and when the version becomes eligible,
-and `deps-cli update` skips it (exit 0). Nothing older is proposed in its place, and a version
-already in the lock file stays eligible. Which manager applies is decided by the lock file the
+explained and not written (except as a security fix): hover names the setting, while `check`,
+diagnostics and `deps-cli update` move to the newest eligible version, see
+[Release-Age Holds](../cross-ecosystem/version-diagnostics.md#release-age-holds). With no
+eligible version, `deps-cli update` skips the dependency (exit 0). A version already in the lock
+file stays eligible. Which manager applies is decided by the lock file the
 project resolves with (`package-lock.json`, `pnpm-lock.yaml`, `bun.lock`/`bun.lockb`, `yarn.lock`);
 without one, a `pnpm-workspace.yaml` selects pnpm, a `bunfig.toml` selects Bun, otherwise npm.
 Only that manager's own file in the project root (the directory of the lock file, else the

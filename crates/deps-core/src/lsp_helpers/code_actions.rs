@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
 use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
+use crate::freshness::format_relative_age;
 use crate::osv::ScanOutcome;
 use crate::{
     ConcreteVersion, Dependency, PackageKey, PublishTime, Registry, TypedParseResult, Version,
@@ -11,13 +12,14 @@ use crate::{
 
 use super::exemption::ExemptionCheck;
 use super::{
-    BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DependencyFormatter, EcosystemFormatter,
-    FetchContext, InteractiveFetch, InteractiveFetchRequest, LatestVerdict, LineOffsetTable,
-    NoLiveList, RequirementGate, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
-    await_interactive_versions, candidate_verdict, is_safe_version_string, latest_verdict,
-    literal_span_matches, requirement_is_unsatisfiable, requirement_len_exceeds_cap,
-    resolve_latest_status, resolve_scan_outcome, single_file_edit, slice_for_range,
-    strip_whitespace, warn_rejected_value,
+    BoundedVersionReq, CooldownBlocker, CooldownDisposition, CooldownPrecedence,
+    DEPRECATED_DIAGNOSTIC_CODE, DependencyFormatter, EcosystemFormatter, FetchContext,
+    InteractiveFetch, InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
+    RequirementGate, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions,
+    candidate_verdict, cooldown_disposition, cooldown_precedence, is_safe_version_string,
+    latest_verdict, literal_span_matches, requirement_is_unsatisfiable,
+    requirement_len_exceeds_cap, resolve_latest_status, resolve_scan_outcome, single_file_edit,
+    slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// Whether REFACTOR "Update to X" items may offer pre-release versions (#1885).
@@ -155,12 +157,17 @@ struct VulnerabilityFixAction {
 /// ahead of phase B completing) leaves that unresolved and suppresses this action — the
 /// intended fail-safe degradation, not a bug. Callers must still reconcile the result against a successful registry fetch when one
 /// is available — see the yank check in [`generate_code_actions`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "freshness is explicit so no caller can silently skip the hold"
+)]
 fn build_vulnerability_fix_action<P, F>(
     parse_result: &P,
     dep: &P::Dep,
     uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     version_req: &str,
     formatter: &F,
 ) -> Option<VulnerabilityFixAction>
@@ -267,20 +274,32 @@ where
     } else {
         format!("{first_id} +{} more", rest_ids.len())
     };
-    // The fix target never changes because of a native publish-age window; the title only says
-    // when the written version is still inside it.
+    // The fix target never changes because of a release-age window; the title only says when the
+    // written version is still inside one. The native window wins when both apply.
+    let target = ConcreteVersion::new(version_native.as_str());
+    let published_at = versions
+        .cached_for(&key)
+        .and_then(|cached| cached.published_at_of(&target));
     let inside_window = crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions)
-        .filter(|gate| {
-            let target = ConcreteVersion::new(version_native.as_str());
-            gate.excludes(
-                versions
-                    .cached_for(&key)
-                    .and_then(|cached| cached.published_at_of(&target)),
-                &target,
-                gate.now(),
-            )
+        .filter(|gate| gate.excludes(published_at, &target, gate.now()))
+        .map(|gate| format!("; inside {}", gate.cooldown()))
+        .or_else(|| {
+            let by = freshness_blocker(&versions, &key, &target, published_at, freshness)?;
+            let published_at = match by {
+                CooldownBlocker::Local { published_at } => Some(published_at),
+                CooldownBlocker::Gossip => published_at,
+            };
+            Some(published_at.map_or_else(
+                || "; inside the release cooldown (deps.dev/GOSSIP)".to_string(),
+                |published_at| {
+                    format!(
+                        "; published {}, inside the release cooldown",
+                        format_relative_age(published_at.age_secs_from(versions.now))
+                    )
+                },
+            ))
         })
-        .map_or_default(|gate| format!("; inside {}", gate.cooldown()));
+        .unwrap_or_default();
     let title = if lockfile_hit {
         format!(
             "Update to {version_native} (fixes {fixes}; update lockfile to apply{inside_window})"
@@ -318,6 +337,28 @@ where
             ..Default::default()
         },
     })
+}
+
+/// What the freshness cooldown (GOSSIP first, local heuristic otherwise) says about `version`;
+/// `None` when it is not held or freshness is disabled.
+fn freshness_blocker(
+    versions: &VersionData<'_>,
+    key: &PackageKey,
+    version: &ConcreteVersion,
+    published_at: Option<PublishTime>,
+    freshness: crate::freshness::FreshnessSettings,
+) -> Option<CooldownBlocker> {
+    match cooldown_precedence(
+        versions.gossip_prefetch,
+        key.normalized(),
+        version.as_str(),
+        published_at,
+        freshness.cooldown()?,
+        versions.now,
+    ) {
+        CooldownPrecedence::Cleared => None,
+        CooldownPrecedence::Blocked(by) => Some(by),
+    }
 }
 
 /// The unsatisfiable-requirement quickfix built by [`build_unsatisfiable_fix_action`],
@@ -365,6 +406,7 @@ fn build_unsatisfiable_fix_action<F: DependencyFormatter>(
     uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     version_req: &VersionReq,
     formatter: &F,
 ) -> Option<UnsatisfiableFixAction> {
@@ -386,16 +428,18 @@ fn build_unsatisfiable_fix_action<F: DependencyFormatter>(
     }
 
     let latest = package_versions.latest.clone();
-    // Explain-only: a `latest` still inside the package manager's publish-age window is never
-    // proposed as the fix.
-    if crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions).is_some_and(
-        |gate| {
-            gate.excludes(
-                package_versions.published_at_of(&latest),
-                &latest,
-                gate.now(),
-            )
-        },
+    // A held `latest` is never proposed as the fix.
+    let gate = crate::native_cooldown::NativeGate::for_dependency(dep, &key, &versions);
+    if matches!(
+        cooldown_disposition(
+            package_versions,
+            key.normalized(),
+            freshness,
+            versions.gossip_prefetch,
+            gate.as_ref(),
+            versions.now,
+        ),
+        CooldownDisposition::NativeHeld { .. } | CooldownDisposition::Blocked { .. }
     ) {
         return None;
     }
@@ -542,6 +586,7 @@ pub(super) fn code_actions_offered<P, F, R>(
     parse_result: &P,
     dep: &P::Dep,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     fetched: &FetchedVersions,
     registry: &R,
     formatter: &F,
@@ -570,13 +615,21 @@ where
         uri,
         version_range,
         versions,
+        freshness,
         version_req.as_str(),
         formatter,
     )
     .filter(|f| !fetched.rules_out(&f.version_native));
-    let unsatisfiable_fix =
-        build_unsatisfiable_fix_action(dep, uri, version_range, versions, version_req, formatter)
-            .filter(|f| !fetched.rules_out(&f.version_native));
+    let unsatisfiable_fix = build_unsatisfiable_fix_action(
+        dep,
+        uri,
+        version_range,
+        versions,
+        freshness,
+        version_req,
+        formatter,
+    )
+    .filter(|f| !fetched.rules_out(&f.version_native));
     if vulnerability_fix.is_some() || unsatisfiable_fix.is_some() {
         return true;
     }
@@ -605,6 +658,7 @@ where
         version_range,
         version_req,
         versions: &versions,
+        freshness,
         formatter,
     };
     refactor_targets(&refactor, registry, registry_versions)
@@ -708,11 +762,16 @@ where
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
 /// fixtures in the sibling `test_support` module rather than as public
 /// API — see the `generate_code_actions_*` tests here for realistic calls.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "freshness is explicit so no caller can silently skip the hold"
+)]
 pub async fn generate_code_actions<P, F, R>(
     parse_result: &P,
     position: Position,
     uri: &url::Url,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     content: &str,
     registry: &R,
     formatter: &F,
@@ -744,11 +803,19 @@ where
         uri,
         version_range,
         versions,
+        freshness,
         version_req.as_str(),
         formatter,
     );
-    let unsat_fix =
-        build_unsatisfiable_fix_action(dep, uri, version_range, versions, version_req, formatter);
+    let unsat_fix = build_unsatisfiable_fix_action(
+        dep,
+        uri,
+        version_range,
+        versions,
+        freshness,
+        version_req,
+        formatter,
+    );
     // Registry-independent for the same FR-007 reason as the two fix actions above —
     // `versions.outcomes`' deprecation channel is cache-derived, not a fresh registry call.
     let replacement_action = build_replacement_action(
@@ -761,7 +828,7 @@ where
         formatter,
     );
 
-    let fetched = fetch_fix_versions(registry, dep, uri, versions, formatter).await;
+    let fetched = fetch_fix_versions(registry, dep, uri, versions, freshness, formatter).await;
 
     // A fix target the registry reports as yanked is dropped entirely rather than offered —
     // see `FetchedVersions::rules_out`. Yank-filtering both actions before the collision check
@@ -825,6 +892,7 @@ where
             version_range,
             version_req,
             versions: &versions,
+            freshness,
             formatter,
         };
         latest_refactor_idx = push_refactor_actions(
@@ -969,6 +1037,7 @@ async fn fetch_fix_versions<R: Registry + ?Sized>(
     dep: &dyn Dependency,
     uri: &url::Url,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     formatter: &dyn EcosystemFormatter,
 ) -> FetchedVersions {
     if !formatter.can_resolve_source(&dep.source()) {
@@ -987,7 +1056,8 @@ async fn fetch_fix_versions<R: Registry + ?Sized>(
                 formatter,
                 FetchContext::CodeAction,
             ),
-            crate::freshness::FreshnessSettings::Disabled,
+            // Several registries report publish times only under freshness.
+            freshness,
         )
         .await,
     )
@@ -1001,6 +1071,7 @@ struct RefactorContext<'a, 'v, P: TypedParseResult, F> {
     version_range: Range,
     version_req: &'a VersionReq,
     versions: &'a VersionData<'v>,
+    freshness: crate::freshness::FreshnessSettings,
     formatter: &'a F,
 }
 
@@ -1032,6 +1103,7 @@ where
         dep,
         version_req,
         versions,
+        freshness,
         formatter,
         ..
     } = *ctx;
@@ -1099,16 +1171,20 @@ where
             );
             continue;
         }
-        if native_gate.as_ref().is_some_and(|gate| {
-            gate.excludes(
-                live_published_at
-                    .get(item.version.as_str())
-                    .copied()
-                    .flatten(),
-                &item.version,
-                gate.now(),
-            )
-        }) {
+        let published_at = live_published_at
+            .get(item.version.as_str())
+            .copied()
+            .flatten()
+            .or_else(|| {
+                versions
+                    .cached_for(&key)
+                    .and_then(|cached| cached.published_at_of(&item.version))
+            });
+        if native_gate
+            .as_ref()
+            .is_some_and(|gate| gate.excludes(published_at, &item.version, gate.now()))
+            || freshness_blocker(versions, &key, &item.version, published_at, freshness).is_some()
+        {
             continue;
         }
         // Issue #1517/#1524: never offer an "update to X" quickfix unless OSV has
@@ -1264,6 +1340,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1337,6 +1414,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &MOCK_FORMATTER,
@@ -1444,6 +1522,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1532,6 +1611,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1631,6 +1711,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1704,6 +1785,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1769,6 +1851,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1838,6 +1921,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1918,6 +2002,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -1976,6 +2061,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -2036,6 +2122,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -2094,6 +2181,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &IDENTITY_FORMATTER,
@@ -2152,6 +2240,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &CaretWrappingFormatter,
@@ -2185,6 +2274,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &IDENTITY_FORMATTER,
@@ -2258,6 +2348,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &registry,
                 &ProvenAheadFormatter { proven },
@@ -2303,6 +2394,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &TrailingSpaceFormatter,
@@ -2338,6 +2430,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &IDENTITY_FORMATTER,
@@ -2401,6 +2494,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &IDENTITY_FORMATTER,
@@ -2486,6 +2580,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &ErrorRegistry,
             formatter,
@@ -2623,6 +2718,7 @@ mod tests {
             Position::new(0, version_start),
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &IDENTITY_FORMATTER,
@@ -2638,6 +2734,7 @@ mod tests {
             Position::new(1, version_start),
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &IDENTITY_FORMATTER,
@@ -2706,6 +2803,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &TruncatingFormatter,
@@ -2768,6 +2866,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &TruncatingFormatter,
@@ -2830,6 +2929,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &MOCK_FORMATTER,
@@ -2892,6 +2992,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &ErrorRegistry,
             &MOCK_FORMATTER,
@@ -2961,6 +3062,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3031,6 +3133,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             registry,
             &MOCK_FORMATTER,
@@ -3146,6 +3249,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3174,6 +3278,169 @@ mod tests {
         );
     }
 
+    /// npm, Maven, NuGet and others fill publish times only when freshness is on.
+    struct EnrichingRegistry;
+
+    impl crate::Registry for EnrichingRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn Version>>>> {
+            Box::pin(std::future::ready(Ok(enriched_versions(None))))
+        }
+
+        fn get_versions_from<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+            _source: &'a crate::DependencySource,
+            freshness: crate::FreshnessSettings,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn Version>>>> {
+            let published_at = freshness.is_enabled().then(PublishTime::now);
+            Box::pin(std::future::ready(Ok(enriched_versions(published_at))))
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+            _req: &'a VersionReq,
+            _selection_context: &'a crate::SelectionContext,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn Version>>>>
+        {
+            Box::pin(std::future::ready(Ok(None)))
+        }
+
+        fn search_raw<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+
+        fn select_latest_matching(
+            &self,
+            versions: &[Box<dyn Version>],
+            _req: &VersionReq,
+            _selection_context: &crate::SelectionContext,
+        ) -> Option<usize> {
+            crate::select_latest_for_existence(versions, |v| v.as_ref())
+        }
+    }
+
+    /// `2.0.0`, published at `published_at`, and an old `1.5.0` listed only when times are known.
+    fn enriched_versions(published_at: Option<PublishTime>) -> Vec<Box<dyn Version>> {
+        let mut latest = crate::test_util::MockVersion::new("2.0.0");
+        let mut older = crate::test_util::MockVersion::new("1.5.0");
+        if let Some(published_at) = published_at {
+            latest = latest.with_published_at(published_at);
+            older = older.with_published_at(PublishTime::from_unix_secs(1_000));
+        }
+        vec![Box::new(latest), Box::new(older)]
+    }
+
+    #[tokio::test]
+    async fn refactor_actions_skip_a_held_version_when_publish_times_need_freshness() {
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            VersionData::new(&cached, &resolved),
+            crate::FreshnessSettings::Enabled {
+                cooldown: crate::CooldownWindow::from_secs(3_600),
+            },
+            &content,
+            &EnrichingRegistry,
+            &MOCK_FORMATTER,
+        )
+        .await;
+
+        let titles: Vec<&str> = actions.iter().map(|a| a.title.as_str()).collect();
+        assert!(!titles.iter().any(|t| t.contains("2.0.0")), "{titles:?}");
+        assert!(titles.iter().any(|t| t.contains("1.5.0")), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn security_fix_title_names_a_gossip_hold_by_age_when_the_publish_time_is_known() {
+        use crate::deps_dev::{GossipCooldown, GossipRiskLevel};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+        };
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let advisory = Advisory::new(
+            "A1".to_string(),
+            "2023-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+        )
+        .expect("valid osv id")
+        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]);
+        let vulnerabilities = HashMap::from([(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
+                advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: ConcreteVersion::new("1.2.0"),
+                },
+            }),
+        )]);
+        let gossip = HashMap::from([(
+            crate::NormalizedName::for_test("pkg"),
+            crate::test_util::stub_gossip_findings(
+                "1.2.0",
+                Some(GossipCooldown::new(
+                    PublishTime::from_unix_secs(i64::MAX / 2),
+                    GossipRiskLevel::High,
+                )),
+            ),
+        )]);
+        let resolved = HashMap::new();
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.2.0", false), ("1.0.0", false)],
+        };
+        let published = crate::lsp_helpers::PackageVersions::latest_only("1.2.0")
+            .with_published_at(PublishTime::from_unix_secs(1_000));
+
+        for (cached, expected) in [
+            (None, "; inside the release cooldown (deps.dev/GOSSIP)"),
+            (Some(published), "; published "),
+        ] {
+            let cached: crate::CachedVersionsMap = cached
+                .into_iter()
+                .map(|versions| (crate::NormalizedName::for_test("pkg"), versions))
+                .collect();
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                VersionData::new(&cached, &resolved)
+                    .with_vulnerabilities(&vulnerabilities)
+                    .with_gossip_prefetch(&gossip),
+                crate::FreshnessSettings::default(),
+                &content,
+                &registry,
+                &MOCK_FORMATTER,
+            )
+            .await;
+
+            let titles = quickfix_titles(&actions);
+            assert!(titles.iter().any(|t| t.contains(expected)), "{titles:?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_generate_code_actions_latest_refactor_is_preferred_when_no_fix_exists() {
         // Critic C1: the most common production path — no vulnerability, no unsatisfiable
@@ -3199,6 +3466,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3270,6 +3538,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3350,6 +3619,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3399,6 +3669,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3457,6 +3728,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             formatter,
@@ -3751,6 +4023,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3804,6 +4077,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3859,6 +4133,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &registry,
             &MOCK_FORMATTER,
@@ -3932,6 +4207,7 @@ mod tests {
             version_range.start,
             parse_result.uri(),
             versions,
+            crate::FreshnessSettings::Disabled,
             &content,
             &MockRegistry,
             &PinPreservingFormatter,
@@ -4155,6 +4431,7 @@ mod tests {
                 position,
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &CaRegistry,
                 &MOCK_FORMATTER.for_dependency(),
@@ -4218,6 +4495,7 @@ mod tests {
                 position,
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &CaRegistry,
                 &MOCK_FORMATTER.for_dependency(),
@@ -4250,6 +4528,7 @@ mod tests {
                 position,
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &CaRegistry,
                 &MOCK_FORMATTER.for_dependency(),
@@ -4281,6 +4560,7 @@ mod tests {
                 position,
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &CaRegistry,
                 &MOCK_FORMATTER.for_dependency(),
@@ -4318,6 +4598,7 @@ mod tests {
                 position,
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &CaRegistry,
                 &MOCK_FORMATTER.for_dependency(),
@@ -4355,6 +4636,7 @@ mod tests {
                 position,
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &CaRegistry,
                 &MOCK_FORMATTER.for_dependency(),
@@ -4530,7 +4812,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
-                    cooldown_fallback: None,
+                    cooldown_candidates: Default::default(),
                     publish_times: std::sync::Arc::from(Vec::new()),
                 },
             );
@@ -4561,6 +4843,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &ExactMatchFormatter,
@@ -4591,6 +4874,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &ExactMatchFormatter,
@@ -4622,6 +4906,7 @@ mod tests {
                     version_range.start,
                     parse_result.uri(),
                     versions,
+                    crate::FreshnessSettings::Disabled,
                     &content,
                     &MockRegistry,
                     &ExactMatchFormatter,
@@ -4666,6 +4951,7 @@ mod tests {
                 Position::new(0, 0).into(),
                 pr.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 content,
                 &MockRegistry,
                 &NonRegistryExactFormatter,
@@ -4696,6 +4982,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &ExactMatchFormatter,
@@ -4727,6 +5014,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &NonFixingFormatter,
@@ -4755,6 +5043,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &NormalizingExactFormatter,
@@ -4787,6 +5076,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &registry,
                 &ExactMatchFormatter,
@@ -4815,6 +5105,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &ErrorRegistry,
                 &ExactMatchFormatter,
@@ -4875,6 +5166,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &ExactMatchFormatter,
@@ -4957,6 +5249,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &ExactMatchFormatter,
@@ -5029,6 +5322,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &registry,
                 &CollidingTextFormatter,
@@ -5065,6 +5359,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &registry,
                 &ExactMatchFormatter,
@@ -5162,6 +5457,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &MockRegistry,
                 &PlaceholderGatedFormatter,
@@ -5201,6 +5497,7 @@ mod tests {
                 version_range.start,
                 parse_result.uri(),
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &content,
                 &registry,
                 &PlaceholderGatedFormatter,

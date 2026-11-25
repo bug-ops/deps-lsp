@@ -1127,6 +1127,7 @@ mod tests {
         let hints = deps_core::lsp_helpers::generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            deps_core::FreshnessSettings::Disabled,
             deps_core::LoadingState::Loaded,
             &config,
             &fmt,
@@ -1172,6 +1173,7 @@ mod tests {
         let hints = deps_core::lsp_helpers::generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
+            deps_core::FreshnessSettings::Disabled,
             deps_core::LoadingState::Loaded,
             &config,
             &fmt,
@@ -3011,6 +3013,7 @@ mod tests {
             range.start.into(),
             &uri,
             VersionData::new(&cached, &resolved),
+            deps_core::FreshnessSettings::Disabled,
             content,
             &registry,
             &fmt,

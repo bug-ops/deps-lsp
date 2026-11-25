@@ -302,7 +302,7 @@ pub enum ConfigError {
     },
 }
 
-/// Where `check` looks for its auto-discovered [`DEFAULT_CONFIG_FILENAME`] (#2168).
+/// Where `check` looks for its auto-discovered [`DEFAULT_CONFIG_FILENAME`] (#2168, #2182).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigLookup {
     /// Look for the default config file inside this directory.
@@ -310,6 +310,10 @@ pub enum ConfigLookup {
     /// The one explicitly checked file is itself the default config file, so it is a manifest
     /// (for example a Gradle catalog named `deps.toml`) and never configuration.
     CheckedFileIsDefault,
+    /// The discovered default config file (of the one checked directory, of the one checked
+    /// file's parent, or `./deps.toml` for several paths) is claimed as a manifest, so it is not
+    /// loaded; [`load_for_check`] says so on stderr, because the repository can cause this.
+    DiscoveredDefaultIsManifest(PathBuf),
 }
 
 impl ConfigLookup {
@@ -319,13 +323,44 @@ impl ConfigLookup {
     /// Exactly one path resolves unambiguously (its own directory, or its parent when it is a
     /// file itself); multiple paths have no single "walked root", so the current directory is
     /// used.
+    ///
+    /// `is_manifest` answers whether a file is claimed as a manifest. It is asked about the
+    /// default config file that would be discovered, and never about a file that does not
+    /// exist.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::config::ConfigLookup;
+    /// use std::path::PathBuf;
+    ///
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::write(dir.path().join("deps.toml"), "")?;
+    /// let paths = [dir.path().to_path_buf()];
+    ///
+    /// assert_eq!(
+    ///     ConfigLookup::for_walk_paths(&paths, |_| true),
+    ///     ConfigLookup::DiscoveredDefaultIsManifest(dir.path().join("deps.toml"))
+    /// );
+    /// assert_eq!(
+    ///     ConfigLookup::for_walk_paths(&paths, |_| false),
+    ///     ConfigLookup::Discover(PathBuf::from(dir.path()))
+    /// );
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     #[must_use]
-    pub fn for_walk_paths(paths: &[PathBuf]) -> Self {
-        match paths {
-            [only] if only.is_dir() => Self::Discover(only.clone()),
-            [only] if is_default_config_file(only) => Self::CheckedFileIsDefault,
-            [only] => Self::Discover(parent_dir_or_cwd(only).to_path_buf()),
-            _ => Self::Discover(PathBuf::from(".")),
+    pub fn for_walk_paths(paths: &[PathBuf], is_manifest: impl Fn(&Path) -> bool) -> Self {
+        let dir = match paths {
+            [only] if only.is_dir() => only.clone(),
+            [only] if is_default_config_file(only) => return Self::CheckedFileIsDefault,
+            [only] => parent_dir_or_cwd(only).to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let default = dir.join(DEFAULT_CONFIG_FILENAME);
+        if default.is_file() && is_manifest(&default) {
+            Self::DiscoveredDefaultIsManifest(default)
+        } else {
+            Self::Discover(dir)
         }
     }
 }
@@ -364,9 +399,11 @@ fn is_default_config_file(file: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(DEFAULT_CONFIG_FILENAME))
 }
 
-/// Loads `check`'s [`CliConfig`]: `explicit_path` when given, otherwise the auto-discovered
-/// default file per `lookup`, or [`CliConfig::default`] when the checked file is itself the
-/// default file name (#2168).
+/// Loads `check`'s [`CliConfig`] according to `lookup`.
+///
+/// `explicit_path` wins when given. Otherwise the auto-discovered default file is loaded, or
+/// [`CliConfig::default`] is used when that file is itself a manifest (#2168, #2182); a
+/// discovered file skipped for that reason is announced on stderr.
 ///
 /// # Errors
 ///
@@ -377,8 +414,18 @@ pub fn load_for_check(
 ) -> Result<CliConfig, ConfigError> {
     match (explicit_path, lookup) {
         (None, ConfigLookup::CheckedFileIsDefault) => Ok(CliConfig::default()),
+        (None, ConfigLookup::DiscoveredDefaultIsManifest(skipped)) => {
+            eprintln!(
+                "deps-cli: warning: {} was not loaded as configuration: a Gradle settings file declares it as a version catalog; pass a configuration file with --config",
+                crate::sanitize::sanitize_path_for_display(skipped).display(),
+            );
+            Ok(CliConfig::default())
+        }
         (_, ConfigLookup::Discover(dir)) => load(explicit_path, dir),
-        (Some(_), ConfigLookup::CheckedFileIsDefault) => load(explicit_path, Path::new(".")),
+        (
+            Some(_),
+            ConfigLookup::CheckedFileIsDefault | ConfigLookup::DiscoveredDefaultIsManifest(_),
+        ) => load(explicit_path, Path::new(".")),
     }
 }
 
@@ -1309,5 +1356,31 @@ b = 2
         assert!(!UpdateTypeToken::Major.matches(deps_core::edit::UpdateKind::Unknown));
         assert!(UpdateTypeToken::Minor.matches(deps_core::edit::UpdateKind::Minor));
         assert!(UpdateTypeToken::Patch.matches(deps_core::edit::UpdateKind::Patch));
+    }
+
+    #[test]
+    fn test_lookup_skips_every_discovered_default_claimed_as_a_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = dir.path().join(DEFAULT_CONFIG_FILENAME);
+        std::fs::write(&default, "").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+
+        for path in [dir.path().to_path_buf(), dir.path().join("Cargo.toml")] {
+            assert_eq!(
+                ConfigLookup::for_walk_paths(&[path], |_| true),
+                ConfigLookup::DiscoveredDefaultIsManifest(default.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn test_lookup_never_asks_about_a_missing_default_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let lookup = ConfigLookup::for_walk_paths(&[dir.path().to_path_buf()], |_| {
+            panic!("no default file exists")
+        });
+
+        assert_eq!(lookup, ConfigLookup::Discover(dir.path().to_path_buf()));
     }
 }

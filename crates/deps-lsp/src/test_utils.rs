@@ -254,6 +254,7 @@ pub(crate) mod blocking_ecosystem {
             &'a self,
             _parsed: ParsedView<'a, StubParseResult>,
             _versions: VersionData<'a>,
+            _freshness: deps_core::FreshnessSettings,
             _loading_state: deps_core::LoadingState,
             _config: &'a EcosystemConfig,
         ) -> BoxFuture<'a, Vec<InlayHint>> {
@@ -279,6 +280,7 @@ pub(crate) mod blocking_ecosystem {
             _parsed: ParsedView<'a, StubParseResult>,
             _content: &'a str,
             _versions: VersionData<'a>,
+            _freshness: deps_core::FreshnessSettings,
             _uri: &'a url::Url,
             _command_id: &'a str,
         ) -> BoxFuture<'a, Vec<CodeLens>> {

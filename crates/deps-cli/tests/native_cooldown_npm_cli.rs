@@ -50,12 +50,26 @@ struct Fixture {
 }
 
 async fn fixture(npmrc_extra: &str, latest_age: i64) -> Fixture {
+    fixture_listing(npmrc_extra, latest_age, None).await
+}
+
+/// [`fixture`] with an extra `(version, age)` between the in-use version and `latest`.
+async fn fixture_listing(
+    npmrc_extra: &str,
+    latest_age: i64,
+    between: Option<(&str, i64)>,
+) -> Fixture {
+    let extra_version = between.map_or_default(|(v, _)| format!(r#""{v}":{{}},"#));
+    let extra_time =
+        between.map_or_default(|(v, age)| format!(r#""{v}":"{}","#, rfc3339(now_secs() - age)));
     let mut registry = mockito::Server::new_async().await;
     let abbreviated = registry
         .mock("GET", "/widget")
         .match_header("accept", "application/vnd.npm.install-v1+json")
         .with_status(200)
-        .with_body(r#"{"dist-tags":{"latest":"1.1.0"},"versions":{"1.0.0":{},"1.1.0":{}}}"#)
+        .with_body(format!(
+            r#"{{"dist-tags":{{"latest":"1.1.0"}},"versions":{{"1.0.0":{{}},{extra_version}"1.1.0":{{}}}}}}"#
+        ))
         .expect_at_least(0)
         .create_async()
         .await;
@@ -64,7 +78,7 @@ async fn fixture(npmrc_extra: &str, latest_age: i64) -> Fixture {
         .match_header("accept", "application/json")
         .with_status(200)
         .with_body(format!(
-            r#"{{"time":{{"1.0.0":"{}","1.1.0":"{}"}}}}"#,
+            r#"{{"time":{{"1.0.0":"{}",{extra_time}"1.1.0":"{}"}}}}"#,
             rfc3339(now_secs() - 100 * DAY),
             rfc3339(now_secs() - latest_age)
         ))
@@ -195,7 +209,8 @@ fn held_items(plan: &UpdatePlan) -> usize {
 
 #[tokio::test]
 async fn check_names_the_npm_window_with_freshness_disabled() {
-    let fx = fixture(WINDOW_7D, 3 * DAY).await;
+    // 1.0.5 is eligible, so the held 1.1.0 still has a finding to explain.
+    let fx = fixture_listing(WINDOW_7D, 3 * DAY, Some(("1.0.5", 30 * DAY))).await;
     let messages = fx.check_messages().await;
     let held: Vec<_> = messages.iter().filter(|m| m.contains(NOTE)).collect();
     assert_eq!(held.len(), 1, "{messages:?}");

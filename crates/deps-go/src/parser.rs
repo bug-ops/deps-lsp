@@ -59,6 +59,9 @@ pub struct GoParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// `require` lines that name no version (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 /// Parses a go.mod file and extracts all dependencies with positions, using a fresh, default
@@ -95,6 +98,9 @@ pub fn parse_go_mod_with_context(
     let mut dependencies = Vec::with_capacity(50);
     let mut module_path = None;
     let mut go_version = None;
+    let mut invalid_declarations = Vec::new();
+    let mut invalid_budget =
+        deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     // Compile-time-constant patterns; a malformed literal is a build-visible programmer
     // error, not attacker-influenceable input.
@@ -105,10 +111,6 @@ pub fn parse_go_mod_with_context(
     #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static GO_PATTERN: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*go\s+(\S+)").unwrap());
-    // Same guarantee as MODULE_PATTERN above.
-    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
-    static REQUIRE_SINGLE: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s+(\S+)\s+(\S+)").unwrap());
     // Same guarantee as MODULE_PATTERN above.
     #[expect(clippy::unwrap_used, reason = "constant regex literal")]
     static REQUIRE_BLOCK_START: std::sync::LazyLock<Regex> =
@@ -155,17 +157,20 @@ pub fn parse_go_mod_with_context(
             continue;
         }
 
-        if (in_require_block || REQUIRE_SINGLE.is_match(line_trimmed))
-            && let Some(dep) = parse_require_line(
-                line_without_comment,
-                line.contains("// indirect"),
-                line_offset,
-                content,
-                &line_table,
-            )
-            && budget.allow()
-        {
-            dependencies.push(dep);
+        let requirement = read_requirement_line(
+            line,
+            line_without_comment,
+            in_require_block,
+            line_offset,
+            content,
+            &line_table,
+        );
+        match requirement {
+            Some(Ok(dep)) if budget.allow() => dependencies.push(dep),
+            Some(Err(occurrence)) if invalid_budget.allow() => {
+                invalid_declarations.push(occurrence);
+            }
+            _ => {}
         }
 
         if let Some(caps) = REPLACE_PATTERN.captures(line_trimmed) {
@@ -265,6 +270,7 @@ pub fn parse_go_mod_with_context(
         blocked_registries,
         rejected_registries,
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
     })
 }
 
@@ -338,6 +344,41 @@ fn strip_line_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+/// Reads a line that declares, or sits where it should declare, a requirement: `Err` when it
+/// names a module but no version.
+fn read_requirement_line(
+    line: &str,
+    code: &str,
+    in_require_block: bool,
+    line_offset: usize,
+    content: &str,
+    line_table: &LineOffsetTable,
+) -> Option<std::result::Result<GoDependency, deps_core::InvalidDeclarationOccurrence>> {
+    #[expect(clippy::unwrap_used, reason = "constant regex literal")]
+    static REQUIRE_SINGLE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s+(\S+)\s+(\S+)").unwrap());
+
+    let trimmed = code.trim();
+    let rest = trimmed
+        .strip_prefix("require ")
+        .or_else(|| in_require_block.then_some(trimmed));
+    if rest.is_none() && !REQUIRE_SINGLE.is_match(trimmed) {
+        return None;
+    }
+    let indirect = line.contains("// indirect");
+    if let Some(dep) = parse_require_line(code, indirect, line_offset, content, line_table) {
+        return Some(Ok(dep));
+    }
+
+    let module = rest?.split_whitespace().next()?;
+    let start = line_offset + line.find(module)?;
+    Some(Err(deps_core::InvalidDeclarationOccurrence {
+        range: byte_span_to_range(content, line_table, start, start + module.len()),
+        key: module.to_owned(),
+        reason: deps_core::InvalidDeclarationReason::MalformedCoordinate,
+    }))
 }
 
 /// Parses a single require line.
@@ -534,6 +575,7 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
         rejected_registries: rejected_registries,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -1343,5 +1385,27 @@ require (
                 .public_content(&result.dependencies[1])
                 .is_some()
         );
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_require_without_a_version_is_reported() {
+        let result = parse_go_mod(
+            "module m\n\nrequire (\n\tgithub.com/a/b\n\n\tgithub.com/c/d v1.0.0\n)\nrequire github.com/e/f\n",
+            &test_uri(),
+        )
+        .unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        let keys: Vec<_> = reported(&result).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["github.com/a/b", "github.com/e/f"]);
     }
 }

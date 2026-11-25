@@ -52,7 +52,7 @@ fn absolute_declaration_is_rejected_even_when_its_relative_form_names_the_candid
     );
     let candidate = write(&root, "etc/gradle/deps.toml", "[libraries]\n");
 
-    assert!(!ecosystem().claims_unrouted_manifest(&candidate));
+    assert!(!ecosystem().claims_unrouted_manifest(&candidate, None));
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn interpolated_declaration_is_rejected_even_when_the_candidate_is_named_literal
     write(&root, "settings.gradle.kts", &declaring("$x/deps.toml"));
     let candidate = write(&root, "$x/deps.toml", "[libraries]\n");
 
-    assert!(!ecosystem().claims_unrouted_manifest(&candidate));
+    assert!(!ecosystem().claims_unrouted_manifest(&candidate, None));
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn empty_declaration_claims_nothing() {
     write(&root, "settings.gradle.kts", &declaring(""));
     let candidate = write(&root, "gradle/deps.toml", "[libraries]\n");
 
-    assert!(!ecosystem().claims_unrouted_manifest(&candidate));
+    assert!(!ecosystem().claims_unrouted_manifest(&candidate, None));
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn claim_matches_an_uppercase_toml_extension() {
     write(&root, "settings.gradle.kts", &declaring("gradle/Deps.TOML"));
     let candidate = write(&root, "gradle/Deps.TOML", "[libraries]\n");
 
-    assert!(ecosystem().claims_unrouted_manifest(&candidate));
+    assert!(ecosystem().claims_unrouted_manifest(&candidate, None));
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn claim_honours_either_settings_file_in_the_same_directory() {
     write(&root, "settings.gradle", &declaring("gradle/deps.toml"));
     let candidate = write(&root, "gradle/deps.toml", "[libraries]\n");
 
-    assert!(ecosystem().claims_unrouted_manifest(&candidate));
+    assert!(ecosystem().claims_unrouted_manifest(&candidate, None));
 }
 
 #[test]
@@ -117,21 +117,21 @@ fn settings_edited_after_the_first_probe_is_picked_up() {
     let ecosystem = ecosystem();
 
     assert!(
-        !ecosystem.claims_unrouted_manifest(&candidate),
+        !ecosystem.claims_unrouted_manifest(&candidate, None),
         "not declared yet"
     );
 
     std::fs::write(&settings, declaring("gradle/deps.toml")).unwrap();
     bump_mtime(&settings, 10);
     assert!(
-        ecosystem.claims_unrouted_manifest(&candidate),
+        ecosystem.claims_unrouted_manifest(&candidate, None),
         "the new declaration must be seen"
     );
 
     std::fs::write(&settings, "rootProject.name = \"x\"\n").unwrap();
     bump_mtime(&settings, 20);
     assert!(
-        !ecosystem.claims_unrouted_manifest(&candidate),
+        !ecosystem.claims_unrouted_manifest(&candidate, None),
         "a removed declaration must stop claiming"
     );
 }
@@ -143,9 +143,9 @@ fn deleting_the_settings_file_stops_the_claim() {
     let settings = write(&root, "settings.gradle.kts", &declaring("gradle/deps.toml"));
     let candidate = write(&root, "gradle/deps.toml", "[libraries]\n");
     let ecosystem = ecosystem();
-    assert!(ecosystem.claims_unrouted_manifest(&candidate));
+    assert!(ecosystem.claims_unrouted_manifest(&candidate, None));
 
     std::fs::remove_file(&settings).unwrap();
 
-    assert!(!ecosystem.claims_unrouted_manifest(&candidate));
+    assert!(!ecosystem.claims_unrouted_manifest(&candidate, None));
 }

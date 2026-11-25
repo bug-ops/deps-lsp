@@ -107,27 +107,37 @@ dependencyResolutionManagement {
 ```
 
 The settings file is scanned with a tokenizer, so comments (`//`, `/* */`), string decoys, braces
-inside strings and a `from(` call split across lines are handled correctly.
+inside strings and a `from(` call split across lines are handled correctly. The declared path
+may lead out of the settings directory with `..` (a sibling `catalogs/` folder, say) and may have
+a hidden name.
 
 An unreadable `[libraries]` entry (malformed short notation, or a table without `module` or
 `group` + `name`) produces a Warning diagnostic in the editor and in `deps-cli check` instead of
 being dropped silently.
 
+When you save a settings file, open documents are re-evaluated: a newly declared catalog is
+checked with the text in your editor, and a catalog that is no longer declared has its
+diagnostics cleared. This needs a client that supports watched-file notifications. The server
+keeps the text of up to 256 not-yet-recognized documents (16 MiB in total). A document beyond
+that is not picked up by the re-evaluation; a later request reads it from disk, so unsaved edits
+show only after your next change.
+
 Limits of settings-declared catalogs:
 
-- The path must be relative and inside the directory subtree of the settings file; paths that
-  leave it with `..` are not supported (#2178). At most 256 declarations per settings file are
-  honoured.
-- In nested or composite builds, the nearest four settings-bearing ancestor directories are
-  consulted; settings files further up are ignored.
-- A document opened before the declaration was added, or before the settings file changed, is not
-  re-evaluated; reopen it (#2180).
-- The CLI directory walk skips catalogs with hidden names (starting with `.`) (#2179).
+- The path must be relative, end in `.toml` and contain no `$` interpolation. At most 256
+  declarations per settings file are honoured.
+- Settings files are looked up in two places: the nearest four settings-bearing directories above
+  the catalog, and direct child directories of the catalog's two nearest parent directories
+  (sibling layouts). Settings files elsewhere are not found.
+- The sibling lookup never leaves the project: it stops at the outermost of the nearest `.git`
+  directory and your workspace folder (in the CLI, the walked directory, or the working directory
+  for a file given by path). Without either, it does not run. It also skips hidden and symlinked
+  directories and reads a bounded number of entries and settings files.
+- The CLI directory walk visits a hidden catalog only when a settings file found in the same walk
+  declares it, and the catalog lies inside the walked directory.
 - Any `*.toml` file handed to the Gradle parser is treated as a catalog.
-- A catalog named `deps.toml` is read as the deps-cli configuration file when it sits in a
-  directory that `deps-cli check` walks (`check gradle/` or `check .`), and the run fails with an
-  invalid-configuration error (#2182). Checking the file by explicit path works:
-  `deps-cli check gradle/deps.toml`.
+- A `deps.toml` declared as a catalog is not loaded as `deps-cli`
+  [configuration](../cli.md#configuration-depstoml); a warning on stderr says so.
 - The pre-commit hook matches every `*.versions.toml` file, but not a settings-declared catalog with
   an arbitrary name such as `gradle/deps.toml`: staging only that file does not trigger the hook.
   Run `deps-cli check` on it directly (#2167).

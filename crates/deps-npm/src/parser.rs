@@ -7,7 +7,7 @@ use crate::config::{DeclaredNpmRegistry, NpmConfig, NpmParseContext};
 use crate::types::{NpmDependency, NpmDependencyOrigin, NpmDependencySection};
 use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
-use deps_core::json_helpers::string_valued_entries;
+use deps_core::json_helpers::{non_string_entry_declarations, string_valued_entries};
 use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use url::Url;
@@ -50,6 +50,9 @@ pub struct NpmParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// Entries of a dependency section that are not version strings (#2181), read by
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
     /// `Some(range of the `catalogs.default` key)` when a parsed `pnpm-workspace.yaml` defines
     /// the default catalog twice (a top-level `catalog:` and `catalogs.default:`), which pnpm
     /// rejects for the whole workspace (spec 078 FR-030). Always `None` for a `package.json`.
@@ -76,6 +79,7 @@ deps_core::impl_parse_result!(
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
         rejected_registries: rejected_registries,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -142,6 +146,9 @@ pub fn parse_package_json_with_context(
     }
 
     let mut dependencies = Vec::new();
+    let mut invalid_declarations = Vec::new();
+    let mut invalid_budget =
+        deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     // Shared across every section below (#796) — the ceiling is per-document, not
     // per-section.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -170,6 +177,11 @@ pub fn parse_package_json_with_context(
                 &line_table,
                 &mut budget,
             ));
+            invalid_declarations.extend(
+                non_string_entry_declarations(deps, positions.as_ref(), content, &line_table)
+                    .into_iter()
+                    .filter(|_| invalid_budget.allow()),
+            );
         }
     }
 
@@ -195,6 +207,7 @@ pub fn parse_package_json_with_context(
         blocked_registries: registries.blocked,
         rejected_registries: registries.rejected,
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
         duplicate_default_catalog: None,
         workspace_members: None,
     })
@@ -280,7 +293,8 @@ fn parse_dependency_section(
     let mut result = Vec::new();
 
     // A non-string manifest value isn't a valid dependency declaration — `string_valued_entries`
-    // skips it rather than fabricating an entry with no `version_req` (#619).
+    // skips it rather than fabricating an entry with no `version_req` (#619); the caller reports
+    // it as an invalid declaration.
     for (name, version_req) in string_valued_entries(deps) {
         if !budget.allow() {
             continue;
@@ -2065,6 +2079,7 @@ mod tests {
             &result,
             content,
             versions,
+            deps_core::FreshnessSettings::Disabled,
             &crate::formatter::NpmFormatter,
         );
 
@@ -2400,5 +2415,54 @@ mod tests {
         assert_eq!(result[0].name, "express");
         assert_eq!(result[0].name_range, Range::default());
         assert!(result[0].version_range.is_none());
+    }
+
+    fn reported(
+        result: &impl deps_core::ParseResult,
+    ) -> Vec<(String, deps_core::InvalidDeclarationReason)> {
+        deps_core::ParseResult::invalid_declarations(result)
+            .into_iter()
+            .map(|occurrence| (occurrence.key, occurrence.reason))
+            .collect()
+    }
+
+    #[test]
+    fn test_non_string_entries_are_reported_and_not_listed() {
+        let result = parse_package_json(
+            r#"{"dependencies": {"express": {"version": "4.0.0"}, "a": 1, "ok": "1"}}"#,
+            &deps_core::test_util::test_uri("/p/package.json"),
+        )
+        .unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            reported(&result),
+            [
+                (
+                    "express".to_owned(),
+                    deps_core::InvalidDeclarationReason::UnsupportedValue
+                ),
+                (
+                    "a".to_owned(),
+                    deps_core::InvalidDeclarationReason::UnsupportedValue
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_entries_never_displace_dependencies_at_the_cap() {
+        let cap = deps_core::MAX_DEPENDENCIES_PER_DOCUMENT;
+        let valid: Vec<String> = (0..cap).map(|i| format!(r#""p{i}": "1""#)).collect();
+        let json = format!(
+            r#"{{"dependencies": {{"bad": 1}}, "devDependencies": {{{}}}}}"#,
+            valid.join(",")
+        );
+        let result =
+            parse_package_json(&json, &deps_core::test_util::test_uri("/p/package.json")).unwrap();
+
+        assert_eq!(result.dependencies.len(), cap);
+        assert!(result.dependency_truncation.is_none());
+        assert_eq!(reported(&result).len(), 1);
     }
 }

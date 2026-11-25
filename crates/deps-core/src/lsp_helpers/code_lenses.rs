@@ -155,6 +155,7 @@ pub struct PinNoun {
 ///     &parse_result,
 ///     content,
 ///     VersionData::new(&cached, &resolved),
+///     deps_core::FreshnessSettings::Disabled,
 ///     &MockFormatter,
 /// );
 ///
@@ -165,6 +166,7 @@ pub fn collect_update_all_edits<P, F>(
     parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     formatter: &F,
 ) -> Vec<TextEdit>
 where
@@ -174,7 +176,7 @@ where
     let suppression = versions
         .suppression
         .map_or_default(|set| set.resolve(formatter));
-    crate::edit::collect_update_edits(parse_result, content, versions, formatter)
+    crate::edit::collect_update_edits(parse_result, content, versions, freshness, formatter)
         .into_iter()
         .filter(|planned| {
             !suppression
@@ -272,6 +274,7 @@ impl crate::edit::EditSpan for TextEdit {
 ///     &parse_result,
 ///     "",
 ///     VersionData::new(&cached, &resolved),
+///     deps_core::FreshnessSettings::Disabled,
 ///     &MockFormatter,
 ///     parse_result.uri(),
 ///     "deps-lsp.updateAllOutdated",
@@ -283,6 +286,7 @@ pub fn generate_code_lenses<P, F>(
     parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
+    freshness: crate::freshness::FreshnessSettings,
     formatter: &F,
     uri: &url::Url,
     command_id: &str,
@@ -291,7 +295,7 @@ where
     P: TypedParseResult,
     F: DependencyFormatter<Dep = P::Dep>,
 {
-    let edits = collect_update_all_edits(parse_result, content, versions, formatter);
+    let edits = collect_update_all_edits(parse_result, content, versions, freshness, formatter);
     if edits.is_empty() {
         return Vec::new();
     }
@@ -501,14 +505,20 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits =
-                collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER.for_dependency());
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER.for_dependency(),
+            );
             assert!(edits.is_empty());
 
             let lenses = generate_code_lenses(
                 &pr,
                 content,
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
@@ -535,8 +545,13 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits =
-                collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER.for_dependency());
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER.for_dependency(),
+            );
             assert_eq!(edits.len(), 2);
             assert_eq!(edits[0].range, range(0, 9, 0, 14));
             assert_eq!(
@@ -553,6 +568,7 @@ mod tests {
                 &pr,
                 content,
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
@@ -579,6 +595,7 @@ mod tests {
                 &pr,
                 content,
                 versions,
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
@@ -605,6 +622,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
@@ -628,6 +646,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
@@ -651,6 +670,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
@@ -673,6 +693,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
@@ -696,6 +717,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
@@ -718,6 +740,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
@@ -740,6 +763,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(edits.is_empty());
@@ -763,6 +787,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &FloorFormatter,
             );
             assert_eq!(edits.len(), 1);
@@ -830,6 +855,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &NoOpFormatter,
             );
             assert!(edits.is_empty());
@@ -856,6 +882,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
@@ -885,6 +912,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(edits.len(), 1, "whitespace-only divergence must not skip");
@@ -911,6 +939,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
@@ -942,6 +971,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
@@ -972,6 +1002,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
@@ -1002,6 +1033,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(
@@ -1032,6 +1064,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert!(
@@ -1062,8 +1095,13 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits =
-                collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER.for_dependency());
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                versions,
+                crate::FreshnessSettings::Disabled,
+                &MOCK_FORMATTER.for_dependency(),
+            );
             let diagnostics = generate_diagnostics_from_cache(
                 &pr,
                 versions,
@@ -1106,6 +1144,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
+                crate::FreshnessSettings::Disabled,
                 &MOCK_FORMATTER.for_dependency(),
             );
             assert_eq!(edits.len(), 1, "the overlapping later edit must be dropped");

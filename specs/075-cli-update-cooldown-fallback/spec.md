@@ -217,6 +217,14 @@ encoded here).
 > `### Fixed`/`### Changed` `CHANGELOG.md` entry once spec 076 ships, not a reversion of this
 > line's original `### Changed` entry.
 
+> [!info] Amended by [[099-honor-native-package-manager-cooldown/spec|spec 099: eligible version under a held latest]] (implemented, PR pending)
+> Issues #2190, #2191. The stored `cooldown_fallback: Option<CooldownFallback>` (section 5, NFR-003)
+> becomes a bounded newest-first candidate list collected at fetch time, and the fallback is picked at
+> read time. FR-001 no-retry is kept (an unsafe pick ends the list). NFR-001 step 0: a native window
+> collects candidates even with freshness disabled. NFR-004: `check` runs the fallback OSV round too.
+> The "`deps-lsp` surfaces unchanged" statements (NFR-001, section 8 Never) no longer hold for
+> diagnostics, inlay hints, the bulk lens and code actions. The bulk lens skips held dependencies (#2192).
+
 ## 5. Data Model
 
 New, additive types in `deps_core::lsp_helpers` (unless noted):

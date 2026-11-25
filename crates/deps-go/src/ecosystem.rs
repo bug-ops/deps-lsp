@@ -292,6 +292,7 @@ mod tests {
             blocked_registries: Vec::new(),
             rejected_registries: Vec::new(),
             dependency_truncation: None,
+            invalid_declarations: Vec::new(),
         }
     }
 
@@ -577,6 +578,7 @@ require github.com/gin-gonic/gin v1.9.1
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -615,6 +617,7 @@ require github.com/gin-gonic/gin v1.9.1
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -657,6 +660,7 @@ require github.com/gin-gonic/gin v1.9.1
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -687,6 +691,7 @@ require github.com/gin-gonic/gin v1.9.1
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -1042,6 +1047,7 @@ require github.com/gin-gonic/gin v1.9.1
                 position,
                 &uri,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;

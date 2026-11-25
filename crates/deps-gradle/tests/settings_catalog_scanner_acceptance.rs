@@ -32,7 +32,7 @@ impl Project {
 }
 
 fn claimed(candidate: &std::path::Path) -> bool {
-    GradleEcosystem::new(Arc::new(HttpCache::new())).claims_unrouted_manifest(candidate)
+    GradleEcosystem::new(Arc::new(HttpCache::new())).claims_unrouted_manifest(candidate, None)
 }
 
 fn claims(settings_name: &str, settings: &str, candidate_rel: &str) -> bool {

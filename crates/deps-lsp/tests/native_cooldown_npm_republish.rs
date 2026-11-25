@@ -74,7 +74,7 @@ fn settings() -> Value {
     })
 }
 
-/// A repository whose `latest` (1.1.0) is three days old, with `npmrc_extra` appended to its
+/// A repository whose `latest` (1.1.0) is three days old (1.0.5 is eligible), with `npmrc_extra` appended to its
 /// `.npmrc` and `files` written at its root.
 async fn fixture(npmrc_extra: &str, files: &[(&str, &str)]) -> Fixture {
     let mut server = mockito::Server::new_async().await;
@@ -82,7 +82,9 @@ async fn fixture(npmrc_extra: &str, files: &[(&str, &str)]) -> Fixture {
         .mock("GET", "/widget")
         .match_header("accept", "application/vnd.npm.install-v1+json")
         .with_status(200)
-        .with_body(r#"{"dist-tags":{"latest":"1.1.0"},"versions":{"1.0.0":{},"1.1.0":{}}}"#)
+        .with_body(
+            r#"{"dist-tags":{"latest":"1.1.0"},"versions":{"1.0.0":{},"1.0.5":{},"1.1.0":{}}}"#,
+        )
         .expect_at_least(0)
         .create_async()
         .await;
@@ -91,8 +93,9 @@ async fn fixture(npmrc_extra: &str, files: &[(&str, &str)]) -> Fixture {
         .match_header("accept", "application/json")
         .with_status(200)
         .with_body(format!(
-            r#"{{"time":{{"1.0.0":"{}","1.1.0":"{}"}}}}"#,
+            r#"{{"time":{{"1.0.0":"{}","1.0.5":"{}","1.1.0":"{}"}}}}"#,
             rfc3339(now_secs() - 100 * DAY),
+            rfc3339(now_secs() - 50 * DAY),
             rfc3339(now_secs() - 3 * DAY)
         ))
         .expect_at_least(0)

@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use zeroize::Zeroizing;
@@ -44,6 +45,8 @@ pub const MAX_CACHED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 struct CacheEntry<T> {
     mtime: SystemTime,
     value: Arc<T>,
+    /// Tick of the last use; atomic so a hit can refresh it under a shared map guard.
+    last_used: AtomicU64,
 }
 
 /// Per-path memoization of a file's parsed contents, invalidated by mtime.
@@ -53,6 +56,9 @@ struct CacheEntry<T> {
 /// is never cached: only a file that existed, was a regular file, and parsed successfully
 /// gets an entry, so a file created after the cache first found nothing is picked up on the
 /// very next call with no extra bookkeeping.
+///
+/// Holds at most `capacity` entries: caching a new path in a full cache evicts the least
+/// recently used one.
 pub struct MtimeFileCache<T> {
     files: dashmap::DashMap<PathBuf, CacheEntry<T>>,
     /// Last mtime an oversized path was warned about, so [`Self::get_or_parse`] logs at most
@@ -63,6 +69,7 @@ pub struct MtimeFileCache<T> {
     /// map without limit.
     oversize_warned: dashmap::DashMap<PathBuf, SystemTime>,
     capacity: usize,
+    clock: AtomicU64,
     label: &'static str,
 }
 
@@ -78,14 +85,43 @@ impl<T> std::fmt::Debug for MtimeFileCache<T> {
 
 impl<T> MtimeFileCache<T> {
     /// Creates an empty cache holding at most `capacity` entries, labeled `label` for
-    /// diagnostics (e.g. `"cargo config"`, `"npm config"`) when the capacity is reached.
+    /// diagnostics (e.g. `"cargo config"`, `"npm config"`) when an entry is evicted.
     #[must_use]
     pub fn new(capacity: usize, label: &'static str) -> Self {
         Self {
             files: dashmap::DashMap::new(),
             oversize_warned: dashmap::DashMap::new(),
             capacity,
+            clock: AtomicU64::new(0),
             label,
+        }
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Evicts least recently used entries until there is room for one more.
+    ///
+    /// The victim's key is cloned out of the iteration before it is removed, so no `DashMap`
+    /// guard is held across the removal (which would deadlock on the same shard).
+    fn evict_for_new_entry(&self) {
+        while self.files.len() >= self.capacity {
+            let Some(victim) = self
+                .files
+                .iter()
+                .min_by_key(|entry| entry.last_used.load(Ordering::Relaxed))
+                .map(|entry| entry.key().clone())
+            else {
+                return;
+            };
+            self.files.remove(&victim);
+            tracing::debug!(
+                path = %victim.display(),
+                label = self.label,
+                cap = self.capacity,
+                "mtime file cache full; evicted the least recently used entry"
+            );
         }
     }
 
@@ -115,6 +151,42 @@ impl<T> MtimeFileCache<T> {
         {
             self.oversize_warned.insert(path.to_path_buf(), mtime);
         }
+    }
+
+    fn fresh_entry(&self, path: &Path, mtime: SystemTime) -> Option<Arc<T>> {
+        let existing = self.files.get(path)?;
+        if existing.mtime != mtime {
+            return None;
+        }
+        existing.last_used.store(self.tick(), Ordering::Relaxed);
+        Some(Arc::clone(&existing.value))
+    }
+
+    /// Returns the cached value if and only if an entry for `path` exists and its mtime matches
+    /// the file's, at the cost of one `stat`; never reads or parses the file.
+    ///
+    /// Shares its freshness check with [`Self::get_or_parse`], and a hit counts as a use for
+    /// eviction. For a caller that must bound how much it parses while still serving what is
+    /// already known.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::mtime_cache::MtimeFileCache;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("config.toml");
+    /// std::fs::write(&path, "value = 1").unwrap();
+    ///
+    /// let cache: MtimeFileCache<String> = MtimeFileCache::new(8, "example");
+    /// assert!(cache.get_if_fresh(&path).is_none());
+    /// cache.get_or_parse(&path, str::to_owned).unwrap();
+    /// assert!(cache.get_if_fresh(&path).is_some());
+    /// ```
+    #[must_use]
+    pub fn get_if_fresh(&self, path: &Path) -> Option<Arc<T>> {
+        let mtime = fs_probe::metadata(path).ok()?.modified().ok()?;
+        self.fresh_entry(path, mtime)
     }
 
     /// Returns `path`'s parsed contents, from cache if `path`'s mtime is unchanged, else
@@ -174,10 +246,8 @@ impl<T> MtimeFileCache<T> {
         }
         let mtime = metadata.modified().ok()?;
 
-        if let Some(existing) = self.files.get(path)
-            && existing.mtime == mtime
-        {
-            return Some(Arc::clone(&existing.value));
+        if let Some(value) = self.fresh_entry(path, mtime) {
+            return Some(value);
         }
 
         let content = match fs_probe::read_to_string_capped(path, MAX_CACHED_FILE_BYTES).ok()? {
@@ -191,20 +261,18 @@ impl<T> MtimeFileCache<T> {
         };
         let value = Arc::new(parse(&content));
 
-        if !self.files.contains_key(path) && self.files.len() >= self.capacity {
-            tracing::warn!(
-                path = %path.display(),
-                label = self.label,
-                cap = self.capacity,
-                "mtime file cache capacity reached; not caching this file (still used for this parse)"
-            );
+        if self.capacity == 0 {
             return Some(value);
+        }
+        if !self.files.contains_key(path) {
+            self.evict_for_new_entry();
         }
         self.files.insert(
             path.to_path_buf(),
             CacheEntry {
                 mtime,
                 value: Arc::clone(&value),
+                last_used: AtomicU64::new(self.tick()),
             },
         );
         Some(value)
@@ -487,10 +555,27 @@ mod tests {
         );
     }
 
-    /// At capacity, a freshly parsed value is still returned to the caller but not inserted
-    /// into the map — the parse succeeds, only memoization is declined.
+    /// A zero-capacity cache still returns every parsed value, it just memoizes nothing.
     #[test]
-    fn capacity_cap_returns_value_without_inserting() {
+    fn zero_capacity_returns_value_without_inserting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "a").unwrap();
+
+        // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
+        // test still needs this guard.
+        let _guard = fs_probe::snapshot_guard();
+        let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(0, "test");
+        let first = cache.get_or_parse(&path, parse_upper).unwrap();
+        let second = cache.get_or_parse(&path, parse_upper).unwrap();
+
+        assert_eq!(first.0, "A");
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// A changed file already in a full cache is replaced in place: nothing else is evicted.
+    #[test]
+    fn refreshing_a_cached_path_at_capacity_evicts_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path_a = dir.path().join("a.txt");
         let path_b = dir.path().join("b.txt");
@@ -500,16 +585,20 @@ mod tests {
         // See the comment in `hit_reuses_same_arc_without_reparsing` on why a non-diffing
         // test still needs this guard.
         let _guard = fs_probe::snapshot_guard();
-        let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(1, "test");
-        let first = cache.get_or_parse(&path_a, parse_upper).unwrap();
-        assert_eq!(first.0, "A");
+        let cache: MtimeFileCache<Parsed> = MtimeFileCache::new(2, "test");
+        cache.get_or_parse(&path_a, parse_upper).unwrap();
+        let first_b = cache.get_or_parse(&path_b, parse_upper).unwrap();
 
-        let second = cache.get_or_parse(&path_b, parse_upper).unwrap();
-        assert_eq!(second.0, "B", "the value is still returned despite the cap");
+        let future = SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path_a)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        cache.get_or_parse(&path_a, parse_upper).unwrap();
 
-        // `b` was not cached (capacity already held `a`), so a repeat call re-parses it —
-        // a fresh Arc, not the same one.
-        let second_again = cache.get_or_parse(&path_b, parse_upper).unwrap();
-        assert!(!Arc::ptr_eq(&second, &second_again));
+        let second_b = cache.get_or_parse(&path_b, parse_upper).unwrap();
+        assert!(Arc::ptr_eq(&first_b, &second_b));
     }
 }

@@ -75,7 +75,8 @@ A dependency flagged by the diagnostic above gets a `QUICKFIX` titled `Fix unsat
 requirement: update to <version>`, targeting the same cached `latest` value the diagnostic
 message names, so the action's title and the diagnostic text always agree on what "the
 latest" is. The action is gated by the identical unsatisfiability check the diagnostic uses,
-so the action never appears without the diagnostic — though several further guards (a
+so the action never appears without the diagnostic. It is not offered while `latest` is
+[held](#release-age-holds), and several further guards (a
 yanked target, a no-op or still-unsatisfiable rewrite, a text collision with the
 vulnerability fix) can independently suppress the action while the diagnostic itself stays up.
 
@@ -207,9 +208,52 @@ This covers `package.json`, `composer.json` and `deno.json` as well: JSON nested
 
 The diagnostic is cleared as soon as the document parses again or is closed.
 
+## Skipped Invalid Declarations
+
+A declaration the parser cannot turn into a dependency is reported instead of silently dropped.
+It gets a Warning at its own position, for example
+`declaration "guava" is not a well-formed coordinate and is not checked`. The other reasons are
+`declares no coordinate` and `has an unsupported value`.
+
+This applies to Cargo, npm, Composer, Deno, PyPI, NuGet, Maven, Go, Swift and Gradle version
+catalogs. `deps-cli check` reports the same text as an `other` finding, so
+`--fail-on other` turns it into a failing run.
+
 ## Unexpanded Template Placeholders
 
 A dependency name that is an unexpanded template placeholder (Maven/Gradle `$grp:x` or `${grp}`, NuGet `$(Pkg)`, npm `${pkg}`) is not a real package name in any ecosystem: it gets no registry link, no registry request and no OSV claim.
+
+## Release-Age Holds
+
+A new release is often not the one you want to adopt on its first day. The newest version
+(`latest`) is **held** when it is inside either window:
+
+- the package manager's own window ([Cargo](../ecosystems/cargo.md#cargos-publish-age-window-min-publish-age),
+  [npm, pnpm, Yarn, Bun](../ecosystems/npm.md#release-age-windows),
+  [uv](../ecosystems/pypi.md#uvs-release-age-window-exclude-newer)), or
+- the freshness cooldown (`freshness.cooldown_secs`, 3 days by default, or a
+  [GOSSIP](gossip-signals.md) finding).
+
+While `latest` is held, the **newest eligible version** takes its place: the first older version
+that both windows clear, that has a known publish time and that is newer than the version in use.
+
+| Where | What you see |
+|---|---|
+| Outdated diagnostic and `deps-cli check` | Names the eligible version and why `latest` is held, for example `... : 2.4.0 (3.0.0 published 1 day ago — still within the release cooldown window)`. No finding when there is nothing newer to move to, or the requirement already admits the eligible version |
+| Inlay hint | Follows the diagnostic: the eligible version (the tooltip says why `latest` is held), or up to date |
+| "Update N outdated dependencies" lens | Skips the dependency; the count excludes it |
+| Code actions | Never offer "Update to" a held version, nor an unsatisfiable-requirement fix that writes it. Eligible versions stay in the list |
+| Security quick fix | Keeps its target and notes the hold in the title (`inside <setting>`, or `published ... ago, inside the release cooldown`) |
+| `deps-cli update` | Writes the eligible version, or skips the dependency when there is none |
+| Hover | Still shows the true `latest`, with the explanation |
+
+- An eligible version that OSV has not checked yet is named with `(not yet verified against OSV)`.
+- The diagnostic keeps reporting the held `latest` when the eligible version cannot be determined
+  (for example a range requirement with no lock file, or an undated release in the way), when
+  the eligible version is flagged by OSV, or when the in-use version is unknown.
+- A `latest` that is itself flagged or not yet verified is reported as such, as without a window.
+- The lens and `deps-cli update` can therefore differ for held dependencies only: the lens
+  skips them, `update` writes the eligible version.
 
 ## CodeLens: "Update N Outdated Dependencies"
 
@@ -219,6 +263,10 @@ single batch edit that rewrites every such dependency's version to the latest kn
 version, sharing the same "is this outdated" definition as diagnostics (a requirement
 already satisfied by the latest version — e.g. Cargo's `^1.2` accepting `1.9` — is left
 alone; that lag is the lock file's, not the manifest's, to fix).
+
+The lens and its command leave out a dependency whose `latest` is
+[held by a release-age window](#release-age-holds), and one whose `latest` is flagged by OSV or
+not yet verified against it.
 
 **Coverage caveat.** Before rewriting a dependency's declared version text, the feature
 verifies the manifest span it is about to edit actually *is* that version literal. Some

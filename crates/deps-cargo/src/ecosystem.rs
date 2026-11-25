@@ -537,6 +537,7 @@ mod tests {
                 blocked_registries: vec![],
                 rejected_registries: vec![],
                 dependency_truncation: None,
+                invalid_declarations: vec![],
             }
         }
 
@@ -568,6 +569,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -599,6 +601,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -629,6 +632,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -661,6 +665,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -690,6 +695,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -719,6 +725,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loaded,
                 &config,
             ));
@@ -1236,6 +1243,7 @@ mod tests {
             let hints = tokio_test::block_on(ecosystem.inlay_hints(
                 ParsedView::new(&parse_result),
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::Disabled,
                 deps_core::LoadingState::Loading,
                 &config,
             ));

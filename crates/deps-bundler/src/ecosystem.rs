@@ -587,6 +587,7 @@ gem 'rails', '~> 7.0'";
                 position,
                 &uri,
                 versions,
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;
@@ -639,6 +640,7 @@ gem 'rails', '~> 7.0'";
                 position,
                 &uri,
                 versions,
+                deps_core::FreshnessSettings::Disabled,
                 content,
             )
             .await;
