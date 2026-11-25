@@ -45,8 +45,9 @@ graph TD
     PT --> HC[HttpCache::set_persistence]
     HC --> RT[read-through: semaphore, 250 ms, classify]
     HC --> WQ[bounded write queue + writer]
-    RT --> FS[fs_probe: no-follow read, owner check]
-    WQ --> FS
+    RT --> FST[FileStore: CAS get, put_if_newer, restamp_if_matches, remove, prune]
+    WQ --> FST
+    FST --> FS[fs_probe: no-follow read, owner check]
     FS --> DIR[(deps-lsp/http/v1/*.entry)]
     PK[PersistKey: host, query, PageRole] --> RT
     PK --> WQ
@@ -58,8 +59,9 @@ graph TD
 |----------|--------|-----------|-------------------------|
 | Freshness | R2: 10-min window from last validation, restored entries only | Anonymous 304 spends GitHub quota (live-confirmed); only a window saves requests | R1 always revalidate (zero request savings) |
 | Stamp | File mtime = last validation, restamped on 304 | One stat gives age; survives restart; prune order = least recently validated | Header `fetched_at` (not restampable without rewrite) |
-| Backend | One file per entry, magic + version + JSON header + body | No lock, no new dependency, torn-read safe | `redb`/`fjall` (process lock breaks multi-window), `sled`, `rusqlite`, `cacache` |
-| Concurrency | Atomic rename, newest validation wins | Simple, NFS-safe | `File::lock` (hangs on NFS/SMB), single snapshot file (lost updates) |
+| Backend | One file per entry, magic + version + JSON header + body, behind a single `FileStore` module (no trait) | No lock, no new dependency, torn-read safe; one storage boundary keeps a later backend swap cheap | `rusqlite` (SQLite `fcntl` locks unreliable on NFS/SMB and WAL unsupported there, whereas atomic rename is safe; a corrupt DB file loses the whole store versus one entry; NFR-005/006 forbid a new dependency; scale is bounded by FR-016 and access is by key only, so queries and transactions are not needed), `redb`/`fjall` (process lock breaks multi-window), `sled` (unmaintained), `cacache` (heavy tree). C build and cross targets are not a reason: `aws-lc-sys` already builds via `reqwest`/`rustls` on all release targets. APFS measurement (2048 x 16 KiB: scan 5.5 ms vs 1.0 ms, read 15 vs 6 µs, write 0.15 vs 0.09 ms; 16384 entries 42 vs 7 ms) shows no visible difference at current limits. Revisit triggers: [[spec#Backend revisit triggers]] |
+| Storage boundary | Concrete `FileStore` in `persist/file_store.rs` over `StoreDir` and `fs_probe`; surface `get(&PersistKey) -> Option<(PersistedEntry, ValidatedAt)>`, `put_if_newer(&PersistKey, PersistedEntry, ValidatedAt)`, `restamp_if_matches(&PersistKey, &EntryFingerprint, ValidatedAt)`, `remove(&PersistKey)`, `prune(now)`. `DiskTier` and the writer never touch mtime, handles or paths | The FR-012 semantics (drop a stale op, restamp only on fingerprint match, `stale_on_disk`) become CAS-style methods, testable in isolation and the only code a backend swap would replace | A storage trait (a trait with one implementation is premature abstraction; extract one only when a second backend exists) |
+| Concurrency | Atomic rename, newest validation wins | Simple; atomic rename is NFS/SMB-safe for write integrity, but the mtime as a freshness stamp is not verified on network mounts (#2177) | `File::lock` (hangs on NFS/SMB), single snapshot file (lost updates) |
 | Eligibility | Typed `PersistKey` over closed `PersistableHost` and `PersistableQueryKey` | No path- or query-borne token can reach disk; admits GitHub tags/compare/releases and gitlab.com | `RedactedUrl` equality (rejects every query URL) |
 | Pagination | `PageRole::{ListingPage, Standalone}` declared by the caller; page-1 anchoring for `ListingPage` only | Stops mixed-age pages dropping an existing tag; compare probes stay fresh | Sibling `Remove` (misses another process's late put), URL inference |
 | Directory trust | Probe uid from `temp_dir()`; root ownership only; owned `$HOME` for creation; per-file owner check | Never creates foreign-owned dirs under `sudo`/containers; planted files cannot be owned by us | Mode check on root (breaks umask-002 homes), gid exception (macOS inherits parent gid) |
@@ -82,6 +84,7 @@ crates/deps-core/src/
 │   │   ├── key.rs            # PersistKey, PersistableHost, PersistableQueryKey, PageNumber, PageRole
 │   │   ├── freshness.rs      # ValidatedAt, DiskFreshness, classify, classify_restored
 │   │   ├── format.rs         # PersistedEntry, StoredHeaders, EntryFingerprint, DecodeError (key-typed API)
+│   │   ├── file_store.rs     # FileStore: sole disk boundary (get, put_if_newer, restamp_if_matches, remove, prune), wraps StoreDir + fs_probe
 │   │   └── dir.rs            # CacheDir, CacheDirEnvVar, open + ownership logic, prune
 │   └── tests/                # persistence integration + two-process tests
 ├── fs_probe.rs               # AtomicWrite, FileMode, read_capped_no_follow_with_metadata, open_for_restamp
