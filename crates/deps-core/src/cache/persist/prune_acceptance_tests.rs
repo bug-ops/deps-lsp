@@ -72,7 +72,7 @@ fn prune_dir_removes_only_store_shaped_files() {
         "a.tmp".to_owned(),
         "notes.txt.deps-cli-1-2.tmp".to_owned(),
         format!("{HASH_C}.entry.bak"),
-        format!("{}.entry", HASH_C.to_uppercase()),
+        format!("{HASH_C}0.ENTRY"),
     ];
     for name in &foreign {
         put(dir, name, now, ANCIENT);
@@ -119,6 +119,43 @@ fn prune_dir_budget_counts_only_store_shaped_files() {
     }
 }
 
+// #2163: a case-insensitive volume can hand a store file back as `<HEX>.ENTRY`.
+#[test]
+fn prune_dir_removes_an_expired_case_variant_entry() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let dir = tmp_dir.path();
+    let now = SystemTime::now();
+    let upper = format!("{}.ENTRY", HASH_A.to_uppercase());
+    let mixed = format!("{}.Entry", HASH_B.to_uppercase());
+    put(dir, &upper, now, ANCIENT);
+    put(dir, &mixed, now, ANCIENT);
+
+    let report = prune_dir(dir, own_trust(dir), now, roomy()).expect("prune");
+
+    assert_eq!(report.removed, 2);
+    assert!(!exists(dir, &upper));
+    assert!(!exists(dir, &mixed));
+}
+
+#[test]
+fn prune_dir_budget_counts_case_variant_entries() {
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let dir = tmp_dir.path();
+    let now = SystemTime::now();
+    let older_upper = format!("{}.ENTRY", HASH_A.to_uppercase());
+    put(dir, &older_upper, now, Duration::from_mins(2));
+    put(dir, &entry(HASH_B), now, Duration::from_mins(1));
+    let limits = PruneLimits {
+        max_files: 1,
+        ..roomy()
+    };
+
+    prune_dir(dir, own_trust(dir), now, limits).expect("prune");
+
+    assert!(!exists(dir, &older_upper), "oldest goes first");
+    assert!(exists(dir, &entry(HASH_B)));
+}
+
 #[test]
 fn prune_dir_keeps_fresh_store_shaped_files_within_budget() {
     let tmp_dir = tempfile::tempdir().expect("tempdir");
@@ -154,6 +191,103 @@ fn prune_dir_leaves_files_the_trust_does_not_own_untouched() {
     assert_eq!(report.failed, 0);
     assert!(exists(dir, &entry(HASH_A)));
     assert!(exists(dir, &tmp(HASH_B)));
+}
+
+// #2164: store-shaped names that are not regular files are never pruned, counted or followed.
+#[cfg(unix)]
+mod non_regular_entries {
+    use super::super::key::StoreFileKind;
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn assert_entry_shaped(name: &str) {
+        assert_eq!(
+            StoreFileKind::classify(OsStr::new(name)),
+            Some(StoreFileKind::Entry),
+            "{name} must be store-shaped for this test to mean anything"
+        );
+    }
+
+    fn tight() -> PruneLimits {
+        PruneLimits {
+            max_bytes: 0,
+            max_files: 0,
+            ..roomy()
+        }
+    }
+
+    #[test]
+    fn prune_dir_never_removes_a_store_shaped_symlink_or_its_target() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let dir = tmp_dir.path();
+        let now = SystemTime::now();
+        let target = outside.path().join("precious.txt");
+        put(outside.path(), "precious.txt", now, ANCIENT);
+        let link_name = entry(HASH_A);
+        assert_entry_shaped(&link_name);
+        std::os::unix::fs::symlink(&target, dir.join(&link_name)).expect("symlink");
+
+        let report = prune_dir(dir, own_trust(dir), now, tight()).expect("prune");
+
+        assert_eq!(report.removed, 0);
+        assert!(
+            fs::symlink_metadata(dir.join(&link_name))
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the store-shaped symlink must be left in place"
+        );
+        assert_eq!(fs::read(&target).expect("target"), b"x");
+    }
+
+    #[test]
+    fn prune_dir_leaves_a_store_shaped_directory_untouched() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let dir = tmp_dir.path();
+        let now = SystemTime::now();
+        let dir_name = entry(HASH_A);
+        assert_entry_shaped(&dir_name);
+        fs::create_dir(dir.join(&dir_name)).expect("mkdir");
+        fs::write(dir.join(&dir_name).join("inner"), b"x").expect("inner");
+
+        let report = prune_dir(dir, own_trust(dir), now, tight()).expect("prune");
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.failed, 0);
+        assert!(dir.join(&dir_name).join("inner").exists());
+    }
+
+    #[test]
+    fn prune_dir_budget_ignores_non_regular_store_shaped_names() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let dir = tmp_dir.path();
+        let now = SystemTime::now();
+        put(outside.path(), "target.txt", now, Duration::from_mins(5));
+        let link_name = entry(HASH_A);
+        let dir_name = entry(HASH_B);
+        let regular = entry(HASH_C);
+        for name in [&link_name, &dir_name, &regular] {
+            assert_entry_shaped(name);
+        }
+        std::os::unix::fs::symlink(outside.path().join("target.txt"), dir.join(&link_name))
+            .expect("symlink");
+        fs::create_dir(dir.join(&dir_name)).expect("mkdir");
+        put(dir, &regular, now, Duration::from_mins(1));
+        let limits = PruneLimits {
+            max_files: 1,
+            ..roomy()
+        };
+
+        let report = prune_dir(dir, own_trust(dir), now, limits).expect("prune");
+
+        assert_eq!(
+            report.removed, 0,
+            "the one regular entry fits max_files = 1"
+        );
+        assert!(exists(dir, &regular));
+    }
 }
 
 #[cfg(unix)]

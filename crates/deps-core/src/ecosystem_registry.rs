@@ -304,6 +304,9 @@ impl EcosystemRegistry {
     /// When only one of the two matches, or both agree on the same ecosystem, that
     /// ecosystem is returned as before.
     ///
+    /// Pure: no filesystem access. See [`for_uri_blocking`](Self::for_uri_blocking) for
+    /// content-aware claims.
+    ///
     /// # Arguments
     ///
     /// * `uri` - Document URI (file:///path/to/Cargo.toml)
@@ -340,6 +343,42 @@ impl EcosystemRegistry {
             (Some(by_filename), _) => Some(by_filename),
             (None, by_directory) => by_directory,
         }
+    }
+
+    /// Like [`for_uri`](Self::for_uri), but when static routing finds nothing, asks each
+    /// ecosystem (ascending [`EcosystemId`] order) whether it claims the file through
+    /// [`EcosystemBase::claims_unrouted_manifest`].
+    ///
+    /// Only local absolute `file:` URIs are probed. The claims may read the filesystem, so call
+    /// this only from a blocking context; [`for_uri`](Self::for_uri) stays pure.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Arc<dyn Ecosystem>)` - the statically routed ecosystem, else the first claimant
+    /// * `None` - no ecosystem handles or claims this URI
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::EcosystemRegistry;
+    /// use url::Url;
+    ///
+    /// let registry = EcosystemRegistry::new();
+    /// let uri = Url::parse("file:///project/gradle/deps.toml").unwrap();
+    ///
+    /// // No ecosystem is registered, so nothing routes or claims the file.
+    /// assert!(registry.for_uri_blocking(&uri).is_none());
+    /// ```
+    pub fn for_uri_blocking(&self, uri: &url::Url) -> Option<Arc<dyn Ecosystem>> {
+        if let Some(routed) = self.for_uri(uri) {
+            return Some(routed);
+        }
+        let path = crate::lockfile::resolve_manifest_file_path(uri)?;
+        let mut ids = self.ecosystem_ids();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| self.get(id))
+            .find(|ecosystem| ecosystem.claims_unrouted_manifest(&path))
     }
 
     /// Matches a file whose containing directory path (tail) and file suffix are
@@ -693,6 +732,9 @@ fn patterns_overlap(a: (&str, &str), b: (&str, &str)) -> bool {
 
 #[cfg(test)]
 mod patterns_overlap_tests;
+
+#[cfg(test)]
+mod claim_fallback_tests;
 
 #[cfg(test)]
 mod tests {

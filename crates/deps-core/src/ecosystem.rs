@@ -1383,6 +1383,14 @@ pub trait EcosystemBase: Send + Sync + private::Sealed {
     /// to the appropriate ecosystem implementation.
     fn manifest_filenames(&self) -> &[&'static str];
 
+    /// Whether this ecosystem parses `path` as its manifest although static routing does not
+    /// match it (e.g. a `*.toml` that `settings.gradle` declares as a version catalog).
+    ///
+    /// May block on filesystem I/O: call it only from a blocking context. Defaults to `false`.
+    fn claims_unrouted_manifest(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// File extensions this ecosystem handles when the manifest basename is
     /// not fixed (e.g. `[".csproj", ".fsproj"]` for NuGet project files).
     ///

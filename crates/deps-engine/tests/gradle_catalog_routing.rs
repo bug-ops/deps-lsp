@@ -3,6 +3,7 @@
 //! Fixtures use `plugins.versions.toml`, a name no `libs`-specific rule can satisfy.
 
 #![cfg(all(feature = "cargo", feature = "gradle", feature = "pypi"))]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use std::sync::Arc;
 
@@ -60,4 +61,64 @@ fn for_filename_keeps_other_ecosystems_routing() {
         routed(&registry, "requirements-dev.txt"),
         Some(EcosystemId::Pypi)
     );
+}
+
+const SETTINGS_DECLARING: &str =
+    "versionCatalogs { create(\"deps\") { from(files(\"gradle/deps.toml\")) } }\n";
+
+fn declared_catalog(settings: Option<&str>) -> (tempfile::TempDir, url::Url) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir_all(root.join("gradle")).expect("gradle dir");
+    if let Some(settings) = settings {
+        std::fs::write(root.join("settings.gradle.kts"), settings).expect("settings");
+    }
+    let catalog = root.join("gradle/deps.toml");
+    std::fs::write(&catalog, "[libraries]\n").expect("catalog");
+    let uri = url::Url::from_file_path(catalog).expect("file url");
+    (dir, uri)
+}
+
+#[test]
+fn for_uri_blocking_routes_a_settings_declared_catalog_to_gradle() {
+    let _guard = deps_core::fs_probe::snapshot_guard();
+    let registry = registry();
+    let (_dir, uri) = declared_catalog(Some(SETTINGS_DECLARING));
+
+    assert!(registry.for_uri(&uri).is_none(), "for_uri stays pure");
+    assert_eq!(
+        registry
+            .for_uri_blocking(&uri)
+            .map(|ecosystem| ecosystem.ecosystem_id()),
+        Some(EcosystemId::Gradle)
+    );
+}
+
+#[test]
+fn for_uri_blocking_leaves_an_undeclared_toml_unrouted() {
+    let _guard = deps_core::fs_probe::snapshot_guard();
+    let registry = registry();
+    let (_dir, uri) = declared_catalog(None);
+
+    assert!(registry.for_uri_blocking(&uri).is_none());
+}
+
+#[test]
+fn for_uri_blocking_keeps_static_routing_for_cargo_and_pypi() {
+    let _guard = deps_core::fs_probe::snapshot_guard();
+    let registry = registry();
+    let root = tempfile::tempdir().expect("tempdir");
+    for (name, id) in [
+        ("Cargo.toml", EcosystemId::Cargo),
+        ("requirements.txt", EcosystemId::Pypi),
+    ] {
+        let uri = url::Url::from_file_path(root.path().join(name)).expect("file url");
+        assert_eq!(
+            registry
+                .for_uri_blocking(&uri)
+                .map(|ecosystem| ecosystem.ecosystem_id()),
+            Some(id),
+            "{name}"
+        );
+    }
 }

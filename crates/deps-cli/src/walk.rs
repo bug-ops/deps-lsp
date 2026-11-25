@@ -857,7 +857,7 @@ fn detect_ignored_manifests(
         }
         match url::Url::from_file_path(path) {
             Ok(uri) => {
-                if ctx.registry.for_uri(&uri).is_some() {
+                if ctx.registry.for_uri_blocking(&uri).is_some() {
                     ctx.outcome.push_ignored_manifest(display);
                 }
             }
@@ -980,12 +980,12 @@ fn display_relative_path(path: &Path, display_root: &Path) -> PathBuf {
     }
 }
 
-/// `EcosystemRegistry::for_uri` on `path`'s own name, never on a resolved target.
+/// `EcosystemRegistry::for_uri_blocking` on `path`'s own name, never on a resolved target.
 fn is_manifest_shaped_by_name(path: &Path, registry: &EcosystemRegistry) -> bool {
     let Ok(uri) = url::Url::from_file_path(path) else {
         return false;
     };
-    registry.for_uri(&uri).is_some()
+    registry.for_uri_blocking(&uri).is_some()
 }
 
 /// Routes one already-discovered file through `registry.for_uri`, pushing a
@@ -1024,7 +1024,7 @@ fn route_file(
         ));
         return;
     };
-    if let Some(ecosystem) = registry.for_uri(&uri) {
+    if let Some(ecosystem) = registry.for_uri_blocking(&uri) {
         outcome.push_manifest(DiscoveredManifest {
             path: read_path.to_path_buf(),
             uri_path: route_path.to_path_buf(),

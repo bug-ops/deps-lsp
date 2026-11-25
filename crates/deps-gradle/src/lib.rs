@@ -21,15 +21,23 @@ mod license;
 pub mod lockfile;
 pub mod parser;
 pub mod range;
+mod settings_catalogs;
 pub mod types;
 pub mod version;
 
-/// Basename glob that identifies a Gradle version catalog (`libs.versions.toml`,
-/// `plugins.versions.toml`, ...).
-///
-/// The single source for routing (`manifest_patterns`) and classification
-/// (`GradleManifestKind`, lock lookup), so the two cannot diverge.
+/// Basename glob for the static routing of Gradle version catalogs (`libs.versions.toml`,
+/// `plugins.versions.toml`, ...). Catalogs that `settings.gradle(.kts)` declares under another
+/// name are routed through `claims_unrouted_manifest` instead; classification of a routed
+/// file uses [`is_catalog_file_name`].
 pub(crate) const CATALOG_PATTERN: &str = "*.versions.toml";
+
+/// Whether a basename that is routed to Gradle is a version catalog: any `.toml` (ASCII
+/// case-insensitive), because Gradle imports only TOML catalogs and routing is the gate.
+pub(crate) fn is_catalog_file_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+}
 
 pub use ecosystem::GradleEcosystem;
 pub use formatter::GradleFormatter;

@@ -41,6 +41,8 @@ pub struct GradleEcosystem {
     /// used by many build files is read and parsed once per mtime rather than once per parse
     /// (#1514) — see [`crate::parser::parse_gradle_with_cache`].
     properties_cache: crate::parser::properties::GradlePropertiesCache,
+    /// Catalogs declared by settings files, backing `claims_unrouted_manifest` (#2161).
+    settings_catalogs: crate::settings_catalogs::SettingsCatalogCache,
 }
 
 impl GradleEcosystem {
@@ -51,6 +53,7 @@ impl GradleEcosystem {
             formatter: GradleFormatter,
             http_cache: cache,
             properties_cache: crate::parser::properties::GradlePropertiesCache::new(),
+            settings_catalogs: crate::settings_catalogs::SettingsCatalogCache::new(),
         }
     }
 
@@ -191,6 +194,10 @@ impl EcosystemBase for GradleEcosystem {
 
     fn manifest_patterns(&self) -> &[&'static str] {
         &[crate::CATALOG_PATTERN]
+    }
+
+    fn claims_unrouted_manifest(&self, path: &std::path::Path) -> bool {
+        self.settings_catalogs.declares(path)
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
