@@ -1,6 +1,7 @@
 //! #2172: a cold-start request (document never opened) for a file no ecosystem handles is logged
 //! at debug, never WARN, including a burst that trips the cold-start limiter and a server with
 //! cold start disabled. A routed file that fails to load still warns.
+#![cfg(feature = "npm")]
 #![expect(clippy::unwrap_used, reason = "test code")]
 
 mod log_capture;
