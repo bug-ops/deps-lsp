@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: JSON lockfile `failed` entries for `lockfile-pin-not-kept`, `fallback-pin-not-kept` and `lock-state-drift` fill `package`/`expected` and add optional `configuration`/`change` (#2132, #2136)
 
 ### Added
-- **deps-core**: `EcosystemBase::claims_unrouted_manifest` and `EcosystemRegistry::for_uri_blocking` route a file an ecosystem claims by content when static routing misses it (#2161)
+- **deps-core**: `EcosystemBase::claims_unrouted_manifest` and `EcosystemRegistry::for_uri_blocking` route a file an ecosystem claims by content when static routing misses it (#2161, #2175)
 - **deps-gradle**: version catalogs are recognized by the `*.versions.toml` basename (any catalog name), not only `libs.versions.toml` (#2151, #2165)
 - **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #2134)
 - **deps-cli**: `update --lockfile regenerate` migrates the legacy Gradle `gradle/dependency-locks` layout to `gradle.lockfile` behind an exact lock-state drift guard, reporting created and removed lock files (also in `--open-pr`) (#2102, #2134)
@@ -22,10 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: std-only Windows `CacheDir::open` for the disk cache, relying on the per-user `%LOCALAPPDATA%` ACL, not yet wired into `HttpCache` (#2145, #2149)
 
 ### Fixed
-- **deps-gradle**: version-catalog libraries in short notation (`alias = "group:artifact[:version]"`) are checked for updates and vulnerabilities (#2162)
-- **deps-gradle**, **deps-lsp**, **deps-cli**: a `*.toml` declared in `settings.gradle(.kts)` `versionCatalogs { from(files(...)) }` is recognized as a version catalog in the LSP and the CLI (#2161)
-- **deps-core**: no-follow reads of Windows reparse-point files (WOF, dedup, cloud) fail loudly on a short or all-zero read instead of returning wrong content (#2158)
-- **deps-core**: disk-cache prune recognizes case-variant store file names (`<HEX>.ENTRY`) on case-insensitive volumes (#2163)
+- **deps-gradle**: version-catalog libraries in short notation (`alias = "group:artifact[:version]"`) are checked for updates and vulnerabilities (#2162, #2175)
+- **deps-gradle**, **deps-lsp**, **deps-cli**: a `*.toml` declared in `settings.gradle(.kts)` `versionCatalogs { from(files(...)) }` is recognized as a version catalog in the LSP and the CLI (#2161, #2175)
+- **deps-core**: no-follow reads of Windows reparse-point files (WOF, dedup, cloud) fail loudly on a short or all-zero read instead of returning wrong content (#2158, #2175)
+- **deps-core**: disk-cache prune recognizes case-variant store file names (`<HEX>.ENTRY`) on case-insensitive volumes (#2163, #2175)
 - **workflow**: `stale.yml` exempts `P0`, `P1`, `pinned`, `security` and `epic` issues and PRs from auto-close instead of non-existent `priority/*` labels (#2154, #2165)
 - **deps-cli**: `update` capped process output of exactly the cap size is no longer reported as truncated; both runners share one `read_capped` (#2155, #2165)
 - **deps-core**: disk-cache prune deletes and counts only cache-shaped files owned by the probing user (#2159, #2165)
@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workspace**: scheduled `semver` job excludes crates new since the baseline and allows the just-published baseline version (#2126, #2128)
 
 ### Changed
-- **deps-gradle**: `parse_gradle` treats any `*.toml` URI as a version catalog (#2161)
+- **deps-gradle**: `parse_gradle` treats any `*.toml` URI as a version catalog (#2161, #2175)
 - **deps-core**: disk-cache entry format and file naming accept only `PersistKey` (#2153, #2165)
 - **deps-core**: disk-cache primitives share `closed_str_enum!`, `EntryTrust`, `OpenBlocking` and one `deps_core::hash::fnv1a64` (#2156, #2165)
 - **workspace**: adopt `map_or_default` and `bool::ok_or` where the MSRV already allows them (#2157, #2165)
