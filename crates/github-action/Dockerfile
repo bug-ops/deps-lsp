@@ -13,8 +13,7 @@ ARG TARGETARCH
 
 WORKDIR /tmp/fetch
 
-# DEPS_CLI_VERSION has no default: a docker-container action build (e.g. `uses:
-# ./crates/github-action` from this repo's own ci.yml) never passes build-args, so an empty
+# DEPS_CLI_VERSION has no default: a plain `docker build` passes no build-args, so an empty
 # value here resolves "latest" the same way scripts/install-deps-cli.sh does, while
 # release.yml's image-publish job always passes the exact version being released explicitly.
 RUN set -eu; \
