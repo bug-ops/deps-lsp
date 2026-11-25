@@ -134,11 +134,32 @@ pub(crate) async fn open_document(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<CommittedChange>> {
-    open_with_reservation(None, uri, content, version, state, client, config).await
+    // Validated before reserving: a rejected open must not replace, then release, the
+    // reservation of a valid open of the same URI still in flight.
+    if let Err(too_large) = check_content_size(&content, &uri) {
+        let routed = crate::lsp_types_interop::from_lsp_uri(&uri)
+            .is_some_and(|domain_uri| state.ecosystem_registry.for_uri(&domain_uri).is_some());
+        return Err(if routed {
+            too_large
+        } else {
+            unsupported_ecosystem(&uri)
+        });
+    }
+    let resolved = reserve_and_resolve(&state, &uri, None).await?;
+    open_with_reservation(
+        resolved,
+        uri,
+        content,
+        version,
+        Arc::clone(&state),
+        client,
+        config,
+    )
+    .await
 }
 
-/// [`open_document`] for a cold start that reserved its open before reading the file; with
-/// `None` the open reserves its own epoch once its input is validated.
+/// The open of a document whose ecosystem [`reserve_and_resolve`] already resolved, so a cold
+/// start can resolve before reading the file and a probe runs once per open.
 ///
 /// # Errors
 ///
@@ -148,7 +169,7 @@ pub(crate) async fn open_document(
     fields(uri = ?uri, ecosystem = tracing::field::Empty, doc_version = ?version)
 )]
 async fn open_with_reservation(
-    reservation: Option<OpenReservation<'_>>,
+    resolved: ResolvedOpen<'_>,
     uri: Uri,
     content: String,
     version: Option<i32>,
@@ -156,29 +177,14 @@ async fn open_with_reservation(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<CommittedChange>> {
-    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
-    // same as "no ecosystem handles this URI" — see its own doc for why this happens.
-    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
-        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
-        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-            "{uri:?}"
-        )));
-    };
-
-    let ecosystem = match state.ecosystem_registry.for_uri(&domain_uri) {
-        Some(e) => e,
-        None => {
-            tracing::debug!("No ecosystem handler for {:?}", uri);
-            return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-                "{uri:?}"
-            )));
-        }
-    };
+    let ResolvedOpen {
+        reservation,
+        ecosystem,
+        domain_uri,
+    } = resolved;
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
     check_content_size(&content, &uri)?;
-
-    let reservation = reservation.unwrap_or_else(|| state.reserve_open(&uri));
 
     tracing::info!(
         "Opening {:?} with ecosystem: {}",
@@ -1169,6 +1175,7 @@ pub async fn handle_document_change(
 
 /// A committed change or open: the background task it spawned and the open it was committed
 /// against.
+#[derive(Debug)]
 pub(crate) struct CommittedChange {
     /// The debounced fetch/diagnostics task, not yet registered.
     pub(crate) task: JoinHandle<()>,
@@ -1195,9 +1202,24 @@ pub(crate) async fn handle_document_change_for_open(
     // instead of overwriting the new open (#2022). A document that is not open still has its
     // change validated (unsupported URI, oversized) before being dropped.
     let Some(epoch) = state.capture_open_epoch(&uri) else {
-        resolve_change_ecosystem(&uri, &content, &state)?;
+        match resolve_change_ecosystem(&uri, &content, &state).await {
+            Ok(_) | Err(deps_core::error::DepsError::UnsupportedEcosystem(_)) => {}
+            Err(error) => return Err(error),
+        }
         return Ok(None);
     };
+    if !wait_for_open_to_land(&state, &uri, epoch).await {
+        // The open ended without a document. A URI that no static route handles was only ever
+        // a claimed or unsupported candidate: report it as unsupported (debug-level at the
+        // server) rather than as a dropped edit of a document that was open.
+        let statically_routed = crate::lsp_types_interop::from_lsp_uri(&uri)
+            .is_some_and(|domain_uri| state.ecosystem_registry.for_uri(&domain_uri).is_some());
+        return if statically_routed {
+            Ok(None)
+        } else {
+            Err(unsupported_ecosystem(&uri))
+        };
+    }
     commit_document_change(
         uri,
         content,
@@ -1210,6 +1232,28 @@ pub(crate) async fn handle_document_change_for_open(
         config,
     )
     .await
+}
+
+/// Poll interval of [`wait_for_open_to_land`]; short against an open's parse and probe.
+const OPEN_LANDING_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Waits until the open that reserved `epoch` has inserted its document; `false` when it ended
+/// without one (closed, superseded or rejected, which releases the reservation).
+///
+/// A change that captured an in-flight open's epoch would otherwise parse and commit before the
+/// open inserts the document, find it untracked and be dropped, leaving the editor's newer text
+/// out of the document (#2161 live contract L4r).
+///
+/// Limitation: changes woken on the same tick are not ordered with each other, so two edits
+/// queued behind one open can still commit out of order, as two edits to a tracked document can.
+async fn wait_for_open_to_land(state: &Arc<ServerState>, uri: &Uri, epoch: OpenEpoch) -> bool {
+    while state.get_document(uri).is_none() {
+        if state.capture_open_epoch(uri) != Some(epoch) {
+            return false;
+        }
+        tokio::time::sleep(OPEN_LANDING_POLL).await;
+    }
+    true
 }
 
 /// [`commit_document_change`] without the epoch, for tests that spawn the task themselves.
@@ -1277,7 +1321,7 @@ pub(crate) async fn commit_document_change(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<Option<CommittedChange>> {
-    let ecosystem = resolve_change_ecosystem(&uri, &content, &state)?;
+    let ecosystem = resolve_change_ecosystem(&uri, &content, &state).await?;
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
     let (parse_result, diff, selection_context_changed) =
@@ -1370,24 +1414,20 @@ pub(crate) async fn commit_document_change(
 ///
 /// [`deps_core::error::DepsError::UnsupportedEcosystem`] when no ecosystem handles `uri`; an I/O
 /// error of kind `FileTooLarge` when `content` exceeds the cap.
-fn resolve_change_ecosystem(
+async fn resolve_change_ecosystem(
     uri: &Uri,
     content: &str,
-    state: &ServerState,
+    state: &Arc<ServerState>,
 ) -> Result<Arc<dyn Ecosystem>> {
     // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
     // same as "no ecosystem handles this URI".
     let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
         tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
-        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-            "{uri:?}"
-        )));
+        return Err(unsupported_ecosystem(uri));
     };
-    let Some(ecosystem) = state.ecosystem_registry.for_uri(&domain_uri) else {
+    let Some(ecosystem) = change_ecosystem(state, uri, &domain_uri).await else {
         tracing::debug!("No ecosystem handler for {:?}", uri);
-        return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-            "{uri:?}"
-        )));
+        return Err(unsupported_ecosystem(uri));
     };
     check_content_size(content, uri)?;
     Ok(ecosystem)
@@ -2398,16 +2438,14 @@ pub async fn ensure_document_loaded(
         return false;
     }
 
-    // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects) is treated the
-    // same as "no ecosystem handles this URI".
-    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
-        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
-        return false;
+    let resolved = match reserve_and_resolve(&state, uri, Some(reservation)).await {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tracing::debug!(%error, "Unsupported file type: {:?}", uri);
+            return false;
+        }
     };
-    if state.ecosystem_registry.for_uri(&domain_uri).is_none() {
-        tracing::debug!("Unsupported file type: {:?}", uri);
-        return false;
-    }
+    let domain_uri = resolved.domain_uri.clone();
 
     tracing::info!("Loading document from disk (cold start): {:?}", uri);
     let content = match load_document_from_disk(&domain_uri).await {
@@ -2425,7 +2463,7 @@ pub async fn ensure_document_loaded(
     // client-tracked version to record (see `DocumentState::version` and the
     // cold-start refusal in `handlers::code_lens`).
     match open_with_reservation(
-        Some(reservation),
+        resolved,
         uri.clone(),
         content,
         None,
@@ -2450,6 +2488,106 @@ pub async fn ensure_document_loaded(
         }
     }
 }
+
+/// An open whose ecosystem is resolved while its reservation is already visible to `capture_open_epoch`.
+pub(crate) struct ResolvedOpen<'a> {
+    /// The open's reservation, held until the document is inserted.
+    pub reservation: OpenReservation<'a>,
+    /// Ecosystem that handles the document.
+    pub ecosystem: Arc<dyn Ecosystem>,
+    /// The URI as a `url::Url`.
+    pub domain_uri: url::Url,
+}
+
+fn unsupported_ecosystem(uri: &Uri) -> deps_core::error::DepsError {
+    deps_core::error::DepsError::UnsupportedEcosystem(format!("{uri:?}"))
+}
+
+/// The ecosystem of `uri` for an open: static routing, else a content-aware claim probed on the
+/// blocking pool so a runtime worker never waits on the filesystem (#2161).
+async fn resolve_open_ecosystem(
+    state: &Arc<ServerState>,
+    uri: &url::Url,
+) -> Option<Arc<dyn Ecosystem>> {
+    if let Some(ecosystem) = state.ecosystem_registry.for_uri(uri) {
+        return Some(ecosystem);
+    }
+    let registry = Arc::clone(&state.ecosystem_registry);
+    let uri = uri.clone();
+    tokio::task::spawn_blocking(move || registry.for_uri_blocking(&uri))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Reserves the open (reusing `reservation` when given), then resolves its ecosystem.
+///
+/// The reservation is taken before the first await, so `capture_open_epoch` sees the open while
+/// the probe runs and a racing `didChange` is committed under `SameOpen`. On error, or when the
+/// future is dropped, the reservation is released.
+///
+/// # Errors
+///
+/// `UnsupportedEcosystem` when no ecosystem handles `uri`.
+pub(crate) async fn reserve_and_resolve<'a>(
+    state: &'a Arc<ServerState>,
+    uri: &Uri,
+    reservation: Option<OpenReservation<'a>>,
+) -> Result<ResolvedOpen<'a>> {
+    // A URI shape `url::Url` rejects is treated as "no ecosystem handles this URI".
+    let domain_uri = crate::lsp_types_interop::from_lsp_uri(uri);
+    let reservation = reservation.unwrap_or_else(|| state.reserve_open(uri));
+    let Some(domain_uri) = domain_uri else {
+        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+        return Err(unsupported_ecosystem(uri));
+    };
+    let Some(ecosystem) = resolve_open_ecosystem(state, &domain_uri).await else {
+        tracing::debug!("No ecosystem handler for {:?}", uri);
+        return Err(unsupported_ecosystem(uri));
+    };
+    Ok(ResolvedOpen {
+        reservation,
+        ecosystem,
+        domain_uri,
+    })
+}
+
+/// Ecosystem of a tracked document, else the static route; performs no I/O.
+pub(crate) fn tracked_ecosystem(
+    state: &ServerState,
+    uri: &Uri,
+    domain_uri: &url::Url,
+) -> Option<Arc<dyn Ecosystem>> {
+    let stored = state
+        .get_document(uri)
+        .and_then(|doc| state.ecosystem_registry.get(doc.ecosystem));
+    stored.or_else(|| state.ecosystem_registry.for_uri(domain_uri))
+}
+
+/// Ecosystem for a change: tracked, else probed only while an open of `uri` is in flight.
+pub(crate) async fn change_ecosystem(
+    state: &Arc<ServerState>,
+    uri: &Uri,
+    domain_uri: &url::Url,
+) -> Option<Arc<dyn Ecosystem>> {
+    if let Some(ecosystem) = tracked_ecosystem(state, uri, domain_uri) {
+        return Some(ecosystem);
+    }
+    state.capture_open_epoch(uri)?;
+    resolve_open_ecosystem(state, domain_uri).await
+}
+
+#[cfg(all(test, feature = "gradle"))]
+#[path = "lifecycle_claimed_open_tests.rs"]
+mod claimed_open_tests;
+
+#[cfg(all(test, feature = "gradle"))]
+#[path = "lifecycle_change_during_open_tests.rs"]
+mod change_during_open_tests;
+
+#[cfg(all(test, feature = "gradle"))]
+#[path = "lifecycle_oversized_open_tests.rs"]
+mod oversized_open_tests;
 
 #[cfg(all(test, feature = "pypi"))]
 #[path = "lifecycle_rekey_signals_tests.rs"]

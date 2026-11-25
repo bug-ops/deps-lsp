@@ -178,6 +178,25 @@ fn resolve_variable_ref(
     properties.get(name).map(|v| v.as_str().to_string())
 }
 
+/// A Gradle DSL block [`find_block_spans`] can locate; a closed set, so its keywords are ASCII
+/// by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockKeyword {
+    /// `buildscript { }`.
+    Buildscript,
+    /// `versionCatalogs { }` in a settings file.
+    VersionCatalogs,
+}
+
+impl BlockKeyword {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Buildscript => "buildscript",
+            Self::VersionCatalogs => "versionCatalogs",
+        }
+    }
+}
+
 /// Which Gradle manifest shape a URI's basename identifies (issue #1436), so the parser and
 /// `ecosystem::GradleEcosystem::detect_completion_context` dispatch from the same
 /// classification instead of independently re-deriving (and potentially diverging on) it from
@@ -201,8 +220,7 @@ impl GradleManifestKind {
     pub(crate) fn from_uri(uri: &Url) -> Self {
         let path = uri.path();
         let basename = path.rsplit('/').next().unwrap_or_default();
-        if deps_core::ecosystem_registry::manifest_pattern_matches(basename, crate::CATALOG_PATTERN)
-        {
+        if crate::is_catalog_file_name(basename) {
             Self::Catalog
         } else if path.ends_with("settings.gradle.kts") || path.ends_with("settings.gradle") {
             Self::Settings
@@ -396,7 +414,7 @@ fn find_matching_brace(text: &str, open: usize) -> Option<usize> {
 /// apart from the project's own `gradle.lockfile`. Positional, so a `classpath` string outside
 /// the block stays [`deps_core::LockScope::Project`].
 fn tag_buildscript_scope(dependencies: &mut [GradleDependency], content: &str) {
-    let spans = find_buildscript_spans(content);
+    let spans = find_block_spans(content, BlockKeyword::Buildscript);
     if spans.is_empty() {
         return;
     }
@@ -418,21 +436,27 @@ fn tag_buildscript_scope(dependencies: &mut [GradleDependency], content: &str) {
     }
 }
 
-/// Byte ranges of every `buildscript { }` block found anywhere in `content` (#1212 impl-critic
-/// S1, regardless of nesting depth — this is a linear text scan, not a depth-aware walk): a
-/// `content { }` restriction declared inside `buildscript { repositories { ... } }` scopes
-/// *plugin* resolution, not the project's own `dependencies { }` — [`parse_repository_content_restrictions`]
-/// must never let it reclassify an unrelated project dependency.
-// Every slice bound comes from `str::find` of the ASCII literal "buildscript"/"{" or from
+/// Byte ranges of every `<keyword> { }` block found anywhere in `content`.
+///
+/// A linear text scan, not a depth-aware walk: blocks are found regardless of nesting depth, and
+/// an unmatched `{` ends the scan. Used for `buildscript` (#1212 impl-critic S1) and for a
+/// settings file's `versionCatalogs` (#2161).
+///
+/// For `buildscript`, the spans keep a `content { }` restriction declared inside
+/// `buildscript { repositories { ... } }` from reclassifying an unrelated project dependency:
+/// it scopes *plugin* resolution, not the project's own `dependencies { }` (see
+/// [`parse_repository_content_restrictions`]).
+// Every slice bound comes from `str::find` of the ASCII `keyword`/"{" (plus its length) or from
 // `find_matching_brace`'s brace byte position — always a char boundary.
 #[allow(clippy::string_slice)]
-fn find_buildscript_spans(content: &str) -> Vec<(usize, usize)> {
+pub(crate) fn find_block_spans(content: &str, keyword: BlockKeyword) -> Vec<(usize, usize)> {
+    let keyword = keyword.as_str();
     let mut spans = Vec::new();
     let mut search_from = 0usize;
 
-    while let Some(rel) = content[search_from..].find("buildscript") {
+    while let Some(rel) = content[search_from..].find(keyword) {
         let kw_start = search_from + rel;
-        let after_kw = kw_start + "buildscript".len();
+        let after_kw = kw_start + keyword.len();
 
         let preceded_by_ident_char = content
             .as_bytes()
@@ -467,7 +491,7 @@ fn find_buildscript_spans(content: &str) -> Vec<(usize, usize)> {
 /// `includeGroupByRegex`/`includeModule` call found.
 ///
 /// Skips any `repositories { }` block nested inside a `buildscript { }` block (#1212
-/// impl-critic S1, see [`find_buildscript_spans`]) — that scopes plugin resolution, not the
+/// impl-critic S1, see [`find_block_spans`]) — that scopes plugin resolution, not the
 /// project's own dependencies.
 ///
 /// Known limitations (impl-critic minor, documented not fixed): only `includeGroup`/
@@ -481,7 +505,7 @@ pub(crate) fn parse_repository_content_restrictions(
     content: &str,
 ) -> Vec<RepositoryContentRestriction> {
     let mut restrictions = Vec::new();
-    let buildscript_spans = find_buildscript_spans(content);
+    let buildscript_spans = find_block_spans(content, BlockKeyword::Buildscript);
     let mut search_from = 0usize;
 
     while let Some(rel) = content[search_from..].find("repositories") {
@@ -865,6 +889,25 @@ mod tests {
 
     fn make_uri(path: &str) -> Url {
         deps_core::test_util::test_uri(path)
+    }
+
+    #[test]
+    fn find_block_spans_returns_each_closed_block_with_identifier_boundaries() {
+        let content = "buildscript { a }\nmybuildscript { b }\nbuildscript\n{ c }\n";
+        let spans = find_block_spans(content, BlockKeyword::Buildscript);
+
+        let texts: Vec<_> = spans
+            .iter()
+            .map(|&(s, e)| content.get(s..=e).unwrap())
+            .collect();
+        assert_eq!(texts, ["buildscript { a }", "buildscript\n{ c }"]);
+    }
+
+    #[test]
+    fn find_block_spans_stops_at_an_unmatched_brace() {
+        let content = "versionCatalogs { x\nversionCatalogs { y }\n";
+
+        assert!(find_block_spans(content, BlockKeyword::VersionCatalogs).is_empty());
     }
 
     #[test]

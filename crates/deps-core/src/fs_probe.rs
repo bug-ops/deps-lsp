@@ -135,8 +135,13 @@ pub fn metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
 /// Reads at most `max_bytes + 1` bytes from an already-open `file` and returns `Ok(None)` if
 /// that read produced more than `max_bytes` — shared body for [`read_to_string_capped`] and
 /// [`read_to_string_capped_no_follow`], which differ only in how they obtain `file`.
-fn read_capped(file: std::fs::File, max_bytes: u64) -> std::io::Result<Option<String>> {
-    read_capped_bytes(file, max_bytes)?
+fn read_capped(
+    file: std::fs::File,
+    max_bytes: u64,
+    path: &Path,
+    completeness: ReadCompleteness,
+) -> std::io::Result<Option<String>> {
+    read_capped_bytes(file, max_bytes, path, completeness)?
         .map(|buf| {
             String::from_utf8(buf)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
@@ -145,10 +150,21 @@ fn read_capped(file: std::fs::File, max_bytes: u64) -> std::io::Result<Option<St
 }
 
 /// Byte-level core of [`read_capped`]: no UTF-8 validation.
-fn read_capped_bytes(file: std::fs::File, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
+///
+/// `completeness` verifies the read against the handle's reported length; a failure keeps its
+/// kind and gains `path` in the message.
+fn read_capped_bytes(
+    file: std::fs::File,
+    max_bytes: u64,
+    path: &Path,
+    completeness: ReadCompleteness,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
+    completeness.check(&buf, max_bytes).map_err(|error| {
+        std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+    })?;
     Ok((buf.len() as u64 <= max_bytes).then_some(buf))
 }
 
@@ -175,7 +191,7 @@ pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Opt
     #[cfg(any(test, feature = "test-util"))]
     READ_COUNT.fetch_add(1, Ordering::Relaxed);
     let file = std::fs::File::open(path)?;
-    read_capped(file, max_bytes)
+    read_capped(file, max_bytes, path, ReadCompleteness::Unchecked)
 }
 
 /// Like [`read_to_string_capped`], but refuses to read through a symlinked `path`.
@@ -208,7 +224,8 @@ pub fn read_to_string_capped_no_follow(
     #[cfg(any(test, feature = "test-util"))]
     READ_COUNT.fetch_add(1, Ordering::Relaxed);
     let file = open_no_follow(path)?;
-    read_capped(file, max_bytes)
+    let completeness = ReadCompleteness::of_no_follow_handle(&file)?;
+    read_capped(file, max_bytes, path, completeness)
 }
 
 /// Reads `path` without following a symlinked final component, returning raw bytes.
@@ -222,7 +239,8 @@ pub fn read_capped_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<Opt
     #[cfg(any(test, feature = "test-util"))]
     READ_COUNT.fetch_add(1, Ordering::Relaxed);
     let file = open_no_follow(path)?;
-    read_capped_bytes(file, max_bytes)
+    let completeness = ReadCompleteness::of_no_follow_handle(&file)?;
+    read_capped_bytes(file, max_bytes, path, completeness)
 }
 
 /// How [`write_atomic_bytes_with`] chooses the permissions of the replacement file.
@@ -323,7 +341,8 @@ pub fn read_capped_no_follow_with_metadata(
     let mut read_only = std::fs::OpenOptions::new();
     read_only.read(true);
     let (file, metadata) = open_regular_no_follow(path, read_only)?;
-    Ok(read_capped_bytes(file, max_bytes)?.map(|bytes| (bytes, metadata)))
+    let completeness = ReadCompleteness::of_no_follow_handle(&file)?;
+    Ok(read_capped_bytes(file, max_bytes, path, completeness)?.map(|bytes| (bytes, metadata)))
 }
 
 /// Opens `path` for reading and writing, without truncating, so its mtime can be restamped
@@ -418,6 +437,89 @@ pub(crate) fn atomic_temp_file_name(file_name: &OsStr, pid: u32, nanos: u128) ->
 #[cfg(all(test, unix))]
 mod open_blocking_tests;
 
+/// Whether a capped read must be verified against the length the opened handle reported.
+///
+/// Reparse-point files on Windows (WOF, dedup, cloud placeholders) can yield a short or
+/// zero-filled read when a filter may be bypassed; `Exact` makes such a read fail closed.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(
+        dead_code,
+        reason = "`Exact` is only constructed for Windows reparse-point handles"
+    )
+)]
+enum ReadCompleteness {
+    /// No verification; the read is taken as is.
+    Unchecked,
+    /// The handle reported this logical length; the read must cover it (up to the cap).
+    Exact(u64),
+}
+
+impl ReadCompleteness {
+    /// Classifies an already-opened no-follow handle.
+    ///
+    /// On Windows a handle carrying `FILE_ATTRIBUTE_REPARSE_POINT` (a non-symlink reparse point,
+    /// since symlinks were already refused) is `Exact` to its reported length; every other
+    /// handle gets `Unchecked`. Windows costs one extra handle-metadata query per read; other
+    /// targets cost none.
+    #[cfg(windows)]
+    fn of_no_follow_handle(file: &std::fs::File) -> std::io::Result<Self> {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+        let metadata = file.metadata()?;
+        Ok(
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                Self::Unchecked
+            } else {
+                Self::Exact(metadata.len())
+            },
+        )
+    }
+
+    /// Non-Windows targets never need a completeness check.
+    #[cfg(not(windows))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "signature shared with the Windows variant"
+    )]
+    const fn of_no_follow_handle(_file: &std::fs::File) -> std::io::Result<Self> {
+        Ok(Self::Unchecked)
+    }
+
+    /// Verifies `bytes` against the expected length under the `max_bytes` cap.
+    ///
+    /// # Errors
+    ///
+    /// `UnexpectedEof` for a read shorter than `min(len, max_bytes + 1)`, `InvalidData` for a
+    /// non-empty, all-zero read. `Unchecked` always succeeds.
+    fn check(self, bytes: &[u8], max_bytes: u64) -> std::io::Result<()> {
+        let Self::Exact(len) = self else {
+            return Ok(());
+        };
+        let read = bytes.len() as u64;
+        let expected = len.min(max_bytes.saturating_add(1));
+        if read < expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short read: expected {expected} bytes, read {read}"),
+            ));
+        }
+        if !bytes.is_empty() && bytes.iter().all(|&byte| byte == 0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("read returned {read} zero bytes"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_completeness_tests;
+
 fn open_regular_no_follow(
     path: &Path,
     options: std::fs::OpenOptions,
@@ -478,7 +580,9 @@ fn open_no_follow_with(
     // Opening with `FILE_FLAG_OPEN_REPARSE_POINT` yields a handle to the reparse point itself
     // instead of following it, so the check on that same handle cannot race a swap. std reports
     // only name-surrogate reparse points (symlinks, junctions) as `is_symlink`, so dedup/WOF/
-    // cloud placeholder files are not refused.
+    // cloud placeholder files are not refused. Such a handle may bypass its filter, so the read
+    // may be short or zero-filled; `ReadCompleteness` makes that fail loudly. A partially
+    // rehydrated dedup file (real prefix, zeroed tail) still passes that check (#2158).
     let file = options
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;

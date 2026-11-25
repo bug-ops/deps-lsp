@@ -88,17 +88,23 @@ fn is_decimal(text: &str) -> bool {
 /// The shape of a file in the store directory, as the writer names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StoreFileKind {
-    /// A finished entry: `{16 lowercase hex}.entry`.
+    /// A finished entry: `{16 hex}.entry`, matched ASCII case-insensitively.
     Entry,
-    /// An in-flight temp file of the atomic writer.
+    /// An in-flight temp file of the atomic writer, matched ASCII case-insensitively.
     Tmp,
 }
 
 impl StoreFileKind {
     /// Classifies a directory entry name; `None` for anything the store did not create.
+    ///
+    /// The whole name is matched ASCII case-insensitively on every platform, because case
+    /// sensitivity is a property of the volume: on a case-insensitive one the writer's
+    /// `{hex}.entry` may be listed as `{HEX}.ENTRY`, and such a file must still be pruned.
+    /// Callers must act on the real directory-entry path, never on a rebuilt lowercase name.
     #[must_use]
     pub(super) fn classify(name: &OsStr) -> Option<Self> {
-        let name = name.to_str()?;
+        let lowered = name.to_str()?.to_ascii_lowercase();
+        let name = lowered.as_str();
         let (stem, rest) = name.split_once('.')?;
         if stem.len() != HASH_LEN || !stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return None;

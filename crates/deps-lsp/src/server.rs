@@ -6,9 +6,9 @@ use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change_for_open, handle_document_open,
     refresh_with_timeout, reload_resolved_versions, rescan_after_resolved_version_change,
-    run_license_prefetch, spawn_supervised, trigger_gossip_prefetch_for_open_documents,
-    trigger_license_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
-    trigger_typosquat_prefetch_for_open_documents,
+    run_license_prefetch, spawn_supervised, tracked_ecosystem,
+    trigger_gossip_prefetch_for_open_documents, trigger_license_prefetch_for_open_documents,
+    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -780,6 +780,9 @@ impl Backend {
             Ok(false) => {
                 tracing::debug!(?uri, "open superseded by a close or a newer open");
             }
+            Err(deps_core::DepsError::UnsupportedEcosystem(_)) => {
+                tracing::debug!(?uri, "unsupported file type");
+            }
             Err(e) => {
                 tracing::error!("failed to open document {:?}: {}", uri, e);
                 self.client
@@ -824,6 +827,9 @@ impl Backend {
                     "dropped a change to a document that is not open (closed, or its open was \
                      rejected); edits stay dropped until it is closed and reopened"
                 );
+            }
+            Err(deps_core::DepsError::UnsupportedEcosystem(_)) => {
+                tracing::debug!(?uri, "unsupported file type");
             }
             Err(e) => {
                 tracing::error!("failed to process document change {:?}: {}", uri, e);
@@ -1811,17 +1817,6 @@ impl LanguageServer for Backend {
 
         tracing::info!("document opened: {:?}", uri);
 
-        // `from_lsp_uri` returning `None` (a URI shape `url::Url` rejects, e.g. a `file:`
-        // URI with a port) is treated the same as "no ecosystem handles this file type".
-        let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(&uri) else {
-            tracing::debug!("unsupported file type: {:?}", uri);
-            return;
-        };
-        if self.state.ecosystem_registry.for_uri(&domain_uri).is_none() {
-            tracing::debug!("unsupported file type: {:?}", uri);
-            return;
-        }
-
         self.handle_open(uri, content, version).await;
     }
 
@@ -1839,7 +1834,11 @@ impl LanguageServer for Backend {
                 tracing::debug!("unsupported file type: {:?}", uri);
                 return;
             };
-            if self.state.ecosystem_registry.for_uri(&domain_uri).is_none() {
+            // No probe here: the commit path resolves a claimed catalog once, after waiting for
+            // an in-flight open to land (edits queued behind the same open are not ordered).
+            let handled = tracked_ecosystem(&self.state, &uri, &domain_uri).is_some()
+                || self.state.capture_open_epoch(&uri).is_some();
+            if !handled {
                 tracing::debug!("unsupported file type: {:?}", uri);
                 return;
             }

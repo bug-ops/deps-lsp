@@ -2,7 +2,10 @@
 //!
 //! Extracts plugin declarations from `pluginManagement { plugins { } }` blocks.
 
-use crate::parser::{GradleParseResult, LineOffsetTable, SourceLine};
+use crate::parser::{
+    BlockKeyword, GradleParseResult, LineOffsetTable, SourceLine, find_block_spans,
+};
+use crate::settings_catalogs::{DeclaredCatalogFile, DeclaredCatalogs, MAX_DECLARED_CATALOGS};
 use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Regex;
@@ -17,6 +20,44 @@ static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"id\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s+version\s+['"]([^'"]+)['"]"#)
         .expect("RE_PLUGIN")
 });
+
+/// Matches `from(files("p"))` / `from files('p')`, capturing the path in group 1 or 2.
+#[expect(clippy::expect_used, reason = "constant regex literal")]
+static RE_CATALOG_FROM_FILES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\bfrom\s*\(?\s*files\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)"#)
+        .expect("RE_CATALOG_FROM_FILES")
+});
+
+/// Catalog files a settings file declares inside its `versionCatalogs { }` blocks, capped at
+/// [`MAX_DECLARED_CATALOGS`]; `//`-commented lines, coordinate sources (`from("g:a:v")`) and
+/// unsafe paths are ignored.
+pub(crate) fn declared_catalog_files(content: &str) -> DeclaredCatalogs {
+    let mut declared = DeclaredCatalogs::default();
+    let lines = find_block_spans(content, BlockKeyword::VersionCatalogs)
+        .into_iter()
+        .flat_map(|(start, end)| content.get(start..=end).unwrap_or_default().lines())
+        .filter(|line| !line.trim_start().starts_with("//"));
+    'scan: for line in lines {
+        for caps in RE_CATALOG_FROM_FILES.captures_iter(line) {
+            let raw = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .map_or("", |m| m.as_str());
+            if let Some(file) = DeclaredCatalogFile::parse(raw)
+                && !declared.insert(file)
+            {
+                break 'scan;
+            }
+        }
+    }
+    if declared.is_truncated() {
+        tracing::warn!(
+            cap = MAX_DECLARED_CATALOGS,
+            "settings file declares more version catalogs than the cap; the rest are ignored"
+        );
+    }
+    declared
+}
 
 /// Parses `pluginManagement { plugins { ... } }` blocks from settings.gradle / settings.gradle.kts.
 ///

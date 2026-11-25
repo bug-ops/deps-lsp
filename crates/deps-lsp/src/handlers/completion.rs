@@ -3,7 +3,7 @@
 //! Delegates to ecosystem-specific completion logic.
 
 use crate::config::DepsConfig;
-use crate::document::{ServerState, ensure_document_loaded};
+use crate::document::{ServerState, ensure_document_loaded, tracked_ecosystem};
 use deps_core::EcosystemId;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
@@ -60,11 +60,11 @@ pub async fn handle_completion(
         )
     };
 
-    // Resolved from the URI alone via `for_uri`, not the loaded document's `ecosystem_id`
-    // (only available after the load/lookup early returns below). `is_some_and`, not `?`,
-    // so an unrecognized URI falls through to `false` instead of short-circuiting.
+    // Resolved without I/O before the load/lookup early returns below (a claimed catalog is
+    // routed once tracked). `is_some_and`, not `?`, so an unrecognized URI falls through to
+    // `false` instead of short-circuiting.
     let package_search_is_incomplete = crate::lsp_types_interop::from_lsp_uri(uri)
-        .and_then(|domain_uri| state.ecosystem_registry.for_uri(&domain_uri))
+        .and_then(|domain_uri| tracked_ecosystem(&state, uri, &domain_uri))
         .is_some_and(|e| e.package_search_is_incomplete());
 
     // Shared by the early returns below so both report `isIncomplete` consistently when

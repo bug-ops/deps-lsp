@@ -34,7 +34,7 @@ resolved through a `${property}` reference, see below) is always the "in-use" ve
 
 **Gradle** manifests are `build.gradle` (Groovy DSL), `build.gradle.kts` (Kotlin DSL),
 `settings.gradle`/`settings.gradle.kts` (for `pluginManagement {}` dependencies), and
-any `*.versions.toml` file (the Gradle **version catalog** format, for example `gradle/libs.versions.toml` or `gradle/plugins.versions.toml`). Catalogs declared in `settings.gradle(.kts)` under a name that does not end in `.versions.toml` are not recognized yet. A dependency declared in
+any `*.versions.toml` file (the Gradle **version catalog** format, for example `gradle/libs.versions.toml` or `gradle/plugins.versions.toml`). Catalogs declared in `settings.gradle(.kts)` under another file name are recognized too (see [Version Catalogs](#version-catalogs-gradle)). A dependency declared in
 any Gradle configuration — `implementation`, `api`, `testImplementation`,
 `androidTestImplementation`, `compileOnly`, `classpath`, the legacy `compile`/`testCompile`/
 `provided`, and their variant-prefixed forms — is recognized:
@@ -81,6 +81,43 @@ with `gradle :<project>:dependencies --update-locks <group:module>`, commit and 
 and reported as migrated or stale, and `--open-pr` commits the new `gradle.lockfile` and the deletions. A
 legacy directory beside an existing `gradle.lockfile`, or one holding a `settings-*` lock, is refused with
 an actionable message (see the CLI chapter).
+
+## Version Catalogs (Gradle)
+
+Catalog libraries are checked like any other Gradle dependency: outdated versions, vulnerabilities,
+hover, inlay hints and code actions. Besides the table form shown above, the short notation
+`alias = "group:artifact[:version]"` is supported:
+
+```toml
+# gradle/libs.versions.toml
+[libraries]
+guava = "com.google.guava:guava:33.0.0-jre"
+```
+
+A catalog declared in `settings.gradle(.kts)` under a name that does not end in `.versions.toml`
+is recognized in the editor and in the CLI:
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    versionCatalogs {
+        create("tools") { from(files("gradle/tools.toml")) }
+    }
+}
+```
+
+Limits of settings-declared catalogs:
+
+- The path must be relative and inside the directory subtree of the settings file; the nearest
+  settings file wins, and at most 256 declarations per settings file are honoured.
+- The settings file is scanned line by line: a declaration inside a block comment or followed by a
+  trailing `//` comment is still counted, and a `from(` call split across lines is missed.
+- A document opened before the declaration was added is not re-evaluated; reopen it.
+- The CLI directory walk skips files with hidden names (starting with `.`).
+- Any `*.toml` file handed to the Gradle parser is treated as a catalog.
+- A catalog named `deps.toml` collides with the deps-cli configuration file name when checked as an
+  explicit path (issue #2168). Check the containing directory instead, or pass
+  `--config <empty.toml>`.
 
 ## Non-Registry Dependency Sources (Maven)
 

@@ -75,12 +75,79 @@ fn get_table_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
     table.get(key)
 }
 
+/// A `group:artifact[:version]` short-notation library value, borrowed from the decoded string.
+struct ShortNotation<'a> {
+    group: &'a str,
+    artifact: &'a str,
+    version: Option<&'a str>,
+}
+
+/// Splits a short-notation coordinate; `None` unless it has 2 or 3 non-empty `:`-separated segments.
+fn parse_short_notation(value: &str) -> Option<ShortNotation<'_>> {
+    let mut parts = value.split(':');
+    let group = parts.next()?;
+    let artifact = parts.next()?;
+    let version = parts.next();
+    if parts.next().is_some()
+        || group.is_empty()
+        || artifact.is_empty()
+        || version.is_some_and(str::is_empty)
+    {
+        return None;
+    }
+    Some(ShortNotation {
+        group,
+        artifact,
+        version,
+    })
+}
+
+/// Builds a dependency from a short-notation value; ranges are exact only when the raw source
+/// equals the decoded value (no escapes, single line), otherwise the whole value is the name range.
+fn parse_short_notation_entry(
+    value: &str,
+    span: toml_span::Span,
+    content: &str,
+    line_table: &LineOffsetTable,
+) -> Option<GradleDependency> {
+    let short = parse_short_notation(value)?;
+    let verbatim = content.get(span.start..span.end) == Some(value);
+    let coordinate_len = short.group.len() + 1 + short.artifact.len();
+    let (name_range, version_range) = if verbatim {
+        let name_range = byte_range(content, line_table, span.start, span.start + coordinate_len);
+        let version_range = short
+            .version
+            .map(|v| byte_range(content, line_table, span.end - v.len(), span.end));
+        (name_range, version_range)
+    } else {
+        (span_to_range(content, line_table, span), None)
+    };
+    Some(GradleDependency {
+        group_id: short.group.to_string(),
+        artifact_id: short.artifact.to_string(),
+        name: format!("{}:{}", short.group, short.artifact).into(),
+        name_range,
+        version_req: short.version.map(Into::into),
+        version_range,
+        configuration: String::new(),
+        source: deps_core::parser::DependencySource::Registry,
+        lock_scope: deps_core::LockScope::Project,
+    })
+}
+
+fn byte_range(content: &str, line_table: &LineOffsetTable, start: usize, end: usize) -> Range {
+    deps_core::lsp_helpers::byte_span_to_range(content, line_table, start, end)
+}
+
 fn parse_library_entry(
     item: &Value<'_>,
     content: &str,
     line_table: &LineOffsetTable,
     version_refs: &HashMap<String, PropertyValue>,
 ) -> Option<GradleDependency> {
+    if let Some(value) = item.as_str() {
+        return parse_short_notation_entry(value, item.span, content, line_table);
+    }
     let table = item.as_table()?;
     let (group_id, artifact_id, name, name_range) =
         extract_coordinates(table, content, line_table)?;
@@ -161,7 +228,7 @@ fn extract_version(
 /// Adapts a `toml_span::Span` to [`deps_core::lsp_helpers::byte_span_to_range`].
 /// toml-span string spans already exclude surrounding quotes.
 fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Range {
-    deps_core::lsp_helpers::byte_span_to_range(content, line_table, span.start, span.end)
+    byte_range(content, line_table, span.start, span.end)
 }
 
 #[cfg(test)]

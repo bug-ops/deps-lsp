@@ -52,7 +52,7 @@ pub(crate) mod tag_refresh;
 pub(crate) use diff::reload_resolved_versions;
 pub(crate) use lifecycle::{
     ChangeTaskTriggerGates, ResolvedVersionMove, change_task_triggers,
-    handle_document_change_for_open, trigger_gossip_prefetch_for_open_documents,
+    handle_document_change_for_open, tracked_ecosystem, trigger_gossip_prefetch_for_open_documents,
     trigger_license_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
     trigger_typosquat_prefetch_for_open_documents,
 };

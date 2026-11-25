@@ -130,12 +130,7 @@ impl LockFileProvider for GradleLockParser {
         let in_gradle_dir = resolve_manifest_file_path(manifest_uri).is_some_and(|path| {
             path.file_name()
                 .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|name| {
-                    deps_core::ecosystem_registry::manifest_pattern_matches(
-                        name,
-                        crate::CATALOG_PATTERN,
-                    )
-                })
+                .is_some_and(crate::is_catalog_file_name)
                 && path
                     .parent()
                     .and_then(Path::file_name)

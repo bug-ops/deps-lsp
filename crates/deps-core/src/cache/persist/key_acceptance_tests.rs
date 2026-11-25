@@ -97,8 +97,10 @@ fn store_file_kind_classify_rejects_every_foreign_shape() {
     let rejected = [
         "a.entry".to_owned(),
         "0123.entry".to_owned(),
-        format!("{}.entry", HASH.to_uppercase()),
         format!("{HASH}0.entry"),
+        format!("{HASH}0.ENTRY"),
+        "A.ENTRY".to_owned(),
+        format!("{}.ENTRY.BAK", HASH.to_uppercase()),
         format!("{HASH}.entry.bak"),
         format!("{HASH}.tmp"),
         format!("{HASH}.entry.deps-cli--1.tmp"),
@@ -107,7 +109,6 @@ fn store_file_kind_classify_rejects_every_foreign_shape() {
         format!("{HASH}.entry.deps-cli-a-2.tmp"),
         format!("{HASH}.entry.other-1-2.tmp"),
         format!("{HASH}.entry.deps-cli-1-2.tmp.bak"),
-        format!("{HASH}.ENTRY"),
         "notes.txt.deps-cli-1-2.tmp".to_owned(),
         "notes.entry".to_owned(),
         "a.tmp".to_owned(),
@@ -115,6 +116,27 @@ fn store_file_kind_classify_rejects_every_foreign_shape() {
     ];
     for name in &rejected {
         assert_eq!(classify(name), None, "{name:?} must not be a store file");
+    }
+}
+
+// #2163: a case-insensitive volume can hand a store file back under any casing.
+#[test]
+fn store_file_kind_classify_is_ascii_case_insensitive() {
+    let upper = HASH.to_uppercase();
+    for name in [
+        format!("{upper}.entry"),
+        format!("{HASH}.ENTRY"),
+        format!("{upper}.ENTRY"),
+        "0123456789AbCdEf.EnTrY".to_owned(),
+    ] {
+        assert_eq!(classify(&name), Some(StoreFileKind::Entry), "{name}");
+    }
+    for name in [
+        format!("{upper}.ENTRY.DEPS-CLI-4242-1700000000000000000.TMP"),
+        format!("{HASH}.entry.Deps-Cli-4242-1.tmp"),
+        format!("{HASH}.ENTRY.deps-cli-4242-1.TMP"),
+    ] {
+        assert_eq!(classify(&name), Some(StoreFileKind::Tmp), "{name}");
     }
 }
 
