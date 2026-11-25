@@ -45,6 +45,31 @@ pub mod private {
     pub trait Sealed {}
 }
 
+/// The caller's upper limit for forward catalog lookups.
+///
+/// An ecosystem that asks whether a manifest is declared by a file elsewhere in the tree never
+/// lists a directory above this bound, so the search cannot reach an unbounded part of the
+/// filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimBound {
+    dir: PathBuf,
+}
+
+impl ClaimBound {
+    /// Builds a bound from an absolute directory.
+    ///
+    /// Returns `None` for a relative path, a filesystem root (including Windows drive and UNC
+    /// roots) or the user's home directory.
+    #[must_use]
+    #[expect(
+        unused_variables,
+        reason = "signature stub, body follows in the same PR"
+    )]
+    pub fn new(dir: &Path) -> Option<Self> {
+        todo!()
+    }
+}
+
 /// A boxed, type-erased future used throughout the [`Ecosystem`] trait's async methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
