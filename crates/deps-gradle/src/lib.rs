@@ -34,9 +34,7 @@ pub(crate) const CATALOG_PATTERN: &str = "*.versions.toml";
 /// Whether a basename that is routed to Gradle is a version catalog: any `.toml` (ASCII
 /// case-insensitive), because Gradle imports only TOML catalogs and routing is the gate.
 pub(crate) fn is_catalog_file_name(name: &str) -> bool {
-    std::path::Path::new(name)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+    deps_core::gradle_layout::is_version_catalog_file(std::path::Path::new(name))
 }
 
 pub use ecosystem::GradleEcosystem;

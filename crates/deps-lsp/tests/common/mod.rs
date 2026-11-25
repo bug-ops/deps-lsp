@@ -288,6 +288,48 @@ impl LspClient {
         self.get_notifications().into_iter().find(|n| predicate(n))
     }
 
+    /// Waits until no `textDocument/publishDiagnostics` for `uri` has arrived for `quiet`,
+    /// giving up after `deadline`; returns whether the document went quiet.
+    ///
+    /// Replaces a fixed sleep: a late background publish (a slow registry fetch finishing after
+    /// the first publish) would otherwise land inside a later assertion window (#2169).
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn wait_for_quiescence(
+        &mut self,
+        uri: &str,
+        quiet: Duration,
+        deadline: Duration,
+    ) -> bool {
+        let publishes = |client: &Self| {
+            client
+                .get_notifications()
+                .iter()
+                .filter(|n| {
+                    n.method == "textDocument/publishDiagnostics"
+                        && n.params.get("uri").is_some_and(|u| u == uri)
+                })
+                .count()
+        };
+        let started = Instant::now();
+        let mut seen = publishes(self);
+        let mut last_change = Instant::now();
+        loop {
+            self.flush_notifications();
+            std::thread::sleep(Duration::from_millis(100));
+            let now_seen = publishes(self);
+            if now_seen != seen {
+                seen = now_seen;
+                last_change = Instant::now();
+            }
+            if last_change.elapsed() >= quiet {
+                return true;
+            }
+            if started.elapsed() >= deadline {
+                return false;
+            }
+        }
+    }
+
     /// Find a notification by method name from already captured notifications.
     #[allow(dead_code)] // Used in notification_ordering tests
     pub(crate) fn find_notification(&self, method: &str) -> Option<CapturedNotification> {
@@ -439,20 +481,23 @@ impl LspClient {
     /// requests to a client that declined the capability (see #290).
     #[allow(dead_code)] // Used by the #290 capability-gating regression test
     pub(crate) fn initialize_with_progress_support(&mut self, work_done_progress: bool) -> Value {
-        self.initialize_with_capabilities(work_done_progress, false)
+        self.initialize_with_capabilities(work_done_progress, false, None)
     }
 
     /// Initialize the LSP session declaring `workspace.diagnostics.refreshSupport`, i.e. a
     /// pull-diagnostics-capable client (#1794).
     #[allow(dead_code)] // Used by the #1794 pull-client test
     pub(crate) fn initialize_with_diagnostic_refresh_support(&mut self) -> Value {
-        self.initialize_with_capabilities(true, true)
+        self.initialize_with_capabilities(true, true, None)
     }
 
-    fn initialize_with_capabilities(
+    /// Initialize the LSP session with the given capabilities and `initializationOptions`.
+    #[allow(dead_code)] // Used by the #1794 notification tests
+    pub(crate) fn initialize_with_capabilities(
         &mut self,
         work_done_progress: bool,
         diagnostic_refresh: bool,
+        initialization_options: Option<Value>,
     ) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
@@ -488,7 +533,8 @@ impl LspClient {
                     }
                 },
                 "rootUri": "file:///tmp",
-                "workspaceFolders": null
+                "workspaceFolders": null,
+                "initializationOptions": initialization_options
             }
         }));
 

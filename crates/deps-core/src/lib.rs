@@ -148,6 +148,7 @@ pub mod fallback_completion;
 pub mod freshness;
 pub mod fs_probe;
 pub mod github;
+pub mod gradle_layout;
 /// Non-cryptographic hashing ([`hash::fnv1a64`]).
 pub mod hash;
 /// Protocol-agnostic [`hover::Hover`] type (issue #1277).
@@ -262,9 +263,10 @@ pub use deps_dev::{
 pub use detached_flight::{FlightEnd, FlightHandle, SingleFlight};
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency,
-    DependencyKind, Ecosystem, EcosystemBase, EcosystemConfig, EcosystemId, LicenseSource,
-    OwnerReach, ParseResult, ParsedManifest, RegistryOccurrence, RejectedRegistryOccurrence,
-    RejectedSourceClass, TypedEcosystem, UserHome, WatchedConfig, WatchedConfigEffect, normal_kind,
+    DependencyKind, Ecosystem, EcosystemBase, EcosystemConfig, EcosystemId,
+    InvalidDeclarationOccurrence, InvalidDeclarationReason, LicenseSource, OwnerReach, ParseResult,
+    ParsedManifest, RegistryOccurrence, RejectedRegistryOccurrence, RejectedSourceClass,
+    TypedEcosystem, UserHome, WatchedConfig, WatchedConfigEffect, normal_kind,
     parse_manifest_blocking, parse_manifest_now,
 };
 pub use ecosystem_registry::{EcosystemRegistry, WatchedConfigMatch};

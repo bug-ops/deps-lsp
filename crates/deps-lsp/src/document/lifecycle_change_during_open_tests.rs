@@ -71,7 +71,7 @@ async fn change_during_open_is_applied_after_the_open_lands(uri: &Uri) {
 
     let document = DocumentState::new_without_parse_result(EcosystemId::Gradle, CATALOG.to_owned());
     assert!(state.insert_opened(reservation, document));
-    let Some(committed) = change.await.unwrap() else {
+    let Some(committed) = change.await.unwrap().committed() else {
         panic!("the change of the open it captured must commit");
     };
 
@@ -93,7 +93,7 @@ async fn change_during_a_static_open_is_applied_after_the_open_lands() {
 
 /// Starts a change that waits on a reserved open of `uri`, abandons the open, and returns the
 /// change's outcome.
-async fn change_outcome_when_the_open_is_abandoned(uri: &Uri) -> Result<Option<CommittedChange>> {
+async fn change_outcome_when_the_open_is_abandoned(uri: &Uri) -> Result<ChangeOutcome> {
     let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let state = Arc::new(ServerState::new());
     let (client, config) = create_test_client_and_config();
@@ -131,5 +131,8 @@ async fn change_waiting_for_an_abandoned_static_open_is_dropped() {
 
     let outcome = change_outcome_when_the_open_is_abandoned(&fx.static_catalog).await;
 
-    assert_matches!(outcome, Ok(None));
+    assert_matches!(
+        outcome,
+        Ok(ChangeOutcome::Dropped(CommitRefusal::Untracked))
+    );
 }

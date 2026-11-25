@@ -28,4 +28,9 @@
   # unrelated files doesn't spam one "not recognized by any ecosystem"
   # warning per file; `deps-cli`'s own `EcosystemRegistry` remains the
   # single source of truth for what actually gets checked.
-  files: '(^|/)(Cargo\.toml|Gemfile|composer\.json|pubspec\.yaml|deno\.jsonc?|go\.mod|package\.json|pom\.xml|pyproject\.toml|Package\.swift|Directory\.Packages\.props|packages\.config|libs\.versions\.toml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|\.gitlab-ci\.yml|action\.ya?ml|requirements[^/]*\.txt|[^/]*-requirements\.txt|[^/]*\.requirements\.txt|constraints[^/]*\.txt)$|\.(csproj|fsproj|vbproj)$|(^|/)\.github/workflows/[^/]*\.ya?ml$|(^|/)\.gitlab/ci/[^/]*\.ya?ml$|(^|/)requirements/[^/]*\.txt$'
+  #
+  # Known limit (#2167): a Gradle catalog that `settings.gradle(.kts)` declares
+  # under an arbitrary name (for example `gradle/deps.toml`) cannot be matched
+  # by a static regex, so staging only that file does not trigger this hook;
+  # run `deps-cli check` on it directly. `*.versions.toml` catalogs are matched.
+  files: '(^|/)(Cargo\.toml|Gemfile|composer\.json|pubspec\.yaml|deno\.jsonc?|go\.mod|package\.json|pom\.xml|pyproject\.toml|Package\.swift|Directory\.Packages\.props|packages\.config|[^/]*\.versions\.toml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|\.gitlab-ci\.yml|action\.ya?ml|requirements[^/]*\.txt|[^/]*-requirements\.txt|[^/]*\.requirements\.txt|constraints[^/]*\.txt)$|\.(csproj|fsproj|vbproj)$|(^|/)\.github/workflows/[^/]*\.ya?ml$|(^|/)\.gitlab/ci/[^/]*\.ya?ml$|(^|/)requirements/[^/]*\.txt$'

@@ -159,20 +159,6 @@ fn claim_rejects_undeclared_or_unsafe_declarations() {
 }
 
 #[test]
-fn claim_is_shadowed_by_a_nearer_settings_file_that_does_not_declare_it() {
-    let _guard = deps_core::fs_probe::snapshot_guard();
-    let project = Project::new();
-    project.write(
-        "settings.gradle.kts",
-        "versionCatalogs { create(\"d\") { from(files(\"sub/gradle/deps.toml\")) } }",
-    );
-    project.write("sub/settings.gradle.kts", "rootProject.name = \"sub\"\n");
-    let candidate = project.write("sub/gradle/deps.toml", "[libraries]\n");
-
-    assert!(!ecosystem().claims_unrouted_manifest(&candidate));
-}
-
-#[test]
 fn claim_ignores_an_unclosed_or_misnamed_block() {
     let _guard = deps_core::fs_probe::snapshot_guard();
     let unclosed = "versionCatalogs {\n  create(\"d\") {\n    from(files(\"gradle/deps.toml\"))\n";

@@ -211,8 +211,8 @@ fn run_check_command(
     osv_endpoint: &OsvEndpoint,
 ) -> ExitCode {
     let walk_paths = args.walk_paths();
-    let default_config_dir = config_default_dir(&walk_paths);
-    let cli_config = match config::load(args.config.as_deref(), &default_config_dir) {
+    let config_lookup = config::ConfigLookup::for_walk_paths(&walk_paths);
+    let cli_config = match config::load_for_check(args.config.as_deref(), &config_lookup) {
         Ok(config) => config::apply_overrides(
             config,
             NetworkMode::from_offline_flag(args.offline),
@@ -487,23 +487,6 @@ async fn run_check(
         probe_summary,
         osv_coverage,
     )
-}
-
-/// Directory `config::load` resolves its default `deps.toml` lookup against when `--config`
-/// is not given (FR-014's "at the walked root", spec 062 review S4).
-///
-/// `paths` is [`deps_cli::cli::CheckArgs::walk_paths`]'s output, so it is never empty. Exactly
-/// one path resolves unambiguously (its own directory, or its parent when it is a file
-/// itself); multiple paths have no single "the walked root" to pick, so this falls back to
-/// the current directory, matching this crate's pre-S4 behavior for that case.
-fn config_default_dir(paths: &[PathBuf]) -> PathBuf {
-    match paths {
-        [only] if only.is_dir() => only.clone(),
-        [only] => only
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
-        _ => PathBuf::from("."),
-    }
 }
 
 /// Loads [`CliConfig`] for `update` (FR-007): only from an explicit `--config <path>`, never

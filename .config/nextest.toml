@@ -13,6 +13,16 @@ fail-fast = false
 filter = 'test(redacting_debug_compile_fail)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# #2169: nextest intermittently reports LEAK (pipes still open ~100 ms after the test process
+# exits) for these two in-process mockito tests under full-suite load. No holder was found: the
+# tests spawn no child process (only the deps-lsp mkfifo test helpers and deps-npm's catalog_usage
+# test use `Command`, neither reachable from them), 48 isolated/loaded stress runs showed no LEAK,
+# and the only unjoined task is a drain task inside the test process. Widen the window for these two
+# tests only; remove the override if a holder is ever identified.
+[[profile.default.overrides]]
+filter = 'test(rt_002_npm_edit_during_initial_fetch_keeps_registry_data) | test(adding_uv_toml_applies_the_window_to_an_open_document)'
+leak-timeout = "1s"
+
 [profile.ci]
 retries = 2
 fail-fast = true

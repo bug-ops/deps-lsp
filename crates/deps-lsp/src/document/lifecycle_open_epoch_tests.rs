@@ -227,3 +227,28 @@ async fn public_handle_document_change_keeps_its_signature_and_commits_for_an_op
     task.expect("an open document commits").await.unwrap();
     assert_eq!(content_of(&race), NEXT_CONTENT);
 }
+
+fn npm_state() -> DocumentState {
+    DocumentState::new_without_parse_result(deps_core::EcosystemId::Npm, OPEN_CONTENT.to_owned())
+}
+
+#[test]
+fn same_open_guard_refuses_only_a_strictly_lower_version() {
+    let mut current = npm_state();
+    let guard = CommitGuard::SameOpen(current.open_epoch());
+
+    current.set_version(Some(3));
+    assert!(!guard.admits(&current, Some(2)), "lower is refused");
+    assert!(guard.admits(&current, Some(3)), "equal is admitted");
+    assert!(guard.admits(&current, Some(4)), "higher is admitted");
+    assert!(
+        guard.admits(&current, None),
+        "unversioned incoming is admitted"
+    );
+
+    current.set_version(None);
+    assert!(
+        guard.admits(&current, Some(1)),
+        "unversioned stored is admitted"
+    );
+}

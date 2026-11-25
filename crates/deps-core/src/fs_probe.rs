@@ -141,7 +141,7 @@ fn read_capped(
     path: &Path,
     completeness: ReadCompleteness,
 ) -> std::io::Result<Option<String>> {
-    read_capped_bytes(file, max_bytes, path, completeness)?
+    read_capped_bytes(file, max_bytes, path, completeness, ReadContent::Text)?
         .map(|buf| {
             String::from_utf8(buf)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
@@ -158,13 +158,16 @@ fn read_capped_bytes(
     max_bytes: u64,
     path: &Path,
     completeness: ReadCompleteness,
+    content: ReadContent,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
-    completeness.check(&buf, max_bytes).map_err(|error| {
-        std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-    })?;
+    completeness
+        .check(&buf, max_bytes, content)
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })?;
     Ok((buf.len() as u64 <= max_bytes).then_some(buf))
 }
 
@@ -216,7 +219,8 @@ pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Opt
 /// Returns an error under the same conditions as [`read_to_string_capped`], plus
 /// [`std::io::ErrorKind::InvalidInput`] (matching [`write_atomic`]'s own symlink-refusal
 /// error kind) when `path`'s final component is a symlink. On Windows a directory
-/// symlink or junction is still refused but may yield `PermissionDenied` instead.
+/// symlink or junction is still refused but may yield `PermissionDenied` instead. A complete
+/// reparse-point read ending in a NUL byte is refused with `InvalidData` (#2173).
 pub fn read_to_string_capped_no_follow(
     path: &Path,
     max_bytes: u64,
@@ -232,6 +236,10 @@ pub fn read_to_string_capped_no_follow(
 ///
 /// `Ok(None)` means the file is larger than `max_bytes`. No UTF-8 validation is done.
 ///
+/// The bytes are treated as text for the Windows reparse-point completeness check: a complete
+/// read ending in a NUL byte is refused (#2173). Callers of binary-framed content use
+/// [`read_capped_no_follow_with_metadata`].
+///
 /// # Errors
 ///
 /// Same conditions as [`read_to_string_capped_no_follow`].
@@ -240,7 +248,7 @@ pub fn read_capped_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<Opt
     READ_COUNT.fetch_add(1, Ordering::Relaxed);
     let file = open_no_follow(path)?;
     let completeness = ReadCompleteness::of_no_follow_handle(&file)?;
-    read_capped_bytes(file, max_bytes, path, completeness)
+    read_capped_bytes(file, max_bytes, path, completeness, ReadContent::Text)
 }
 
 /// How [`write_atomic_bytes_with`] chooses the permissions of the replacement file.
@@ -314,6 +322,9 @@ pub fn write_atomic_bytes_with(
 /// Same conditions as [`read_capped_no_follow`], plus
 /// [`std::io::ErrorKind::InvalidInput`] when `path` is not a regular file.
 ///
+/// The bytes are binary-framed content, so the trailing-NUL refusal of the text readers does
+/// not apply (#2173).
+///
 /// # Examples
 ///
 /// ```
@@ -342,7 +353,10 @@ pub fn read_capped_no_follow_with_metadata(
     read_only.read(true);
     let (file, metadata) = open_regular_no_follow(path, read_only)?;
     let completeness = ReadCompleteness::of_no_follow_handle(&file)?;
-    Ok(read_capped_bytes(file, max_bytes, path, completeness)?.map(|bytes| (bytes, metadata)))
+    Ok(
+        read_capped_bytes(file, max_bytes, path, completeness, ReadContent::Binary)?
+            .map(|bytes| (bytes, metadata)),
+    )
 }
 
 /// Opens `path` for reading and writing, without truncating, so its mtime can be restamped
@@ -494,8 +508,10 @@ impl ReadCompleteness {
     /// # Errors
     ///
     /// `UnexpectedEof` for a read shorter than `min(len, max_bytes + 1)`, `InvalidData` for a
-    /// non-empty, all-zero read. `Unchecked` always succeeds.
-    fn check(self, bytes: &[u8], max_bytes: u64) -> std::io::Result<()> {
+    /// non-empty, all-zero read, and, for `Text` only, a read within the cap that ends in a NUL
+    /// byte (the zero-filled tail of a partially rehydrated file, #2173). `Unchecked` always
+    /// succeeds.
+    fn check(self, bytes: &[u8], max_bytes: u64, content: ReadContent) -> std::io::Result<()> {
         let Self::Exact(len) = self else {
             return Ok(());
         };
@@ -513,12 +529,30 @@ impl ReadCompleteness {
                 format!("read returned {read} zero bytes"),
             ));
         }
+        if content == ReadContent::Text && read <= max_bytes && bytes.last() == Some(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "text read ends in a NUL byte (zero-filled tail)",
+            ));
+        }
         Ok(())
     }
 }
 
+/// What the bytes of a capped read are, so [`ReadCompleteness::check`] can apply the rules that
+/// only make sense for one kind of content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadContent {
+    /// Text (config, manifests, snapshots): a complete read never legitimately ends in NUL.
+    Text,
+    /// Binary-framed content: a trailing NUL byte is ordinary data.
+    Binary,
+}
+
 #[cfg(test)]
 mod read_completeness_tests;
+#[cfg(test)]
+mod read_content_tests;
 
 fn open_regular_no_follow(
     path: &Path,

@@ -313,6 +313,32 @@ impl std::fmt::Display for EcosystemId {
     }
 }
 
+/// Why a dependency declaration could not be turned into a dependency.
+///
+/// Exhaustive so every consumer must handle each reason (#2170).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidDeclarationReason {
+    /// The value is present but is not a well-formed coordinate.
+    MalformedCoordinate,
+    /// A coordinate was expected but the declaration carries none.
+    MissingCoordinate,
+    /// The value has a shape the parser does not support.
+    UnsupportedValue,
+}
+
+/// One declaration that was skipped as invalid, returned by [`ParseResult::invalid_declarations`].
+///
+/// Lets a parser report entries it dropped instead of ignoring them silently (#2170).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidDeclarationOccurrence {
+    /// Range of the offending declaration in the manifest.
+    pub range: Range,
+    /// The declaration's key (for example a catalog alias).
+    pub key: String,
+    /// Why the declaration was rejected.
+    pub reason: InvalidDeclarationReason,
+}
+
 /// The shape shared by [`BlockedRegistryOccurrence`] and [`RejectedRegistryOccurrence`].
 ///
 /// A dependency's name range plus which config declaration produced the notice (#1438 code
@@ -557,6 +583,14 @@ pub trait ParseResult: Send + Sync {
     /// — an ecosystem with no such configurable host (nothing a workspace or user config could
     /// point at an unreachable-by-policy host) has nothing to report here and keeps the default.
     fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+        Vec::new()
+    }
+
+    /// Declarations the parser skipped as invalid (#2170).
+    ///
+    /// Default empty: an ecosystem overrides this only when it can tell a malformed
+    /// declaration apart from one that is simply not a dependency.
+    fn invalid_declarations(&self) -> Vec<InvalidDeclarationOccurrence> {
         Vec::new()
     }
 

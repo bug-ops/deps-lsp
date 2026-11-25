@@ -15,7 +15,9 @@ use tokio::sync::{RwLock, broadcast::error::RecvError};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
 
-use super::lifecycle::{CommitGuard, CommittedChange, ParseTrigger, commit_document_change};
+use super::lifecycle::{
+    ChangeOutcome, CommitGuard, CommittedChange, ParseTrigger, commit_document_change,
+};
 use super::resolved::RefetchPolicy;
 use super::state::{OpenEpoch, ServerState};
 use crate::config::DepsConfig;
@@ -188,13 +190,14 @@ async fn reparse_due(
         )
         .await
         {
-            Ok(Some(CommittedChange { task, epoch })) => {
+            Ok(ChangeOutcome::Committed(CommittedChange { task, epoch })) => {
                 reparsed = true;
                 state.register_change_task(uri, task, epoch).await;
             }
-            Ok(None) => tracing::debug!(
-                "skipped stale reparse for {:?}: superseded by a concurrent edit",
-                uri
+            Ok(ChangeOutcome::Dropped(refusal)) => tracing::debug!(
+                "skipped stale reparse for {:?}: dropped as {:?} (concurrent edit, close or reopen)",
+                uri,
+                refusal
             ),
             Err(e) => tracing::error!(
                 "failed to reparse {:?} after an identity change: {}",

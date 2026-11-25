@@ -2,12 +2,11 @@
 //!
 //! Extracts plugin declarations from `pluginManagement { plugins { } }` blocks.
 
-use crate::parser::{
-    BlockKeyword, GradleParseResult, LineOffsetTable, SourceLine, find_block_spans,
-};
+use crate::parser::{GradleParseResult, LineOffsetTable, SourceLine};
 use crate::settings_catalogs::{DeclaredCatalogFile, DeclaredCatalogs, MAX_DECLARED_CATALOGS};
 use crate::types::GradleDependency;
 use deps_core::Result;
+use deps_core::quote_scan::{CodeSpans, ScanSyntax, read_string_literal};
 use regex::Regex;
 use std::sync::LazyLock;
 use url::Url;
@@ -21,29 +20,163 @@ static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("RE_PLUGIN")
 });
 
-/// Matches `from(files("p"))` / `from files('p')`, capturing the path in group 1 or 2.
-#[expect(clippy::expect_used, reason = "constant regex literal")]
-static RE_CATALOG_FROM_FILES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bfrom\s*\(?\s*files\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)"#)
-        .expect("RE_CATALOG_FROM_FILES")
-});
+/// Cursor over settings-file text that only stops on real code: bytes inside comments or string
+/// literals (other than a literal's opening quote) are never matched.
+struct SettingsCursor<'a> {
+    text: &'a str,
+    code: CodeSpans<'a>,
+    pos: usize,
+}
+
+impl<'a> SettingsCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            code: CodeSpans::new(text, ScanSyntax::Groovy),
+            pos: 0,
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .text
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn eat_byte(&mut self, expected: u8) -> bool {
+        let matches = self.text.as_bytes().get(self.pos) == Some(&expected)
+            && self.code.is_code_byte(self.pos);
+        self.pos += usize::from(matches);
+        matches
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        let matches = self.code.is_code_byte(self.pos)
+            && self
+                .text
+                .get(self.pos..)
+                .is_some_and(|rest| rest.starts_with(word))
+            && !self
+                .text
+                .as_bytes()
+                .get(self.pos + word.len())
+                .is_some_and(|b| is_identifier_byte(*b));
+        if matches {
+            self.pos += word.len();
+        }
+        matches
+    }
+
+    fn eat_string(&mut self) -> Option<&'a str> {
+        if !self.code.is_code_byte(self.pos) {
+            return None;
+        }
+        let literal = read_string_literal(self.text, self.pos, ScanSyntax::Groovy)?;
+        self.pos = literal.end;
+        self.text.get(literal.content)
+    }
+
+    /// Byte offset of the `}` closing the `{` at `open`, counting only code braces.
+    fn matching_brace(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, byte) in self.text.as_bytes().iter().enumerate().skip(open) {
+            if !self.code.is_code_byte(index) {
+                continue;
+            }
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether `index` is real code and not the tail of a longer identifier.
+    fn word_starts_at(&self, index: usize) -> bool {
+        self.code.is_code_byte(index)
+            && !index
+                .checked_sub(1)
+                .and_then(|before| self.text.as_bytes().get(before))
+                .is_some_and(|b| is_identifier_byte(*b))
+    }
+}
+
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Body ranges of every top-level `versionCatalogs { ... }` code block in `text`.
+fn version_catalog_blocks(text: &str) -> Vec<std::ops::Range<usize>> {
+    const KEYWORD: &str = "versionCatalogs";
+    let mut cursor = SettingsCursor::new(text);
+    let mut blocks = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = text.get(search_from..).and_then(|rest| rest.find(KEYWORD)) {
+        let start = search_from + relative;
+        search_from = start + KEYWORD.len();
+        if !cursor.word_starts_at(start) {
+            continue;
+        }
+        cursor.pos = search_from;
+        cursor.skip_whitespace();
+        let open = cursor.pos;
+        if !cursor.eat_byte(b'{') {
+            continue;
+        }
+        let Some(close) = cursor.matching_brace(open) else {
+            break;
+        };
+        blocks.push(open..close);
+        search_from = close;
+    }
+    blocks
+}
+
+/// Parses one `from(files("path"))` / `from files('path')` call starting at `from`.
+fn parse_from_files<'a>(cursor: &mut SettingsCursor<'a>, from: usize) -> Option<&'a str> {
+    cursor.pos = from;
+    cursor.eat_word("from").then_some(())?;
+    cursor.skip_whitespace();
+    cursor.eat_byte(b'(');
+    cursor.skip_whitespace();
+    cursor.eat_word("files").then_some(())?;
+    cursor.skip_whitespace();
+    cursor.eat_byte(b'(').then_some(())?;
+    cursor.skip_whitespace();
+    let path = cursor.eat_string()?;
+    cursor.skip_whitespace();
+    cursor.eat_byte(b')').then_some(path)
+}
 
 /// Catalog files a settings file declares inside its `versionCatalogs { }` blocks, capped at
-/// [`MAX_DECLARED_CATALOGS`]; `//`-commented lines, coordinate sources (`from("g:a:v")`) and
-/// unsafe paths are ignored.
+/// [`MAX_DECLARED_CATALOGS`].
+///
+/// Comments and string literals are not code, so a declaration inside one is ignored; a `from(`
+/// call may span lines; coordinate sources (`from("g:a:v")`) and unsafe paths are ignored.
 pub(crate) fn declared_catalog_files(content: &str) -> DeclaredCatalogs {
+    const KEYWORD: &str = "from";
     let mut declared = DeclaredCatalogs::default();
-    let lines = find_block_spans(content, BlockKeyword::VersionCatalogs)
-        .into_iter()
-        .flat_map(|(start, end)| content.get(start..=end).unwrap_or_default().lines())
-        .filter(|line| !line.trim_start().starts_with("//"));
-    'scan: for line in lines {
-        for caps in RE_CATALOG_FROM_FILES.captures_iter(line) {
-            let raw = caps
-                .get(1)
-                .or_else(|| caps.get(2))
-                .map_or("", |m| m.as_str());
-            if let Some(file) = DeclaredCatalogFile::parse(raw)
+    let mut cursor = SettingsCursor::new(content);
+    'scan: for block in version_catalog_blocks(content) {
+        let body = content.get(block.clone()).unwrap_or_default();
+        for (relative, _) in body.match_indices(KEYWORD) {
+            let from = block.start + relative;
+            if !cursor.word_starts_at(from) {
+                continue;
+            }
+            let path = parse_from_files(&mut cursor, from).and_then(DeclaredCatalogFile::parse);
+            if let Some(file) = path
                 && !declared.insert(file)
             {
                 break 'scan;
@@ -150,6 +283,7 @@ pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
         dependencies,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        invalid_declarations: Vec::new(),
     })
 }
 
@@ -159,6 +293,37 @@ mod tests {
 
     fn make_uri(name: &str) -> Url {
         deps_core::test_util::test_uri(&format!("/project/{name}"))
+    }
+
+    fn declares(settings: &str, path: &str) -> bool {
+        declared_catalog_files(settings).contains(std::path::Path::new(path))
+    }
+
+    #[test]
+    fn declared_catalog_after_a_nested_block_in_the_same_block_is_found() {
+        let settings = "versionCatalogs {\n  create(\"a\") { }\n  create(\"b\") {\n    from(files(\"gradle/x.toml\"))\n  }\n}";
+
+        assert!(declares(settings, "gradle/x.toml"));
+    }
+
+    #[test]
+    fn declarations_in_every_version_catalogs_block_are_found() {
+        let settings = "versionCatalogs { create(\"a\") { from(files(\"gradle/a.toml\")) } }\nversionCatalogs { create(\"b\") { from(files(\"gradle/b.toml\")) } }";
+
+        assert!(declares(settings, "gradle/a.toml"));
+        assert!(declares(settings, "gradle/b.toml"));
+    }
+
+    #[test]
+    fn from_and_files_must_be_whole_words() {
+        for settings in [
+            "versionCatalogs { create(\"a\") { fromx(files(\"gradle/x.toml\")) } }",
+            "versionCatalogs { create(\"a\") { xfrom(files(\"gradle/x.toml\")) } }",
+            "versionCatalogs { create(\"a\") { from(filesx(\"gradle/x.toml\")) } }",
+            "versionCatalogs { create(\"a\") { from(abcde(\"gradle/x.toml\")) } }",
+        ] {
+            assert!(!declares(settings, "gradle/x.toml"), "{settings}");
+        }
     }
 
     #[test]

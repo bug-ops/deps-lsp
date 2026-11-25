@@ -1,4 +1,5 @@
 use super::config_epoch::{ConfigApplyGuard, ConfigEpoch, ConfigEpochCell};
+use super::lifecycle::DocumentUnavailable;
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::NormalizeName;
@@ -462,6 +463,8 @@ impl ColdStartLimiter {
 
     /// Returns true if cold start is allowed, false if rate limited.
     ///
+    /// Logs nothing: the caller knows whether the URI is routed and picks the level (#2172).
+    ///
     /// Updates the last attempt time if the cold start is allowed.
     pub fn allow_cold_start(&self, uri: &Uri) -> bool {
         let min_interval = Duration::from_millis(self.min_interval_ms.load(Ordering::Relaxed));
@@ -470,12 +473,6 @@ impl ColdStartLimiter {
         if let Some(mut entry) = self.last_attempts.get_mut(uri) {
             let elapsed = now.duration_since(*entry);
             if elapsed < min_interval {
-                let retry_after = min_interval.saturating_sub(elapsed);
-                tracing::warn!(
-                    "Cold start rate limited for {:?} (retry after {:?})",
-                    uri,
-                    retry_after
-                );
                 return false;
             }
             *entry = now;
@@ -2006,13 +2003,28 @@ impl ServerState {
         })
     }
 
-    /// Logs that a request could not get its document: at debug while an open of `uri` is still
-    /// parsing (ordinary open traffic), at warn otherwise.
-    pub(crate) fn log_document_unavailable(&self, uri: &Uri, request: &str) {
-        if self.capture_open_epoch(uri).is_some() {
-            tracing::debug!("Document not tracked yet (open in flight) for {request}: {uri:?}");
-        } else {
-            tracing::warn!("Could not load document for {request}: {uri:?}");
+    /// Logs that a request could not get its document: at debug for a file no ecosystem handles
+    /// or a load skipped by configuration, and while an open of `uri` is still parsing (ordinary
+    /// traffic); at warn only for a routed file that failed to load.
+    pub(crate) fn log_document_unavailable(
+        &self,
+        uri: &Uri,
+        request: &str,
+        reason: DocumentUnavailable,
+    ) {
+        match reason {
+            DocumentUnavailable::Unsupported => {
+                tracing::debug!("No ecosystem handles the document for {request}: {uri:?}");
+            }
+            DocumentUnavailable::ColdStartDisabled => {
+                tracing::debug!("Cold start disabled, document not loaded for {request}: {uri:?}");
+            }
+            DocumentUnavailable::NotLoaded if self.capture_open_epoch(uri).is_some() => {
+                tracing::debug!("Document not tracked yet (open in flight) for {request}: {uri:?}");
+            }
+            DocumentUnavailable::NotLoaded => {
+                tracing::warn!("Could not load document for {request}: {uri:?}");
+            }
         }
     }
 

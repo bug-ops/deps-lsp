@@ -3,12 +3,13 @@ use crate::document::keychain_refresh::{KeychainRefreshLifecycle, KeychainRefres
 use crate::document::republish::{self, RepublishLifecycle};
 use crate::document::tag_refresh::{TagRefreshLifecycle, TagRefreshSubscriptions};
 use crate::document::{
-    CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
-    change_task_triggers, handle_document_change_for_open, handle_document_open,
-    refresh_with_timeout, reload_resolved_versions, rescan_after_resolved_version_change,
-    run_license_prefetch, spawn_supervised, tracked_ecosystem,
-    trigger_gossip_prefetch_for_open_documents, trigger_license_prefetch_for_open_documents,
-    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
+    CLIENT_REFRESH_TIMEOUT, ChangeOutcome, ChangeTaskTriggerGates, CommitRefusal, RefreshKind,
+    ResolvedVersionMove, ServerState, change_task_triggers, handle_document_change_for_open,
+    handle_document_open, refresh_with_timeout, reload_resolved_versions,
+    rescan_after_resolved_version_change, run_license_prefetch, spawn_supervised,
+    tracked_ecosystem, trigger_gossip_prefetch_for_open_documents,
+    trigger_license_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -813,7 +814,7 @@ impl Backend {
         )
         .await
         {
-            Ok(Some(change)) => {
+            Ok(ChangeOutcome::Committed(change)) => {
                 // Registered only if the document is still the open the change committed
                 // against: a close or reopen that raced it must neither keep nor cancel this
                 // task's replacement (#2022).
@@ -821,11 +822,18 @@ impl Backend {
                     .register_change_task(uri, change.task, change.epoch)
                     .await;
             }
-            Ok(None) => {
+            Ok(ChangeOutcome::Dropped(CommitRefusal::Untracked)) => {
                 tracing::warn!(
                     ?uri,
                     "dropped a change to a document that is not open (closed, or its open was \
                      rejected); edits stay dropped until it is closed and reopened"
+                );
+            }
+            Ok(ChangeOutcome::Dropped(CommitRefusal::Superseded)) => {
+                tracing::debug!(
+                    ?uri,
+                    version,
+                    "change superseded by a newer version or another open"
                 );
             }
             Err(deps_core::DepsError::UnsupportedEcosystem(_)) => {
@@ -1835,7 +1843,7 @@ impl LanguageServer for Backend {
                 return;
             };
             // No probe here: the commit path resolves a claimed catalog once, after waiting for
-            // an in-flight open to land (edits queued behind the same open are not ordered).
+            // an in-flight open to land (queued edits are ordered by the version-monotonic guard).
             let handled = tracked_ecosystem(&self.state, &uri, &domain_uri).is_some()
                 || self.state.capture_open_epoch(&uri).is_some();
             if !handled {

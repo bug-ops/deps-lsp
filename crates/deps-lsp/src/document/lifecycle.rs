@@ -960,6 +960,15 @@ async fn parse_and_diff_manifest(
 /// A manifest parse: the result, or why the parser rejected the content.
 type ParseOutcome = std::result::Result<Box<dyn deps_core::ParsedManifest>, ParseFailure>;
 
+/// Why a commit did not land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitRefusal {
+    /// The document is not tracked: closed meanwhile, or its open was rejected.
+    Untracked,
+    /// The commit guard refused it: a newer version or another open owns the document.
+    Superseded,
+}
+
 /// Whether [`commit_parsed_document`] should verify the document's current version before
 /// committing — see that function's doc for why this exists.
 #[derive(Debug, Clone, Copy)]
@@ -975,7 +984,10 @@ pub(crate) enum CommitGuard {
     #[cfg(test)]
     #[allow(dead_code, reason = "constructed only by feature-gated test modules")]
     ExpectVersion(Option<i32>),
-    /// Commit only if the document is still the same open as `epoch`.
+    /// Commit only if the document is still the same open as `epoch` and the incoming version
+    /// is not older than the stored one (#2166): parses of consecutive edits can finish in any
+    /// order, and the older one must not overwrite the newer commit. An equal version, or a
+    /// missing version on either side, is admitted.
     SameOpen(OpenEpoch),
     /// Commit only if the document is still the same open and at `version`.
     SameOpenAndVersion {
@@ -987,14 +999,17 @@ pub(crate) enum CommitGuard {
 }
 
 impl CommitGuard {
-    /// Whether a commit may overwrite `current`, the entry it would replace.
-    fn admits(self, current: &DocumentState) -> bool {
+    /// Whether a commit carrying `incoming` may overwrite `current`, the entry it would replace.
+    pub(crate) fn admits(self, current: &DocumentState, incoming: Option<i32>) -> bool {
         match self {
             #[cfg(test)]
             Self::IfTracked => true,
             #[cfg(test)]
             Self::ExpectVersion(version) => current.version == version,
-            Self::SameOpen(epoch) => current.open_epoch() == epoch,
+            Self::SameOpen(epoch) => {
+                current.open_epoch() == epoch
+                    && !matches!((incoming, current.version), (Some(new), Some(stored)) if new < stored)
+            }
             Self::SameOpenAndVersion { epoch, version } => {
                 current.open_epoch() == epoch && current.version == version
             }
@@ -1044,12 +1059,17 @@ fn commit_parsed_document(
         state,
         options,
     )
-    .is_some()
+    .is_ok()
 }
 
 /// [`commit_parsed_document`], returning the [`OpenEpoch`] of the entry it replaced so the
 /// caller can register follow-up work against exactly that open (#2022). Read inside the same
 /// `documents` entry the commit writes through, so no reopen can slip in between.
+///
+/// # Errors
+///
+/// [`CommitRefusal::Untracked`] when no document is tracked for `uri`,
+/// [`CommitRefusal::Superseded`] when the guard refuses; nothing is written in either case.
 fn commit_parsed_document_in_open(
     uri: &Uri,
     ecosystem: &dyn Ecosystem,
@@ -1058,7 +1078,7 @@ fn commit_parsed_document_in_open(
     version: Option<i32>,
     state: &ServerState,
     options: CommitOptions<'_>,
-) -> Option<OpenEpoch> {
+) -> std::result::Result<OpenEpoch, CommitRefusal> {
     let diff = options.diff;
 
     let mut doc_state = match parse_result {
@@ -1083,16 +1103,16 @@ fn commit_parsed_document_in_open(
             ?uri,
             "skipping reparse commit: document is no longer tracked"
         );
-        return None;
+        return Err(CommitRefusal::Untracked);
     };
-    if !options.guard.admits(old_doc.get()) {
+    if !options.guard.admits(old_doc.get(), version) {
         tracing::debug!(
             ?uri,
             guard = ?options.guard,
             current_version = ?old_doc.get().version,
             "skipping stale reparse commit: document version or open changed since it started"
         );
-        return None;
+        return Err(CommitRefusal::Superseded);
     }
     doc_state.inherit_open_epoch(old_doc.get());
     preserve_cache(&mut doc_state, old_doc.get());
@@ -1139,7 +1159,7 @@ fn commit_parsed_document_in_open(
     // a fresh `state.update_document` lookup.
     let epoch = doc_state.open_epoch();
     old_doc.insert(doc_state);
-    Some(epoch)
+    Ok(epoch)
 }
 
 /// Generic document change handler using ecosystem registry.
@@ -1153,10 +1173,10 @@ fn commit_parsed_document_in_open(
 /// the configured maximum manifest size. A manifest-parse failure is not an error
 /// here: the document is stored without a parse result instead.
 ///
-/// Returns `Ok(None)` when the document is not tracked at commit time: the change is dropped
-/// rather than creating the document, and no task is returned for the caller to register. That
-/// covers a close that raced the change and a `didOpen` that was rejected (for example for size),
-/// after which every edit is dropped until the document is closed and reopened.
+/// Returns `Ok(None)` when the change was dropped and no task is returned for the caller to
+/// register: the document is not tracked at commit time (a close that raced the change, or a
+/// `didOpen` that was rejected, for example for size, after which every edit is dropped until the
+/// document is closed and reopened), or a newer version already committed (#2166).
 #[tracing::instrument(skip_all, fields(uri = ?uri, doc_version = ?version))]
 pub async fn handle_document_change(
     uri: Uri,
@@ -1169,6 +1189,7 @@ pub async fn handle_document_change(
     Ok(
         handle_document_change_for_open(uri, content, version, state, client, config)
             .await?
+            .committed()
             .map(|change| change.task),
     )
 }
@@ -1184,6 +1205,25 @@ pub(crate) struct CommittedChange {
     pub(crate) epoch: OpenEpoch,
 }
 
+/// What became of a change or reparse: committed, or dropped for a typed reason.
+#[derive(Debug)]
+pub(crate) enum ChangeOutcome {
+    /// The change committed; register its task for the reported open.
+    Committed(CommittedChange),
+    /// The change did not commit, see [`CommitRefusal`].
+    Dropped(CommitRefusal),
+}
+
+impl ChangeOutcome {
+    /// The committed change, if any.
+    pub(crate) fn committed(self) -> Option<CommittedChange> {
+        match self {
+            Self::Committed(change) => Some(change),
+            Self::Dropped(_) => None,
+        }
+    }
+}
+
 /// [`handle_document_change`], also reporting the open the change committed against so the
 /// caller can register the task only for that open.
 ///
@@ -1197,7 +1237,7 @@ pub(crate) async fn handle_document_change_for_open(
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
-) -> Result<Option<CommittedChange>> {
+) -> Result<ChangeOutcome> {
     // Read before the parse, so a close and reopen that land while it runs make the commit skip
     // instead of overwriting the new open (#2022). A document that is not open still has its
     // change validated (unsupported URI, oversized) before being dropped.
@@ -1206,7 +1246,7 @@ pub(crate) async fn handle_document_change_for_open(
             Ok(_) | Err(deps_core::error::DepsError::UnsupportedEcosystem(_)) => {}
             Err(error) => return Err(error),
         }
-        return Ok(None);
+        return Ok(ChangeOutcome::Dropped(CommitRefusal::Untracked));
     };
     if !wait_for_open_to_land(&state, &uri, epoch).await {
         // The open ended without a document. A URI that no static route handles was only ever
@@ -1215,7 +1255,7 @@ pub(crate) async fn handle_document_change_for_open(
         let statically_routed = crate::lsp_types_interop::from_lsp_uri(&uri)
             .is_some_and(|domain_uri| state.ecosystem_registry.for_uri(&domain_uri).is_some());
         return if statically_routed {
-            Ok(None)
+            Ok(ChangeOutcome::Dropped(CommitRefusal::Untracked))
         } else {
             Err(unsupported_ecosystem(&uri))
         };
@@ -1244,8 +1284,8 @@ const OPEN_LANDING_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// open inserts the document, find it untracked and be dropped, leaving the editor's newer text
 /// out of the document (#2161 live contract L4r).
 ///
-/// Limitation: changes woken on the same tick are not ordered with each other, so two edits
-/// queued behind one open can still commit out of order, as two edits to a tracked document can.
+/// Changes woken on the same tick are not ordered with each other, but the version-monotonic
+/// [`CommitGuard::SameOpen`] refuses the older one if it commits last (#2166).
 async fn wait_for_open_to_land(state: &Arc<ServerState>, uri: &Uri, epoch: OpenEpoch) -> bool {
     while state.get_document(uri).is_none() {
         if state.capture_open_epoch(uri) != Some(epoch) {
@@ -1278,6 +1318,7 @@ pub(crate) async fn handle_document_change_guarded(
         uri, content, version, guard, trigger, refetch, state, client, config,
     )
     .await?
+    .committed()
     .map(|change| change.task))
 }
 
@@ -1286,19 +1327,20 @@ pub(crate) async fn handle_document_change_guarded(
 /// document's version in `state` no longer matches by the time this reparse finishes; see
 /// [`commit_parsed_document`]'s doc for why.
 ///
-/// Returns `Ok(None)` on a skip, never a sentinel/no-op `JoinHandle` (impl-critic S3): the
+/// Returns [`ChangeOutcome::Dropped`] on a skip, never a sentinel/no-op `JoinHandle` (impl-critic S3): the
 /// caller ([`crate::server::Backend::handle_watched_config_change`]) feeds the returned handle
 /// straight into [`ServerState::spawn_background_task`], which unconditionally **aborts** any
 /// existing task registered for the URI before installing the new one. A sentinel handle for
 /// a skipped, superseded reparse would therefore abort the concurrent edit's *real* background
 /// task (registry fetch, OSV rescan, `publish_diagnostics`) that a matching-version commit
 /// already installed — silently dropping that newer edit's diagnostics until the next
-/// keystroke. The caller must treat `None` as "do not touch the task registry for this URI at
+/// keystroke. The caller must treat `Dropped` as "do not touch the task registry for this URI at
 /// all", not as "install a no-op task".
 ///
-/// `None` also covers a document closed before the commit, for every guard: the commit never
-/// creates an untracked document. [`handle_document_change`] passes [`CommitGuard::SameOpen`],
-/// so it observes `None` only for a close or reopen.
+/// `Dropped(Untracked)` also covers a document closed before the commit, for every guard: the
+/// commit never creates an untracked document. [`handle_document_change`] passes
+/// [`CommitGuard::SameOpen`], so it observes `Dropped` only for a close, a reopen or a newer
+/// version.
 #[allow(
     clippy::too_many_arguments,
     reason = "issue #592 added `refetch: RefetchPolicy` alongside the pre-existing `guard: \
@@ -1320,7 +1362,7 @@ pub(crate) async fn commit_document_change(
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
-) -> Result<Option<CommittedChange>> {
+) -> Result<ChangeOutcome> {
     let ecosystem = resolve_change_ecosystem(&uri, &content, &state).await?;
     tracing::Span::current().record("ecosystem", ecosystem.id());
 
@@ -1358,8 +1400,9 @@ pub(crate) async fn commit_document_change(
     // A close that raced the recording above already removed the document and cleared the
     // entry before it existed; without this the entry would outlive the document.
     state.drop_refetch_escalation_if_untracked(&uri);
-    let Some(epoch) = committed else {
-        return Ok(None);
+    let epoch = match committed {
+        Ok(epoch) => epoch,
+        Err(refusal) => return Ok(ChangeOutcome::Dropped(refusal)),
     };
 
     // Read before any OSV request is built (FR-011; issue #1517 critique S3 — see the
@@ -1404,7 +1447,7 @@ pub(crate) async fn commit_document_change(
         .instrument(span),
     );
 
-    Ok(Some(CommittedChange { task, epoch }))
+    Ok(ChangeOutcome::Committed(CommittedChange { task, epoch }))
 }
 
 /// The ecosystem that handles a change to `uri`, after rejecting a URI no ecosystem handles and
@@ -2359,31 +2402,31 @@ pub(crate) async fn trigger_license_prefetch_for_open_documents(
     }
 }
 
-/// Ensures a document is loaded in state.
-///
-/// If the document is not already in state, loads it from disk,
-/// parses it, and spawns a background task to fetch version information.
+/// Why a request could not get its document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocumentUnavailable {
+    /// No static route handles the file, and the claim probe declined it or a cold-start gate
+    /// (disabled, rate-limited) skipped the probe. Ordinary traffic for a file such as
+    /// `rustfmt.toml`, not a failure.
+    Unsupported,
+    /// A statically routed file was not loaded because `cold_start.enabled` is off: user
+    /// configuration, not a load failure.
+    ColdStartDisabled,
+    /// A statically routed file could not be loaded (rate-limited, unreadable, rejected), or an
+    /// open that owns the URI has not landed yet.
+    NotLoaded,
+}
+
+/// Ensures a document is loaded in state; see `load_document` for the typed reason a load can
+/// fail.
 ///
 /// This function is idempotent - calling it multiple times with the
 /// same URI is safe and will only load once.
-///
-/// # Arguments
-///
-/// * `uri` - Document URI
-/// * `state` - Server state
-/// * `client` - LSP client for notifications
-/// * `config` - Server configuration
 ///
 /// # Returns
 ///
 /// * `true` - Document is now loaded (either already existed or was just loaded)
 /// * `false` - Document could not be loaded (unsupported file type, read error, etc.)
-///
-/// # Behavior
-///
-/// - If document exists in state → Return true immediately (no-op)
-/// - If document doesn't exist → Load from disk, parse, update state, spawn bg task
-/// - If load fails → Log warning and return false (graceful degradation)
 ///
 /// # Examples
 ///
@@ -2405,16 +2448,37 @@ pub(crate) async fn trigger_license_prefetch_for_open_documents(
 /// }
 /// # }
 /// ```
-#[tracing::instrument(skip_all, fields(uri = ?uri), level = "debug")]
 pub async fn ensure_document_loaded(
     uri: &Uri,
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> bool {
+    load_document(uri, state, client, config).await.is_ok()
+}
+
+/// Loads `uri` from disk into `state` unless it is already tracked.
+///
+/// The route is classified before the cold-start gates only to pick the log level: a file no
+/// ecosystem handles is still rate limited, but is reported at debug; only a statically routed
+/// file that fails to load warns.
+///
+/// If the document exists in state this is a no-op; otherwise it is read, parsed, stored, and a
+/// background fetch task is spawned.
+///
+/// # Errors
+///
+/// [`DocumentUnavailable`] says why no document is tracked on return.
+#[tracing::instrument(skip_all, fields(uri = ?uri), level = "debug")]
+pub(crate) async fn load_document(
+    uri: &Uri,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> std::result::Result<(), DocumentUnavailable> {
     if state.get_document(uri).is_some() {
         tracing::debug!("Document already loaded: {:?}", uri);
-        return true;
+        return Ok(());
     }
 
     // Reserved before any await below: a `didOpen` arriving meanwhile supersedes this cold start
@@ -2422,27 +2486,46 @@ pub async fn ensure_document_loaded(
     // resurrect a closed document (#2036). `None`: an open already owns this URI.
     let Some(reservation) = state.try_reserve_cold_start(uri) else {
         tracing::debug!("Open in flight, skipping cold start: {:?}", uri);
-        return state.get_document(uri).is_some();
+        return if state.get_document(uri).is_some() {
+            Ok(())
+        } else {
+            Err(DocumentUnavailable::NotLoaded)
+        };
     };
+
+    let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) else {
+        tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
+        return Err(DocumentUnavailable::Unsupported);
+    };
+    let statically_routed = state.ecosystem_registry.for_uri(&domain_uri).is_some();
 
     // Clone cold start config before async operations to release lock
     let cold_start_config = { config.read().await.cold_start.clone() };
 
     if !cold_start_config.enabled {
-        tracing::debug!("Cold start disabled via configuration");
-        return false;
+        tracing::debug!("Cold start disabled via configuration: {:?}", uri);
+        return Err(if statically_routed {
+            DocumentUnavailable::ColdStartDisabled
+        } else {
+            DocumentUnavailable::Unsupported
+        });
     }
 
     if !state.cold_start_limiter.allow_cold_start(uri) {
-        tracing::warn!("Cold start rate limited: {:?}", uri);
-        return false;
+        return Err(if statically_routed {
+            tracing::warn!("Cold start rate limited: {:?}", uri);
+            DocumentUnavailable::NotLoaded
+        } else {
+            tracing::debug!("Cold start rate limited: {:?}", uri);
+            DocumentUnavailable::Unsupported
+        });
     }
 
     let resolved = match reserve_and_resolve(&state, uri, Some(reservation)).await {
         Ok(resolved) => resolved,
         Err(error) => {
             tracing::debug!(%error, "Unsupported file type: {:?}", uri);
-            return false;
+            return Err(DocumentUnavailable::Unsupported);
         }
     };
     let domain_uri = resolved.domain_uri.clone();
@@ -2455,7 +2538,7 @@ pub async fn ensure_document_loaded(
             client
                 .log_message(MessageType::WARNING, format!("Could not load file: {e}"))
                 .await;
-            return false;
+            return Err(DocumentUnavailable::NotLoaded);
         }
     };
 
@@ -2480,11 +2563,15 @@ pub async fn ensure_document_loaded(
                     .await;
             }
             tracing::info!("Document loaded successfully from disk: {:?}", uri);
-            state.get_document(uri).is_some()
+            if state.get_document(uri).is_some() {
+                Ok(())
+            } else {
+                Err(DocumentUnavailable::NotLoaded)
+            }
         }
         Err(e) => {
             tracing::warn!("Failed to process loaded document {:?}: {}", uri, e);
-            false
+            Err(DocumentUnavailable::NotLoaded)
         }
     }
 }

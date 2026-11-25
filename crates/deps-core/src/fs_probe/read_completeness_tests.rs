@@ -3,12 +3,12 @@
 //!
 //! Declared from `fs_probe.rs` as a child module.
 
-use super::ReadCompleteness;
+use super::{ReadCompleteness, ReadContent};
 use std::io::ErrorKind;
 
 fn kind(completeness: ReadCompleteness, bytes: &[u8], max_bytes: u64) -> Option<ErrorKind> {
     completeness
-        .check(bytes, max_bytes)
+        .check(bytes, max_bytes, ReadContent::Binary)
         .err()
         .map(|error| error.kind())
 }

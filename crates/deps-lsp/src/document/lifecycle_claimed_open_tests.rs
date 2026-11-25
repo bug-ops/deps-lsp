@@ -249,6 +249,10 @@ async fn change_for_an_untracked_unopened_catalog_is_dropped_quietly() {
     )
     .await;
 
-    assert_matches!(result, Ok(None), "not an error");
+    assert_matches!(
+        result,
+        Ok(ChangeOutcome::Dropped(CommitRefusal::Untracked)),
+        "not an error"
+    );
     assert!(state.get_document(&fx.declared).is_none());
 }
