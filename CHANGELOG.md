@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core**: `CooldownDisposition::{Blocked, NativeHeld}` carry `newest: NewestEligible` instead of `fallback` (#2190, #2205)
+- **deps-nuget**: `version::resolve_float` is generic over `AsRef<str>` (#2190, #2205)
 - **deps-core**: `generate_inlay_hints`, `ParsedManifest::generate_inlay_hints` and `TypedEcosystem::inlay_hints` take `freshness` (#2190, #2205)
 - **deps-cli**: `ConfigLookup` gains the `DiscoveredDefaultIsManifest` variant and `for_walk_paths` takes a manifest probe (#2182, #2205)
 - **deps-cli**: `CooldownFallbackNote::AppliedInsteadOf` also carries the `FallbackHold` that caused it (#2190, #2205)

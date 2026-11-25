@@ -182,7 +182,7 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    #[cfg(feature = "github-actions")]
+    #[cfg(any(feature = "cargo", feature = "github-actions"))]
     use deps_core::ConcreteVersion;
     // Only `cargo_tests` and `cross_ecosystem_tests`' per-ecosystem cases consume this.
     #[cfg(any(

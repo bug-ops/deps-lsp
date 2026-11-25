@@ -1034,6 +1034,12 @@ struct CommitReport {
 /// Parses `content` and commits it to the tracked document, as a change does, returning the
 /// diff against the replaced entry and whether the selection context changed.
 #[cfg(test)]
+#[cfg(any(
+    feature = "cargo",
+    feature = "composer",
+    feature = "dart",
+    feature = "pypi"
+))]
 async fn parse_and_commit(
     state: &ServerState,
     uri: &Uri,
@@ -2942,6 +2948,7 @@ mod rekey_signals_tests;
 mod open_epoch_tests;
 
 #[cfg(test)]
+#[cfg(any(feature = "cargo", feature = "dart"))]
 #[path = "lifecycle_commit_lineage_tests.rs"]
 mod commit_lineage_tests;
 
