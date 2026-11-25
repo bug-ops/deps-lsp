@@ -8,14 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-gradle**: `GradleParseResult` gains the public field `invalid_declarations`, breaking struct-literal construction outside the crate (#2170, #TBD)
+- **deps-gradle**: `GradleParseResult` gains the public field `invalid_declarations`, breaking struct-literal construction outside the crate (#2170, #2188)
 - **deps-cli**: `Outcome::RequiresLockfileUpdate` carries the ecosystem, `LockfileFix::ecosystem` is removed and `LockfileDocument::Failed` gains an additive `held` array (#2116, #2120, #2128)
 - **deps-cli**: lock-only regeneration and Gradle legacy-layout migration add `Companion::{Created, Removed}`, `Removal`, `IoOperation::RemoveLegacyLockfile`, `RekeyRefusal::OriginalRequestMissing`, `RegenerationError::{LockfilePinNotKept, LockStateDrift}`, a `LegacyLayoutConflict` payload on `UnsupportedReason::LegacyLockLayout`, an additive `migration` key in the JSON lockfile document, and drop `LockfileOnlyMove` (#2113, #2102, #2134)
 - **deps-cli**: JSON lockfile `failed` entries for `lockfile-pin-not-kept`, `fallback-pin-not-kept` and `lock-state-drift` fill `package`/`expected` and add optional `configuration`/`change` (#2132, #2136)
 
 ### Added
-- **deps-core**: shared `gradle_layout` module and `ParseResult::invalid_declarations` with a warning diagnostic per skipped declaration (#2174, #2170, #TBD)
-- **deps-gradle**, **deps-cli**: unreadable version-catalog `[libraries]` entries are reported as warnings and `check` findings instead of being dropped silently (#2170, #TBD)
+- **deps-core**: shared `gradle_layout` module and `ParseResult::invalid_declarations` with a warning diagnostic per skipped declaration (#2174, #2170, #2188)
+- **deps-gradle**, **deps-cli**: unreadable version-catalog `[libraries]` entries are reported as warnings and `check` findings instead of being dropped silently (#2170, #2188)
 - **deps-core**: `EcosystemBase::claims_unrouted_manifest` and `EcosystemRegistry::for_uri_blocking` route a file an ecosystem claims by content when static routing misses it (#2161, #2175)
 - **deps-gradle**: version catalogs are recognized by the `*.versions.toml` basename (any catalog name), not only `libs.versions.toml` (#2151, #2165)
 - **deps-cli**: `update --lockfile regenerate` regenerates NuGet lock-file-only pins of floating (`*`) declarations without a cooldown bypass, refusing floats declared outside the project file (#2113, #2134)
@@ -25,13 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: std-only Windows `CacheDir::open` for the disk cache, relying on the per-user `%LOCALAPPDATA%` ACL, not yet wired into `HttpCache` (#2145, #2149)
 
 ### Fixed
-- **deps-lsp**: `didChange` parses finishing out of order no longer overwrite a newer document version; a superseded edit is logged at debug, not WARN (#2166, #TBD)
-- **deps-lsp**: cold-start requests for files no ecosystem handles, or with `cold_start.enabled = false`, log at debug instead of WARN when skipped by the cold-start gates (#2172, #TBD)
-- **deps-lsp**: flaky `did_change_reopen_race` and `notification_ordering` tests made deterministic, with a scoped nextest `leak-timeout` for two tests (#2169, #TBD)
-- **deps-cli**: `check` of a file named `deps.toml` (such as a Gradle catalog) no longer parses it as CLI configuration (#2168, #TBD)
-- **workflow**: the `deps-lsp-check` pre-commit hook matches every `*.versions.toml` catalog, not only `libs.versions.toml` (#2167, #TBD)
-- **deps-gradle**: settings-declared catalogs ignore comments and string literals, accept `from(` split across lines, and are found through the nearest four settings files above the catalog (#2171, #TBD)
-- **deps-core**: text reads that end in a NUL byte are refused as incomplete (Windows reparse-point files), while binary disk-cache reads are exempt (#2173, #TBD)
+- **deps-lsp**: `didChange` parses finishing out of order no longer overwrite a newer document version; a superseded edit is logged at debug, not WARN (#2166, #2188)
+- **deps-lsp**: cold-start requests for files no ecosystem handles, or with `cold_start.enabled = false`, log at debug instead of WARN when skipped by the cold-start gates (#2172, #2188)
+- **deps-lsp**: flaky `did_change_reopen_race` and `notification_ordering` tests made deterministic, with a scoped nextest `leak-timeout` for two tests (#2169, #2188)
+- **deps-cli**: `check` of a file named `deps.toml` (such as a Gradle catalog) no longer parses it as CLI configuration (#2168, #2188)
+- **workflow**: the `deps-lsp-check` pre-commit hook matches every `*.versions.toml` catalog, not only `libs.versions.toml` (#2167, #2188)
+- **deps-gradle**: settings-declared catalogs ignore comments and string literals, accept `from(` split across lines, and are found through the nearest four settings files above the catalog (#2171, #2188)
+- **deps-core**: text reads that end in a NUL byte are refused as incomplete (Windows reparse-point files), while binary disk-cache reads are exempt (#2173, #2188)
 - **deps-gradle**: version-catalog libraries in short notation (`alias = "group:artifact[:version]"`) are checked for updates and vulnerabilities (#2162, #2175)
 - **deps-gradle**, **deps-lsp**, **deps-cli**: a `*.toml` declared in `settings.gradle(.kts)` `versionCatalogs { from(files(...)) }` is recognized as a version catalog in the LSP and the CLI (#2161, #2175)
 - **deps-core**: no-follow reads of Windows reparse-point files (WOF, dedup, cloud) fail loudly on a short or all-zero read instead of returning wrong content (#2158, #2175)
