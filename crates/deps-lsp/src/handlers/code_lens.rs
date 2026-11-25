@@ -6,7 +6,7 @@
 //! not here — it needs the raw `Vec<TextEdit>`, not the wrapped `CodeLens`.
 
 use crate::config::DepsConfig;
-use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, load_document};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -42,8 +42,8 @@ pub async fn handle_code_lens(
 
     let uri = &params.text_document.uri;
 
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
-        state.log_document_unavailable(uri, "code lens");
+    if let Err(reason) = load_document(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
+        state.log_document_unavailable(uri, "code lens", reason);
         return vec![];
     }
 

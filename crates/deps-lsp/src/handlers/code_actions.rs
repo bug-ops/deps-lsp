@@ -1,7 +1,7 @@
 //! Code actions handler using ecosystem trait delegation.
 
 use crate::config::DepsConfig;
-use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, load_document};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -24,8 +24,8 @@ pub async fn handle_code_actions(
     let uri = &params.text_document.uri;
     let position = params.range.start;
 
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
-        state.log_document_unavailable(uri, "code actions");
+    if let Err(reason) = load_document(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
+        state.log_document_unavailable(uri, "code actions", reason);
         return vec![];
     }
 

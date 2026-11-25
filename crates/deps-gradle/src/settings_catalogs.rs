@@ -1,31 +1,40 @@
 //! Version catalogs declared in `settings.gradle(.kts)` under names static routing misses (#2161).
 //!
 //! `versionCatalogs { create("x") { from(files("gradle/deps.toml")) } }` makes an arbitrary
-//! `*.toml` a Gradle catalog. [`SettingsCatalogCache::declares`] answers whether the nearest
-//! settings file declares a given candidate, reading settings through an mtime-gated cache.
+//! `*.toml` a Gradle catalog. [`SettingsCatalogCache::declares`] answers whether a settings
+//! file in the candidate's ancestor directories declares it (the nearest
+//! [`MAX_SETTINGS_ANCESTORS`] settings-bearing directories are consulted), reading settings
+//! through an mtime-gated cache.
 //!
 //! A settings file contributes at most [`MAX_DECLARED_CATALOGS`] declarations; later ones are
 //! ignored (those catalogs stay unrecognized) and the cap is logged once per settings change.
+//! Settings text is tokenized with the shared Groovy/Kotlin code scanner, so comments and string
+//! literals never count as code.
 //!
 //! Limitations:
 //! - a catalog outside the settings file's directory subtree is not recognized;
+//! - only the nearest [`MAX_SETTINGS_ANCESTORS`] (4) settings-bearing ancestor directories are
+//!   consulted, so a declaration in a settings file further up is not seen;
 //! - the CLI walk skips hidden names, so a declared catalog with a hidden name is not walked;
-//! - a document opened before its declaration exists stays untracked until reopened;
-//! - settings are scanned line by line: only lines starting with `//` are skipped, so a
-//!   declaration inside a `/* ... */` comment, or in a trailing `//` comment after code on the
-//!   same line, is still claimed; a `from(` call split across lines is missed; and a brace
-//!   inside a string literal in the block can end the block early.
+//! - recognition is decided once, when a document is opened: a document opened before its
+//!   declaration exists stays untracked until reopened, and a tracked document whose declaring
+//!   settings file later changes or drops the declaration stays tracked as a catalog.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
+use deps_core::gradle_layout::{GradleSettingsFile, is_version_catalog_file};
 use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache, fs_probe};
-
-const SETTINGS_FILE_NAMES: [&str; 2] = ["settings.gradle.kts", "settings.gradle"];
 
 /// Most catalog declarations one settings file contributes, bounding both the memory kept per
 /// cached settings file and the work an adversarial settings file can cause.
 pub(crate) const MAX_DECLARED_CATALOGS: usize = 256;
+
+/// Most settings-bearing ancestor directories one probe consults. Once the settings cache is
+/// full it stops caching, so every consulted ancestor costs a fresh read and tokenize (up to
+/// the 8 MiB read cap each); this bounds that amplification to a few parses per probe while
+/// covering a root build with nested composite builds.
+pub(crate) const MAX_SETTINGS_ANCESTORS: usize = 4;
 
 /// A catalog path declared in a settings file: relative to the settings directory, made only
 /// of normal components, with no `$` interpolation.
@@ -98,39 +107,38 @@ impl SettingsCatalogCache {
         ))
     }
 
-    /// Whether the nearest settings file above `candidate` declares it as a version catalog.
+    /// Whether a settings file above `candidate` declares it as a version catalog.
     ///
-    /// Makes no filesystem call unless `candidate` is an absolute `.toml` path; may block.
+    /// Consults at most [`MAX_SETTINGS_ANCESTORS`] settings-bearing ancestor directories,
+    /// nearest first. Makes no filesystem call unless `candidate` is an absolute `.toml` path;
+    /// may block.
     pub(crate) fn declares(&self, candidate: &Path) -> bool {
-        let is_toml = candidate
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(crate::is_catalog_file_name);
-        if !candidate.is_absolute() || !is_toml {
+        if !candidate.is_absolute() || !is_version_catalog_file(candidate) {
             return false;
         }
         let Some(parent) = candidate.parent() else {
             return false;
         };
-        for dir in fs_probe::config_ancestors(parent) {
-            let settings: Vec<PathBuf> = SETTINGS_FILE_NAMES
-                .iter()
-                .map(|name| dir.join(name))
-                .filter(|path| fs_probe::is_file(path))
-                .collect();
-            if settings.is_empty() {
-                continue;
-            }
-            let Ok(relative) = candidate.strip_prefix(dir) else {
-                return false;
-            };
-            return settings.iter().any(|path| {
-                self.0
-                    .get_or_parse(path, crate::parser::settings::declared_catalog_files)
-                    .is_some_and(|declared| declared.contains(relative))
-            });
-        }
-        false
+        fs_probe::config_ancestors(parent)
+            .filter_map(|dir| {
+                let settings: Vec<PathBuf> = GradleSettingsFile::ALL
+                    .iter()
+                    .map(|settings| dir.join(settings.file_name()))
+                    .filter(|path| fs_probe::is_file(path))
+                    .collect();
+                (!settings.is_empty()).then_some((dir, settings))
+            })
+            .take(MAX_SETTINGS_ANCESTORS)
+            .any(|(dir, settings)| {
+                let Ok(relative) = candidate.strip_prefix(dir) else {
+                    return false;
+                };
+                settings.iter().any(|path| {
+                    self.0
+                        .get_or_parse(path, crate::parser::settings::declared_catalog_files)
+                        .is_some_and(|declared| declared.contains(relative))
+                })
+            })
     }
 }
 
@@ -140,6 +148,52 @@ mod tests {
 
     fn declaration(index: usize) -> DeclaredCatalogFile {
         DeclaredCatalogFile::parse(&format!("gradle/c{index}.toml")).unwrap()
+    }
+
+    /// Builds `levels` nested directories, each holding a settings file; only the outermost
+    /// declares the catalog at the innermost directory. Returns that catalog's path.
+    fn nested_project(root: &Path, levels: usize) -> PathBuf {
+        let mut dir = root.to_path_buf();
+        let mut relative = PathBuf::new();
+        for level in 0..levels {
+            std::fs::create_dir_all(&dir).unwrap();
+            let settings = if level == 0 {
+                let target = PathBuf::from_iter((1..levels).map(|n| format!("n{n}")));
+                format!(
+                    "versionCatalogs {{ create(\"d\") {{ from(files(\"{}\")) }} }}",
+                    target.join("x.toml").display()
+                )
+            } else {
+                "rootProject.name = \"nested\"\n".to_owned()
+            };
+            std::fs::write(dir.join("settings.gradle.kts"), settings).unwrap();
+            relative.push(format!("n{}", level + 1));
+            dir = root.join(&relative);
+        }
+        let leaf = root.join(PathBuf::from_iter((1..levels).map(|n| format!("n{n}"))));
+        leaf.join("x.toml")
+    }
+
+    #[test]
+    fn only_the_nearest_settings_bearing_ancestors_are_consulted() {
+        let _guard = fs_probe::snapshot_guard();
+        let within = tempfile::tempdir().unwrap();
+        let beyond = tempfile::tempdir().unwrap();
+        let within_catalog = nested_project(
+            &within.path().canonicalize().unwrap(),
+            MAX_SETTINGS_ANCESTORS,
+        );
+        let beyond_catalog = nested_project(
+            &beyond.path().canonicalize().unwrap(),
+            MAX_SETTINGS_ANCESTORS + 1,
+        );
+        let cache = SettingsCatalogCache::new();
+
+        assert!(cache.declares(&within_catalog));
+        assert!(
+            !cache.declares(&beyond_catalog),
+            "the outermost settings file is past the ancestor cap"
+        );
     }
 
     #[test]

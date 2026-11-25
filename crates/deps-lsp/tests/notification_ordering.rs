@@ -14,6 +14,38 @@ use common::LspClient;
 #[cfg(feature = "cargo")]
 use std::time::Duration;
 
+/// Longest wait for the first `publishDiagnostics` of a document: it follows a real crates.io
+/// fetch, which a loaded machine can stretch well past the old 2 s budget (#2169).
+#[cfg(feature = "cargo")]
+const INITIAL_PUBLISH_ATTEMPTS: u32 = 300;
+
+/// No publish for this long means the document's background work has settled.
+#[cfg(feature = "cargo")]
+const QUIET_PERIOD: Duration = Duration::from_secs(1);
+
+/// Upper bound on waiting for [`QUIET_PERIOD`] after the first publish.
+#[cfg(feature = "cargo")]
+const QUIESCENCE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Settings that keep the late OSV, typosquat and gossip scans from publishing on their own.
+/// Sent in `initializationOptions` and in every `didChangeConfiguration`, because a
+/// configuration change replaces the whole configuration: an omitted key falls back to its
+/// default and would switch the scan back on (#2169).
+#[cfg(feature = "cargo")]
+fn quiet_settings(outdated_severity: Option<u8>) -> serde_json::Value {
+    let diagnostics = match outdated_severity {
+        Some(severity) => {
+            serde_json::json!({ "vulnerabilities_enabled": false, "outdated_severity": severity })
+        }
+        None => serde_json::json!({ "vulnerabilities_enabled": false }),
+    };
+    serde_json::json!({
+        "diagnostics": diagnostics,
+        "typosquat": { "enabled": false },
+        "gossip": { "enabled": false },
+    })
+}
+
 /// Builds a platform-portable absolute `file://` URI string for a test fixture:
 /// `url::Url::to_file_path` (which `parse_manifest`'s workspace-root discovery calls
 /// internally) requires a drive-letter path segment to succeed on Windows, so a bare
@@ -166,7 +198,8 @@ fn diagnostic_severities(notification: &common::CapturedNotification) -> Vec<u64
 fn test_push_only_client_gets_republish_after_non_parse_config_change() {
     let mut client = LspClient::spawn();
 
-    let _init_response = client.initialize();
+    let _init_response =
+        client.initialize_with_capabilities(true, false, Some(quiet_settings(None)));
     client.clear_notifications();
 
     let cargo_toml = r#"[package]
@@ -181,16 +214,17 @@ serde = "1.0.0"
     client.did_open(&uri, "toml", cargo_toml);
 
     let _initial = client
-        .wait_for_notification(20, |n| {
+        .wait_for_notification(INITIAL_PUBLISH_ATTEMPTS, |n| {
             n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
         })
         .expect("Server should publish diagnostics once the document's fetch completes");
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        client.wait_for_quiescence(&uri, QUIET_PERIOD, QUIESCENCE_DEADLINE),
+        "the document kept publishing diagnostics after its initial load"
+    );
     client.clear_notifications();
 
-    client.did_change_configuration(serde_json::json!({
-        "diagnostics": { "outdated_severity": 1 }
-    }));
+    client.did_change_configuration(quiet_settings(Some(1)));
 
     let republish = client
         .wait_for_notification(20, |n| {
@@ -257,7 +291,8 @@ serde = "1.0.0"
 fn test_pull_client_gets_refresh_not_republish_after_non_parse_config_change() {
     let mut client = LspClient::spawn();
 
-    let _init_response = client.initialize_with_diagnostic_refresh_support();
+    let _init_response =
+        client.initialize_with_capabilities(true, true, Some(quiet_settings(None)));
     client.clear_notifications();
 
     let cargo_toml = r#"[package]
@@ -271,17 +306,18 @@ serde = "1.0.0"
     let uri = fixture_uri("Cargo.toml");
     client.did_open(&uri, "toml", cargo_toml);
     let _initial = client
-        .wait_for_notification(20, |n| {
+        .wait_for_notification(INITIAL_PUBLISH_ATTEMPTS, |n| {
             n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
         })
         .expect("Server should publish diagnostics once the document's fetch completes");
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        client.wait_for_quiescence(&uri, QUIET_PERIOD, QUIESCENCE_DEADLINE),
+        "the document kept publishing diagnostics after its initial load"
+    );
     client.clear_notifications();
     let refreshes_before = client.diagnostic_refresh_request_count();
 
-    client.did_change_configuration(serde_json::json!({
-        "diagnostics": { "outdated_severity": 1 }
-    }));
+    client.did_change_configuration(quiet_settings(Some(1)));
 
     let _ = client.wait_for_notification(30, |_| false);
     assert!(

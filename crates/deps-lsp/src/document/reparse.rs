@@ -3,7 +3,9 @@
 //! a [`ReparseScope`], reusing the version-guarded, sequential-await machinery
 //! [`commit_document_change`] already provides against a concurrent `did_change`.
 
-use super::lifecycle::{CommitGuard, CommittedChange, ParseTrigger, commit_document_change};
+use super::lifecycle::{
+    ChangeOutcome, CommitGuard, CommittedChange, ParseTrigger, commit_document_change,
+};
 use super::resolved::RefetchPolicy;
 use super::state::{OpenEpoch, RefreshKind, ServerState, refresh_with_timeout};
 use crate::config::{DepsConfig, ReparseScope};
@@ -126,16 +128,17 @@ pub(crate) async fn reparse_open_documents(
         )
         .await
         {
-            Ok(Some(CommittedChange { task, epoch })) => {
+            Ok(ChangeOutcome::Committed(CommittedChange { task, epoch })) => {
                 state.register_change_task(uri, task, epoch).await;
             }
             // A skip (superseded by a concurrent `did_change`) must never touch the task
             // registry for this URI — `spawn_background_task` unconditionally aborts
             // whatever task is already registered there, which would cancel the
             // concurrent edit's own, already-installed background task.
-            Ok(None) => tracing::debug!(
-                "skipped stale reparse for {:?}: superseded by a concurrent edit",
-                uri
+            Ok(ChangeOutcome::Dropped(refusal)) => tracing::debug!(
+                "skipped stale reparse for {:?}: dropped as {:?} (concurrent edit, close or reopen)",
+                uri,
+                refusal
             ),
             Err(e) => tracing::error!("failed to reparse {:?} after {reason}: {}", uri, e),
         }

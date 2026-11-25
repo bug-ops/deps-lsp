@@ -6,7 +6,7 @@
 //! currently the only implementor, surfacing pip's `-r`/`-c` targets.
 
 use crate::config::DepsConfig;
-use crate::document::{ServerState, ensure_document_loaded};
+use crate::document::{ServerState, load_document};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -25,8 +25,8 @@ pub async fn handle_document_link(
 ) -> Vec<DocumentLink> {
     let uri = &params.text_document.uri;
 
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
-        state.log_document_unavailable(uri, "document link");
+    if let Err(reason) = load_document(uri, Arc::clone(&state), client, config).await {
+        state.log_document_unavailable(uri, "document link", reason);
         return vec![];
     }
 

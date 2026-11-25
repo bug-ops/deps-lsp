@@ -1,6 +1,7 @@
 //! Regression test for #2022: a `didChange` that started under one open of a document must not
 //! commit over a later open of the same URI.
 #![cfg(feature = "npm")]
+#![expect(clippy::unwrap_used, reason = "test code")]
 
 use std::sync::Arc;
 
@@ -17,8 +18,13 @@ const OPEN: &str = r#"{"dependencies": {"express": "^4.18.0"}}"#;
 const STALE: &str = r#"{"dependencies": {"express": "^4.18.0", "lodash": "^4.0.0"}}"#;
 const REOPEN: &str = r#"{"dependencies": {"express": "^4.19.0"}}"#;
 
-#[tokio::test]
-async fn did_change_started_before_a_close_and_reopen_does_not_commit_over_the_reopen() {
+/// Fresh fixtures tried before giving up on seeing the change suspended in its parse.
+const ATTEMPTS: usize = 5;
+
+/// Runs the close/reopen interleaving once on a fresh fixture: the stale change's returned task
+/// and the document content afterwards. `None` when the change finished on its very first poll,
+/// so no reopen could land inside it.
+async fn reopen_during_change() -> Option<(Option<tokio::task::JoinHandle<()>>, String)> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().canonicalize().unwrap().join("package.json");
     std::fs::write(&path, OPEN).unwrap();
@@ -44,16 +50,20 @@ async fn did_change_started_before_a_close_and_reopen_does_not_commit_over_the_r
     .unwrap();
     state.cancel_background_task(&uri).await;
 
-    // 1. did_change starts and suspends inside `parse_manifest_blocking`.
-    let change = tokio::spawn(handle_document_change(
+    // 1. did_change captures the open's epoch on its first poll and suspends in the parse; an
+    // unpolled future cannot commit, so the suspension needs no timing assumption.
+    let change = handle_document_change(
         uri.clone(),
         STALE.to_owned(),
         Some(2),
         Arc::clone(&state),
         client.clone(),
         Arc::clone(&config),
-    ));
-    tokio::task::yield_now().await;
+    );
+    let mut change = std::pin::pin!(change);
+    if futures::poll!(change.as_mut()).is_ready() {
+        return None;
+    }
     assert_eq!(
         state.get_document(&uri).unwrap().content,
         OPEN,
@@ -69,14 +79,28 @@ async fn did_change_started_before_a_close_and_reopen_does_not_commit_over_the_r
     );
 
     // 4. The stale change finishes.
-    let committed = change.await.unwrap().unwrap();
+    let committed = change.await.unwrap();
     let content = state.get_document(&uri).unwrap().content.clone();
-    assert!(
-        committed.is_none(),
-        "a change of a closed open returns no task"
-    );
-    assert_eq!(
-        content, REOPEN,
-        "the stale did_change committed its content over the reopened document"
+    Some((committed, content))
+}
+
+#[tokio::test]
+async fn did_change_started_before_a_close_and_reopen_does_not_commit_over_the_reopen() {
+    for _ in 0..ATTEMPTS {
+        let Some((committed, content)) = reopen_during_change().await else {
+            continue;
+        };
+        assert!(
+            committed.is_none(),
+            "a change of a closed open returns no task"
+        );
+        assert_eq!(
+            content, REOPEN,
+            "the stale did_change committed its content over the reopened document"
+        );
+        return;
+    }
+    panic!(
+        "the change finished on its first poll in every attempt, so the race was never exercised"
     );
 }

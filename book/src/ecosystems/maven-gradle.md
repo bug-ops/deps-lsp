@@ -106,18 +106,31 @@ dependencyResolutionManagement {
 }
 ```
 
+The settings file is scanned with a tokenizer, so comments (`//`, `/* */`), string decoys, braces
+inside strings and a `from(` call split across lines are handled correctly.
+
+An unreadable `[libraries]` entry (malformed short notation, or a table without `module` or
+`group` + `name`) produces a Warning diagnostic in the editor and in `deps-cli check` instead of
+being dropped silently.
+
 Limits of settings-declared catalogs:
 
-- The path must be relative and inside the directory subtree of the settings file; the nearest
-  settings file wins, and at most 256 declarations per settings file are honoured.
-- The settings file is scanned line by line: a declaration inside a block comment or followed by a
-  trailing `//` comment is still counted, and a `from(` call split across lines is missed.
-- A document opened before the declaration was added is not re-evaluated; reopen it.
-- The CLI directory walk skips files with hidden names (starting with `.`).
+- The path must be relative and inside the directory subtree of the settings file; paths that
+  leave it with `..` are not supported (#2178). At most 256 declarations per settings file are
+  honoured.
+- In nested or composite builds, the nearest four settings-bearing ancestor directories are
+  consulted; settings files further up are ignored.
+- A document opened before the declaration was added, or before the settings file changed, is not
+  re-evaluated; reopen it (#2180).
+- The CLI directory walk skips catalogs with hidden names (starting with `.`) (#2179).
 - Any `*.toml` file handed to the Gradle parser is treated as a catalog.
-- A catalog named `deps.toml` collides with the deps-cli configuration file name when checked as an
-  explicit path (issue #2168). Check the containing directory instead, or pass
-  `--config <empty.toml>`.
+- A catalog named `deps.toml` is read as the deps-cli configuration file when it sits in a
+  directory that `deps-cli check` walks (`check gradle/` or `check .`), and the run fails with an
+  invalid-configuration error (#2182). Checking the file by explicit path works:
+  `deps-cli check gradle/deps.toml`.
+- The pre-commit hook matches every `*.versions.toml` file, but not a settings-declared catalog with
+  an arbitrary name such as `gradle/deps.toml`: staging only that file does not trigger the hook.
+  Run `deps-cli check` on it directly (#2167).
 
 ## Non-Registry Dependency Sources (Maven)
 

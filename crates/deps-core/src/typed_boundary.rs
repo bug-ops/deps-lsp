@@ -154,6 +154,10 @@ impl<P: TypedParseResult> ParseResult for ParsedView<'_, P> {
         self.erased.rejected_registries()
     }
 
+    fn invalid_declarations(&self) -> Vec<crate::InvalidDeclarationOccurrence> {
+        self.erased.invalid_declarations()
+    }
+
     fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
         self.erased.dependency_truncation()
     }

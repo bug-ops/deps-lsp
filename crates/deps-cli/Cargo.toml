@@ -92,6 +92,7 @@ urlencoding.workspace = true
 rustix = { workspace = true, features = ["process", "termios"] }
 
 [dev-dependencies]
+regex = { workspace = true }
 # `deps_core::test_util::test_uri` is used directly by the tier-3 license parity/regression
 # tests in `tests/check_integration.rs` (issue #1133). This dependency also exists so
 # deps-core's `test-util` feature is reachable in *this* crate's dev-dependency tree, which

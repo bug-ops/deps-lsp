@@ -3,7 +3,7 @@
 //! Delegates to ecosystem-specific completion logic.
 
 use crate::config::DepsConfig;
-use crate::document::{ServerState, ensure_document_loaded, tracked_ecosystem};
+use crate::document::{DocumentUnavailable, ServerState, load_document, tracked_ecosystem};
 use deps_core::EcosystemId;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
@@ -87,15 +87,19 @@ pub async fn handle_completion(
 
         let load_result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            ensure_document_loaded(uri, Arc::clone(&state), client.clone(), Arc::clone(&config)),
+            load_document(uri, Arc::clone(&state), client.clone(), Arc::clone(&config)),
         )
         .await;
 
         match load_result {
-            Ok(true) => {
+            Ok(Ok(())) => {
                 tracing::debug!("completion: document loaded successfully");
             }
-            Ok(false) | Err(_) => {
+            Ok(Err(DocumentUnavailable::Unsupported | DocumentUnavailable::ColdStartDisabled)) => {
+                tracing::debug!("completion: document not loadable here");
+                return context_less_response();
+            }
+            Ok(Err(DocumentUnavailable::NotLoaded)) | Err(_) => {
                 tracing::warn!("completion: document load failed or timed out");
                 return context_less_response();
             }

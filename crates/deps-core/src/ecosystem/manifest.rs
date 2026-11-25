@@ -233,6 +233,10 @@ impl<E: TypedEcosystem> ParseResult for EcosystemManifest<E> {
         self.parsed.rejected_registries()
     }
 
+    fn invalid_declarations(&self) -> Vec<crate::InvalidDeclarationOccurrence> {
+        self.parsed.invalid_declarations()
+    }
+
     fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
         if self.total > MAX_DEPENDENCIES_PER_DOCUMENT {
             Some(crate::DependencyTruncation {
@@ -483,6 +487,14 @@ mod tests {
             }]
         }
 
+        fn invalid_declarations(&self) -> Vec<crate::InvalidDeclarationOccurrence> {
+            vec![crate::InvalidDeclarationOccurrence {
+                range: range(),
+                key: "invalid-key".to_string(),
+                reason: crate::InvalidDeclarationReason::MalformedCoordinate,
+            }]
+        }
+
         fn dependency_truncation(&self) -> Option<crate::DependencyTruncation> {
             Some(crate::DependencyTruncation { kept: 7, total: 9 })
         }
@@ -513,6 +525,9 @@ mod tests {
         let rejected = outer.rejected_registries();
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].declaration_key, "rejected-key");
+        let invalid = outer.invalid_declarations();
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].key, "invalid-key");
         assert_eq!(
             outer.invalid_minimum_stability().map(|o| o.raw),
             Some("betta".to_string())

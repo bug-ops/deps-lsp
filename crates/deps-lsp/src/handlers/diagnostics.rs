@@ -4,7 +4,7 @@ use crate::config::DepsConfig;
 use crate::document::config_epoch::ConfigEpoch;
 use crate::document::{
     DocStamp, ParseFailure, PrefetchVisibility, PublishGate, PublishTicket, ServerState,
-    ensure_document_loaded,
+    load_document,
 };
 use deps_core::policy_config::{
     FetchConcurrency, FetchTimeout, GossipChecks, OsvChecks, TyposquatChecks,
@@ -437,8 +437,10 @@ pub async fn handle_diagnostics(
     client: Client,
     full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
-        state.log_document_unavailable(uri, "diagnostics");
+    if let Err(reason) =
+        load_document(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await
+    {
+        state.log_document_unavailable(uri, "diagnostics", reason);
         return vec![];
     }
 

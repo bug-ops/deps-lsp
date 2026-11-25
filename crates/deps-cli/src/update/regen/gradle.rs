@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use deps_core::NormalizeName;
 use deps_core::edit::{ManifestEdit, apply_edits};
+use deps_core::gradle_layout::{GradleSettingsFile, is_version_catalog_file};
 
 mod lock_state;
 
@@ -29,16 +30,12 @@ use super::{
     unsafe_argument, unsupported,
 };
 
-const SETTINGS_FILES: [&str; 2] = ["settings.gradle", "settings.gradle.kts"];
 const LOCK_FILES: [&str; 2] = ["gradle.lockfile", "buildscript-gradle.lockfile"];
 
-/// Whether `path` is a Gradle version catalog: any `.toml` (ASCII case-insensitive), since a
-/// manifest routed to Gradle with that extension is a catalog, whether by the
-/// `*.versions.toml` glob or by a `settings.gradle` declaration (#2161). Duplicates
-/// `deps_gradle::is_catalog_file_name`, which deps-cli cannot call (no `deps-gradle` dependency).
-fn is_version_catalog(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+fn has_settings_file(dir: &Path) -> bool {
+    GradleSettingsFile::ALL
+        .iter()
+        .any(|settings| dir.join(settings.file_name()).is_file())
 }
 
 /// Most lock files one run snapshots, stages and restores.
@@ -224,10 +221,7 @@ fn in_nested_build(root: &Path, lock: &Path) -> bool {
         .into_iter()
         .flat_map(Path::ancestors)
         .take_while(|dir| *dir != root && dir.starts_with(root))
-        .any(|dir| {
-            dir.file_name().is_some_and(|name| name == "buildSrc")
-                || SETTINGS_FILES.iter().any(|name| dir.join(name).is_file())
-        })
+        .any(|dir| dir.file_name().is_some_and(|name| name == "buildSrc") || has_settings_file(dir))
 }
 
 /// The distinct projects owning the lock directories `dirs`, one per directory below `root`.
@@ -306,9 +300,9 @@ impl Session<'_> {
     /// the project directory (the parent of `gradle/` for a version catalog).
     fn gradle_build_root(&self) -> Option<PathBuf> {
         let physical = std::fs::canonicalize(self.manifest_dir).ok()?;
-        let settings_dir = deps_core::fs_probe::config_ancestors(&physical)
-            .find(|dir| SETTINGS_FILES.iter().any(|name| dir.join(name).is_file()));
-        let catalog_in_gradle_dir = is_version_catalog(self.target.manifest_path)
+        let settings_dir =
+            deps_core::fs_probe::config_ancestors(&physical).find(|dir| has_settings_file(dir));
+        let catalog_in_gradle_dir = is_version_catalog_file(self.target.manifest_path)
             && physical.file_name() == Some(std::ffi::OsStr::new("gradle"));
         Some(match settings_dir {
             Some(dir) => dir.to_path_buf(),
@@ -704,7 +698,7 @@ impl Session<'_> {
         set: &LockSet,
         states: &'a [LegacyState],
     ) -> Vec<&'a LegacyState> {
-        let catalog = is_version_catalog(self.target.manifest_path);
+        let catalog = is_version_catalog_file(self.target.manifest_path);
         let own_dir = std::fs::canonicalize(self.manifest_dir).ok();
         set.legacy
             .iter()
@@ -1150,28 +1144,6 @@ mod tests {
             });
 
             assert_eq!(root, Some(expected));
-        }
-
-        #[test]
-        fn is_version_catalog_matches_any_toml_file() {
-            let cases = [
-                ("gradle/libs.versions.toml", true),
-                ("gradle/plugins.versions.toml", true),
-                ("gradle/.versions.toml", true),
-                ("plugins.versions.toml", true),
-                ("gradle/versions.toml", true),
-                ("gradle/Deps.TOML", true),
-                ("gradle/plugins.version.toml", true),
-                ("gradle/plugins.versions.toml.bak", false),
-                ("gradle/plugins.versions.tom", false),
-                ("gradle/plugins.versions", false),
-                ("build.gradle.kts", false),
-                ("gradle/plugins.versions.toml/build.gradle", false),
-                ("", false),
-            ];
-            for (path, expected) in cases {
-                assert_eq!(is_version_catalog(Path::new(path)), expected, "{path}");
-            }
         }
 
         fn two_legacy_projects(root: &Path) -> (LockSet, Vec<LegacyState>) {

@@ -302,6 +302,86 @@ pub enum ConfigError {
     },
 }
 
+/// Where `check` looks for its auto-discovered [`DEFAULT_CONFIG_FILENAME`] (#2168).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLookup {
+    /// Look for the default config file inside this directory.
+    Discover(PathBuf),
+    /// The one explicitly checked file is itself the default config file, so it is a manifest
+    /// (for example a Gradle catalog named `deps.toml`) and never configuration.
+    CheckedFileIsDefault,
+}
+
+impl ConfigLookup {
+    /// Resolves the lookup from `check`'s walk paths (FR-014's "at the walked root", spec 062
+    /// review S4).
+    ///
+    /// Exactly one path resolves unambiguously (its own directory, or its parent when it is a
+    /// file itself); multiple paths have no single "walked root", so the current directory is
+    /// used.
+    #[must_use]
+    pub fn for_walk_paths(paths: &[PathBuf]) -> Self {
+        match paths {
+            [only] if only.is_dir() => Self::Discover(only.clone()),
+            [only] if is_default_config_file(only) => Self::CheckedFileIsDefault,
+            [only] => Self::Discover(parent_dir_or_cwd(only).to_path_buf()),
+            _ => Self::Discover(PathBuf::from(".")),
+        }
+    }
+}
+
+fn parent_dir_or_cwd(file: &Path) -> &Path {
+    file.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Whether `file` is the [`DEFAULT_CONFIG_FILENAME`] of its own directory.
+///
+/// Unix compares file identity (device + inode): correct on case-sensitive and
+/// case-insensitive file systems and for hard links. Elsewhere an ASCII case-insensitive name
+/// match is used because `std`'s file index is unstable. An I/O error counts as "not the same
+/// file".
+#[cfg(unix)]
+fn is_default_config_file(file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (
+        std::fs::metadata(file),
+        std::fs::metadata(parent_dir_or_cwd(file).join(DEFAULT_CONFIG_FILENAME)),
+    ) {
+        (Ok(checked), Ok(default)) => {
+            checked.dev() == default.dev() && checked.ino() == default.ino()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_default_config_file(file: &Path) -> bool {
+    file.file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case(DEFAULT_CONFIG_FILENAME))
+}
+
+/// Loads `check`'s [`CliConfig`]: `explicit_path` when given, otherwise the auto-discovered
+/// default file per `lookup`, or [`CliConfig::default`] when the checked file is itself the
+/// default file name (#2168).
+///
+/// # Errors
+///
+/// Same as [`load`].
+pub fn load_for_check(
+    explicit_path: Option<&Path>,
+    lookup: &ConfigLookup,
+) -> Result<CliConfig, ConfigError> {
+    match (explicit_path, lookup) {
+        (None, ConfigLookup::CheckedFileIsDefault) => Ok(CliConfig::default()),
+        (_, ConfigLookup::Discover(dir)) => load(explicit_path, dir),
+        (Some(_), ConfigLookup::CheckedFileIsDefault) => load(explicit_path, Path::new(".")),
+    }
+}
+
 /// Loads [`CliConfig`] from `explicit_path`, or from [`DEFAULT_CONFIG_FILENAME`] inside
 /// `default_dir` when `explicit_path` is `None`.
 ///

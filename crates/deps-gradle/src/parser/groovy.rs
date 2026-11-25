@@ -228,6 +228,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
         dependencies,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        invalid_declarations: Vec::new(),
     })
 }
 

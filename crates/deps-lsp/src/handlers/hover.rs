@@ -1,7 +1,7 @@
 //! Hover handler using ecosystem trait delegation.
 
 use crate::config::DepsConfig;
-use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, load_document};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -21,8 +21,8 @@ pub async fn handle_hover(
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
-        state.log_document_unavailable(uri, "hover");
+    if let Err(reason) = load_document(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
+        state.log_document_unavailable(uri, "hover", reason);
         return None;
     }
 

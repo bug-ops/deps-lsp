@@ -4,7 +4,7 @@
 //! to the appropriate ecosystem implementation.
 
 use crate::config::{DepsConfig, InlayHintsConfig};
-use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, load_document};
 use deps_core::EcosystemConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,8 +32,10 @@ pub async fn handle_inlay_hints(
 
     let uri = &params.text_document.uri;
 
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
-        state.log_document_unavailable(uri, "inlay hints");
+    if let Err(reason) =
+        load_document(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await
+    {
+        state.log_document_unavailable(uri, "inlay hints", reason);
         return vec![];
     }
 

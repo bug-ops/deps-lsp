@@ -17,9 +17,10 @@ use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
-    EcosystemId, FetchCompleteness, FetchFailure, NormalizedName, PackageKey, PackageName,
-    ParseResult, PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus,
-    TypedParseResult, TyposquatSignal, VersionReq, format_relative_age,
+    EcosystemId, FetchCompleteness, FetchFailure, InvalidDeclarationReason, NormalizedName,
+    PackageKey, PackageName, ParseResult, PublishTime, RegistryOccurrence,
+    RejectedRegistryOccurrence, RemovalStatus, TypedParseResult, TyposquatSignal, VersionReq,
+    format_relative_age,
 };
 
 use super::{
@@ -1124,6 +1125,7 @@ where
 
     dependency_ceiling_notice(&mut diagnostics, parse_result);
     invalid_minimum_stability_notice(&mut diagnostics, parse_result);
+    invalid_declaration_notices(&mut diagnostics, parse_result);
     offline_notice(&mut diagnostics, versions, deps);
     skip_reason_notice(
         &mut diagnostics,
@@ -1376,6 +1378,36 @@ fn invalid_minimum_stability_notice(
                     "minimum-stability \"{raw}\" is not one of dev, alpha, beta, RC, stable; \
                      \"stable\" is assumed when choosing the latest version"
                 ),
+            )
+            .with_severity(Severity::Warning),
+        );
+    }
+}
+
+/// Notice for each declaration the parser skipped as invalid (#2170).
+///
+/// Without it a malformed entry is dropped silently and the user sees no sign that the
+/// dependency is not being checked.
+///
+/// Reads: `parse_result.invalid_declarations()`.
+/// Emits: one [`Severity::Warning`] per occurrence, at the declaration's own range, naming its
+/// sanitized key and the rejection reason.
+fn invalid_declaration_notices(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
+    for occurrence in parse_result.invalid_declarations() {
+        let key = sanitize_and_truncate_for_diagnostic(
+            &redact_declaration_key(&occurrence.key),
+            MAX_DIAGNOSTIC_VALUE_CHARS,
+        );
+        let problem = match occurrence.reason {
+            InvalidDeclarationReason::MalformedCoordinate => "is not a well-formed coordinate",
+            InvalidDeclarationReason::MissingCoordinate => "declares no coordinate",
+            InvalidDeclarationReason::UnsupportedValue => "has an unsupported value",
+        };
+        diagnostics.push(
+            Diagnostic::new(
+                DiagnosticKind::Notice,
+                occurrence.range,
+                format!("declaration \"{key}\" {problem} and is not checked"),
             )
             .with_severity(Severity::Warning),
         );
@@ -3908,6 +3940,118 @@ mod tests {
                 .contains("dev, alpha, beta, RC, stable")
         );
         assert!(notices[0].message().contains("stable"));
+    }
+
+    /// #2170: each `invalid_declarations()` occurrence gets one WARNING at its own range, naming
+    /// the sanitized key.
+    #[test]
+    fn test_generate_diagnostics_from_cache_reports_invalid_declarations() {
+        use crate::position::{Position, Range};
+        use crate::{InvalidDeclarationOccurrence, InvalidDeclarationReason};
+
+        struct InvalidDeclarationsParseResult {
+            deps: Vec<MockDep>,
+            uri: url::Url,
+            invalid: Vec<InvalidDeclarationOccurrence>,
+        }
+
+        impl ParseResult for InvalidDeclarationsParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn invalid_declarations(&self) -> Vec<InvalidDeclarationOccurrence> {
+                self.invalid.clone()
+            }
+        }
+
+        impl crate::TypedParseResult for InvalidDeclarationsParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
+            }
+        }
+
+        let formatter = MOCK_FORMATTER;
+        let range = Range::new(Position::new(1, 0), Position::new(1, 3));
+        let parse_result = InvalidDeclarationsParseResult {
+            deps: Vec::new(),
+            uri: crate::test_util::test_uri("/test/libs.versions.toml"),
+            invalid: vec![InvalidDeclarationOccurrence {
+                range,
+                key: "bad\u{7}key".to_string(),
+                reason: InvalidDeclarationReason::MalformedCoordinate,
+            }],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notices: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message().contains("not a well-formed coordinate"))
+            .collect();
+        assert_eq!(notices.len(), 1, "got: {diagnostics:?}");
+        assert_eq!(notices[0].severity, Some(Severity::Warning));
+        assert_eq!(notices[0].range, range);
+        assert!(!notices[0].message().contains('\u{7}'));
+        assert!(notices[0].message().contains("bad"));
+    }
+
+    /// #2170 security L1: a key that carries a credential URL is redacted before it reaches the
+    /// rendered message.
+    #[test]
+    fn test_invalid_declaration_notice_redacts_credentials_in_key() {
+        use crate::position::Range;
+        use crate::{InvalidDeclarationOccurrence, InvalidDeclarationReason};
+
+        struct Parsed {
+            uri: url::Url,
+        }
+        impl ParseResult for Parsed {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                Vec::new()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn invalid_declarations(&self) -> Vec<InvalidDeclarationOccurrence> {
+                vec![InvalidDeclarationOccurrence {
+                    range: Range::default(),
+                    key: "https://user:hunter2@example.com/repo".to_string(),
+                    reason: InvalidDeclarationReason::UnsupportedValue,
+                }]
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        invalid_declaration_notices(
+            &mut diagnostics,
+            &Parsed {
+                uri: crate::test_util::test_uri("/test/libs.versions.toml"),
+            },
+        );
+        assert_eq!(diagnostics.len(), 1);
+        let message = diagnostics[0].message();
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(message.contains("unsupported value"), "{message}");
     }
 
     /// #1444: the sanitize/truncate pass already applied to every other diagnostic value must

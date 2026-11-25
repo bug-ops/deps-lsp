@@ -513,6 +513,19 @@ macro_rules! __impl_parse_result_rejected_registries {
     };
 }
 
+/// Emits [`impl_parse_result!`]'s `invalid_declarations` method body, or nothing when the
+/// field is omitted (the trait default applies) — not part of the public macro API.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_parse_result_invalid_declarations {
+    () => {};
+    ($field:ident) => {
+        fn invalid_declarations(&self) -> Vec<$crate::ecosystem::InvalidDeclarationOccurrence> {
+            self.$field.clone()
+        }
+    };
+}
+
 /// Implement `ParseResult` trait for a struct.
 ///
 /// # Arguments
@@ -535,9 +548,13 @@ macro_rules! __impl_parse_result_rejected_registries {
 ///   override (#1438), read via `.clone()` — omit when the ecosystem produces no
 ///   `InvalidEntry`-based rejections beyond the blocked-host case (the trait default empty
 ///   `Vec` applies).
+/// * `invalid_declarations` - Optional: field name for the `Vec<InvalidDeclarationOccurrence>`
+///   [`ecosystem::ParseResult::invalid_declarations`](crate::ecosystem::ParseResult::invalid_declarations)
+///   override (#2170), read via `.clone()` — omit when the parser reports no skipped invalid
+///   declarations (the trait default empty `Vec` applies).
 ///
 /// All optional fields are given in the fixed order shown above — `workspace_root`, then
-/// `dependency_truncation`, then `blocked_registries`, then `rejected_registries` — any
+/// `dependency_truncation`, then `blocked_registries`, then `rejected_registries`, then `invalid_declarations` — any
 /// subset may be omitted, but a present field cannot appear out of order.
 ///
 /// # Examples
@@ -581,6 +598,7 @@ macro_rules! impl_parse_result {
         $(, dependency_truncation: $dependency_truncation:ident)?
         $(, blocked_registries: $blocked_registries:ident)?
         $(, rejected_registries: $rejected_registries:ident)?
+        $(, invalid_declarations: $invalid_declarations:ident)?
         $(,)?
     }) => {
         impl $crate::ecosystem::ParseResult for $type {
@@ -602,6 +620,8 @@ macro_rules! impl_parse_result {
             $crate::__impl_parse_result_blocked_registries!($($blocked_registries)?);
 
             $crate::__impl_parse_result_rejected_registries!($($rejected_registries)?);
+
+            $crate::__impl_parse_result_invalid_declarations!($($invalid_declarations)?);
         }
 
         impl $crate::typed_boundary::TypedParseResult for $type {
@@ -886,6 +906,7 @@ mod tests {
         dependency_truncation: Option<crate::DependencyTruncation>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
         rejected_registries: Vec<crate::ecosystem::RejectedRegistryOccurrence>,
+        invalid_declarations: Vec<crate::ecosystem::InvalidDeclarationOccurrence>,
     }
 
     #[derive(Debug)]
@@ -999,6 +1020,7 @@ mod tests {
             dependency_truncation: dependency_truncation,
             blocked_registries: blocked_registries,
             rejected_registries: rejected_registries,
+            invalid_declarations: invalid_declarations,
         }
     );
 
@@ -1227,9 +1249,15 @@ mod tests {
                 raw_value: "not-a-url".into(),
                 declaration_key: "rejected".into(),
             }],
+            invalid_declarations: vec![crate::ecosystem::InvalidDeclarationOccurrence {
+                range: Range::default(),
+                key: "bad".into(),
+                reason: crate::ecosystem::InvalidDeclarationReason::MissingCoordinate,
+            }],
         };
 
         assert_eq!(result.rejected_registries().len(), 1);
+        assert_eq!(result.invalid_declarations().len(), 1);
         assert_eq!(result.dependencies().len(), 1);
         assert_eq!(
             result.workspace_root(),

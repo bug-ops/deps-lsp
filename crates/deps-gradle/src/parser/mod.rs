@@ -146,6 +146,9 @@ pub struct GradleParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<deps_core::DependencyTruncation>,
+    /// Declarations skipped as invalid (#2170), surfaced through
+    /// [`deps_core::ParseResult::invalid_declarations`].
+    pub invalid_declarations: Vec<deps_core::InvalidDeclarationOccurrence>,
 }
 
 /// Resolves `$var` and `${var}` references in dependency versions using the given properties map.
@@ -184,15 +187,12 @@ fn resolve_variable_ref(
 pub(crate) enum BlockKeyword {
     /// `buildscript { }`.
     Buildscript,
-    /// `versionCatalogs { }` in a settings file.
-    VersionCatalogs,
 }
 
 impl BlockKeyword {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Buildscript => "buildscript",
-            Self::VersionCatalogs => "versionCatalogs",
         }
     }
 }
@@ -278,6 +278,7 @@ pub fn parse_gradle_with_cache(
                 dependencies: vec![],
                 uri: uri.clone(),
                 dependency_truncation: None,
+                invalid_declarations: Vec::new(),
             });
         }
     };
@@ -320,6 +321,7 @@ deps_core::impl_parse_result!(
         dependencies: dependencies,
         uri: uri,
         dependency_truncation: dependency_truncation,
+        invalid_declarations: invalid_declarations,
     }
 );
 
@@ -905,9 +907,9 @@ mod tests {
 
     #[test]
     fn find_block_spans_stops_at_an_unmatched_brace() {
-        let content = "versionCatalogs { x\nversionCatalogs { y }\n";
+        let content = "buildscript { x\nbuildscript { y }\n";
 
-        assert!(find_block_spans(content, BlockKeyword::VersionCatalogs).is_empty());
+        assert!(find_block_spans(content, BlockKeyword::Buildscript).is_empty());
     }
 
     #[test]

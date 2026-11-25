@@ -6,7 +6,7 @@ use crate::parser::{GradleParseResult, LineOffsetTable};
 use crate::types::GradleDependency;
 use deps_core::interpolation::PropertyValue;
 use deps_core::position::Range;
-use deps_core::{DepsError, Result};
+use deps_core::{DepsError, InvalidDeclarationOccurrence, InvalidDeclarationReason, Result};
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
 use url::Url;
@@ -50,26 +50,44 @@ pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResu
             dependencies,
             uri: uri.clone(),
             dependency_truncation: None,
+            invalid_declarations: Vec::new(),
         });
     };
 
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
-    for item in libs_table.values() {
+    let mut invalid_declarations = Vec::new();
+    for (key, item) in libs_table {
         if !budget.allow() {
             continue;
         }
-        let Some(dep) = parse_library_entry(item, content, &line_table, &version_refs) else {
-            continue;
-        };
-        dependencies.push(dep);
+        match parse_library_entry(item, content, &line_table, &version_refs) {
+            Ok(dep) => dependencies.push(dep),
+            Err(reason) => invalid_declarations.push(InvalidDeclarationOccurrence {
+                range: span_to_range(content, &line_table, key.span),
+                key: key.name.to_string(),
+                reason,
+            }),
+        }
     }
+
+    // The TOML table iterates by key, so restore source order.
+    invalid_declarations.sort_by_key(|occurrence| {
+        (
+            occurrence.range.start.line,
+            occurrence.range.start.character,
+        )
+    });
 
     Ok(GradleParseResult {
         dependencies,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        invalid_declarations,
     })
 }
+
+/// Outcome of reading one `[libraries]` entry: the declaration, or why it is unreadable.
+type Declared<T> = std::result::Result<T, InvalidDeclarationReason>;
 
 fn get_table_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
     table.get(key)
@@ -109,8 +127,8 @@ fn parse_short_notation_entry(
     span: toml_span::Span,
     content: &str,
     line_table: &LineOffsetTable,
-) -> Option<GradleDependency> {
-    let short = parse_short_notation(value)?;
+) -> Declared<GradleDependency> {
+    let short = parse_short_notation(value).ok_or(InvalidDeclarationReason::MalformedCoordinate)?;
     let verbatim = content.get(span.start..span.end) == Some(value);
     let coordinate_len = short.group.len() + 1 + short.artifact.len();
     let (name_range, version_range) = if verbatim {
@@ -122,7 +140,7 @@ fn parse_short_notation_entry(
     } else {
         (span_to_range(content, line_table, span), None)
     };
-    Some(GradleDependency {
+    Ok(GradleDependency {
         group_id: short.group.to_string(),
         artifact_id: short.artifact.to_string(),
         name: format!("{}:{}", short.group, short.artifact).into(),
@@ -144,16 +162,18 @@ fn parse_library_entry(
     content: &str,
     line_table: &LineOffsetTable,
     version_refs: &HashMap<String, PropertyValue>,
-) -> Option<GradleDependency> {
+) -> Declared<GradleDependency> {
     if let Some(value) = item.as_str() {
         return parse_short_notation_entry(value, item.span, content, line_table);
     }
-    let table = item.as_table()?;
+    let table = item
+        .as_table()
+        .ok_or(InvalidDeclarationReason::UnsupportedValue)?;
     let (group_id, artifact_id, name, name_range) =
         extract_coordinates(table, content, line_table)?;
     let (version_req, version_range) = extract_version(table, content, line_table, version_refs);
 
-    Some(GradleDependency {
+    Ok(GradleDependency {
         group_id,
         artifact_id,
         name: name.into(),
@@ -170,25 +190,32 @@ fn extract_coordinates<'a>(
     table: &'a Table<'a>,
     content: &str,
     line_table: &LineOffsetTable,
-) -> Option<(String, String, String, Range)> {
+) -> Declared<(String, String, String, Range)> {
     if let Some(module_val) = get_table_val(table, "module") {
-        let module_str = module_val.as_str()?;
+        let module_str = module_val
+            .as_str()
+            .ok_or(InvalidDeclarationReason::UnsupportedValue)?;
         let name_range = span_to_range(content, line_table, module_val.span);
-        let (g, a) = module_str.split_once(':')?;
-        return Some((
+        let (g, a) = module_str
+            .split_once(':')
+            .ok_or(InvalidDeclarationReason::MalformedCoordinate)?;
+        return Ok((
             g.to_string(),
             a.to_string(),
             module_str.to_string(),
             name_range,
         ));
     }
-    let group_val = get_table_val(table, "group")?;
-    let name_val = get_table_val(table, "name")?;
-    let g = group_val.as_str()?.to_string();
-    let a = name_val.as_str()?.to_string();
-    let name_str = format!("{g}:{a}");
+    let (Some(group_val), Some(name_val)) =
+        (get_table_val(table, "group"), get_table_val(table, "name"))
+    else {
+        return Err(InvalidDeclarationReason::MissingCoordinate);
+    };
+    let (Some(g), Some(a)) = (group_val.as_str(), name_val.as_str()) else {
+        return Err(InvalidDeclarationReason::UnsupportedValue);
+    };
     let name_range = span_to_range(content, line_table, name_val.span);
-    Some((g, a, name_str, name_range))
+    Ok((g.to_string(), a.to_string(), format!("{g}:{a}"), name_range))
 }
 
 fn extract_version(
