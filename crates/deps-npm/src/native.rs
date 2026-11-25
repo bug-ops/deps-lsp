@@ -389,8 +389,7 @@ pub(crate) fn parse_pnpm(path: &Path, content: &str) -> Option<Settings> {
     };
     let excluded: Vec<&str> = get("minimumReleaseAgeExclude")
         .and_then(Yaml::as_vec)
-        .map(|entries| entries.iter().filter_map(Yaml::as_str).collect())
-        .unwrap_or_default();
+        .map_or_default(|entries| entries.iter().filter_map(Yaml::as_str).collect());
     Some(Settings::global(
         limit,
         NativeCooldownSource::PnpmMinimumReleaseAge,
@@ -414,8 +413,7 @@ fn parse_bunfig(path: &Path, content: &str) -> Option<Settings> {
     let excluded: Vec<&str> = install
         .get("minimumReleaseAgeExcludes")
         .and_then(|value| value.as_array())
-        .map(|entries| entries.iter().filter_map(|entry| entry.as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|entries| entries.iter().filter_map(|entry| entry.as_str()).collect());
     Some(Settings::global(
         span(path, seconds, TimeUnit::Second)?,
         NativeCooldownSource::BunMinimumReleaseAge,
@@ -596,8 +594,7 @@ fn parse_yarnrc(path: &Path, content: &str) -> Option<Settings> {
     let preapproved: Vec<&str> = root
         .get(&Yaml::String("npmPreapprovedPackages".to_owned()))
         .and_then(Yaml::as_vec)
-        .map(|entries| entries.iter().filter_map(Yaml::as_str).collect())
-        .unwrap_or_default();
+        .map_or_default(|entries| entries.iter().filter_map(Yaml::as_str).collect());
     Some(Settings {
         global,
         scopes,

@@ -1,4 +1,4 @@
-//! Parser for Gradle Version Catalog (gradle/libs.versions.toml).
+//! Parser for Gradle Version Catalogs (`gradle/*.versions.toml`, e.g. `libs.versions.toml`).
 //!
 //! Handles \[versions\], \[libraries\] sections with position tracking via toml-span.
 
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use toml_span::value::{Table, Value};
 use url::Url;
 
-/// Parses a Gradle version catalog (`gradle/libs.versions.toml`) into a [`GradleParseResult`].
+/// Parses a Gradle version catalog (`gradle/*.versions.toml`) into a [`GradleParseResult`].
 ///
 /// # Errors
 ///

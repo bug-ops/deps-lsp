@@ -157,8 +157,7 @@ where
         vuln_keys: super::hover::vuln_keys_for(parse_result, &versions, formatter),
         suppression: versions
             .suppression
-            .map(|set| set.resolve(formatter))
-            .unwrap_or_default(),
+            .map_or_default(|set| set.resolve(formatter)),
         // ASSUMPTION: no caller supplies the clock to this entry point, so exemption expiry is
         // evaluated at request time; one instant is shared by every hint of the call.
         exemptions: ExemptionCheck::new(versions.advisory_exemptions, PublishTime::now()),

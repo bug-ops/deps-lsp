@@ -7,143 +7,128 @@
 
 use crate::cache::CacheTier;
 use crate::cache::auth::KeyAuth;
+use crate::hash::fnv1a64;
+use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use url::{Host, Url};
 
 const MAX_QUERY_VALUE_LEN: usize = 32;
 
-/// A registry host whose responses may be persisted.
-///
-/// Closed on purpose: a new host needs an explicit variant, and
-/// self-hosted or IP hosts can never qualify.
-///
-/// Only hosts whose cached requests are fully identified by the URL belong here. `api.osv.dev`
-/// and `api.deps.dev` are excluded because their queries are POSTs whose response depends on the
-/// request body, which a URL-only [`PersistKey`] cannot name (#2141).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum PersistableHost {
-    /// `api.github.com`
-    ApiGithubCom,
-    /// `gitlab.com`
-    GitlabCom,
-    /// `index.crates.io`
-    IndexCratesIo,
-    /// `crates.io`
-    CratesIo,
-    /// `registry.npmjs.org`
-    RegistryNpmjsOrg,
-    /// `pypi.org`
-    PypiOrg,
-    /// `proxy.golang.org`
-    ProxyGolangOrg,
-    /// `rubygems.org`
-    RubygemsOrg,
-    /// `pub.dev`
-    PubDev,
-    /// `repo1.maven.org`
-    Repo1MavenOrg,
-    /// `dl.google.com`
-    DlGoogleCom,
-    /// `plugins.gradle.org`
-    PluginsGradleOrg,
-    /// `repo.packagist.org`
-    RepoPackagistOrg,
-    /// `api.nuget.org`
-    ApiNugetOrg,
-    /// `jsr.io`
-    JsrIo,
-    /// `api.jsr.io`
-    ApiJsrIo,
-}
-
-impl PersistableHost {
-    const ALL: [Self; 16] = [
-        Self::ApiGithubCom,
-        Self::GitlabCom,
-        Self::IndexCratesIo,
-        Self::CratesIo,
-        Self::RegistryNpmjsOrg,
-        Self::PypiOrg,
-        Self::ProxyGolangOrg,
-        Self::RubygemsOrg,
-        Self::PubDev,
-        Self::Repo1MavenOrg,
-        Self::DlGoogleCom,
-        Self::PluginsGradleOrg,
-        Self::RepoPackagistOrg,
-        Self::ApiNugetOrg,
-        Self::JsrIo,
-        Self::ApiJsrIo,
-    ];
-
-    /// Parses an exact, lowercase host name; anything else is `None`.
-    #[must_use]
-    pub(super) fn from_host(host: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|h| h.as_str() == host)
+crate::macros::closed_str_enum! {
+    /// A registry host whose responses may be persisted.
+    ///
+    /// Closed on purpose: a new host needs an explicit variant, and
+    /// self-hosted or IP hosts can never qualify.
+    ///
+    /// Only hosts whose cached requests are fully identified by the URL belong here. `api.osv.dev`
+    /// and `api.deps.dev` are excluded because their queries are POSTs whose response depends on the
+    /// request body, which a URL-only [`PersistKey`] cannot name (#2141).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) enum PersistableHost {
+        /// `api.github.com`
+        ApiGithubCom => "api.github.com",
+        /// `gitlab.com`
+        GitlabCom => "gitlab.com",
+        /// `index.crates.io`
+        IndexCratesIo => "index.crates.io",
+        /// `crates.io`
+        CratesIo => "crates.io",
+        /// `registry.npmjs.org`
+        RegistryNpmjsOrg => "registry.npmjs.org",
+        /// `pypi.org`
+        PypiOrg => "pypi.org",
+        /// `proxy.golang.org`
+        ProxyGolangOrg => "proxy.golang.org",
+        /// `rubygems.org`
+        RubygemsOrg => "rubygems.org",
+        /// `pub.dev`
+        PubDev => "pub.dev",
+        /// `repo1.maven.org`
+        Repo1MavenOrg => "repo1.maven.org",
+        /// `dl.google.com`
+        DlGoogleCom => "dl.google.com",
+        /// `plugins.gradle.org`
+        PluginsGradleOrg => "plugins.gradle.org",
+        /// `repo.packagist.org`
+        RepoPackagistOrg => "repo.packagist.org",
+        /// `api.nuget.org`
+        ApiNugetOrg => "api.nuget.org",
+        /// `jsr.io`
+        JsrIo => "jsr.io",
+        /// `api.jsr.io`
+        ApiJsrIo => "api.jsr.io",
     }
-
+    /// Every host, in declaration order.
+    all: pub(super);
     /// The canonical host name.
     #[must_use]
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::ApiGithubCom => "api.github.com",
-            Self::GitlabCom => "gitlab.com",
-            Self::IndexCratesIo => "index.crates.io",
-            Self::CratesIo => "crates.io",
-            Self::RegistryNpmjsOrg => "registry.npmjs.org",
-            Self::PypiOrg => "pypi.org",
-            Self::ProxyGolangOrg => "proxy.golang.org",
-            Self::RubygemsOrg => "rubygems.org",
-            Self::PubDev => "pub.dev",
-            Self::Repo1MavenOrg => "repo1.maven.org",
-            Self::DlGoogleCom => "dl.google.com",
-            Self::PluginsGradleOrg => "plugins.gradle.org",
-            Self::RepoPackagistOrg => "repo.packagist.org",
-            Self::ApiNugetOrg => "api.nuget.org",
-            Self::JsrIo => "jsr.io",
-            Self::ApiJsrIo => "api.jsr.io",
-        }
-    }
+    to_str: pub(super) as_str;
+    /// Parses an exact, lowercase host name; anything else is `None`.
+    #[must_use]
+    parse: pub(super) from_host;
 }
 
 /// Host names of every [`PersistableHost`], for tests that pin the allow-list against what the
 /// ecosystem crates fetch by default.
-#[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub fn persistable_hosts() -> impl Iterator<Item = &'static str> {
     PersistableHost::ALL
-        .into_iter()
+        .iter()
+        .copied()
         .map(PersistableHost::as_str)
 }
 
-/// A query parameter that may appear in a persisted URL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PersistableQueryKey {
-    Page,
-    PerPage,
-    OrderBy,
-    Sort,
+const HASH_LEN: usize = 16;
+const ENTRY_EXTENSION: &str = "entry";
+
+fn is_decimal(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-impl PersistableQueryKey {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "page" => Some(Self::Page),
-            "per_page" => Some(Self::PerPage),
-            "order_by" => Some(Self::OrderBy),
-            "sort" => Some(Self::Sort),
-            _ => None,
-        }
-    }
+/// The shape of a file in the store directory, as the writer names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreFileKind {
+    /// A finished entry: `{16 lowercase hex}.entry`.
+    Entry,
+    /// An in-flight temp file of the atomic writer.
+    Tmp,
+}
 
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Page => "page",
-            Self::PerPage => "per_page",
-            Self::OrderBy => "order_by",
-            Self::Sort => "sort",
+impl StoreFileKind {
+    /// Classifies a directory entry name; `None` for anything the store did not create.
+    #[must_use]
+    pub(super) fn classify(name: &OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        let (stem, rest) = name.split_once('.')?;
+        if stem.len() != HASH_LEN || !stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
         }
+        let tail = rest.strip_prefix(ENTRY_EXTENSION)?;
+        if tail.is_empty() {
+            return Some(Self::Entry);
+        }
+        let mut numbers = tail
+            .strip_prefix(".deps-cli-")?
+            .strip_suffix(".tmp")?
+            .split('-');
+        let (pid, nanos) = (numbers.next()?, numbers.next()?);
+        (numbers.next().is_none() && is_decimal(pid) && is_decimal(nanos)).then_some(Self::Tmp)
     }
+}
+
+crate::macros::closed_str_enum! {
+    /// A query parameter that may appear in a persisted URL.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum PersistableQueryKey {
+        Page => "page",
+        PerPage => "per_page",
+        OrderBy => "order_by",
+        Sort => "sort",
+    }
+    #[expect(dead_code, reason = "only the exhaustive match of to_str and parse is used")]
+    all: ;
+    to_str: as_str;
+    parse: from_name;
 }
 
 /// A query value restricted to `[A-Za-z0-9_.-]{1,32}`.
@@ -271,6 +256,18 @@ impl PersistKey {
     #[must_use]
     pub(super) fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The request's `Accept` value, verbatim.
+    #[must_use]
+    pub(super) fn accept(&self) -> &str {
+        &self.accept
+    }
+
+    /// The file name this key is stored under: `{fnv1a64(url):016x}.entry`.
+    #[must_use]
+    pub(super) fn file_name(&self) -> String {
+        format!("{:016x}.{ENTRY_EXTENSION}", fnv1a64(self.url.as_bytes()))
     }
 
     /// The `page` value, when present.

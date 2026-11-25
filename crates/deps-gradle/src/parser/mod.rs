@@ -184,7 +184,7 @@ fn resolve_variable_ref(
 /// the raw URI string — mirrors `deps_pypi::ecosystem::PypiManifestKind`'s `from_uri` pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GradleManifestKind {
-    /// `libs.versions.toml` version catalog.
+    /// A `*.versions.toml` version catalog (`libs`, or any custom name).
     Catalog,
     /// `settings.gradle`/`settings.gradle.kts`: plugin-management declarations, not the
     /// dependency-coordinate DSL `build.gradle(.kts)` uses.
@@ -200,7 +200,9 @@ pub(crate) enum GradleManifestKind {
 impl GradleManifestKind {
     pub(crate) fn from_uri(uri: &Url) -> Self {
         let path = uri.path();
-        if path.ends_with("libs.versions.toml") {
+        let basename = path.rsplit('/').next().unwrap_or_default();
+        if deps_core::ecosystem_registry::manifest_pattern_matches(basename, crate::CATALOG_PATTERN)
+        {
             Self::Catalog
         } else if path.ends_with("settings.gradle.kts") || path.ends_with("settings.gradle") {
             Self::Settings

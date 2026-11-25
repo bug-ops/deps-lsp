@@ -37,7 +37,7 @@ jobs:
           stale-issue-label: 'stale'
           days-before-issue-stale: 60
           days-before-issue-close: 7
-          exempt-issue-labels: 'pinned,security,good-first-issue,help-wanted,priority/critical,priority/high'
+          exempt-issue-labels: 'pinned,security,epic,P0,P1'
 
           # Stale PR configuration
           stale-pr-message: |
@@ -59,7 +59,7 @@ jobs:
           stale-pr-label: 'stale'
           days-before-pr-stale: 30
           days-before-pr-close: 14
-          exempt-pr-labels: 'work-in-progress,blocked,priority/critical,priority/high'
+          exempt-pr-labels: 'pinned,security,epic,P0,P1'
 
           # Draft PRs are automatically exempt
           exempt-draft-pr: true

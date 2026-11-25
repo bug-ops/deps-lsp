@@ -9,7 +9,7 @@
 //! Gradle build system support for deps-lsp.
 //!
 //! Provides parsing and version resolution for Gradle manifest formats:
-//! - `gradle/libs.versions.toml` (Version Catalog)
+//! - `gradle/*.versions.toml` (Version Catalog, `libs.versions.toml` and custom-named ones)
 //! - `build.gradle.kts` (Kotlin DSL)
 //! - `build.gradle` (Groovy DSL)
 //!
@@ -23,6 +23,13 @@ pub mod parser;
 pub mod range;
 pub mod types;
 pub mod version;
+
+/// Basename glob that identifies a Gradle version catalog (`libs.versions.toml`,
+/// `plugins.versions.toml`, ...).
+///
+/// The single source for routing (`manifest_patterns`) and classification
+/// (`GradleManifestKind`, lock lookup), so the two cannot diverge.
+pub(crate) const CATALOG_PATTERN: &str = "*.versions.toml";
 
 pub use ecosystem::GradleEcosystem;
 pub use formatter::GradleFormatter;

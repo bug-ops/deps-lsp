@@ -10,8 +10,8 @@
 //! Pruning bounds the store by age, file count and total size.
 
 use super::freshness::{DiskFreshness, ValidatedAt, classify};
+use super::key::StoreFileKind;
 use crate::net_policy::EnvSource;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -24,12 +24,6 @@ const STORE_COMPONENTS: [&str; 3] = ["deps-lsp", "http", "v1"];
 /// Permission bits that grant access to group or other users.
 #[cfg(unix)]
 const GROUP_OTHER_BITS: u32 = 0o077;
-
-/// Extension of finished entry files.
-const ENTRY_EXTENSION: &str = "entry";
-
-/// Extension of in-flight write files.
-const TMP_EXTENSION: &str = "tmp";
 
 /// Age after which an in-flight write file is considered abandoned.
 const STALE_TMP_AGE: Duration = Duration::from_hours(1);
@@ -163,13 +157,22 @@ impl CacheDir {
 
 /// The verified store directory `<root>/deps-lsp/http/v1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct StoreDir(PathBuf);
+pub(super) struct StoreDir {
+    path: PathBuf,
+    trust: EntryTrust,
+}
 
 impl StoreDir {
     /// The store directory path.
     #[must_use]
     pub(super) fn path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// The trust this store was opened with.
+    #[must_use]
+    pub(super) const fn trust(&self) -> EntryTrust {
+        self.trust
     }
 
     /// Prunes the store with [`PruneLimits::DEFAULT`].
@@ -179,7 +182,57 @@ impl StoreDir {
     /// [`DiskTierError::Io`] when a file cannot be listed or removed for a reason other than
     /// having vanished.
     pub(super) fn prune(&self, now: SystemTime) -> Result<PruneReport, DiskTierError> {
-        prune_dir(&self.0, now, PruneLimits::DEFAULT)
+        prune_dir(&self.path, self.trust, now, PruneLimits::DEFAULT)
+    }
+}
+
+/// The user whose files the disk tier trusts.
+///
+/// Opaque so that the unix owner id and the windows "trust the per-user ACL" model share one
+/// signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EntryTrust {
+    #[cfg(unix)]
+    uid: ProbeUid,
+}
+
+impl EntryTrust {
+    /// Trust for the user this process runs as.
+    ///
+    /// # Errors
+    ///
+    /// [`DiskTierError::ProbeFailed`] when the owner id cannot be probed (unix only).
+    pub(super) fn probe() -> Result<Self, DiskTierError> {
+        #[cfg(unix)]
+        {
+            Ok(Self::for_uid(ProbeUid::probe()?))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Whether the user this trust names owns the file `meta` describes.
+    ///
+    /// Always true off unix, where trust rests on the per-user profile ACL (NFR-004).
+    fn owns(self, meta: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            meta.uid() == self.uid.as_raw()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            true
+        }
+    }
+
+    /// Trust for an explicit owner id.
+    #[cfg(unix)]
+    #[must_use]
+    pub(super) const fn for_uid(uid: ProbeUid) -> Self {
+        Self { uid }
     }
 }
 
@@ -254,10 +307,10 @@ impl CacheDir {
     ///
     /// See [`CacheDir::open_with`]; additionally [`DiskTierError::ProbeFailed`].
     pub(super) fn open(&self, env: &impl EnvSource) -> Result<StoreDir, DiskTierError> {
-        self.open_with(env, ProbeUid::probe()?)
+        self.open_with(env, EntryTrust::probe()?)
     }
 
-    /// Opens the store directory for an already-probed user id.
+    /// Opens the store directory for an already-probed trust.
     ///
     /// An existing root must be a directory owned by `uid` (symlinks followed, mode not
     /// checked). A missing root is created with a single non-recursive `0700` `create_dir`,
@@ -273,8 +326,9 @@ impl CacheDir {
     pub(super) fn open_with(
         &self,
         env: &impl EnvSource,
-        uid: ProbeUid,
+        trust: EntryTrust,
     ) -> Result<StoreDir, DiskTierError> {
+        let uid = trust.uid;
         self.ensure_root(env, uid)?;
         let mut dir = self.0.clone();
         for component in STORE_COMPONENTS {
@@ -282,7 +336,7 @@ impl CacheDir {
             create_private_dir(&dir)?;
             verify_private_dir(&dir, uid)?;
         }
-        Ok(StoreDir(dir))
+        Ok(StoreDir { path: dir, trust })
     }
 
     fn ensure_root(&self, env: &impl EnvSource, uid: ProbeUid) -> Result<(), DiskTierError> {
@@ -319,36 +373,26 @@ fn create_private_dir(path: &Path) -> Result<(), DiskTierError> {
 
 #[cfg(unix)]
 fn verify_owned_dir(meta: &std::fs::Metadata, uid: ProbeUid) -> Result<(), DiskTierError> {
-    if meta.is_dir() && meta.uid() == uid.as_raw() {
-        Ok(())
-    } else {
-        Err(DiskTierError::InsecureDirectory)
-    }
+    (meta.is_dir() && meta.uid() == uid.as_raw()).ok_or(DiskTierError::InsecureDirectory)
 }
 
 #[cfg(unix)]
 fn verify_private_dir(path: &Path, uid: ProbeUid) -> Result<(), DiskTierError> {
     let meta = std::fs::symlink_metadata(path)?;
     verify_owned_dir(&meta, uid)?;
-    if meta.permissions().mode() & GROUP_OTHER_BITS == 0 {
-        Ok(())
-    } else {
-        Err(DiskTierError::InsecureDirectory)
-    }
+    (meta.permissions().mode() & GROUP_OTHER_BITS == 0).ok_or(DiskTierError::InsecureDirectory)
 }
 
-/// Whether an entry file may be read: a regular file (not a symlink) owned by `uid` that no
-/// group or other user can write.
+/// Whether an entry file may be read: a regular file (not a symlink) owned by `trust`'s user
+/// that no group or other user can write.
 ///
 /// `meta` must come from the very handle the entry is read through (the metadata returned by
 /// [`crate::fs_probe::read_capped_no_follow_with_metadata`]), not from a separate path `lstat`,
 /// which would leave a check-then-open race. An untrusted file is treated as a cache miss.
 #[cfg(unix)]
 #[must_use]
-pub(super) fn entry_file_trusted(meta: &std::fs::Metadata, uid: ProbeUid) -> bool {
-    meta.file_type().is_file()
-        && meta.uid() == uid.as_raw()
-        && meta.permissions().mode() & 0o022 == 0
+pub(super) fn entry_file_trusted(meta: &std::fs::Metadata, trust: EntryTrust) -> bool {
+    meta.file_type().is_file() && trust.owns(meta) && meta.permissions().mode() & 0o022 == 0
 }
 
 /// `FILE_ATTRIBUTE_REPARSE_POINT`, declared locally to avoid a `windows-sys` dependency.
@@ -379,7 +423,20 @@ impl CacheDir {
     /// - [`DiskTierError::InsecureDirectory`]: the root is not a directory, or a component is not
     ///   a directory or is a reparse point.
     /// - [`DiskTierError::Io`]: the root or a component could not be inspected.
-    pub(super) fn open(&self, _env: &impl EnvSource) -> Result<StoreDir, DiskTierError> {
+    pub(super) fn open(&self, env: &impl EnvSource) -> Result<StoreDir, DiskTierError> {
+        self.open_with(env, EntryTrust::probe()?)
+    }
+
+    /// Opens the store directory for an already-built trust; see [`CacheDir::open`].
+    ///
+    /// # Errors
+    ///
+    /// See [`CacheDir::open`].
+    pub(super) fn open_with(
+        &self,
+        _env: &impl EnvSource,
+        trust: EntryTrust,
+    ) -> Result<StoreDir, DiskTierError> {
         match std::fs::metadata(&self.0) {
             Ok(meta) if meta.is_dir() => {}
             Ok(_) => return Err(DiskTierError::InsecureDirectory),
@@ -398,7 +455,7 @@ impl CacheDir {
             }
             verify_plain_dir(&dir)?;
         }
-        Ok(StoreDir(dir))
+        Ok(StoreDir { path: dir, trust })
     }
 }
 
@@ -407,11 +464,8 @@ fn verify_plain_dir(path: &Path) -> Result<(), DiskTierError> {
     use std::os::windows::fs::MetadataExt;
 
     let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
-        Ok(())
-    } else {
-        Err(DiskTierError::InsecureDirectory)
-    }
+    (meta.file_type().is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
+        .ok_or(DiskTierError::InsecureDirectory)
 }
 
 /// Whether an entry file may be read: a regular file.
@@ -421,7 +475,7 @@ fn verify_plain_dir(path: &Path) -> Result<(), DiskTierError> {
 /// the entry is read through, as on Unix. An untrusted file is treated as a cache miss.
 #[cfg(windows)]
 #[must_use]
-pub(super) fn entry_file_trusted(meta: &std::fs::Metadata) -> bool {
+pub(super) fn entry_file_trusted(meta: &std::fs::Metadata, _trust: EntryTrust) -> bool {
     meta.file_type().is_file()
 }
 
@@ -450,7 +504,7 @@ impl PruneLimits {
 }
 
 /// Outcome of a prune pass.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(super) struct PruneReport {
     /// Directory entries examined.
     pub(super) scanned: usize,
@@ -478,7 +532,13 @@ struct EntryFile {
 
 /// Removes abandoned, expired and surplus files from `dir`.
 ///
-/// Order: `*.tmp` older than one hour, then entries that are expired (or stamped in the
+/// Acts only on files named like the store's own ([`StoreFileKind`]) and owned by `trust`'s user;
+/// anything else is ignored: never removed and never counted against the budgets. The remaining
+/// same-user redirect (a symlinked `http/v1` pointing at victim-owned files named in cache
+/// shape) is closed by the store-chain re-verification of spec 051 T009 (#700). Foreign files
+/// still count toward [`PruneReport::scanned`] and [`PruneLimits::max_scan`].
+///
+/// Order: temp files older than one hour, then entries that are expired (or stamped in the
 /// future), then least recently validated entries until the remainder fits
 /// [`PruneLimits::max_bytes`] and [`PruneLimits::max_files`]. Fresh `*.tmp` files belong to
 /// in-flight writers and are never touched. A missing directory or a file that vanished
@@ -491,51 +551,48 @@ struct EntryFile {
 /// [`DiskTierError::Io`] when the directory cannot be listed.
 pub(super) fn prune_dir(
     dir: &Path,
+    trust: EntryTrust,
     now: SystemTime,
     limits: PruneLimits,
 ) -> Result<PruneReport, DiskTierError> {
     let listing = match std::fs::read_dir(dir) {
         Ok(listing) => listing,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PruneReport {
-                scanned: 0,
-                removed: 0,
-                failed: 0,
-            });
+            return Ok(PruneReport::default());
         }
         Err(err) => return Err(err.into()),
     };
 
-    let mut report = PruneReport {
-        scanned: 0,
-        removed: 0,
-        failed: 0,
-    };
+    let mut report = PruneReport::default();
     let mut entries = Vec::new();
     for item in listing.take(limits.max_scan) {
         report.scanned += 1;
         let item = item?;
+        let Some(kind) = StoreFileKind::classify(&item.file_name()) else {
+            continue;
+        };
         let Ok(meta) = item.metadata() else { continue };
-        if !meta.is_file() {
+        if !meta.is_file() || !trust.owns(&meta) {
             continue;
         }
         let Ok(validated_at) = meta.modified() else {
             continue;
         };
         let path = item.path();
-        if has_extension(&path, TMP_EXTENSION) {
-            let stale = now
-                .duration_since(validated_at)
-                .is_ok_and(|age| age > STALE_TMP_AGE);
-            if stale {
-                report.remove(&path);
+        match kind {
+            StoreFileKind::Tmp => {
+                let stale = now
+                    .duration_since(validated_at)
+                    .is_ok_and(|age| age > STALE_TMP_AGE);
+                if stale {
+                    report.remove(&path);
+                }
             }
-        } else if has_extension(&path, ENTRY_EXTENSION) {
-            entries.push(EntryFile {
+            StoreFileKind::Entry => entries.push(EntryFile {
                 path,
                 len: meta.len(),
                 validated_at,
-            });
+            }),
         }
     }
 
@@ -559,8 +616,4 @@ pub(super) fn prune_dir(
     }
 
     Ok(report)
-}
-
-fn has_extension(path: &Path, extension: &str) -> bool {
-    path.extension() == Some(OsStr::new(extension))
 }

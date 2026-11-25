@@ -173,8 +173,7 @@ where
 {
     let suppression = versions
         .suppression
-        .map(|set| set.resolve(formatter))
-        .unwrap_or_default();
+        .map_or_default(|set| set.resolve(formatter));
     crate::edit::collect_update_edits(parse_result, content, versions, formatter)
         .into_iter()
         .filter(|planned| {

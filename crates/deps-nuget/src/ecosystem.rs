@@ -264,7 +264,7 @@ impl TypedEcosystem for NuGetEcosystem {
             // unguarded `to_file_path`.
             let config = deps_core::lockfile::resolve_manifest_file_path(uri)
                 .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-                .map(|dir| {
+                .map_or_default(|dir| {
                     crate::config::resolve_with_context(
                         &dir,
                         &self.context.config_cache,
@@ -272,8 +272,7 @@ impl TypedEcosystem for NuGetEcosystem {
                         self.context.user_profile_config.as_ref(),
                         &self.context.user_profile_sources,
                     )
-                })
-                .unwrap_or_default();
+                });
 
             for dep in &mut result.dependencies {
                 (dep.source, dep.feed_route) = config.resolve_for(&dep.name);

@@ -25,6 +25,7 @@
 //! fs_probe-touching test in one of those eight crates to catch a missing guard before it
 //! reaches CI's i686 cross-test leg (issue #806).
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -389,16 +390,39 @@ fn symlink_refused_error(path: &Path) -> std::io::Error {
     )
 }
 
-#[cfg(unix)]
-const NON_BLOCKING: i32 = libc::O_NONBLOCK;
-#[cfg(not(unix))]
-const NON_BLOCKING: i32 = 0;
+/// Whether opening a path may block (e.g. on a FIFO).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenBlocking {
+    Allow,
+    NonBlocking,
+}
+
+impl OpenBlocking {
+    #[cfg(unix)]
+    const fn flags(self) -> i32 {
+        match self {
+            Self::Allow => 0,
+            Self::NonBlocking => libc::O_NONBLOCK,
+        }
+    }
+}
+
+/// The temp file name `write_atomic` stages `file_name` under:
+/// `{file_name}.deps-cli-{pid}-{nanos}.tmp`.
+///
+/// Shared with the disk-cache prune classifier so writer and pruner cannot drift apart.
+pub(crate) fn atomic_temp_file_name(file_name: &OsStr, pid: u32, nanos: u128) -> String {
+    format!("{}.deps-cli-{pid}-{nanos}.tmp", file_name.to_string_lossy())
+}
+
+#[cfg(all(test, unix))]
+mod open_blocking_tests;
 
 fn open_regular_no_follow(
     path: &Path,
     options: std::fs::OpenOptions,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    let file = open_no_follow_with(path, options, NON_BLOCKING)?;
+    let file = open_no_follow_with(path, options, OpenBlocking::NonBlocking)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::new(
@@ -412,14 +436,14 @@ fn open_regular_no_follow(
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     let mut read_only = std::fs::OpenOptions::new();
     read_only.read(true);
-    open_no_follow_with(path, read_only, 0)
+    open_no_follow_with(path, read_only, OpenBlocking::Allow)
 }
 
 #[cfg(unix)]
 fn open_no_follow_with(
     path: &Path,
     mut options: std::fs::OpenOptions,
-    extra_flags: i32,
+    blocking: OpenBlocking,
 ) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -430,7 +454,7 @@ fn open_no_follow_with(
     // (by this point nothing has been read either way) and cannot reintroduce the race this
     // function exists to close.
     options
-        .custom_flags(libc::O_NOFOLLOW | extra_flags)
+        .custom_flags(libc::O_NOFOLLOW | blocking.flags())
         .open(path)
         .map_err(|error| {
             if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -445,7 +469,7 @@ fn open_no_follow_with(
 fn open_no_follow_with(
     path: &Path,
     mut options: std::fs::OpenOptions,
-    _extra_flags: i32,
+    _blocking: OpenBlocking,
 ) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -468,7 +492,7 @@ fn open_no_follow_with(
 fn open_no_follow_with(
     path: &Path,
     options: std::fs::OpenOptions,
-    _extra_flags: i32,
+    _blocking: OpenBlocking,
 ) -> std::io::Result<std::fs::File> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(symlink_refused_error(path));
@@ -541,11 +565,7 @@ fn write_atomic_impl(path: &Path, content: &[u8], options: AtomicWrite) -> std::
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or_default(|d| d.as_nanos());
-    let tmp_path = dir.join(format!(
-        "{}.deps-cli-{}-{nanos}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id(),
-    ));
+    let tmp_path = dir.join(atomic_temp_file_name(file_name, std::process::id(), nanos));
 
     let mut open_options = std::fs::OpenOptions::new();
     open_options.write(true).create_new(true);

@@ -1270,3 +1270,54 @@ mod tests {
         assert!(result.own_dependencies().is_empty());
     }
 }
+
+/// Generates a closed enum with `ALL`, an exhaustive to-string and an exact parser from one
+/// variant list, so the four can never drift apart.
+///
+/// The caller supplies every generated item's metadata and visibility. `all:` takes a literal
+/// `pub`-style visibility (a `vis` fragment cannot precede `;`); `to_str:` and `parse:` take a
+/// visibility followed by the method name. Matching on the generated enum stays exhaustive.
+macro_rules! closed_str_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $($(#[$vmeta:meta])* $variant:ident => $text:literal),+ $(,)?
+        }
+        $(#[$ameta:meta])*
+        all: $(pub $(($($ascope:tt)+))?)?;
+        $(#[$tmeta:meta])*
+        to_str: $tvis:vis $to_str:ident;
+        $(#[$pmeta:meta])*
+        parse: $pvis:vis $parse:ident;
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            $($(#[$vmeta])* $variant),+
+        }
+
+        impl $name {
+            $(#[$ameta])*
+            $(pub $(($($ascope)+))?)? const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            $(#[$tmeta])*
+            $tvis const fn $to_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text,)+
+                }
+            }
+
+            $(#[$pmeta])*
+            $pvis fn $parse(text: &str) -> Option<Self> {
+                match text {
+                    $($text => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use closed_str_enum;
+
+#[cfg(test)]
+mod closed_str_enum_tests;

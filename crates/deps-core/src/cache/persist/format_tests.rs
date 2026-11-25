@@ -4,14 +4,14 @@
 //! magic `DEPSLSPC`, `u16` little-endian version `1`, `u32` little-endian header
 //! length (at most 64 KiB), JSON header, body.
 
-use super::format::{
-    DecodeError, EncodeError, EntryFingerprint, PersistedEntry, entry_file_name, fnv1a64,
-};
-use crate::cache::MAX_CACHEABLE_ENTRY_BYTES;
+use super::format::{DecodeError, EncodeError, EntryFingerprint, PersistedEntry, StoredHeaders};
+use super::key::{PageRole, PersistKey};
+use crate::cache::auth::KeyAuth;
+use crate::cache::{CacheTier, MAX_CACHEABLE_ENTRY_BYTES};
+use crate::hash::fnv1a64;
 use proptest::prelude::*;
 use std::assert_matches;
 use std::io::{self, Read};
-use std::time::{Duration, SystemTime};
 
 const MAGIC: &[u8; 8] = b"DEPSLSPC";
 const VERSION: u16 = 1;
@@ -20,17 +20,36 @@ const MAX_HEADER_LEN: usize = 64 * 1024;
 const URL: &str = "https://api.github.com/repos/o/r/tags?page=2";
 const ACCEPT: &str = "application/json";
 
-fn now() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_hours(500_000)
+fn key_for(url: &str, accept: &str) -> PersistKey {
+    PersistKey::new(
+        url,
+        CacheTier::Baseline,
+        KeyAuth::ANONYMOUS,
+        accept,
+        Some(PageRole::ListingPage),
+    )
+    .expect("eligible key")
+}
+
+fn key() -> PersistKey {
+    key_for(URL, ACCEPT)
+}
+
+fn etag(etag: &str) -> StoredHeaders<'_> {
+    StoredHeaders {
+        etag: Some(etag),
+        ..StoredHeaders::default()
+    }
 }
 
 fn sample() -> PersistedEntry {
     PersistedEntry::new(
-        URL,
-        ACCEPT,
-        Some("\"abc\""),
-        Some("Tue, 01 Jan 2030 00:00:00 GMT"),
-        Some("<https://api.github.com/repos/o/r/tags?page=3>; rel=\"next\""),
+        &key(),
+        StoredHeaders {
+            etag: Some("\"abc\""),
+            last_modified: Some("Tue, 01 Jan 2030 00:00:00 GMT"),
+            link: Some("<https://api.github.com/repos/o/r/tags?page=3>; rel=\"next\""),
+        },
         br#"[{"name":"v1.0.0"}]"#.to_vec(),
     )
     .expect("sample header fits")
@@ -70,7 +89,7 @@ fn raw_with_header(header: &serde_json::Value, body: &[u8]) -> Vec<u8> {
 }
 
 fn decode(bytes: &[u8]) -> Result<PersistedEntry, DecodeError> {
-    PersistedEntry::decode(bytes, URL, ACCEPT, now())
+    PersistedEntry::decode(bytes, &key())
 }
 
 #[test]
@@ -81,7 +100,7 @@ fn encode_decode_round_trips_all_fields() {
 
 #[test]
 fn encode_decode_round_trips_absent_validators_and_empty_body() {
-    let entry = PersistedEntry::new(URL, ACCEPT, None, None, None, Vec::new()).expect("fits");
+    let entry = PersistedEntry::new(&key(), StoredHeaders::default(), Vec::new()).expect("fits");
     assert_eq!(decode(&entry.encode()).expect("round trip"), entry);
 }
 
@@ -215,9 +234,7 @@ fn decode_url_mismatch() {
     assert_matches!(
         PersistedEntry::decode(
             &bytes,
-            "https://api.github.com/repos/o/r/tags?page=3",
-            ACCEPT,
-            now()
+            &key_for("https://api.github.com/repos/o/r/tags?page=3", ACCEPT)
         ),
         Err(DecodeError::UrlMismatch)
     );
@@ -227,7 +244,7 @@ fn decode_url_mismatch() {
 fn decode_accept_mismatch() {
     let bytes = sample().encode();
     assert_matches!(
-        PersistedEntry::decode(&bytes, URL, "text/html", now()),
+        PersistedEntry::decode(&bytes, &key_for(URL, "text/html")),
         Err(DecodeError::AcceptMismatch)
     );
 }
@@ -266,29 +283,6 @@ fn decode_body_exactly_at_cap_is_accepted() {
     assert_eq!(decode(&bytes).expect("at cap").body().len(), body.len());
 }
 
-#[test]
-fn fnv1a64_matches_reference_vectors() {
-    assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-    assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-    assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
-}
-
-#[test]
-fn entry_file_name_is_fnv1a64_of_url_as_16_lowercase_hex_digits() {
-    assert_eq!(entry_file_name(""), "cbf29ce484222325.entry");
-    assert_eq!(entry_file_name("a"), "af63dc4c8601ec8c.entry");
-    let name = entry_file_name(URL);
-    assert_eq!(name, format!("{:016x}.entry", fnv1a64(URL.as_bytes())));
-}
-
-#[test]
-fn entry_file_name_differs_for_different_urls() {
-    assert_ne!(
-        entry_file_name("https://pypi.org/simple/a/"),
-        entry_file_name("https://pypi.org/simple/b/")
-    );
-}
-
 struct CountingReader<'a> {
     data: &'a [u8],
     served: usize,
@@ -316,15 +310,7 @@ fn fingerprint_from_reader_matches_the_entry_fingerprint() {
 
 #[test]
 fn fingerprint_from_reader_does_not_read_the_body() {
-    let entry = PersistedEntry::new(
-        URL,
-        ACCEPT,
-        Some("\"e\""),
-        None,
-        None,
-        vec![1u8; 512 * 1024],
-    )
-    .expect("fits");
+    let entry = PersistedEntry::new(&key(), etag("\"e\""), vec![1u8; 512 * 1024]).expect("fits");
     let bytes = entry.encode();
     let mut reader = CountingReader {
         data: &bytes,
@@ -341,19 +327,15 @@ fn fingerprint_from_reader_does_not_read_the_body() {
 
 #[test]
 fn fingerprint_differs_when_body_differs() {
-    let a =
-        PersistedEntry::new(URL, ACCEPT, Some("\"e\""), None, None, b"one".to_vec()).expect("fits");
-    let b =
-        PersistedEntry::new(URL, ACCEPT, Some("\"e\""), None, None, b"two".to_vec()).expect("fits");
+    let a = PersistedEntry::new(&key(), etag("\"e\""), b"one".to_vec()).expect("fits");
+    let b = PersistedEntry::new(&key(), etag("\"e\""), b"two".to_vec()).expect("fits");
     assert_ne!(a.fingerprint(), b.fingerprint());
 }
 
 #[test]
 fn fingerprint_differs_when_validator_differs() {
-    let a =
-        PersistedEntry::new(URL, ACCEPT, Some("\"e1\""), None, None, b"x".to_vec()).expect("fits");
-    let b =
-        PersistedEntry::new(URL, ACCEPT, Some("\"e2\""), None, None, b"x".to_vec()).expect("fits");
+    let a = PersistedEntry::new(&key(), etag("\"e1\""), b"x".to_vec()).expect("fits");
+    let b = PersistedEntry::new(&key(), etag("\"e2\""), b"x".to_vec()).expect("fits");
     assert_ne!(a.fingerprint(), b.fingerprint());
 }
 
@@ -421,9 +403,9 @@ proptest! {
 
 #[test]
 fn new_refuses_a_header_over_the_cap() {
-    let url = "u".repeat(MAX_HEADER_LEN);
+    let huge = "u".repeat(MAX_HEADER_LEN);
     assert_matches!(
-        PersistedEntry::new(&url, ACCEPT, None, None, None, Vec::new()),
+        PersistedEntry::new(&key(), etag(&huge), Vec::new()),
         Err(EncodeError::HeaderTooLarge)
     );
 }
@@ -432,11 +414,8 @@ fn new_refuses_a_header_over_the_cap() {
 fn new_refuses_a_body_over_the_cacheable_cap() {
     assert_matches!(
         PersistedEntry::new(
-            URL,
-            ACCEPT,
-            None,
-            None,
-            None,
+            &key(),
+            StoredHeaders::default(),
             vec![0u8; MAX_CACHEABLE_ENTRY_BYTES + 1]
         ),
         Err(EncodeError::Oversized)

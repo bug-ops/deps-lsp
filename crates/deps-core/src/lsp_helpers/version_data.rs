@@ -939,8 +939,7 @@ impl<'a> VersionData<'a> {
         key: &PackageKey,
     ) -> PackageSuppression {
         self.suppression
-            .map(|set| set.resolve(formatter))
-            .unwrap_or_default()
+            .map_or_default(|set| set.resolve(formatter))
             .for_package(key.normalized())
     }
 

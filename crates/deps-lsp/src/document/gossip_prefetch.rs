@@ -106,16 +106,14 @@ pub(crate) async fn run_gossip_prefetch(
             // it skips those already-claimed names and merges nothing, and the original
             // prefetch then finishes only to drop its own (otherwise-good) result here.
             let formatter = ecosystem.formatter();
-            let current_names: std::collections::HashSet<NormalizedName> = doc
-                .parse_result()
-                .map(|parse_result| {
+            let current_names: std::collections::HashSet<NormalizedName> =
+                doc.parse_result().map_or_default(|parse_result| {
                     parse_result
                         .dependencies()
                         .into_iter()
                         .map(|dep| formatter.normalize_package_name(dep.name()))
                         .collect()
-                })
-                .unwrap_or_default();
+                });
             let filtered: HashMap<NormalizedName, GossipFindings> = findings
                 .into_iter()
                 .filter(|(name, _)| current_names.contains(name))

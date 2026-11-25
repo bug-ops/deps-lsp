@@ -158,15 +158,13 @@ fn bind_diagnostics(actions: &mut [CodeAction], diagnostics: &[Diagnostic]) {
                 .get("diagnostic_range")
                 .and_then(|v| serde_json::from_value::<Range>(v.clone()).ok());
 
-            let overlapping: Vec<Diagnostic> = diagnostic_range
-                .map(|range| {
-                    candidates
-                        .iter()
-                        .filter(|d| ranges_overlap(&d.range, &range))
-                        .map(|d| (**d).clone())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let overlapping: Vec<Diagnostic> = diagnostic_range.map_or_default(|range| {
+                candidates
+                    .iter()
+                    .filter(|d| ranges_overlap(&d.range, &range))
+                    .map(|d| (**d).clone())
+                    .collect()
+            });
 
             if overlapping.is_empty() {
                 candidates.into_iter().cloned().collect()

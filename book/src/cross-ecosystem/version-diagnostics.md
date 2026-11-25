@@ -225,7 +225,7 @@ verifies the manifest span it is about to edit actually *is* that version litera
 ecosystems point the tracked span at something else instead:
 
 - **`pom.xml`** dependencies versioned through a `<properties>` placeholder (`<version>${my.version}</version>`) are skipped — the span covers the placeholder, not a literal.
-- **Gradle** dependencies versioned through a DSL variable (`"...:$myVersion"`, resolved from `gradle.properties`) or a `libs.versions.toml` version-catalog alias (`version.ref = "spring"`) are skipped for the same reason.
+- **Gradle** dependencies versioned through a DSL variable (`"...:$myVersion"`, resolved from `gradle.properties`) or a `*.versions.toml` version-catalog alias (`version.ref = "spring"`) are skipped for the same reason.
 - **`Package.swift`** dependencies declared with a two-literal range (`"1.0.0"..<"2.0.0"` or `"1.0.0"..."1.9.9"`) are skipped — the tracked span covers only the range's lower-bound literal, and rewriting that literal alone would invert the range (SwiftPM traps on `lowerBound > upperBound`, corrupting the whole manifest) rather than leave a merely-stale-but-valid declaration.
 
 For these, no lens appears even when the dependency is genuinely outdated — this is the

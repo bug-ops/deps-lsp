@@ -3,20 +3,19 @@
 //! Layout: magic `DEPSLSPC`, `u16` little-endian version, `u32`
 //! little-endian header length (at most 64 KiB), a JSON [`Header`], then the
 //! body. The header carries the key (URL and `Accept`), the validators, the
-//! body length and an FNV-1a 64 checksum, so a file is self-describing and a
-//! damaged or foreign one is rejected instead of trusted. Decoding is total:
+//! body length and an FNV-1a 64 checksum ([`crate::hash::fnv1a64`]), so a file is
+//! self-describing and a damaged or foreign one is rejected instead of trusted. Decoding is total:
 //! every malformed input maps to a [`DecodeError`], never a panic.
 
+use super::key::PersistKey;
 use crate::cache::MAX_CACHEABLE_ENTRY_BYTES;
+use crate::hash::fnv1a64;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
-use std::time::SystemTime;
 
 const MAGIC: &[u8; 8] = b"DEPSLSPC";
 const FORMAT_VERSION: u16 = 1;
 const MAX_HEADER_LEN: usize = 64 * 1024;
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Why a persisted entry was rejected.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +75,14 @@ struct Header {
     body_fnv1a64: u64,
 }
 
+/// The validator and pagination headers stored alongside a body.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct StoredHeaders<'a> {
+    pub(super) etag: Option<&'a str>,
+    pub(super) last_modified: Option<&'a str>,
+    pub(super) link: Option<&'a str>,
+}
+
 /// A cache entry in its persisted form: key, validators and body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PersistedEntry {
@@ -92,11 +99,8 @@ impl PersistedEntry {
     /// [`EncodeError::HeaderTooLarge`] when the serialized header would exceed the 64 KiB cap,
     /// so every entry that exists can be decoded again.
     pub(super) fn new(
-        url: &str,
-        accept: &str,
-        etag: Option<&str>,
-        last_modified: Option<&str>,
-        link: Option<&str>,
+        key: &PersistKey,
+        headers: StoredHeaders<'_>,
         body: Vec<u8>,
     ) -> Result<Self, EncodeError> {
         if body.len() > MAX_CACHEABLE_ENTRY_BYTES {
@@ -104,11 +108,11 @@ impl PersistedEntry {
         }
         let body_len = u64::try_from(body.len()).map_err(|_| EncodeError::Oversized)?;
         let header = Header {
-            url: url.to_owned(),
-            accept: accept.to_owned(),
-            etag: etag.map(str::to_owned),
-            last_modified: last_modified.map(str::to_owned),
-            link: link.map(str::to_owned),
+            url: key.url().to_owned(),
+            accept: key.accept().to_owned(),
+            etag: headers.etag.map(str::to_owned),
+            last_modified: headers.last_modified.map(str::to_owned),
+            link: headers.link.map(str::to_owned),
             body_len,
             body_fnv1a64: fnv1a64(&body),
         };
@@ -140,8 +144,7 @@ impl PersistedEntry {
 
     /// Parses and fully validates a persisted entry.
     ///
-    /// `_now` is accepted so freshness checks can be added without changing
-    /// callers; age is classified separately from the file time.
+    /// Age is classified separately from the file time.
     ///
     /// # Errors
     ///
@@ -149,18 +152,13 @@ impl PersistedEntry {
     /// or malformed header, a URL or `Accept` that differs from the expected
     /// ones, a declared body over the cacheable cap (never truncated), a
     /// short file, or a checksum mismatch.
-    pub(super) fn decode(
-        bytes: &[u8],
-        expected_url: &str,
-        expected_accept: &str,
-        _now: SystemTime,
-    ) -> Result<Self, DecodeError> {
+    pub(super) fn decode(bytes: &[u8], key: &PersistKey) -> Result<Self, DecodeError> {
         let mut reader = bytes;
         let header = read_header(&mut reader)?;
-        if header.url != expected_url {
+        if header.url != key.url() {
             return Err(DecodeError::UrlMismatch);
         }
-        if header.accept != expected_accept {
+        if header.accept != key.accept() {
             return Err(DecodeError::AcceptMismatch);
         }
         let body_len = usize::try_from(header.body_len)
@@ -260,8 +258,9 @@ fn read_header<R: Read>(reader: &mut R) -> Result<Header, DecodeError> {
     if version != FORMAT_VERSION.to_le_bytes() {
         return Err(DecodeError::ForeignVersion);
     }
-    let header_len = <[u8; 4]>::try_from(header_len)
-        .ok()
+    let header_len = header_len
+        .as_array()
+        .copied()
         .map(u32::from_le_bytes)
         .and_then(|len| usize::try_from(len).ok())
         .filter(|len| *len <= MAX_HEADER_LEN)
@@ -269,21 +268,4 @@ fn read_header<R: Read>(reader: &mut R) -> Result<Header, DecodeError> {
     let mut header = vec![0u8; header_len];
     reader.read_exact(&mut header).map_err(io_error)?;
     serde_json::from_slice(&header).map_err(DecodeError::Header)
-}
-
-/// FNV-1a 64-bit hash.
-///
-/// Detects accidental corruption and derives file names; it is not
-/// collision-resistant against an adversary.
-#[must_use]
-pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-    })
-}
-
-/// The file name an entry for `url` is stored under: `{fnv1a64(url):016x}.entry`.
-#[must_use]
-pub(super) fn entry_file_name(url: &str) -> String {
-    format!("{:016x}.entry", fnv1a64(url.as_bytes()))
 }

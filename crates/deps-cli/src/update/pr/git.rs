@@ -13,12 +13,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::PrError;
-use crate::update::regen::{ChildGuard, ProcessGroup};
+use crate::update::regen::{Capped, ChildGuard, ProcessGroup, read_capped};
 
 /// Time limit of one step, including the hooks it triggers.
 pub(super) const STEP_TIMEOUT: Duration = Duration::from_mins(2);
@@ -225,20 +224,23 @@ impl Runner {
 
         let cap = step.stdout_cap();
         let finished = timeout(STEP_TIMEOUT, async {
-            let mut kept = Vec::new();
-            (&mut stdout).take(cap).read_to_end(&mut kept).await?;
+            let (kept, truncated) = match read_capped(&mut stdout, cap).await? {
+                Capped::Complete(kept) => (kept, false),
+                Capped::OverCap(kept) => (kept, true),
+            };
             // Keep draining so a chatty child never blocks on a full pipe.
             tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await?;
             let status = child.wait().await?;
-            Ok::<_, std::io::Error>((kept, status))
+            Ok::<_, std::io::Error>((kept, truncated, status))
         })
         .await
         .map_err(|_| PrError::TimedOut { tool, step })?;
-        let (kept, status) = finished.map_err(|source| PrError::Spawn { tool, source })?;
+        let (kept, truncated, status) =
+            finished.map_err(|source| PrError::Spawn { tool, source })?;
         Ok(StepOutput {
             code: status.code(),
             stdout: String::from_utf8_lossy(&kept).trim().to_owned(),
-            truncated: kept.len() as u64 >= cap,
+            truncated,
             raw: kept,
         })
     }

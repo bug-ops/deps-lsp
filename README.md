@@ -64,7 +64,7 @@ extensions to install and keep in sync.
 | Ruby | Bundler | `Gemfile` |
 | Dart | Pub | `pubspec.yaml` |
 | Java | Maven | `pom.xml` |
-| Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` |
+| Java | Gradle | `*.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` |
 | Swift | SPM | `Package.swift` |
 | PHP | Composer | `composer.json` |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` |

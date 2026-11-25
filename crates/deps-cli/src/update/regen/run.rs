@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(all(test, unix))]
 use std::ffi::OsString;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, timeout_at};
 
@@ -21,6 +21,38 @@ use super::command::{Invocation, Program};
 
 /// Largest probe stdout accepted; anything longer is not a path or a one-word answer.
 const PROBE_OUTPUT_CAP: u64 = 4096;
+
+/// Result of a bounded read: output of exactly the cap is complete, one byte more is over it.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::update) enum Capped {
+    /// The reader ended within the cap.
+    Complete(Vec<u8>),
+    /// The reader held more than the cap; carries the first `cap` bytes.
+    OverCap(Vec<u8>),
+}
+
+/// Reads `reader` up to `cap` bytes and reports whether more followed.
+///
+/// # Errors
+///
+/// Returns the reader's I/O error.
+pub(in crate::update) async fn read_capped<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    cap: u64,
+) -> std::io::Result<Capped> {
+    let mut buffer = Vec::new();
+    // One byte past the cap tells an over-long answer from one that exactly fits.
+    reader
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut buffer)
+        .await?;
+    if buffer.len() as u64 > cap {
+        buffer.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+        Ok(Capped::OverCap(buffer))
+    } else {
+        Ok(Capped::Complete(buffer))
+    }
+}
 
 /// How long a tool gets to exit after SIGTERM before it is killed with SIGKILL.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -384,19 +416,13 @@ impl ToolRunner {
             .take()
             .ok_or(RegenerationError::UnexpectedProbeOutput { program })?;
 
-        let mut buffer = Vec::new();
-        // One byte past the cap tells an over-long answer from one that exactly fits.
-        timeout_at(
-            deadline,
-            (&mut stdout).take(cap + 1).read_to_end(&mut buffer),
-        )
-        .await
-        .map_err(|_| self.timed_out())?
-        .map_err(|source| spawn_error(program, source))?;
-        if buffer.len() as u64 > cap {
+        let capped = timeout_at(deadline, read_capped(&mut stdout, cap))
+            .await
+            .map_err(|_| self.timed_out())?
+            .map_err(|source| spawn_error(program, source))?;
+        let Capped::Complete(buffer) = capped else {
             return Ok(Probed::OverCap);
-        }
-
+        };
         let status = timeout_at(deadline, child.wait())
             .await
             .map_err(|_| self.timed_out())?
@@ -431,12 +457,10 @@ fn spawn_error(program: Program, source: std::io::Error) -> RegenerationError {
 }
 
 fn check_status(program: Program, status: ExitStatus) -> Result<(), RegenerationError> {
-    if status.success() {
-        Ok(())
-    } else {
-        Err(RegenerationError::ToolFailed {
+    status
+        .success()
+        .ok_or_else(|| RegenerationError::ToolFailed {
             program,
             code: status.code(),
         })
-    }
 }

@@ -521,8 +521,7 @@ mod tests {
         let value: serde_json::Value = crate::parser::parse_json_checked(data)?;
         Ok(value
             .as_array()
-            .map(|arr| (0..arr.len() as u32).collect())
-            .unwrap_or_default())
+            .map_or_default(|arr| (0..arr.len() as u32).collect()))
     }
 
     #[tokio::test]

@@ -189,6 +189,10 @@ impl EcosystemBase for GradleEcosystem {
         ]
     }
 
+    fn manifest_patterns(&self) -> &[&'static str] {
+        &[crate::CATALOG_PATTERN]
+    }
+
     fn lockfile_filenames(&self) -> &[&'static str] {
         &["*.lockfile"]
     }
@@ -1108,6 +1112,23 @@ dependencies {
             assert_eq!(t, GradleCompletionContext::None);
             assert_eq!(v, "");
             assert_eq!(range, Range::default());
+        }
+
+        /// #2151: a catalog under a custom name is a catalog for completion too, not `Other`.
+        #[test]
+        fn test_detect_completion_context_custom_named_catalog_is_version_context() {
+            let content = r#"version = "1.0.0""#;
+            let uri = deps_core::test_util::test_uri("/project/gradle/plugins.versions.toml");
+            let position = Position::new(0, 11);
+
+            let (t, v, range, _scope) =
+                GradleEcosystem::detect_completion_context(content, position, &uri);
+            assert_eq!(t, GradleCompletionContext::Version);
+            assert_eq!(v, "");
+            assert_eq!(
+                range,
+                Range::new(Position::new(0, 11), Position::new(0, 16))
+            );
         }
 
         // #1447: a compact coordinate wrapped in real parens must still resolve, not just the

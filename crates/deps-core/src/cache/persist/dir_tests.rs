@@ -4,12 +4,16 @@
 //! Limits are restated as literals so the tests also pin the constants: 64 MiB, 2048 files,
 //! scan cap 16384 entries, stale `*.tmp` after 1 hour, entries expire at 7 days.
 
-use super::dir::{CacheDir, CachePlatform, NoCacheDir, PruneLimits, prune_dir};
+use super::dir::{CacheDir, CachePlatform, EntryTrust, NoCacheDir, PruneLimits, prune_dir};
 use crate::net_policy::MapEnv;
 use std::assert_matches;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+fn trust() -> EntryTrust {
+    EntryTrust::probe().expect("probe")
+}
 
 fn abs(name: &str) -> PathBuf {
     std::env::temp_dir().join("deps-lsp-dir-tests").join(name)
@@ -163,7 +167,7 @@ mod user_default_table {
 
 #[cfg(unix)]
 mod unix_open {
-    use super::super::dir::{DiskTierError, ProbeUid, entry_file_trusted};
+    use super::super::dir::{DiskTierError, EntryTrust, ProbeUid, entry_file_trusted};
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
@@ -238,7 +242,10 @@ mod unix_open {
     #[test]
     fn open_missing_root_with_owned_home_creates_0700_chain() {
         let fx = Fixture::new();
-        let store = fx.cache_dir().open_with(&fx.env, fx.uid()).expect("open");
+        let store = fx
+            .cache_dir()
+            .open_with(&fx.env, EntryTrust::for_uid(fx.uid()))
+            .expect("open");
 
         let root = fx.root();
         assert_eq!(store.path(), root.join("deps-lsp/http/v1"));
@@ -254,8 +261,13 @@ mod unix_open {
     #[test]
     fn open_twice_ignores_already_exists() {
         let fx = Fixture::new();
-        fx.cache_dir().open_with(&fx.env, fx.uid()).expect("first");
-        let store = fx.cache_dir().open_with(&fx.env, fx.uid()).expect("second");
+        fx.cache_dir()
+            .open_with(&fx.env, EntryTrust::for_uid(fx.uid()))
+            .expect("first");
+        let store = fx
+            .cache_dir()
+            .open_with(&fx.env, EntryTrust::for_uid(fx.uid()))
+            .expect("second");
         assert_eq!(store.path(), fx.root().join("deps-lsp/http/v1"));
     }
 
@@ -264,7 +276,9 @@ mod unix_open {
         let fx = Fixture::new();
         fs::create_dir(fx.root()).expect("root");
         set_mode(&fx.root(), 0o775);
-        fx.cache_dir().open_with(&fx.env, fx.uid()).expect("open");
+        fx.cache_dir()
+            .open_with(&fx.env, EntryTrust::for_uid(fx.uid()))
+            .expect("open");
         assert_eq!(mode_of(&fx.root()), 0o775);
         assert_eq!(mode_of(&fx.root().join("deps-lsp")), 0o700);
     }
@@ -275,7 +289,9 @@ mod unix_open {
         let target = fx.home.join("real-cache");
         fs::create_dir(&target).expect("target");
         symlink(&target, fx.root()).expect("symlink");
-        fx.cache_dir().open_with(&fx.env, fx.uid()).expect("open");
+        fx.cache_dir()
+            .open_with(&fx.env, EntryTrust::for_uid(fx.uid()))
+            .expect("open");
         assert!(target.join("deps-lsp/http/v1").is_dir());
     }
 
@@ -284,7 +300,8 @@ mod unix_open {
         let fx = Fixture::new();
         fs::write(fx.root(), b"x").expect("file");
         assert_matches!(
-            fx.cache_dir().open_with(&fx.env, fx.uid()),
+            fx.cache_dir()
+                .open_with(&fx.env, EntryTrust::for_uid(fx.uid())),
             Err(DiskTierError::InsecureDirectory)
         );
     }
@@ -300,7 +317,7 @@ mod unix_open {
         for root in [&sibling_root, &nested_root] {
             let (dir, env) = fx.with_root(root);
             assert_matches!(
-                dir.open_with(&env, fx.uid()),
+                dir.open_with(&env, EntryTrust::for_uid(fx.uid())),
                 Err(DiskTierError::CreateFailed(_))
             );
             assert!(!root.exists(), "{}", root.display());
@@ -316,7 +333,7 @@ mod unix_open {
         let env = env_var(MapEnv::new(), "XDG_CACHE_HOME", &root);
         let dir = CacheDir::resolve(&env, CachePlatform::Unix).expect("resolvable");
         assert_matches!(
-            dir.open_with(&env, fx.uid()),
+            dir.open_with(&env, EntryTrust::for_uid(fx.uid())),
             Err(DiskTierError::CreateFailed(_))
         );
         assert!(!root.exists());
@@ -326,7 +343,8 @@ mod unix_open {
     fn open_missing_root_with_foreign_owned_home_creates_nothing() {
         let fx = Fixture::new();
         assert_matches!(
-            fx.cache_dir().open_with(&fx.env, foreign_uid(&fx.home)),
+            fx.cache_dir()
+                .open_with(&fx.env, EntryTrust::for_uid(foreign_uid(&fx.home))),
             Err(DiskTierError::InsecureDirectory)
         );
         assert!(!fx.root().exists());
@@ -337,7 +355,8 @@ mod unix_open {
         let fx = Fixture::new();
         fs::create_dir(fx.root()).expect("root");
         assert_matches!(
-            fx.cache_dir().open_with(&fx.env, foreign_uid(&fx.home)),
+            fx.cache_dir()
+                .open_with(&fx.env, EntryTrust::for_uid(foreign_uid(&fx.home))),
             Err(DiskTierError::InsecureDirectory)
         );
         assert_eq!(fs::read_dir(fx.root()).expect("read_dir").count(), 0);
@@ -352,7 +371,9 @@ mod unix_open {
         }
         fs::create_dir(fx.root()).expect("root");
         set_mode(&fx.root(), 0o500);
-        let result = fx.cache_dir().open_with(&fx.env, fx.uid());
+        let result = fx
+            .cache_dir()
+            .open_with(&fx.env, EntryTrust::for_uid(fx.uid()));
         let created = fs::read_dir(fx.root()).expect("read_dir").count();
         set_mode(&fx.root(), 0o700);
         assert_matches!(result, Err(DiskTierError::CreateFailed(_)));
@@ -373,7 +394,8 @@ mod unix_open {
                 }
                 set_mode(&dir, mode);
                 assert_matches!(
-                    fx.cache_dir().open_with(&fx.env, fx.uid()),
+                    fx.cache_dir()
+                        .open_with(&fx.env, EntryTrust::for_uid(fx.uid())),
                     Err(DiskTierError::InsecureDirectory),
                     "component {depth} mode {mode:o}"
                 );
@@ -397,7 +419,8 @@ mod unix_open {
             }
             symlink(&real, dir.join(COMPONENTS[depth])).expect("symlink");
             assert_matches!(
-                fx.cache_dir().open_with(&fx.env, fx.uid()),
+                fx.cache_dir()
+                    .open_with(&fx.env, EntryTrust::for_uid(fx.uid())),
                 Err(DiskTierError::InsecureDirectory),
                 "component {depth}"
             );
@@ -438,12 +461,12 @@ mod unix_open {
     #[test]
     fn entry_file_trusted_table() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let uid = own_uid(tmp.path());
-        let trusted = |mode: u32, probe: ProbeUid| {
+        let uid = EntryTrust::for_uid(own_uid(tmp.path()));
+        let trusted = |mode: u32, trust: EntryTrust| {
             let path = tmp.path().join(format!("f-{mode:o}"));
             fs::write(&path, b"x").expect("file");
             set_mode(&path, mode);
-            entry_file_trusted(&fs::symlink_metadata(&path).expect("metadata"), probe)
+            entry_file_trusted(&fs::symlink_metadata(&path).expect("metadata"), trust)
         };
 
         assert!(trusted(0o600, uid));
@@ -451,13 +474,16 @@ mod unix_open {
         assert!(!trusted(0o620, uid), "group write");
         assert!(!trusted(0o602, uid), "other write");
         assert!(!trusted(0o660, uid));
-        assert!(!trusted(0o600, foreign_uid(tmp.path())), "foreign owner");
+        assert!(
+            !trusted(0o600, EntryTrust::for_uid(foreign_uid(tmp.path()))),
+            "foreign owner"
+        );
     }
 
     #[test]
     fn entry_file_trusted_rejects_directory_and_symlink() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let uid = own_uid(tmp.path());
+        let uid = EntryTrust::for_uid(own_uid(tmp.path()));
         let file = tmp.path().join("real");
         fs::write(&file, b"x").expect("file");
         set_mode(&file, 0o600);
@@ -473,7 +499,7 @@ mod unix_open {
 
 #[cfg(windows)]
 mod windows_open {
-    use super::super::dir::{DiskTierError, entry_file_trusted};
+    use super::super::dir::{DiskTierError, EntryTrust, entry_file_trusted};
     use super::*;
     use std::os::windows::fs::symlink_dir;
 
@@ -582,9 +608,14 @@ mod windows_open {
         let tmp = tempfile::tempdir().expect("tempdir");
         let file = tmp.path().join("f");
         fs::write(&file, b"x").expect("file");
-        assert!(entry_file_trusted(&fs::metadata(&file).expect("metadata")));
+        let trust = EntryTrust::probe().expect("probe");
+        assert!(entry_file_trusted(
+            &fs::metadata(&file).expect("metadata"),
+            trust
+        ));
         assert!(!entry_file_trusted(
-            &fs::metadata(tmp.path()).expect("metadata")
+            &fs::metadata(tmp.path()).expect("metadata"),
+            trust
         ));
     }
 }
@@ -639,7 +670,7 @@ mod prune {
         }
 
         fn prune(&self, limits: PruneLimits) -> super::super::dir::PruneReport {
-            prune_dir(self.tmp.path(), self.now, limits).expect("prune")
+            prune_dir(self.tmp.path(), trust(), self.now, limits).expect("prune")
         }
     }
 
@@ -661,92 +692,108 @@ mod prune {
     #[test]
     fn prune_dir_removes_tmp_older_than_one_hour_only() {
         let s = Store::new();
-        s.put("old.tmp", 1, NOW_SKEW + Duration::from_mins(1));
-        s.put("fresh.tmp", 1, Duration::from_mins(10));
-        s.put("a.entry", 1, Duration::from_mins(1));
+        s.put(
+            "00000000000000a0.entry.deps-cli-1-1.tmp",
+            1,
+            NOW_SKEW + Duration::from_mins(1),
+        );
+        s.put(
+            "00000000000000a1.entry.deps-cli-1-1.tmp",
+            1,
+            Duration::from_mins(10),
+        );
+        s.put("00000000000000a2.entry", 1, Duration::from_mins(1));
         s.prune(roomy());
-        assert!(!s.exists("old.tmp"));
-        assert!(s.exists("fresh.tmp"));
-        assert!(s.exists("a.entry"));
+        assert!(!s.exists("00000000000000a0.entry.deps-cli-1-1.tmp"));
+        assert!(s.exists("00000000000000a1.entry.deps-cli-1-1.tmp"));
+        assert!(s.exists("00000000000000a2.entry"));
     }
 
     #[test]
     fn prune_dir_removes_expired_entries_under_the_caps() {
         let s = Store::new();
-        s.put("expired.entry", 1, Duration::from_hours(24 * 8));
-        s.put("stale.entry", 1, Duration::from_hours(24 * 6));
-        s.put("fresh.entry", 1, Duration::from_mins(1));
+        s.put("00000000000000a3.entry", 1, Duration::from_hours(24 * 8));
+        s.put("00000000000000a4.entry", 1, Duration::from_hours(24 * 6));
+        s.put("00000000000000a5.entry", 1, Duration::from_mins(1));
         s.prune(roomy());
-        assert!(!s.exists("expired.entry"));
-        assert!(s.exists("stale.entry"));
-        assert!(s.exists("fresh.entry"));
+        assert!(!s.exists("00000000000000a3.entry"));
+        assert!(s.exists("00000000000000a4.entry"));
+        assert!(s.exists("00000000000000a5.entry"));
     }
 
     #[test]
     fn prune_dir_enforces_file_cap_least_recently_validated_first() {
         let s = Store::new();
         for (n, age) in [1, 2, 3, 4].into_iter().enumerate() {
-            s.put(&format!("{n}.entry"), 1, Duration::from_mins(age));
+            s.put(&format!("{n:016x}.entry"), 1, Duration::from_mins(age));
         }
         let limits = PruneLimits {
             max_files: 2,
             ..roomy()
         };
         s.prune(limits);
-        assert!(s.exists("0.entry") && s.exists("1.entry"));
-        assert!(!s.exists("2.entry") && !s.exists("3.entry"));
+        assert!(s.exists(&format!("{:016x}.entry", 0)) && s.exists(&format!("{:016x}.entry", 1)));
+        assert!(!s.exists(&format!("{:016x}.entry", 2)) && !s.exists(&format!("{:016x}.entry", 3)));
     }
 
     #[test]
     fn prune_dir_enforces_byte_cap_removing_only_as_many_as_needed() {
         let s = Store::new();
-        s.put("newest.entry", 10, Duration::from_mins(1));
-        s.put("middle.entry", 10, Duration::from_mins(2));
-        s.put("oldest.entry", 10, Duration::from_mins(3));
+        s.put("00000000000000aa.entry", 10, Duration::from_mins(1));
+        s.put("00000000000000ab.entry", 10, Duration::from_mins(2));
+        s.put("00000000000000ac.entry", 10, Duration::from_mins(3));
         let limits = PruneLimits {
             max_bytes: 25,
             ..roomy()
         };
         s.prune(limits);
-        assert!(s.exists("newest.entry") && s.exists("middle.entry"));
-        assert!(!s.exists("oldest.entry"));
+        assert!(s.exists("00000000000000aa.entry") && s.exists("00000000000000ab.entry"));
+        assert!(!s.exists("00000000000000ac.entry"));
     }
 
     #[test]
     fn prune_dir_expired_removal_counts_toward_the_caps() {
         let s = Store::new();
-        s.put("expired.entry", 1, Duration::from_hours(24 * 8));
-        s.put("a.entry", 1, Duration::from_mins(1));
-        s.put("b.entry", 1, Duration::from_mins(2));
+        s.put("00000000000000a3.entry", 1, Duration::from_hours(24 * 8));
+        s.put("00000000000000a2.entry", 1, Duration::from_mins(1));
+        s.put("00000000000000ad.entry", 1, Duration::from_mins(2));
         let limits = PruneLimits {
             max_files: 2,
             ..roomy()
         };
         s.prune(limits);
-        assert!(!s.exists("expired.entry"));
-        assert!(s.exists("a.entry") && s.exists("b.entry"));
+        assert!(!s.exists("00000000000000a3.entry"));
+        assert!(s.exists("00000000000000a2.entry") && s.exists("00000000000000ad.entry"));
     }
 
     #[test]
     fn prune_dir_stale_tmp_removal_counts_toward_the_byte_cap() {
         let s = Store::new();
-        s.put("stale.tmp", 100, NOW_SKEW + Duration::from_mins(5));
-        s.put("a.entry", 10, Duration::from_mins(1));
-        s.put("b.entry", 10, Duration::from_mins(2));
+        s.put(
+            "00000000000000ae.entry.deps-cli-1-1.tmp",
+            100,
+            NOW_SKEW + Duration::from_mins(5),
+        );
+        s.put("00000000000000a2.entry", 10, Duration::from_mins(1));
+        s.put("00000000000000ad.entry", 10, Duration::from_mins(2));
         let limits = PruneLimits {
             max_bytes: 20,
             ..roomy()
         };
         s.prune(limits);
-        assert!(!s.exists("stale.tmp"));
-        assert!(s.exists("a.entry") && s.exists("b.entry"));
+        assert!(!s.exists("00000000000000ae.entry.deps-cli-1-1.tmp"));
+        assert!(s.exists("00000000000000a2.entry") && s.exists("00000000000000ad.entry"));
     }
 
     #[test]
     fn prune_dir_scan_is_capped() {
         let s = Store::new();
         for n in 0..5 {
-            s.put(&format!("{n}.tmp"), 1, NOW_SKEW + Duration::from_mins(5));
+            s.put(
+                &format!("{n:016x}.entry.deps-cli-1-1.tmp"),
+                1,
+                NOW_SKEW + Duration::from_mins(5),
+            );
         }
         let limits = PruneLimits {
             max_scan: 3,
@@ -761,9 +808,13 @@ mod prune {
     #[test]
     fn prune_dir_reports_removed_count() {
         let s = Store::new();
-        s.put("old.tmp", 1, NOW_SKEW + Duration::from_mins(5));
-        s.put("expired.entry", 1, Duration::from_hours(24 * 8));
-        s.put("keep.entry", 1, Duration::from_mins(1));
+        s.put(
+            "00000000000000a0.entry.deps-cli-1-1.tmp",
+            1,
+            NOW_SKEW + Duration::from_mins(5),
+        );
+        s.put("00000000000000a3.entry", 1, Duration::from_hours(24 * 8));
+        s.put("00000000000000af.entry", 1, Duration::from_mins(1));
         let report = s.prune(roomy());
         assert_eq!(report.scanned, 3);
         assert_eq!(report.removed, 2);
@@ -786,11 +837,15 @@ mod prune {
     #[test]
     fn prune_dir_removes_an_entry_stamped_in_the_future() {
         let s = Store::new();
-        s.put_at("future.entry", 1, s.now + Duration::from_hours(24));
-        s.put("ok.entry", 1, Duration::from_mins(1));
+        s.put_at(
+            "00000000000000b0.entry",
+            1,
+            s.now + Duration::from_hours(24),
+        );
+        s.put("00000000000000b1.entry", 1, Duration::from_mins(1));
         let report = s.prune(roomy());
-        assert!(!s.exists("future.entry"));
-        assert!(s.exists("ok.entry"));
+        assert!(!s.exists("00000000000000b0.entry"));
+        assert!(s.exists("00000000000000b1.entry"));
         assert_eq!(report.removed, 1);
     }
 
@@ -800,10 +855,10 @@ mod prune {
         use std::os::unix::fs::PermissionsExt;
         let s = Store::new();
         let sub = s.tmp.path();
-        s.put("expired.entry", 1, Duration::from_hours(24 * 8));
+        s.put("00000000000000a3.entry", 1, Duration::from_hours(24 * 8));
         fs::set_permissions(sub, fs::Permissions::from_mode(0o500)).expect("chmod");
         let vacuous = fs::File::create(sub.join("probe")).is_ok();
-        let result = prune_dir(sub, s.now, roomy());
+        let result = prune_dir(sub, trust(), s.now, roomy());
         fs::set_permissions(sub, fs::Permissions::from_mode(0o700)).expect("chmod");
         if vacuous {
             eprintln!("SKIPPED: directory permissions are not enforced (root)");
@@ -811,7 +866,7 @@ mod prune {
         }
         let report = result.expect("a removal failure is not a pass failure");
         assert_eq!((report.removed, report.failed), (0, 1));
-        assert!(s.exists("expired.entry"));
+        assert!(s.exists("00000000000000a3.entry"));
     }
 
     #[test]
@@ -826,6 +881,7 @@ mod prune {
         let tmp = tempfile::tempdir().expect("tempdir");
         let report = prune_dir(
             &tmp.path().join("gone"),
+            trust(),
             SystemTime::now(),
             PruneLimits::DEFAULT,
         )
