@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **workflow**: the `deps-lsp-check` pre-commit hook matches every `*.versions.toml` catalog, not only `libs.versions.toml` (#2167, #2188)
 - **deps-gradle**: settings-declared catalogs ignore comments and string literals, accept `from(` split across lines, and are found through the nearest four settings files above the catalog (#2171, #2188)
 - **deps-core**: text reads that end in a NUL byte are refused as incomplete (Windows reparse-point files), while binary disk-cache reads are exempt (#2173, #2188)
+- **workflow**: `deps-lsp-check` runs the released digest-pinned action image with an explicit `cooldown`, and `.cargo/**` changes trigger CI (#2189)
 - **deps-gradle**: version-catalog libraries in short notation (`alias = "group:artifact[:version]"`) are checked for updates and vulnerabilities (#2162, #2175)
 - **deps-gradle**, **deps-lsp**, **deps-cli**: a `*.toml` declared in `settings.gradle(.kts)` `versionCatalogs { from(files(...)) }` is recognized as a version catalog in the LSP and the CLI (#2161, #2175)
 - **deps-core**: no-follow reads of Windows reparse-point files (WOF, dedup, cloud) fail loudly on a short or all-zero read instead of returning wrong content (#2158, #2175)

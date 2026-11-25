@@ -50,6 +50,7 @@ jobs:
               - 'rust-toolchain.toml'
               - 'deny.toml'
               - '.github/Cross.toml'
+              - '.cargo/**'
             workflows:
               - '.github/workflows/!(mdbook).{yml,yaml}'
             github_action:
@@ -177,7 +178,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-hack
 
@@ -247,7 +248,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack and cargo-nextest
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-hack, cargo-nextest
 
@@ -324,7 +325,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-hack and cargo-nextest
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-hack, cargo-nextest
 
@@ -350,7 +351,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-machete
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-machete
 
@@ -832,7 +833,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-deny
 
@@ -875,82 +876,29 @@ jobs:
       - name: Run entrypoint.sh regression tests
         run: bash crates/github-action/tests/entrypoint_test.sh
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Resolve deps-cli release version
-        # Authenticated (5000/hr) resolution outside the Docker build: the Dockerfile's own
-        # unauthenticated fallback (60/hr, cached in the `fetch` layer) rate-limits and goes
-        # stale under `cache-from: type=gha` (#1141). Passed explicitly below so the layer
-        # cache busts whenever a new release actually ships.
-        id: deps-cli-version
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          version="$(gh api repos/bug-ops/deps-lsp/releases/latest --jq .tag_name)"
-          [ -n "${version}" ] || { echo "failed to resolve latest deps-lsp release tag" >&2; exit 1; }
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      - name: Build image for self-test
-        # `action.yml`'s `image:` is a `docker://ghcr.io/...` reference (required so real
-        # consumers pull a pre-built image instead of compiling on every run) — GitHub Actions
-        # always `docker pull`s that tag for a `docker://` image reference, regardless of the
-        # git ref/path given to `uses:`, so `uses: ./crates/github-action` here would just pull
-        # the published registry tag and never build this checkout's own Dockerfile (review
-        # finding). Building+running the image directly, the same way `docker-build-and-scan`
-        # does, is the only way this job self-tests the Dockerfile/entrypoint.sh content of the
-        # branch/PR it runs on.
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: crates/github-action
-          load: true
-          push: false
-          tags: deps-lsp-github-action:selftest
-          build-args: |
-            DEPS_CLI_VERSION=${{ steps.deps-cli-version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Run deps-lsp check
         id: deps-check
-        # Mirrors what the GitHub Actions runtime does for a real `using: docker` action: bind
-        # -mounts the checkout as the container's working directory and gives the container
-        # write access to $GITHUB_OUTPUT (bind-mounted at the same path on both sides) so
-        # entrypoint.sh's own `>>"$GITHUB_OUTPUT"` writes land back in this step's real outputs.
-        # `-e VAR` (no `=value`) forwards the host shell's value only if set, so the optional
-        # DEPS_CLI_COOLDOWN/CONFIG are safely omitted rather than passed as literal empty.
-        #
-        # DEPS_CLI_PATHS is scoped to this repo's own dependency manifests (root Cargo.toml,
-        # which carries every pinned version per this project's centralized-versioning
-        # convention, plus .github/ for Actions pins) rather than the repo root: an unscoped
-        # walk also descends into crates/*/tests/fixtures/ and fuzz/seeds/, which deliberately
-        # contain vulnerable/yanked/malformed manifests to exercise ecosystem parsers and
-        # trip this job's own fail-on gate on every run.
-        #
-        # GITHUB_TOKEN raises the GitHub Actions ecosystem's registry-lookup rate limit from
-        # 60/hr (unauthenticated, shared across every job on the runner's IP) to 5000/hr.
+        # Runs the released image pinned by digest in action.yml (release.yml repoints it after
+        # each release), so nothing is built here and PR changes to deps-cli, the Dockerfile or
+        # entrypoint.sh are not exercised by this step.
+        uses: ./crates/github-action
+        with:
+          # Not the repo root: test fixtures and fuzz seeds hold deliberately vulnerable manifests.
+          paths: Cargo.toml .github
+          fail-on: vulnerable,yanked,unsatisfiable
+          # Keep in step with .cargo/config.toml `global-min-publish-age` (read by deps-cli itself
+          # for Cargo) and Dependabot's cooldown; this input covers the other ecosystems.
+          cooldown: 3d
         env:
-          DEPS_CLI_FAIL_ON: vulnerable,yanked,unsatisfiable
-          DEPS_CLI_PATHS: Cargo.toml .github
+          # Raises the GitHub API limit for Actions pin lookups from 60/hr to 5000/hr.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" \
-            -w "${GITHUB_WORKSPACE}" \
-            -v "${GITHUB_OUTPUT}:${GITHUB_OUTPUT}" \
-            -e GITHUB_OUTPUT \
-            -e DEPS_CLI_FAIL_ON \
-            -e DEPS_CLI_PATHS \
-            -e DEPS_CLI_COOLDOWN \
-            -e DEPS_CLI_CONFIG \
-            -e GITHUB_TOKEN \
-            deps-lsp-github-action:selftest
 
       - name: Upload SARIF to code scanning
         # A pull_request from a fork gets a read-only GITHUB_TOKEN regardless of this job's
         # security-events: write permission, so the upload would 403 and fail the job for
         # every external contributor.
         if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
-        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
         with:
           sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
 
@@ -981,7 +929,10 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Resolve deps-cli release version
-        # See deps-lsp-check's identically named step above for the rationale (#1141).
+        # Authenticated (5000/hr) resolution outside the Docker build: the Dockerfile's own
+        # unauthenticated fallback (60/hr, cached in the `fetch` layer) rate-limits and goes
+        # stale under `cache-from: type=gha` (#1141). Passed explicitly below so the layer
+        # cache busts whenever a new release actually ships.
         id: deps-cli-version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1020,7 +971,7 @@ jobs:
         # security-events: write permission, so the upload would 403 and fail the job for
         # every external contributor.
         if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
-        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
         with:
           sarif_file: trivy-results.sarif
 
@@ -1049,7 +1000,7 @@ jobs:
           shared-key: test-${{ matrix.os }}-${{ matrix.rust }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: nextest
 
@@ -1113,7 +1064,7 @@ jobs:
           shared-key: test-aarch64
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: nextest
 
@@ -1156,7 +1107,7 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross_tool
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cross
 
@@ -1242,7 +1193,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386
 
       - name: Install nextest
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: nextest
 
@@ -1283,7 +1234,7 @@ jobs:
           shared-key: coverage
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest, cargo-llvm-cov
 
