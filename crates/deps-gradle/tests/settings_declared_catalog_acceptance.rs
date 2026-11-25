@@ -230,7 +230,10 @@ fn locate_lockfile_for_a_declared_catalog_finds_the_root_lockfile() {
     let catalog = project.write("gradle/deps.toml", "[libraries]\n");
     let uri = Url::from_file_path(&catalog).unwrap();
 
-    assert_eq!(GradleLockParser.locate_lockfile(&uri), Some(lockfile));
+    let located = GradleLockParser
+        .locate_lockfile(&uri)
+        .map(|path| path.canonicalize().unwrap());
+    assert_eq!(located, Some(lockfile.canonicalize().unwrap()));
 }
 
 #[test]
